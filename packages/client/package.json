@@ -1,0 +1,14 @@
+{
+  "name": "@todo-tui/client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "echo \"no tests yet\""
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "2.16.0"
+  }
+}

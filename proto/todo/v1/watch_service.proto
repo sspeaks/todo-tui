@@ -1,0 +1,84 @@
+syntax = "proto3";
+
+package todo.v1;
+
+import "todo/v1/common.proto";
+import "todo/v1/item.proto";
+
+service WatchService {
+  // Subscribes first, then replays changes after since_revision, sends
+  // CaughtUp, then streams live changes (design 4.4).
+  rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
+}
+
+message SubscribeRequest {
+  // Unset: no replay, start at the current revision. Set (including 0, the
+  // revision of an empty database): replay every change with revision >
+  // since_revision before CaughtUp.
+  optional uint64 since_revision = 1;
+  // Empty means all topics.
+  repeated Topic topics = 2;
+}
+
+// The WatchMessage of design 4.4 (named for buf's RPC naming rule).
+message SubscribeResponse {
+  oneof message {
+    Change change = 1;
+    Notice notice = 2;
+    ResyncRequired resync_required = 3;
+    CaughtUp caught_up = 4;
+  }
+}
+
+// Durable and replayable.
+message Change {
+  uint64 revision = 1;
+  Topic topic = 2;
+  // Resource id.
+  string id = 3;
+  bool deleted = 4;
+  // The full resource, unless deleted.
+  oneof resource {
+    Item item = 10;
+    // Allocated: Suggestion suggestion = 11;
+    // Allocated: View view = 12;
+    // Allocated: Person person = 13;
+    // Allocated: RecurrenceSeries series = 14;
+    // Allocated: ReviewSession review = 15;
+    // Allocated: ConfigSnapshot config = 16;
+  }
+}
+
+// Ephemeral: no revision, never replayed.
+message Notice {
+  oneof kind {
+    Toast toast = 10;
+    // Allocated: SyncStatus sync_status = 11;
+    // Allocated: ImportProgress import_progress = 12;
+    // Allocated: AssistantJob assistant_job = 13;
+  }
+}
+
+message Toast {
+  ToastLevel level = 1;
+  string message = 2;
+}
+
+enum ToastLevel {
+  TOAST_LEVEL_UNSPECIFIED = 0;
+  TOAST_LEVEL_INFO = 1;
+  TOAST_LEVEL_WARNING = 2;
+  TOAST_LEVEL_ERROR = 3;
+}
+
+// since_revision is older than the replay window, or newer than the daemon's
+// current revision (the database was replaced). Sent once; the stream then
+// continues from current_revision and the client must reload.
+message ResyncRequired {
+  uint64 current_revision = 1;
+}
+
+// Replay is complete; everything after this is live.
+message CaughtUp {
+  uint64 revision = 1;
+}

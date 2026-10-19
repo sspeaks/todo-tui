@@ -1,0 +1,56 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sspeaks/todo-tui"
+publish = false
+
+[workspace.dependencies]
+todo-core = { path = "crates/todo-core" }
+todo-store = { path = "crates/todo-store" }
+todo-sync = { path = "crates/todo-sync" }
+todo-jira = { path = "crates/todo-jira" }
+todo-assistant = { path = "crates/todo-assistant" }
+todo-proto = { path = "crates/todo-proto" }
+todo-daemon = { path = "crates/todo-daemon" }
+
+anyhow = "1.0.104"
+async-stream = "0.3.6"
+clap = { version = "4.6.7", features = ["derive"] }
+futures-util = "0.3.34"
+hex = "0.4.3"
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+jiff = { version = "0.2.38", features = ["serde"] }
+prost = "0.14.4"
+prost-reflect = { version = "0.16.5", features = ["serde"] }
+prost-types = "0.14.4"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+rustix = { version = "1.1.5", features = ["fs", "process"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+tokio = { version = "1.53.3", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1.19", features = ["net", "sync"] }
+toml = "1.1.8"
+tonic = "0.14.6"
+tonic-prost = "0.14.6"
+tonic-prost-build = "0.14.6"
+tonic-types = "0.14.6"
+tower = { version = "0.5.3", features = ["util"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+ulid = { version = "3.0.0", features = ["serde"] }
+
+[workspace.lints.rust]
+rust_2018_idioms = { level = "warn", priority = -1 }
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

@@ -1,0 +1,43 @@
+[package]
+name = "todo-daemon"
+description = "The todo-tui daemon: tonic services, scheduler and watch fan-out."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+todo-core.workspace = true
+todo-store.workspace = true
+todo-sync.workspace = true
+todo-jira.workspace = true
+todo-assistant.workspace = true
+todo-proto.workspace = true
+anyhow.workspace = true
+async-stream.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+hyper-util.workspace = true
+jiff.workspace = true
+prost-types.workspace = true
+rustix.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tonic-types.workspace = true
+tower.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

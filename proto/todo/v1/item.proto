@@ -1,0 +1,217 @@
+syntax = "proto3";
+
+package todo.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "google/type/date.proto";
+import "todo/v1/common.proto";
+import "todo/v1/field.proto";
+
+// The one entity (design 3.1). Field numbers are grouped by layer (3.2):
+// identity 1-9, Core 10-39, Overlay 40-59, remote extras 60,
+// derived and sync-state 70-99 (read-only, computed by the daemon).
+// ItemField values equal these numbers.
+message Item {
+  // Identity.
+  string id = 1;
+  CreatedVia created_via = 2;
+  google.protobuf.Timestamp created_at = 3;
+  google.protobuf.Timestamp updated_at = 4;
+  // Global revision of the Item's last change; the etag for expected_revision.
+  uint64 revision = 5;
+  // Present once linked to a tracker issue (3.3).
+  RemoteLink remote_link = 6;
+  // 7-9 reserved for future identity fields.
+
+  // Core: owned by the tracker when linked.
+  string title = 10;
+  // Markdown.
+  string description = 11;
+  // "task" by default; the tracker issue type name when linked.
+  string item_type = 12;
+  StatusCategory status_category = 13;
+  // Set only while status_category is DONE.
+  optional ResolutionKind resolution_kind = 14;
+  // Read-only, e.g. "In Review".
+  optional string remote_status_name = 15;
+  Priority priority = 16;
+  PersonRef assignee = 17;
+  // Read-only.
+  PersonRef reporter = 18;
+  repeated string labels = 19;
+  repeated string components = 20;
+  repeated string fix_versions = 21;
+  google.type.Date due_date = 22;
+  // The only representation of hierarchy (3.6).
+  optional string parent_id = 23;
+  // Read-only in v1.
+  optional string sprint = 24;
+  optional double story_points = 25;
+  google.protobuf.Duration original_estimate = 26;
+  google.protobuf.Duration remaining_estimate = 27;
+  // Read-only; informs done vs cancelled.
+  optional string resolution = 28;
+  // Read-only.
+  google.protobuf.Timestamp remote_created_at = 29;
+  // Read-only.
+  google.protobuf.Timestamp remote_updated_at = 30;
+  // 31-39 reserved for future Core fields.
+
+  // Overlay: always local, never pushed.
+  // Meaningful only while status_category is TODO; retained otherwise.
+  TodoRefinement todo_refinement = 40;
+  Waiting waiting = 41;
+  // Hidden from active views until this date.
+  google.type.Date defer_until = 42;
+  // Markdown.
+  string private_notes = 43;
+  // ISO week, "YYYY-Www".
+  optional string focus_week = 44;
+  optional Priority local_priority_override = 45;
+  Archived archived = 46;
+  ItemRecurrence recurrence = 47;
+  // 48-59 reserved for future Overlay fields.
+
+  // Remote extras: tracker field id -> raw value. Read-only.
+  map<string, google.protobuf.Value> remote_extras = 60;
+  // 61-69 reserved.
+
+  // Derived and sync-state (read-only).
+  Status status = 70;
+  // local_priority_override if set, else priority.
+  Priority effective_priority = 71;
+  bool is_mine = 72;
+  // Core fields with an un-pushed local value.
+  repeated ItemField pending_fields = 73;
+  bool has_conflict = 74;
+  bool has_push_failure = 75;
+  bool description_lossy = 76;
+  bool description_dirty = 77;
+  StalenessSignals staleness = 78;
+  // Scope ids (5.3) this Item currently matches.
+  repeated string scopes = 79;
+  // Set when soft-deleted (3.7).
+  google.protobuf.Timestamp deleted_at = 80;
+  // Set when deleted by a merge.
+  optional string merged_into = 81;
+  // due_date is before today in the user's zone and the Item is not done.
+  bool is_overdue = 82;
+  // 83-99 reserved for future derived fields.
+}
+
+message Waiting {
+  PersonRef on = 1;
+  string reason = 2;
+  google.type.Date since = 3;
+  google.type.Date follow_up_on = 4;
+}
+
+message Archived {
+  google.protobuf.Timestamp at = 1;
+  ArchiveReason reason = 2;
+}
+
+message RemoteLink {
+  // "jira".
+  string tracker_kind = 1;
+  // Configured site, e.g. "work-jira".
+  string instance_id = 2;
+  // Stable remote id; the join key.
+  string remote_id = 3;
+  // Display only, e.g. "PLAT-530"; changes when the issue moves.
+  string key = 4;
+  string url = 5;
+  // Remote `updated` at the last successful pull.
+  google.protobuf.Timestamp last_pulled_version = 6;
+  LinkState link_state = 7;
+  // Created by promote or attach: never archived for leaving scope.
+  bool pinned = 8;
+}
+
+// Membership in a local recurrence series (3.8).
+message ItemRecurrence {
+  string series_id = 1;
+  // The date this instance was generated for.
+  google.type.Date occurrence_date = 2;
+}
+
+// Cached staleness signals (3.10).
+message StalenessSignals {
+  google.protobuf.Timestamp last_user_touch_at = 1;
+  google.protobuf.Timestamp last_remote_change_at = 2;
+  google.protobuf.Timestamp status_entered_at = 3;
+  google.protobuf.Timestamp waiting_since = 4;
+}
+
+// "No priority" is always PRIORITY_NONE, never FieldValue.cleared.
+// Sort order: NONE sorts after LOWEST.
+enum Priority {
+  PRIORITY_UNSPECIFIED = 0;
+  PRIORITY_NONE = 1;
+  PRIORITY_LOWEST = 2;
+  PRIORITY_LOW = 3;
+  PRIORITY_MEDIUM = 4;
+  PRIORITY_HIGH = 5;
+  PRIORITY_HIGHEST = 6;
+}
+
+// The derived 6-value status (3.4).
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  STATUS_INBOX = 1;
+  STATUS_NEXT = 2;
+  STATUS_SOMEDAY = 3;
+  STATUS_IN_PROGRESS = 4;
+  STATUS_DONE = 5;
+  STATUS_CANCELLED = 6;
+}
+
+enum StatusCategory {
+  STATUS_CATEGORY_UNSPECIFIED = 0;
+  STATUS_CATEGORY_TODO = 1;
+  STATUS_CATEGORY_IN_PROGRESS = 2;
+  STATUS_CATEGORY_DONE = 3;
+}
+
+enum ResolutionKind {
+  RESOLUTION_KIND_UNSPECIFIED = 0;
+  RESOLUTION_KIND_DONE = 1;
+  RESOLUTION_KIND_CANCELLED = 2;
+}
+
+enum TodoRefinement {
+  TODO_REFINEMENT_UNSPECIFIED = 0;
+  TODO_REFINEMENT_INBOX = 1;
+  TODO_REFINEMENT_NEXT = 2;
+  TODO_REFINEMENT_SOMEDAY = 3;
+}
+
+enum CreatedVia {
+  CREATED_VIA_UNSPECIFIED = 0;
+  CREATED_VIA_TUI = 1;
+  CREATED_VIA_CLI = 2;
+  CREATED_VIA_MCP = 3;
+  CREATED_VIA_REMOTE_IMPORT = 4;
+  CREATED_VIA_RESTORE = 5;
+  CREATED_VIA_SPLIT = 6;
+  CREATED_VIA_RECURRENCE = 7;
+}
+
+enum ArchiveReason {
+  ARCHIVE_REASON_UNSPECIFIED = 0;
+  ARCHIVE_REASON_USER = 1;
+  ARCHIVE_REASON_LEFT_SCOPE = 2;
+  ARCHIVE_REASON_REMOTE_UNAVAILABLE = 3;
+  ARCHIVE_REASON_AUTO_DONE = 4;
+}
+
+enum LinkState {
+  LINK_STATE_UNSPECIFIED = 0;
+  // Promote queued.
+  LINK_STATE_PENDING = 1;
+  LINK_STATE_OK = 2;
+  // Remote deleted or no permission.
+  LINK_STATE_BROKEN = 3;
+}

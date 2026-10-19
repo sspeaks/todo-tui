@@ -1,0 +1,23 @@
+[package]
+name = "todo-store"
+description = "SQLite persistence, migrations, revisions and events."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+todo-core.workspace = true
+jiff.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

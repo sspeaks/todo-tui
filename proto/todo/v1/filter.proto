@@ -1,0 +1,97 @@
+syntax = "proto3";
+
+package todo.v1;
+
+import "todo/v1/field.proto";
+import "todo/v1/field_value.proto";
+
+// The filter language for views and ListItems (design 4.8).
+//
+// An Item matches if every all_of clause matches and (any_of is empty or at
+// least one any_of clause matches), and it passes the implicit rules unless
+// the matching include_* flag is true: exclude archived, exclude done and
+// cancelled, exclude defer_until in the future, exclude deleted.
+message Filter {
+  repeated Clause all_of = 1;
+  repeated Clause any_of = 2;
+  bool include_archived = 3;
+  bool include_done = 4;
+  bool include_deferred = 5;
+  bool include_deleted = 6;
+}
+
+message Clause {
+  oneof kind {
+    Predicate predicate = 1;
+    ClauseGroup group = 2;
+  }
+}
+
+// A nested group with the same all_of / any_of semantics as Filter.
+message ClauseGroup {
+  repeated Clause all_of = 1;
+  repeated Clause any_of = 2;
+}
+
+// A typed predicate on one target: a stored, nested or derived ItemField.
+message Predicate {
+  ItemField target = 1;
+  Operator op = 2;
+  // IN takes one or more operands; IS_SET / IS_UNSET take none; MATCHES takes
+  // one text operand; the comparison operators take exactly one.
+  repeated Operand operands = 3;
+}
+
+enum Operator {
+  OPERATOR_UNSPECIFIED = 0;
+  OPERATOR_IN = 1;
+  OPERATOR_EQ = 2;
+  OPERATOR_NE = 3;
+  OPERATOR_LT = 4;
+  OPERATOR_LE = 5;
+  OPERATOR_GT = 6;
+  OPERATOR_GE = 7;
+  OPERATOR_IS_SET = 8;
+  OPERATOR_IS_UNSET = 9;
+  // Set-valued targets: at least one operand is a member.
+  OPERATOR_CONTAINS_ANY = 10;
+  // Set-valued targets: every operand is a member.
+  OPERATOR_CONTAINS_ALL = 11;
+  // Full-text search (FTS5).
+  OPERATOR_MATCHES = 12;
+}
+
+message Operand {
+  oneof kind {
+    FieldValue value = 1;
+    RelativeDate relative_date = 2;
+    // Query text for OPERATOR_MATCHES.
+    string text = 3;
+  }
+}
+
+// A date resolved by the daemon in the user's local zone at query time.
+message RelativeDate {
+  Anchor anchor = 1;
+  // Days added to the anchor date (e.g. +3 for "+3d"). Ignored for
+  // ANCHOR_CURRENT_WEEK.
+  int32 offset_days = 2;
+
+  enum Anchor {
+    ANCHOR_UNSPECIFIED = 0;
+    ANCHOR_TODAY = 1;
+    // First day of the current ISO week (Monday).
+    ANCHOR_START_OF_WEEK = 2;
+    // Last day of the current ISO week (Sunday); "this_week".
+    ANCHOR_END_OF_WEEK = 3;
+    // The current ISO week as "YYYY-Www", for focus_week.
+    ANCHOR_CURRENT_WEEK = 4;
+  }
+}
+
+// Sort key; keys are any clause target. PRIORITY_NONE sorts after LOWEST and
+// unset values sort last in both directions.
+message SortKey {
+  ItemField key = 1;
+  bool descending = 2;
+}

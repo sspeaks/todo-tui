@@ -1,0 +1,62 @@
+syntax = "proto3";
+
+package todo.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+import "google/type/date.proto";
+import "todo/v1/common.proto";
+import "todo/v1/field.proto";
+import "todo/v1/item.proto";
+
+// A typed value of one ItemField: patch values (set_field expected_old/new),
+// filter operands and undo payloads. Never a JSON string.
+message FieldValue {
+  oneof kind {
+    // Absence, for fields without a domain "none" (dates, waiting, parent,
+    // overrides). Never used for priority: that is PRIORITY_NONE.
+    google.protobuf.Empty cleared = 1;
+    string string_value = 2;
+    // Markdown text (description, private_notes).
+    string markdown_value = 3;
+    bool bool_value = 4;
+    double number_value = 5;
+    uint64 uint_value = 6;
+    google.type.Date date_value = 7;
+    google.protobuf.Timestamp timestamp_value = 8;
+    google.protobuf.Duration duration_value = 9;
+    StringSet string_set = 10;
+    PersonRef person = 11;
+    // An Item ULID (parent_id, merged_into).
+    string item_id = 12;
+    // ISO week, "YYYY-Www".
+    string iso_week = 13;
+
+    Priority priority = 20;
+    Status status = 21;
+    StatusCategory status_category = 22;
+    ResolutionKind resolution_kind = 23;
+    TodoRefinement todo_refinement = 24;
+    CreatedVia created_via = 25;
+    ArchiveReason archive_reason = 26;
+    LinkState link_state = 27;
+    ItemFieldSet item_field_set = 28;
+
+    Waiting waiting = 40;
+    Archived archived = 41;
+    ItemRecurrence recurrence = 42;
+    RemoteLink remote_link = 43;
+    StalenessSignals staleness = 44;
+  }
+}
+
+// A set of strings (labels, components, fix_versions, scopes).
+message StringSet {
+  repeated string values = 1;
+}
+
+// A set of fields (pending_fields).
+message ItemFieldSet {
+  repeated ItemField fields = 1;
+}

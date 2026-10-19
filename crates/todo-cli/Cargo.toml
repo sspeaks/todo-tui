@@ -1,0 +1,33 @@
+[package]
+name = "todo-cli"
+description = "The todo command-line binary."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "todo"
+path = "src/main.rs"
+
+[dependencies]
+todo-proto.workspace = true
+todo-daemon.workspace = true
+todo-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+hyper-util.workspace = true
+jiff.workspace = true
+rustix.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tower.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

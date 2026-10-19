@@ -1,0 +1,27 @@
+[package]
+name = "todo-proto"
+description = "Generated todo.v1 protobuf code and core conversions."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+todo-core.workspace = true
+jiff.workspace = true
+prost.workspace = true
+prost-reflect.workspace = true
+prost-types.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+ulid.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true
+
+[lints]
+workspace = true

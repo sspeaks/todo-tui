@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package todo.v1;
+
+import "google/protobuf/timestamp.proto";
+import "todo/v1/common.proto";
+import "todo/v1/filter.proto";
+import "todo/v1/item.proto";
+
+// Conventions for every mutating request: request_id = 1 is a client ULID
+// (a replay within 24h returns the original result); single-item mutations
+// carry `optional uint64 expected_revision` and fail with ABORTED when the
+// Item's revision differs; responses carry a MutationResult.
+service ItemService {
+  rpc CaptureItem(CaptureItemRequest) returns (CaptureItemResponse);
+  rpc ListItems(ListItemsRequest) returns (ListItemsResponse);
+}
+
+message CaptureItemRequest {
+  string request_id = 1;
+  // Raw capture text. In P0 it becomes the title verbatim.
+  string text = 2;
+  CreatedVia created_via = 3;
+  // "Now" for relative dates in text; defaults to the daemon's clock. Spool
+  // imports pass the original capture time.
+  google.protobuf.Timestamp reference_time = 4;
+  optional string parent_id = 5;
+  // Spool entry id; an id already imported is not imported again.
+  optional string spool_id = 6;
+}
+
+message CaptureItemResponse {
+  Item item = 1;
+  MutationResult result = 2;
+}
+
+message ListItemsRequest {
+  Filter filter = 1;
+  repeated SortKey sort = 2;
+  // 0 means the server default.
+  int32 page_size = 3;
+  // From a previous response; all pages are pinned to the first page's revision.
+  string page_token = 4;
+  // When set, the request narrows this saved view: the effective filter is the
+  // view's filter AND the request's filter (its all_of / any_of as one extra
+  // all_of group), with each include_* flag true if true in either. A
+  // non-empty request sort replaces the view's sort.
+  optional string view_id = 5;
+}
+
+message ListItemsResponse {
+  repeated Item items = 1;
+  string next_page_token = 2;
+  // The revision the results were read at.
+  uint64 revision = 3;
+}

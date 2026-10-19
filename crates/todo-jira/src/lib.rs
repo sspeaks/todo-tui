@@ -1,0 +1,1 @@
+//! Jira Cloud tracker adapter.

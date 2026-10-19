@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package todo.v1;
+
+// A reference to a person. Full Person records are fetched separately and
+// streamed on TOPIC_PERSON.
+message PersonRef {
+  oneof ref {
+    // ULID of a Person record.
+    string person_id = 1;
+    // Free text ("the vendor"). Only valid for waiting.on.
+    string free_text = 2;
+  }
+}
+
+// Returned by every mutating call.
+message MutationResult {
+  // ULID of the op; the unit of undo.
+  string op_id = 1;
+  // The global revision after the op committed.
+  uint64 revision = 2;
+}
+
+// Change-stream topics (design 4.4).
+enum Topic {
+  TOPIC_UNSPECIFIED = 0;
+  // The Item aggregate, including its comments, relations and pending-push state.
+  TOPIC_ITEM = 1;
+  TOPIC_SUGGESTION = 2;
+  TOPIC_VIEW = 3;
+  TOPIC_PERSON = 4;
+  TOPIC_SERIES = 5;
+  TOPIC_REVIEW = 6;
+  TOPIC_CONFIG = 7;
+}

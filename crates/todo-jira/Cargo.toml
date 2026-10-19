@@ -1,0 +1,15 @@
+[package]
+name = "todo-jira"
+description = "Jira Cloud tracker adapter."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+todo-sync.workspace = true
+
+[lints]
+workspace = true

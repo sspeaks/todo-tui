@@ -1,0 +1,7 @@
+packages:
+  - packages/*
+  - tui
+  - mcp
+
+allowBuilds:
+  "@bufbuild/buf": true

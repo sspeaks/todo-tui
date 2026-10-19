@@ -1,0 +1,16 @@
+[package]
+name = "todo-sync"
+description = "Sync engine and tracker adapter trait."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+todo-core.workspace = true
+todo-store.workspace = true
+
+[lints]
+workspace = true

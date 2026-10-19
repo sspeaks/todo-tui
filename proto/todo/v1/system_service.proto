@@ -1,0 +1,40 @@
+syntax = "proto3";
+
+package todo.v1;
+
+service SystemService {
+  // The first call from any client (design 4.2).
+  rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
+  // Fails with FAILED_PRECONDITION when restart is requested while other
+  // interactive clients are connected. Otherwise waits up to 10s for in-flight
+  // work, responds, then exits.
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+}
+
+enum ClientKind {
+  CLIENT_KIND_UNSPECIFIED = 0;
+  CLIENT_KIND_INTERACTIVE = 1;
+  CLIENT_KIND_ONESHOT = 2;
+  CLIENT_KIND_MCP = 3;
+}
+
+message GetServerInfoRequest {
+  ClientKind client_kind = 1;
+  string client_version = 2;
+  uint32 required_api_minor = 3;
+}
+
+message GetServerInfoResponse {
+  string daemon_version = 1;
+  // Bumped with every additive change to todo.v1.
+  uint32 api_minor = 2;
+  // e.g. "jira", "assistant".
+  repeated string capabilities = 3;
+}
+
+message ShutdownRequest {
+  // The caller will re-spawn the daemon (upgrade restart).
+  bool restart = 1;
+}
+
+message ShutdownResponse {}
