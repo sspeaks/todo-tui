@@ -10,7 +10,8 @@
     "gen": "buf generate",
     "lint:proto": "buf lint",
     "typecheck": "pnpm -r typecheck",
-    "test": "pnpm -r test"
+    "test": "pnpm -r test",
+    "smoke": "bash scripts/smoke.sh"
   },
   "devDependencies": {
     "@bufbuild/buf": "1.74.0",

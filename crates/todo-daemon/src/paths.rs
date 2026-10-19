@@ -3,7 +3,11 @@
 //! Resolution is a pure function of [`Env`], so the same vectors
 //! (`testdata/paths.json`) can test this module and the TypeScript port.
 
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Component, Path, PathBuf};
+
+use sha2::{Digest, Sha256};
 
 /// Unix socket paths longer than this fall back to `/tmp` (7.1).
 pub const MAX_SOCKET_PATH_BYTES: usize = 100;
@@ -36,10 +40,53 @@ pub struct Env {
     pub uid: u32,
 }
 
+/// macOS's per-user temp dir, used when `TMPDIR` is unset (as launchd jobs
+/// often are). Must agree with the TS client's `envFromProcess`.
+fn darwin_user_temp_dir() -> Option<PathBuf> {
+    let out = std::process::Command::new("getconf")
+        .arg("DARWIN_USER_TEMP_DIR")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let dir = String::from_utf8(out.stdout).ok()?;
+    let dir = dir.trim();
+    (!dir.is_empty()).then(|| PathBuf::from(dir))
+}
+
 impl Env {
     /// Reads the current process environment and uid.
     pub fn from_process() -> Env {
-        todo!()
+        let var = |name: &str| {
+            std::env::var_os(name)
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+        };
+        let todo_tui_home = var("TODO_TUI_HOME").map(|p| {
+            if p.is_absolute() {
+                p
+            } else {
+                std::env::current_dir().map(|cwd| cwd.join(&p)).unwrap_or(p)
+            }
+        });
+        Env {
+            os: if cfg!(target_os = "macos") {
+                Os::MacOs
+            } else {
+                Os::Linux
+            },
+            home: var("HOME"),
+            todo_tui_home,
+            xdg_config_home: var("XDG_CONFIG_HOME"),
+            xdg_data_home: var("XDG_DATA_HOME"),
+            xdg_state_home: var("XDG_STATE_HOME"),
+            xdg_runtime_dir: var("XDG_RUNTIME_DIR"),
+            tmpdir: var("TMPDIR").filter(|p| p.is_absolute()).or_else(|| {
+                cfg!(target_os = "macos")
+                    .then(darwin_user_temp_dir)
+                    .flatten()
+            }),
+            uid: rustix::process::getuid().as_raw(),
+        }
     }
 }
 
@@ -87,8 +134,133 @@ impl Paths {
     ///   `/tmp/todo-tui-$UID/h-<sha8>` where `sha8` is the first 8 hex digits
     ///   of SHA-256 over the normalised `TODO_TUI_HOME` path bytes (D8), so
     ///   `/x`, `/x/` and `/y/../x` share one socket.
-    #[allow(unused_variables)]
     pub fn resolve(env: &Env) -> Result<Paths, PathsError> {
-        todo!()
+        let fallback = PathBuf::from(format!("/tmp/todo-tui-{}", env.uid));
+        let (config, data, logs, runtime, home_key) = match non_empty(&env.todo_tui_home) {
+            Some(dir) => {
+                if !dir.is_absolute() {
+                    return Err(PathsError::RelativeTodoTuiHome(dir.to_path_buf()));
+                }
+                let dir = normalize(dir);
+                (
+                    dir.join("config.toml"),
+                    dir.join("data"),
+                    dir.join("logs"),
+                    dir.join("run"),
+                    Some(dir),
+                )
+            }
+            None => {
+                let home = || absolute(&env.home).ok_or(PathsError::NoHome);
+                let xdg_or =
+                    |var: &Option<PathBuf>, default: &str| -> Result<PathBuf, PathsError> {
+                        match absolute(var) {
+                            Some(dir) => Ok(dir),
+                            None => Ok(home()?.join(default)),
+                        }
+                    };
+                let config = xdg_or(&env.xdg_config_home, ".config")?.join("todo-tui/config.toml");
+                let (data, logs, runtime_base) = match env.os {
+                    Os::MacOs => (
+                        home()?.join("Library/Application Support/todo-tui"),
+                        home()?.join("Library/Logs/todo-tui"),
+                        &env.tmpdir,
+                    ),
+                    Os::Linux => (
+                        xdg_or(&env.xdg_data_home, ".local/share")?.join("todo-tui"),
+                        xdg_or(&env.xdg_state_home, ".local/state")?.join("todo-tui"),
+                        &env.xdg_runtime_dir,
+                    ),
+                };
+                let runtime = absolute(runtime_base)
+                    .map(|dir| dir.join("todo-tui"))
+                    .unwrap_or_else(|| fallback.clone());
+                (config, data, logs, runtime, None)
+            }
+        };
+
+        let mut runtime = runtime;
+        let mut socket = runtime.join(SOCKET_NAME);
+        if socket.as_os_str().len() > MAX_SOCKET_PATH_BYTES {
+            runtime = match &home_key {
+                Some(home) => fallback.join(format!("h-{}", sha8(home))),
+                None => fallback,
+            };
+            socket = runtime.join(SOCKET_NAME);
+        }
+        let lock = data.join(LOCK_NAME);
+        Ok(Paths {
+            config,
+            data,
+            logs,
+            runtime,
+            socket,
+            lock,
+        })
+    }
+
+    /// The SQLite database in [`Paths::data`].
+    pub fn database(&self) -> PathBuf {
+        self.data.join("todo.db")
+    }
+
+    /// The daemon log file in [`Paths::logs`].
+    pub fn daemon_log(&self) -> PathBuf {
+        self.logs.join("daemon.log")
+    }
+}
+
+const SOCKET_NAME: &str = "daemon.sock";
+const LOCK_NAME: &str = "daemon.lock";
+
+fn non_empty(p: &Option<PathBuf>) -> Option<&Path> {
+    p.as_deref().filter(|p| !p.as_os_str().is_empty())
+}
+
+/// An absolute path with repeated and trailing separators and `.` removed;
+/// `None` for unset, empty or relative values.
+fn absolute(p: &Option<PathBuf>) -> Option<PathBuf> {
+    non_empty(p)
+        .filter(|p| p.is_absolute())
+        .map(|p| p.components().collect())
+}
+
+/// Lexical normalisation of an absolute path, resolving `.` and `..`.
+fn normalize(p: &Path) -> PathBuf {
+    let mut parts: Vec<OsString> = Vec::new();
+    for c in p.components() {
+        match c {
+            Component::Normal(s) => parts.push(s.to_owned()),
+            Component::ParentDir => {
+                parts.pop();
+            }
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+        }
+    }
+    let mut out = PathBuf::from("/");
+    out.extend(parts);
+    out
+}
+
+fn sha8(p: &Path) -> String {
+    let digest = Sha256::digest(p.as_os_str().as_bytes());
+    hex::encode(&digest[..4])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_is_lexical() {
+        for (input, want) in [
+            ("/", "/"),
+            ("/a//b/", "/a/b"),
+            ("/a/./b/../c", "/a/c"),
+            ("/..", "/"),
+            ("/a/../../b", "/b"),
+        ] {
+            assert_eq!(normalize(Path::new(input)), PathBuf::from(want), "{input}");
+        }
     }
 }

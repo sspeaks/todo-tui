@@ -1354,6 +1354,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tower",
+ "tracing",
  "ulid",
 ]
 
@@ -1429,10 +1430,12 @@ version = "0.1.0"
 dependencies = [
  "jiff",
  "rusqlite",
+ "serde_json",
  "tempfile",
  "thiserror",
  "todo-core",
  "tokio",
+ "tracing",
  "ulid",
 ]
 

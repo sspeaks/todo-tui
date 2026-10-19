@@ -1,0 +1,483 @@
+{
+  "comment": "Shared path-resolution vectors for crates/todo-daemon/src/paths.rs and the TypeScript port. Missing or null env values are unset. 'error' is one of no_home, relative_todo_tui_home.",
+  "vectors": [
+    {
+      "name": "macos defaults",
+      "env": {
+        "os": "macos",
+        "home": "/Users/ann",
+        "todo_tui_home": null,
+        "xdg_config_home": null,
+        "xdg_data_home": null,
+        "xdg_state_home": null,
+        "xdg_runtime_dir": null,
+        "tmpdir": "/var/folders/xy/abc123/T/",
+        "uid": 501
+      },
+      "expect": {
+        "config": "/Users/ann/.config/todo-tui/config.toml",
+        "data": "/Users/ann/Library/Application Support/todo-tui",
+        "logs": "/Users/ann/Library/Logs/todo-tui",
+        "runtime": "/var/folders/xy/abc123/T/todo-tui",
+        "socket": "/var/folders/xy/abc123/T/todo-tui/daemon.sock",
+        "lock": "/Users/ann/Library/Application Support/todo-tui/daemon.lock"
+      }
+    },
+    {
+      "name": "macos honours XDG_CONFIG_HOME only",
+      "env": {
+        "os": "macos",
+        "home": "/Users/ann",
+        "todo_tui_home": null,
+        "xdg_config_home": "/cfg",
+        "xdg_data_home": "/ignored-data",
+        "xdg_state_home": "/ignored-state",
+        "xdg_runtime_dir": "/ignored-run",
+        "tmpdir": "/var/folders/xy/T",
+        "uid": 501
+      },
+      "expect": {
+        "config": "/cfg/todo-tui/config.toml",
+        "data": "/Users/ann/Library/Application Support/todo-tui",
+        "logs": "/Users/ann/Library/Logs/todo-tui",
+        "runtime": "/var/folders/xy/T/todo-tui",
+        "socket": "/var/folders/xy/T/todo-tui/daemon.sock",
+        "lock": "/Users/ann/Library/Application Support/todo-tui/daemon.lock"
+      }
+    },
+    {
+      "name": "macos without TMPDIR",
+      "env": {
+        "os": "macos",
+        "home": "/Users/ann",
+        "todo_tui_home": null,
+        "xdg_config_home": null,
+        "xdg_data_home": null,
+        "xdg_state_home": null,
+        "xdg_runtime_dir": null,
+        "tmpdir": null,
+        "uid": 501
+      },
+      "expect": {
+        "config": "/Users/ann/.config/todo-tui/config.toml",
+        "data": "/Users/ann/Library/Application Support/todo-tui",
+        "logs": "/Users/ann/Library/Logs/todo-tui",
+        "runtime": "/tmp/todo-tui-501",
+        "socket": "/tmp/todo-tui-501/daemon.sock",
+        "lock": "/Users/ann/Library/Application Support/todo-tui/daemon.lock"
+      }
+    },
+    {
+      "name": "macos long TMPDIR falls back",
+      "env": {
+        "os": "macos",
+        "home": "/Users/ann",
+        "todo_tui_home": null,
+        "xdg_config_home": null,
+        "xdg_data_home": null,
+        "xdg_state_home": null,
+        "xdg_runtime_dir": null,
+        "tmpdir": "/var/folders/tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt/T/",
+        "uid": 501
+      },
+      "expect": {
+        "config": "/Users/ann/.config/todo-tui/config.toml",
+        "data": "/Users/ann/Library/Application Support/todo-tui",
+        "logs": "/Users/ann/Library/Logs/todo-tui",
+        "runtime": "/tmp/todo-tui-501",
+        "socket": "/tmp/todo-tui-501/daemon.sock",
+        "lock": "/Users/ann/Library/Application Support/todo-tui/daemon.lock"
+      }
+    },
+    {
+      "name": "linux defaults",
+      "env": {
+        "os": "linux",
+        "home": "/home/lin",
+        "todo_tui_home": null,
+        "xdg_config_home": null,
+        "xdg_data_home": null,
+        "xdg_state_home": null,
+        "xdg_runtime_dir": "/run/user/501",
+        "tmpdir": null,
+        "uid": 501
+      },
+      "expect": {
+        "config": "/home/lin/.config/todo-tui/config.toml",
+        "data": "/home/lin/.local/share/todo-tui",
+        "logs": "/home/lin/.local/state/todo-tui",
+        "runtime": "/run/user/501/todo-tui",
+        "socket": "/run/user/501/todo-tui/daemon.sock",
+        "lock": "/home/lin/.local/share/todo-tui/daemon.lock"
+      }
+    },
+    {
+      "name": "linux XDG dirs",
+      "env": {
+        "os": "linux",
+        "home": "/home/lin",
+        "todo_tui_home": null,
+        "xdg_config_home": "/c",
+        "xdg_data_home": "/d/",
+        "xdg_state_home": "/s//x",
+        "xdg_runtime_dir": "/r",
+        "tmpdir": "/ignored",
+        "uid": 501
+      },
+      "expect": {
+        "config": "/c/todo-tui/config.toml",
+        "data": "/d/todo-tui",
+        "logs": "/s/x/todo-tui",
+        "runtime": "/r/todo-tui",
+        "socket": "/r/todo-tui/daemon.sock",
+        "lock": "/d/todo-tui/daemon.lock"
+      }
+    },
+    {
+      "name": "linux relative and empty XDG count as unset",
+      "env": {
+        "os": "linux",
+        "home": "/home/lin",
+        "todo_tui_home": null,
+        "xdg_config_home": "rel/cfg",
+        "xdg_data_home": "",
+        "xdg_state_home": "./state",
+        "xdg_runtime_dir": "run",
+        "tmpdir": null,
+        "uid": 501
+      },
+      "expect": {
+        "config": "/home/lin/.config/todo-tui/config.toml",
+        "data": "/home/lin/.local/share/todo-tui",
+        "logs": "/home/lin/.local/state/todo-tui",
+        "runtime": "/tmp/todo-tui-501",
+        "socket": "/tmp/todo-tui-501/daemon.sock",
+        "lock": "/home/lin/.local/share/todo-tui/daemon.lock"
+      }
+    },
+    {
+      "name": "linux without XDG_RUNTIME_DIR",
+      "env": {
+        "os": "linux",
+        "home": "/home/lin",
+        "todo_tui_home": null,
+        "xdg_config_home": null,
+        "xdg_data_home": null,
+        "xdg_state_home": null,
+        "xdg_runtime_dir": null,
+        "tmpdir": "/tmp",
+        "uid": 501
+      },
+      "expect": {
+        "config": "/home/lin/.config/todo-tui/config.toml",
+        "data": "/home/lin/.local/share/todo-tui",
+        "logs": "/home/lin/.local/state/todo-tui",
+        "runtime": "/tmp/todo-tui-501",
+        "socket": "/tmp/todo-tui-501/daemon.sock",
+        "lock": "/home/lin/.local/share/todo-tui/daemon.lock"
+      }
+    },
+    {
+      "name": "linux no HOME but all XDG set",
+      "env": {
+        "os": "linux",
+        "home": null,
+        "todo_tui_home": null,
+        "xdg_config_home": "/c",
+        "xdg_data_home": "/d",
+        "xdg_state_home": "/s",
+        "xdg_runtime_dir": "/r",
+        "tmpdir": null,
+        "uid": 501
+      },
+      "expect": {
+        "config": "/c/todo-tui/config.toml",
+        "data": "/d/todo-tui",
+        "logs": "/s/todo-tui",
+        "runtime": "/r/todo-tui",
+        "socket": "/r/todo-tui/daemon.sock",
+        "lock": "/d/todo-tui/daemon.lock"
+      }
+    },
+    {
+      "name": "linux no HOME",
+      "env": {
+        "os": "linux",
+        "home": null,
+        "todo_tui_home": null,
+        "xdg_config_home": "/c",
+        "xdg_data_home": null,
+        "xdg_state_home": null,
+        "xdg_runtime_dir": "/r",
+        "tmpdir": null,
+        "uid": 501
+      },
+      "error": "no_home"
+    },
+    {
+      "name": "macos no HOME",
+      "env": {
+        "os": "macos",
+        "home": null,
+        "todo_tui_home": null,
+        "xdg_config_home": null,
+        "xdg_data_home": null,
+        "xdg_state_home": null,
+        "xdg_runtime_dir": null,
+        "tmpdir": "/tmp",
+        "uid": 501
+      },
+      "error": "no_home"
+    },
+    {
+      "name": "macos relative HOME counts as unset",
+      "env": {
+        "os": "macos",
+        "home": "ann",
+        "todo_tui_home": null,
+        "xdg_config_home": null,
+        "xdg_data_home": null,
+        "xdg_state_home": null,
+        "xdg_runtime_dir": null,
+        "tmpdir": "/tmp",
+        "uid": 501
+      },
+      "error": "no_home"
+    },
+    {
+      "name": "TODO_TUI_HOME overrides everything",
+      "env": {
+        "os": "macos",
+        "home": "/Users/ann",
+        "todo_tui_home": "/profiles/work",
+        "xdg_config_home": "/c",
+        "xdg_data_home": null,
+        "xdg_state_home": null,
+        "xdg_runtime_dir": null,
+        "tmpdir": "/var/T",
+        "uid": 501
+      },
+      "expect": {
+        "config": "/profiles/work/config.toml",
+        "data": "/profiles/work/data",
+        "logs": "/profiles/work/logs",
+        "runtime": "/profiles/work/run",
+        "socket": "/profiles/work/run/daemon.sock",
+        "lock": "/profiles/work/data/daemon.lock"
+      }
+    },
+    {
+      "name": "TODO_TUI_HOME on linux",
+      "env": {
+        "os": "linux",
+        "home": null,
+        "todo_tui_home": "/p",
+        "xdg_config_home": null,
+        "xdg_data_home": null,
+        "xdg_state_home": null,
+        "xdg_runtime_dir": null,
+        "tmpdir": null,
+        "uid": 501
+      },
+      "expect": {
+        "config": "/p/config.toml",
+        "data": "/p/data",
+        "logs": "/p/logs",
+        "runtime": "/p/run",
+        "socket": "/p/run/daemon.sock",
+        "lock": "/p/data/daemon.lock"
+      }
+    },
+    {
+      "name": "TODO_TUI_HOME is normalised",
+      "env": {
+        "os": "linux",
+        "home": "/home/lin",
+        "todo_tui_home": "//p/./q/../r//",
+        "xdg_config_home": null,
+        "xdg_data_home": null,
+        "xdg_state_home": null,
+        "xdg_runtime_dir": null,
+        "tmpdir": null,
+        "uid": 501
+      },
+      "expect": {
+        "config": "/p/r/config.toml",
+        "data": "/p/r/data",
+        "logs": "/p/r/logs",
+        "runtime": "/p/r/run",
+        "socket": "/p/r/run/daemon.sock",
+        "lock": "/p/r/data/daemon.lock"
+      }
+    },
+    {
+      "name": "TODO_TUI_HOME .. at root stays at root",
+      "env": {
+        "os": "linux",
+        "home": null,
+        "todo_tui_home": "/../..",
+        "xdg_config_home": null,
+        "xdg_data_home": null,
+        "xdg_state_home": null,
+        "xdg_runtime_dir": null,
+        "tmpdir": null,
+        "uid": 501
+      },
+      "expect": {
+        "config": "/config.toml",
+        "data": "/data",
+        "logs": "/logs",
+        "runtime": "/run",
+        "socket": "/run/daemon.sock",
+        "lock": "/data/daemon.lock"
+      }
+    },
+    {
+      "name": "TODO_TUI_HOME empty counts as unset",
+      "env": {
+        "os": "linux",
+        "home": "/home/lin",
+        "todo_tui_home": "",
+        "xdg_config_home": null,
+        "xdg_data_home": null,
+        "xdg_state_home": null,
+        "xdg_runtime_dir": "/r",
+        "tmpdir": null,
+        "uid": 501
+      },
+      "expect": {
+        "config": "/home/lin/.config/todo-tui/config.toml",
+        "data": "/home/lin/.local/share/todo-tui",
+        "logs": "/home/lin/.local/state/todo-tui",
+        "runtime": "/r/todo-tui",
+        "socket": "/r/todo-tui/daemon.sock",
+        "lock": "/home/lin/.local/share/todo-tui/daemon.lock"
+      }
+    },
+    {
+      "name": "TODO_TUI_HOME relative is an error",
+      "env": {
+        "os": "linux",
+        "home": "/home/lin",
+        "todo_tui_home": "profiles/work",
+        "xdg_config_home": null,
+        "xdg_data_home": null,
+        "xdg_state_home": null,
+        "xdg_runtime_dir": null,
+        "tmpdir": null,
+        "uid": 501
+      },
+      "error": "relative_todo_tui_home"
+    },
+    {
+      "name": "socket of exactly 100 bytes is kept",
+      "env": {
+        "os": "macos",
+        "home": null,
+        "todo_tui_home": "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "xdg_config_home": null,
+        "xdg_data_home": null,
+        "xdg_state_home": null,
+        "xdg_runtime_dir": null,
+        "tmpdir": null,
+        "uid": 501
+      },
+      "expect": {
+        "config": "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/config.toml",
+        "data": "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/data",
+        "logs": "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/logs",
+        "runtime": "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/run",
+        "socket": "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/run/daemon.sock",
+        "lock": "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/data/daemon.lock"
+      }
+    },
+    {
+      "name": "socket of 101 bytes falls back per home",
+      "env": {
+        "os": "macos",
+        "home": null,
+        "todo_tui_home": "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "xdg_config_home": null,
+        "xdg_data_home": null,
+        "xdg_state_home": null,
+        "xdg_runtime_dir": null,
+        "tmpdir": null,
+        "uid": 501
+      },
+      "expect": {
+        "config": "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/config.toml",
+        "data": "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/data",
+        "logs": "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/logs",
+        "runtime": "/tmp/todo-tui-501/h-639b4020",
+        "socket": "/tmp/todo-tui-501/h-639b4020/daemon.sock",
+        "lock": "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/data/daemon.lock"
+      }
+    },
+    {
+      "name": "long home variant 0 shares the normalised hash",
+      "env": {
+        "os": "linux",
+        "home": null,
+        "todo_tui_home": "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/",
+        "xdg_config_home": null,
+        "xdg_data_home": null,
+        "xdg_state_home": null,
+        "xdg_runtime_dir": null,
+        "tmpdir": null,
+        "uid": 1000
+      },
+      "expect": {
+        "config": "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/config.toml",
+        "data": "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/data",
+        "logs": "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/logs",
+        "runtime": "/tmp/todo-tui-1000/h-639b4020",
+        "socket": "/tmp/todo-tui-1000/h-639b4020/daemon.sock",
+        "lock": "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/data/daemon.lock"
+      }
+    },
+    {
+      "name": "long home variant 1 shares the normalised hash",
+      "env": {
+        "os": "linux",
+        "home": null,
+        "todo_tui_home": "/zz/../aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "xdg_config_home": null,
+        "xdg_data_home": null,
+        "xdg_state_home": null,
+        "xdg_runtime_dir": null,
+        "tmpdir": null,
+        "uid": 1000
+      },
+      "expect": {
+        "config": "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/config.toml",
+        "data": "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/data",
+        "logs": "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/logs",
+        "runtime": "/tmp/todo-tui-1000/h-639b4020",
+        "socket": "/tmp/todo-tui-1000/h-639b4020/daemon.sock",
+        "lock": "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/data/daemon.lock"
+      }
+    },
+    {
+      "name": "long home variant 2 shares the normalised hash",
+      "env": {
+        "os": "linux",
+        "home": null,
+        "todo_tui_home": "//./aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "xdg_config_home": null,
+        "xdg_data_home": null,
+        "xdg_state_home": null,
+        "xdg_runtime_dir": null,
+        "tmpdir": null,
+        "uid": 1000
+      },
+      "expect": {
+        "config": "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/config.toml",
+        "data": "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/data",
+        "logs": "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/logs",
+        "runtime": "/tmp/todo-tui-1000/h-639b4020",
+        "socket": "/tmp/todo-tui-1000/h-639b4020/daemon.sock",
+        "lock": "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/data/daemon.lock"
+      }
+    }
+  ]
+}

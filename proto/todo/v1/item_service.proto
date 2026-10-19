@@ -39,7 +39,11 @@ message ListItemsRequest {
   repeated SortKey sort = 2;
   // 0 means the server default.
   int32 page_size = 3;
-  // From a previous response; all pages are pinned to the first page's revision.
+  // From a previous response to the same filter and sort (INVALID_ARGUMENT
+  // otherwise). Each page reads live data: a write between pages may show up
+  // on a later page, and an item created behind the cursor is not returned.
+  // Clients that need a consistent view subscribe from the first page's
+  // revision and apply the changes.
   string page_token = 4;
   // When set, the request narrows this saved view: the effective filter is the
   // view's filter AND the request's filter (its all_of / any_of as one extra
@@ -51,6 +55,6 @@ message ListItemsRequest {
 message ListItemsResponse {
   repeated Item items = 1;
   string next_page_token = 2;
-  // The revision the results were read at.
+  // The revision this page was read at (later pages may report a higher one).
   uint64 revision = 3;
 }

@@ -24,6 +24,7 @@ rustix.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 tower.workspace = true
+tracing.workspace = true
 ulid.workspace = true
 
 [dev-dependencies]
