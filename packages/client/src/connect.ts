@@ -10,7 +10,7 @@ import { isConnectionFailure, readDaemonPid, spawnDaemon, waitForDaemonExit, wit
 import { type TodoTransport, type TodoTransportOptions, UnsafeRuntimeDirError, checkRuntimeDir, createTodoTransport } from "./transport.js";
 
 /** The api_minor this client was built against. */
-export const CLIENT_API_MINOR = 1;
+export const CLIENT_API_MINOR = 2;
 export const CLIENT_VERSION = "0.1.0";
 
 export interface TodoClients {

@@ -401,6 +401,7 @@ pub(crate) fn item_from_row(row: &Row<'_>, today: Option<Date>) -> Result<Item> 
             merged_into,
             is_overdue: false,
         },
+        relations: Vec::new(),
     };
     item.derived.is_overdue = is_overdue(&item, today);
     Ok(item)

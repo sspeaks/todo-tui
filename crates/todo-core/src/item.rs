@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::field::ItemField;
 use crate::ids::{ItemId, PersonId, Revision};
+use crate::relation::Relation;
 use crate::status::{ResolutionKind, Status, StatusCategory, StatusFields, TodoRefinement};
 
 /// `None` sorts after `Lowest` in views; the derived `Ord` here is by rank
@@ -212,6 +213,10 @@ pub struct Item {
     /// Tracker field id -> raw JSON value. Read-only.
     pub remote_extras: BTreeMap<String, serde_json::Value>,
     pub derived: DerivedFields,
+    /// Aggregate member: every relation with this Item at either end, sorted.
+    /// Not an [`ItemField`]; it changes only through the relation calls and
+    /// never appears in a `FieldChange`.
+    pub relations: Vec<Relation>,
 }
 
 impl Item {
@@ -233,6 +238,7 @@ impl Item {
             overlay: OverlayFields::default(),
             remote_extras: BTreeMap::new(),
             derived: DerivedFields::default(),
+            relations: Vec::new(),
         }
     }
 

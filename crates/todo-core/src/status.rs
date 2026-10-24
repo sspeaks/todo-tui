@@ -112,6 +112,12 @@ impl StatusFields {
         }
     }
 
+    /// A resolution kind is set only in the `Done` category. `Done` without
+    /// one is allowed (a tracker may resolve without a resolution).
+    pub fn is_consistent(&self) -> bool {
+        self.resolution_kind.is_none() || self.status_category == StatusCategory::Done
+    }
+
     /// Whether moving to `target` changes the Core category or resolution
     /// (for a linked Item that means a tracker transition).
     pub fn changes_category(&self, target: Status) -> bool {
@@ -197,6 +203,23 @@ mod tests {
             done.with_status(Status::Next).todo_refinement,
             TodoRefinement::Next
         );
+    }
+
+    #[test]
+    fn consistency() {
+        use ResolutionKind as R;
+        use StatusCategory as C;
+        for from in ALL {
+            assert!(StatusFields::from_status(from).is_consistent(), "{from:?}");
+        }
+        let fields = |status_category, resolution_kind| StatusFields {
+            status_category,
+            resolution_kind,
+            todo_refinement: TodoRefinement::Next,
+        };
+        assert!(fields(C::Done, None).is_consistent());
+        assert!(!fields(C::Todo, Some(R::Done)).is_consistent());
+        assert!(!fields(C::InProgress, Some(R::Cancelled)).is_consistent());
     }
 
     #[test]

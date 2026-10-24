@@ -1,0 +1,69 @@
+syntax = "proto3";
+
+package todo.v1;
+
+import "google/protobuf/timestamp.proto";
+import "todo/v1/field.proto";
+import "todo/v1/relation.proto";
+
+// The kind of an op: the mutating RPC that made it.
+enum OpKind {
+  OP_KIND_UNSPECIFIED = 0;
+  // CaptureItem, including spool imports.
+  OP_KIND_CAPTURE = 1;
+  OP_KIND_UPDATE = 2;
+  OP_KIND_SET_STATUS = 3;
+  OP_KIND_ARCHIVE = 4;
+  OP_KIND_UNARCHIVE = 5;
+  OP_KIND_DELETE = 6;
+  OP_KIND_UNDELETE = 7;
+  OP_KIND_BATCH = 8;
+  OP_KIND_UNDO = 9;
+  OP_KIND_REDO = 10;
+  OP_KIND_ADD_RELATION = 11;
+  OP_KIND_REMOVE_RELATION = 12;
+}
+
+// An entry of the undo stack (design 3.10).
+message OpSummary {
+  // The MutationResult.op_id of the call that made the op.
+  string op_id = 1;
+  OpKind kind = 2;
+  // The Items the op changed.
+  repeated string item_ids = 3;
+  // When the op was recorded.
+  google.protobuf.Timestamp at = 4;
+  // Toast text, e.g. `mark done (3 items)` or `capture "call dentist"`;
+  // clients add the verb ("Undid: mark done (3 items)").
+  string description = 5;
+}
+
+// A change that Undo or Redo left alone: the Item keeps its current value.
+message UndoSkip {
+  string item_id = 1;
+  // The field that was not restored. The status triple (status_category,
+  // resolution_kind, todo_refinement) is restored as one unit and reported
+  // once, as ITEM_FIELD_STATUS. UNSPECIFIED for a relation step.
+  ItemField field = 2;
+  UndoSkipReason reason = 3;
+  // Why, for a user.
+  string message = 4;
+  // Set for a relation step: the relation that was not added or removed.
+  // item_id is its from_id.
+  Relation relation = 5;
+}
+
+enum UndoSkipReason {
+  UNDO_SKIP_REASON_UNSPECIFIED = 0;
+  // The field no longer holds the value the op wrote; for a relation step,
+  // the relation has since been removed or added back.
+  UNDO_SKIP_REASON_CHANGED_SINCE = 1;
+  // The Item (for a relation step, either end) is soft-deleted; on a deleted
+  // Item only deleted_at is restored.
+  UNDO_SKIP_REASON_ITEM_DELETED = 2;
+  // The value to restore is no longer valid, e.g. a parent that is now
+  // deleted or would create a cycle.
+  UNDO_SKIP_REASON_INVALID = 3;
+  // Reserved for P2: the op has a remote side effect that cannot be undone.
+  UNDO_SKIP_REASON_NOT_UNDOABLE = 4;
+}

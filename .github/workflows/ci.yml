@@ -13,6 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -27,7 +29,11 @@ jobs:
 
       - name: pnpm install
         run: pnpm install --frozen-lockfile
-      - name: buf lint
+      # buf breaking compares against the local main branch, which a pull
+      # request checkout does not have.
+      - name: main branch for buf breaking
+        run: git rev-parse --verify --quiet refs/heads/main || git branch main origin/main
+      - name: buf lint and breaking
         run: pnpm lint:proto
       - name: cargo fmt
         run: cargo fmt --all --check

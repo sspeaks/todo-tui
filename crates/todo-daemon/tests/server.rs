@@ -286,7 +286,7 @@ async fn handshake_reports_version_and_api_minor() {
         .into_inner();
     assert_eq!(info.daemon_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(info.api_minor, todo_proto::API_MINOR);
-    assert_eq!(info.api_minor, 1);
+    assert_eq!(info.api_minor, 2);
     d.stop().await;
 }
 
@@ -909,6 +909,11 @@ async fn update_item_errors_name_the_request_field() {
             with(titled("b"), &["archived"]),
             "item.archived",
             "changes only through ArchiveItem and UnarchiveItem",
+        ),
+        (
+            with(titled("b"), &["relations"]),
+            "item.relations",
+            "changes only through AddRelation and RemoveRelation",
         ),
         (
             with(titled("b"), &["waiting.follow_up_on"]),

@@ -25,7 +25,8 @@ use crate::v1;
 /// rejects for their class (read-only, status and archived fields) are not
 /// read: they get `Cleared`, and core reports them. Core also rejects the
 /// update at its first repeated field, so from there on no value is read
-/// either, and a long mask repeating a large field stays cheap.
+/// either, and a long mask repeating a large field stays cheap. `relations`
+/// is not a [`core::ItemField`]; it is refused here, at `item.relations`.
 pub fn field_updates_from_proto(
     item: &v1::Item,
     mask: &prost_types::FieldMask,
@@ -41,6 +42,10 @@ pub fn field_updates_from_proto(
     for path in &mask.paths {
         if path == "*" {
             return Err(invalid_mask("\"*\" is not supported".into()));
+        }
+        if path == "relations" {
+            let reason = "changes only through AddRelation and RemoveRelation".into();
+            return Err(ConvertError::Invalid("item.relations".into(), reason));
         }
         let field = item_field_from_path(path)
             .ok_or_else(|| invalid_mask(format!("unknown field path {path:?}")))?;
@@ -726,6 +731,28 @@ mod tests {
         assert_eq!(
             updates(&item, &["title", "bogus"]).unwrap_err().to_string(),
             "update_mask: unknown field path \"bogus\""
+        );
+    }
+
+    #[test]
+    fn relations_change_only_through_their_rpcs() {
+        let err = updates(&full_item(), &["title", "relations"]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "item.relations: changes only through AddRelation and RemoveRelation"
+        );
+        let mut req = update_request();
+        req.update_mask = Some(mask(&["relations"]));
+        let m = v1::Mutation {
+            kind: Some(Kind::UpdateItem(req)),
+        };
+        let err = mutation_from_proto(&m, TODAY).unwrap_err();
+        assert_eq!(err.path(), "update_item.item.relations");
+        // A path into a repeated field is unknown, as anywhere else.
+        let err = updates(&full_item(), &["relations.kind"]).unwrap_err();
+        assert!(
+            matches!(&err, ConvertError::Invalid(f, _) if f == "update_mask"),
+            "{err}"
         );
     }
 

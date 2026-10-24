@@ -8,11 +8,13 @@ import "google/protobuf/timestamp.proto";
 import "google/type/date.proto";
 import "todo/v1/common.proto";
 import "todo/v1/field.proto";
+import "todo/v1/relation.proto";
 
 // The one entity (design 3.1). Field numbers are grouped by layer (3.2):
 // identity 1-9, Core 10-39, Overlay 40-59, remote extras 60,
-// derived and sync-state 70-99 (read-only, computed by the daemon).
-// ItemField values equal these numbers.
+// derived and sync-state 70-99 (read-only, computed by the daemon), and
+// aggregate members 100-119 (changed only through their own RPCs, never by
+// UpdateItem). ItemField values equal the numbers below 100.
 message Item {
   // Identity.
   string id = 1;
@@ -99,6 +101,12 @@ message Item {
   // due_date is before today in the user's zone and the Item is not done.
   bool is_overdue = 82;
   // 83-99 reserved for future derived fields.
+
+  // Aggregate members.
+  // Every relation with this Item at either end, including those whose
+  // other end is deleted. Changed through AddRelation and RemoveRelation.
+  repeated Relation relations = 100;
+  // 101-119 reserved for future aggregate members.
 }
 
 message Waiting {

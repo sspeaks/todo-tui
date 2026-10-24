@@ -8,6 +8,8 @@ import "google/type/date.proto";
 import "todo/v1/common.proto";
 import "todo/v1/filter.proto";
 import "todo/v1/item.proto";
+import "todo/v1/op.proto";
+import "todo/v1/relation.proto";
 
 // Conventions for every mutating request: request_id = 1 is a client ULID
 // (a replay within 24h returns the original MutationResult with the Items'
@@ -16,14 +18,28 @@ import "todo/v1/item.proto";
 // Item, fails with INVALID_ARGUMENT and a BadRequest on "request_id");
 // single-item mutations carry `optional uint64 expected_revision` and fail
 // with ABORTED (ErrorInfo REVISION_MISMATCH) when the Item's revision
-// differs; responses carry a MutationResult.
+// differs; responses carry a MutationResult. Undo and Redo carry `optional
+// string expected_op_id` instead, and the relation RPCs carry neither:
+// relations are a set.
 //
 // Mutating a soft-deleted Item fails with FAILED_PRECONDITION (ErrorInfo
 // ITEM_DELETED), except UndeleteItem, and DeleteItem, which is a no-op on a
 // deleted Item. A mutation that changes nothing (e.g. archiving an archived
 // Item) succeeds without a new revision. Invalid values and read-only fields
 // fail with INVALID_ARGUMENT and a BadRequest naming the offending field
-// path.
+// path. No live Item has a deleted parent (design 3.7).
+//
+// The undo stack (design 3.10) is global, shared by all clients. Its entries
+// are the ops by the user or a suggestion that changed something, except
+// Undo and Redo themselves; a new entry clears the redo stack. Undo and Redo
+// restore field values under a guard: a field gets the value back only if it
+// still holds the value the reverted op wrote (string sets such as labels
+// compare as sets), otherwise it keeps its current value and is reported in
+// `skipped` (changed since, Item deleted, or no longer valid). A restored
+// value is the recorded one, e.g. the original archived.at or deleted_at,
+// not the current time. An Undo or Redo that restores nothing drops the
+// entry from both stacks. Undo, Redo and the relation RPCs are not
+// BatchMutate mutations.
 service ItemService {
   rpc CaptureItem(CaptureItemRequest) returns (CaptureItemResponse);
   // Parses capture text without creating anything (the TUI's live preview).
@@ -35,12 +51,36 @@ service ItemService {
   rpc ArchiveItem(ArchiveItemRequest) returns (ArchiveItemResponse);
   rpc UnarchiveItem(UnarchiveItemRequest) returns (UnarchiveItemResponse);
   // Soft delete (design 3.7): the Item stays as a tombstone with deleted_at
-  // set and is hidden from every view. Never deletes in a tracker.
+  // set and is hidden from every view. Never deletes in a tracker. Every live
+  // descendant of the Item is soft-deleted with it, in the same op (their
+  // changes arrive on the change stream).
   rpc DeleteItem(DeleteItemRequest) returns (DeleteItemResponse);
+  // Also restores the descendants that were deleted by the same op as the
+  // Item. Fails with FAILED_PRECONDITION (ErrorInfo PARENT_DELETED, with
+  // item_id and parent_id) while the Item's parent is deleted: undelete the
+  // parent first.
   rpc UndeleteItem(UndeleteItemRequest) returns (UndeleteItemResponse);
   // Applies the mutations atomically as one op (one undo step): either all
   // succeed or none is applied.
   rpc BatchMutate(BatchMutateRequest) returns (BatchMutateResponse);
+  // Reverts the top entry of the undo stack and moves it to the redo stack;
+  // an undone capture is soft-deleted. There is no out-of-order undo. With
+  // an empty stack Undo succeeds with entry unset, and its request_id is
+  // still recorded, so a late retry cannot undo a newer op.
+  rpc Undo(UndoRequest) returns (UndoResponse);
+  // Re-applies the most recently undone entry and moves it back to the undo
+  // stack: it reverts what the entry's last undo restored, under the same
+  // guard, so a partial undo gives a matching partial redo. With an empty
+  // redo stack Redo succeeds as Undo does.
+  rpc Redo(RedoRequest) returns (RedoResponse);
+  // The entries Undo and Redo would act on next.
+  rpc GetUndoState(GetUndoStateRequest) returns (GetUndoStateResponse);
+  // Relations (design 3.6). Both ends must exist, be live and differ. A
+  // relation change is one op that gives both ends a new revision. Adding a
+  // relation that exists, or removing one that does not, changes nothing.
+  // Relations change only through these two RPCs.
+  rpc AddRelation(AddRelationRequest) returns (AddRelationResponse);
+  rpc RemoveRelation(RemoveRelationRequest) returns (RemoveRelationResponse);
 }
 
 message CaptureItemRequest {
@@ -181,10 +221,11 @@ message UpdateItemRequest {
   // "waiting.follow_up_on". Must not be empty; "*" is not supported. A path
   // whose field is unset in item clears it (a field with a domain "none",
   // such as priority, takes that value instead). Status fields change only
-  // through SetStatus, archived only through Archive/UnarchiveItem, and
-  // read-only, derived and remote fields cannot be updated. Setting "waiting"
-  // without waiting.since uses today. A title is stored trimmed and must then
-  // be non-empty, one line and at most 64 KiB (65536 bytes of UTF-8);
+  // through SetStatus, archived only through Archive/UnarchiveItem,
+  // relations only through Add/RemoveRelation, and read-only, derived and
+  // remote fields cannot be updated. Setting "waiting" without
+  // waiting.since uses today. A title is stored trimmed and must then be
+  // non-empty, one line and at most 64 KiB (65536 bytes of UTF-8);
   // description has no limit of its own.
   google.protobuf.FieldMask update_mask = 3;
   optional uint64 expected_revision = 4;
@@ -281,4 +322,86 @@ message BatchMutateResponse {
   // batch (an Item mutated twice appears twice, identically).
   repeated Item items = 1;
   MutationResult result = 2;
+}
+
+message UndoRequest {
+  string request_id = 1;
+  // The op_id of the entry the client means to undo (GetUndoState.undo).
+  // When the top entry is another one, or the stack is empty, Undo fails
+  // with ABORTED (ErrorInfo UNDO_STACK_CHANGED, with expected_op_id and
+  // top_op_id, empty for an empty stack), so an op made meanwhile by another
+  // client is never undone by mistake.
+  optional string expected_op_id = 2;
+}
+
+// A replay returns the original entry and skipped too.
+message UndoResponse {
+  // The undo op; without a new revision when nothing was restored.
+  MutationResult result = 1;
+  // The entry undone or dropped; unset when the stack was empty.
+  OpSummary entry = 2;
+  // The Items the undo changed, in their state after it.
+  repeated Item items = 3;
+  // The changes left as they were.
+  repeated UndoSkip skipped = 4;
+}
+
+message RedoRequest {
+  string request_id = 1;
+  // As in UndoRequest, for the entry Redo would re-apply
+  // (GetUndoState.redo).
+  optional string expected_op_id = 2;
+}
+
+// A replay returns the original entry and skipped too.
+message RedoResponse {
+  // The redo op; without a new revision when nothing was restored.
+  MutationResult result = 1;
+  // The entry redone or dropped; unset when the stack was empty.
+  OpSummary entry = 2;
+  // The Items the redo changed, in their state after it.
+  repeated Item items = 3;
+  // The changes left as they were.
+  repeated UndoSkip skipped = 4;
+}
+
+message GetUndoStateRequest {}
+
+message GetUndoStateResponse {
+  // The entry Undo would revert; unset when the undo stack is empty.
+  OpSummary undo = 1;
+  // The entry Redo would re-apply; unset when the redo stack is empty.
+  OpSummary redo = 2;
+}
+
+// A from_id that names no Item fails with NOT_FOUND (ErrorInfo
+// ITEM_NOT_FOUND), a deleted one with FAILED_PRECONDITION (ErrorInfo
+// ITEM_DELETED). A to_id that names no Item, a deleted one, or from_id
+// itself fails with INVALID_ARGUMENT on "relation.to_id", and an
+// unspecified kind on "relation.kind". Errors name each end as the request
+// does, also for a RELATES_TO that is stored the other way round.
+message AddRelationRequest {
+  string request_id = 1;
+  Relation relation = 2;
+}
+
+message AddRelationResponse {
+  // The relation's ends as stored (for RELATES_TO, from_id < to_id), in
+  // their state after the op.
+  Item from_item = 1;
+  Item to_item = 2;
+  MutationResult result = 3;
+}
+
+// Validated as in AddRelationRequest.
+message RemoveRelationRequest {
+  string request_id = 1;
+  Relation relation = 2;
+}
+
+message RemoveRelationResponse {
+  // As in AddRelationResponse.
+  Item from_item = 1;
+  Item to_item = 2;
+  MutationResult result = 3;
 }

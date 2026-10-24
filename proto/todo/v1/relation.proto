@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package todo.v1;
+
+// A local link between two Items (design 3.6). Hierarchy is not a relation:
+// it is Item.parent_id. A relation is identified by (from_id, to_id, kind);
+// there is no relation id.
+message Relation {
+  // Item ULIDs. For RELATES_TO, which has no direction, the stored relation
+  // has from_id < to_id; a request may name the ends in either order.
+  string from_id = 1;
+  string to_id = 2;
+  RelationKind kind = 3;
+  // 4-9 reserved for P2 remote ownership (tracker issue links).
+}
+
+enum RelationKind {
+  RELATION_KIND_UNSPECIFIED = 0;
+  // from_id blocks to_id.
+  RELATION_KIND_BLOCKS = 1;
+  // from_id duplicates to_id.
+  RELATION_KIND_DUPLICATES = 2;
+  // Symmetric.
+  RELATION_KIND_RELATES_TO = 3;
+}

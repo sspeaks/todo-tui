@@ -258,7 +258,7 @@ Requires the same as [Quick start](#quick-start): rustup, Node 24 with corepack
 ```sh
 pnpm install
 pnpm gen              # TypeScript codegen into packages/client/src/gen (gitignored)
-pnpm lint:proto       # buf lint
+pnpm lint:proto       # buf lint, and buf breaking against the main branch
 pnpm typecheck
 pnpm test
 cargo build --workspace

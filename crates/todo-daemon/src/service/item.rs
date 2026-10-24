@@ -7,12 +7,14 @@ use todo_proto::convert::{ConvertError, EnumField, timestamp_from_proto};
 use todo_proto::request;
 use todo_proto::v1::item_service_server::ItemService;
 use todo_proto::v1::{
-    self, ArchiveItemRequest, ArchiveItemResponse, BatchMutateRequest, BatchMutateResponse,
-    CaptureItemRequest, CaptureItemResponse, DeleteItemRequest, DeleteItemResponse, Filter,
-    GetItemRequest, GetItemResponse, ItemField, ListItemsRequest, ListItemsResponse, Operator,
-    ParseCaptureRequest, ParseCaptureResponse, SetStatusRequest, SetStatusResponse, SortKey,
+    self, AddRelationRequest, AddRelationResponse, ArchiveItemRequest, ArchiveItemResponse,
+    BatchMutateRequest, BatchMutateResponse, CaptureItemRequest, CaptureItemResponse,
+    DeleteItemRequest, DeleteItemResponse, Filter, GetItemRequest, GetItemResponse,
+    GetUndoStateRequest, GetUndoStateResponse, ItemField, ListItemsRequest, ListItemsResponse,
+    Operator, ParseCaptureRequest, ParseCaptureResponse, RedoRequest, RedoResponse,
+    RemoveRelationRequest, RemoveRelationResponse, SetStatusRequest, SetStatusResponse, SortKey,
     UnarchiveItemRequest, UnarchiveItemResponse, UndeleteItemRequest, UndeleteItemResponse,
-    UpdateItemRequest, UpdateItemResponse, clause, field_value, operand,
+    UndoRequest, UndoResponse, UpdateItemRequest, UpdateItemResponse, clause, field_value, operand,
 };
 use todo_store::{CaptureInput, ListQuery, MutateInput, MutateOutput, OpKind};
 use tonic::{Code, Request, Response, Status};
@@ -287,6 +289,35 @@ impl ItemService for Items {
             revision: page.revision,
         }))
     }
+
+    async fn undo(&self, _request: Request<UndoRequest>) -> Result<Response<UndoResponse>, Status> {
+        Err(not_implemented("Undo"))
+    }
+
+    async fn redo(&self, _request: Request<RedoRequest>) -> Result<Response<RedoResponse>, Status> {
+        Err(not_implemented("Redo"))
+    }
+
+    async fn get_undo_state(
+        &self,
+        _request: Request<GetUndoStateRequest>,
+    ) -> Result<Response<GetUndoStateResponse>, Status> {
+        Err(not_implemented("GetUndoState"))
+    }
+
+    async fn add_relation(
+        &self,
+        _request: Request<AddRelationRequest>,
+    ) -> Result<Response<AddRelationResponse>, Status> {
+        Err(not_implemented("AddRelation"))
+    }
+
+    async fn remove_relation(
+        &self,
+        _request: Request<RemoveRelationRequest>,
+    ) -> Result<Response<RemoveRelationResponse>, Status> {
+        Err(not_implemented("RemoveRelation"))
+    }
 }
 
 impl Items {
@@ -334,6 +365,16 @@ impl Items {
             .await
             .map_err(|e| error::mutation(e, shape, &ids))
     }
+}
+
+/// UNIMPLEMENTED for an RPC this daemon does not serve yet.
+fn not_implemented(rpc: &str) -> Status {
+    error::error_info(
+        Code::Unimplemented,
+        "NOT_IMPLEMENTED",
+        format!("{rpc} is not implemented yet"),
+        [],
+    )
 }
 
 /// Every mutating request carries a client ULID (design 4.3 rule 4),

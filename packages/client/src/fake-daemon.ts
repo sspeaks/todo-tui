@@ -43,8 +43,9 @@ const ON_DELETED = new Set(["DeleteItem", "UndeleteItem"]);
  * for), sorted by id. It does not parse captures (the title is the text) or
  * check field values and read-only fields, except the 64 KiB limit on capture
  * text and titles: SetStatus sets only the derived status, and UpdateItem
- * copies the top-level fields its mask names (status and archived paths are
- * refused). BatchMutate and ParseCapture are not implemented.
+ * copies the top-level fields its mask names (status, archived and relations
+ * paths are refused). BatchMutate, ParseCapture, Undo, Redo, GetUndoState and
+ * the relation RPCs are not implemented.
  */
 export class FakeDaemon {
   revision = 0n;
@@ -57,7 +58,7 @@ export class FakeDaemon {
   pageSize = 1000;
   /** Runs before every ListItems; throw from it to fail that call. */
   onListItems: ((req: ListItemsRequest) => void) | undefined;
-  apiMinor = 1;
+  apiMinor = 2;
   readonly calls = { listItems: 0, subscribe: [] as (bigint | undefined)[] };
   readonly transport: Transport;
   private readonly watchers = new Set<Waiter>();
@@ -348,7 +349,7 @@ const STATUS_PATHS = new Set(["status", "status_category", "resolution_kind", "t
 /**
  * The top-level Item fields named by the update mask, taken from the
  * request's item. Rejects the mask as the daemon does when it is missing,
- * empty or names an unknown field, a status field or archived.
+ * empty or names an unknown field, a status field, archived or relations.
  */
 function maskedFields(req: UpdateItemRequest): MessageInitShape<typeof ItemSchema> {
   if (req.updateMask === undefined) throw badRequest("update_mask", "required field is missing");
@@ -361,6 +362,7 @@ function maskedFields(req: UpdateItemRequest): MessageInitShape<typeof ItemSchem
     if (!field) throw badRequest("update_mask", `unknown field path ${JSON.stringify(path)}`);
     if (STATUS_PATHS.has(top)) throw badRequest(`item.${top}`, "changes only through SetStatus");
     if (top === "archived") throw badRequest("item.archived", "changes only through ArchiveItem and UnarchiveItem");
+    if (top === "relations") throw badRequest("item.relations", "changes only through AddRelation and RemoveRelation");
     patch[field.localName] = source[field.localName];
   }
   return patch as MessageInitShape<typeof ItemSchema>;

@@ -1,5 +1,7 @@
 //! Typed field values, mirroring `todo.v1.FieldValue` (design 4.8).
 
+use std::collections::HashSet;
+
 use jiff::civil::Date;
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
@@ -137,6 +139,18 @@ impl FieldValue {
             F::StalenessWaitingSince => opt(staleness.waiting_since, V::Timestamp),
         };
         Some(value)
+    }
+
+    /// Whether a field holding `self` still holds `other`, for undo's
+    /// still-matching check (design 3.10): equality, except that string sets
+    /// compare as sets (order and repeats are ignored).
+    pub fn matches(&self, other: &FieldValue) -> bool {
+        match (self, other) {
+            (FieldValue::StringSet(a), FieldValue::StringSet(b)) => {
+                a.iter().collect::<HashSet<_>>() == b.iter().collect::<HashSet<_>>()
+            }
+            _ => self == other,
+        }
     }
 
     /// The variant name, as serialized.
@@ -664,6 +678,80 @@ mod tests {
         for (value, want) in rows {
             let json = serde_json::to_value(&value).unwrap();
             assert_eq!(json[value.kind()], want, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn matches_is_equality_except_for_string_sets() {
+        use FieldValue as V;
+        let set = |v: &[&str]| V::StringSet(v.iter().map(|&s| s.to_owned()).collect());
+        let rows = [
+            (set(&["a", "b"]), set(&["b", "a"]), true),
+            (set(&["a", "b"]), set(&["a", "b", "a"]), true),
+            (set(&[]), set(&[]), true),
+            (set(&["a", "b"]), set(&["a"]), false),
+            (set(&["a"]), set(&["A"]), false),
+            (set(&[]), V::Cleared, false),
+            (
+                V::ItemFieldSet(vec![ItemField::Title, ItemField::Priority]),
+                V::ItemFieldSet(vec![ItemField::Priority, ItemField::Title]),
+                false,
+            ),
+            (V::String("a".into()), V::Markdown("a".into()), false),
+            (V::Number(0.1 + 0.2), V::Number(0.3), false),
+            (V::Number(0.1 + 0.2), V::Number(0.1 + 0.2), true),
+            (V::Cleared, V::Cleared, true),
+            (
+                V::Archived(Archived {
+                    at: ts(1),
+                    reason: ArchiveReason::AutoDone,
+                }),
+                V::Archived(Archived {
+                    at: ts(1),
+                    reason: ArchiveReason::User,
+                }),
+                false,
+            ),
+        ];
+        for (a, b, want) in rows {
+            assert_eq!(a.matches(&b), want, "{a:?} {b:?}");
+            assert_eq!(b.matches(&a), want, "{b:?} {a:?}");
+        }
+        for value in samples() {
+            assert!(value.matches(&value), "{value:?}");
+        }
+    }
+
+    /// A stored story-points value must read back bit for bit, or undo would
+    /// see a false conflict (needs serde_json's `float_roundtrip`).
+    #[test]
+    fn numbers_survive_the_json_round_trip_exactly() {
+        let numbers = [
+            0.1 + 0.2,
+            1.0 / 3.0,
+            2.5,
+            1e-7,
+            f64::MIN_POSITIVE,
+            f64::MAX,
+            // Values serde_json's default float parser reads back wrongly.
+            51.248_178_375_505_404,
+            -93.311_370_376_880_33,
+            -36.573_994_842_753_436,
+            52.314_008_204_106_244,
+            97.453_653_200_346_85,
+            2.003_039_774_426_776_2e-253,
+            7.101_215_824_554_616e260,
+        ];
+        for n in numbers {
+            let json = serde_json::to_string(&FieldValue::Number(n)).unwrap();
+            let FieldValue::Number(back) = serde_json::from_str(&json).unwrap() else {
+                panic!("{json}");
+            };
+            assert_eq!(back.to_bits(), n.to_bits(), "{json}");
+            // As the store reads an event column: through serde_json::Value.
+            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            let via_value: FieldValue = serde_json::from_value(value).unwrap();
+            assert!(via_value.matches(&FieldValue::Number(n)), "{json}");
         }
     }
 

@@ -585,6 +585,8 @@ impl From<&core::Item> for v1::Item {
             deleted_at: d.deleted_at.map(timestamp_to_proto),
             merged_into: d.merged_into.map(|id| id.to_string()),
             is_overdue: d.is_overdue,
+
+            relations: Vec::new(),
         }
     }
 }
@@ -695,6 +697,7 @@ impl TryFrom<&v1::Item> for core::Item {
                 merged_into: id("merged_into", &p.merged_into)?,
                 is_overdue: p.is_overdue,
             },
+            relations: Vec::new(),
         })
     }
 }

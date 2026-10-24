@@ -138,6 +138,7 @@ describe("FakeDaemon mutations", () => {
       [updateItem(client, { id: a.id }, ["nope"]), "update_mask"],
       [updateItem(client, { id: a.id, status: Status.DONE }, ["status"]), "item.status"],
       [updateItem(client, { id: a.id }, ["archived"]), "item.archived"],
+      [updateItem(client, { id: a.id }, ["relations"]), "item.relations"],
       [client.captureItem({ requestId: ulid(), text: " ", createdVia: CreatedVia.TUI }), "text"],
       [client.getItem({ id: "nope" }), "id"],
     ];

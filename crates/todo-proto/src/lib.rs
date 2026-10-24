@@ -26,4 +26,4 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/todo_descriptor.bin"));
 
 /// The `api_minor` this build serves (design 4.2).
-pub const API_MINOR: u32 = 1;
+pub const API_MINOR: u32 = 2;
