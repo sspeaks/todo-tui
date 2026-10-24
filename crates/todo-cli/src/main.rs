@@ -2,6 +2,7 @@
 
 mod add;
 mod spawn;
+mod tui;
 
 use std::process::ExitCode;
 
@@ -13,10 +14,10 @@ use todo_proto::v1::system_service_client::SystemServiceClient;
 
 #[derive(Parser)]
 #[command(name = "todo", version, about = "A keyboard-driven todo manager")]
-#[command(arg_required_else_help = true)]
+#[command(after_help = "Without a command, `todo` opens the TUI.")]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -46,7 +47,10 @@ enum DaemonAction {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let Some(command) = Cli::parse().command else {
+        eprintln!("todo: {:#}", tui::launch());
+        return ExitCode::FAILURE;
+    };
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
@@ -54,7 +58,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(dispatch(cli.command)) {
+    match runtime.block_on(dispatch(command)) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("todo: {e:#}");
@@ -114,17 +118,23 @@ mod tests {
         use clap::CommandFactory;
         Cli::command().debug_assert();
         let cli = Cli::try_parse_from(["todo", "a", "call", "-x", "dentist"]).unwrap();
-        assert!(matches!(cli.command, Command::Add { text } if text == ["call", "-x", "dentist"]));
+        assert!(
+            matches!(cli.command, Some(Command::Add { text }) if text == ["call", "-x", "dentist"])
+        );
         let cli = Cli::try_parse_from(["todo", "daemon", "stop"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Daemon {
+            Some(Command::Daemon {
                 action: Some(DaemonAction::Stop),
                 ..
-            }
+            })
         ));
         // Without text, `add` reads stdin.
         let cli = Cli::try_parse_from(["todo", "add"]).unwrap();
-        assert!(matches!(cli.command, Command::Add { text } if text.is_empty()));
+        assert!(matches!(cli.command, Some(Command::Add { text }) if text.is_empty()));
+        // Without a command, `todo` opens the TUI; --help still helps.
+        assert!(Cli::try_parse_from(["todo"]).unwrap().command.is_none());
+        let help = Cli::try_parse_from(["todo", "--help"]).err().unwrap();
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
     }
 }

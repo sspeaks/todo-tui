@@ -7,7 +7,7 @@ use std::time::Duration;
 use jiff::tz::TimeZone;
 use prost_types::FieldMask;
 use tempfile::TempDir;
-use todo_core::new_ulid;
+use todo_core::{MAX_CAPTURE_BYTES, new_ulid};
 use todo_daemon::paths::{Env, Os, Paths};
 use todo_daemon::spool::{self, SpoolEntry};
 use todo_daemon::{Daemon, ShutdownHandle, Started};
@@ -706,6 +706,54 @@ async fn parse_capture_previews_without_writing() {
         .into_inner();
     assert!(page.items.is_empty());
     assert_eq!(page.revision, 0);
+    d.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn capture_text_and_titles_are_limited_to_64_kib() {
+    use mutation::Kind;
+    let d = start().await;
+    let mut items = d.items().await;
+    // 64 KiB of UTF-8 in two-byte characters, then one byte more.
+    let longest = "é".repeat(MAX_CAPTURE_BYTES / 2);
+    let over = format!("{longest}x");
+    let too_long = |field: &str| (field.to_owned(), "is longer than 64 KiB".to_owned());
+
+    assert_eq!(capture(&mut items, &longest).await.title, longest);
+    let status = items.capture_item(capture_req(&over)).await.unwrap_err();
+    assert_eq!(violation(&status), too_long("text"));
+
+    let parse = |text: &str| ParseCaptureRequest {
+        text: text.to_owned(),
+        reference_time: None,
+    };
+    let draft = items.parse_capture(parse(&longest)).await.unwrap();
+    assert_eq!(draft.into_inner().draft.unwrap().title, longest);
+    let status = items.parse_capture(parse(&over)).await.unwrap_err();
+    assert_eq!(violation(&status), too_long("text"));
+
+    let b = capture(&mut items, "b").await;
+    let status = items
+        .update_item(update_req(&b.id, titled(&over), &["title"]))
+        .await
+        .unwrap_err();
+    assert_eq!(violation(&status), too_long("item.title"));
+    let req = batch_req(vec![batched(Kind::UpdateItem(update_req(
+        &b.id,
+        titled(&over),
+        &["title"],
+    )))]);
+    let status = items.batch_mutate(req).await.unwrap_err();
+    assert_eq!(
+        violation(&status),
+        too_long("mutations[0].update_item.item.title")
+    );
+    let res = items
+        .update_item(update_req(&b.id, titled(&longest), &["title"]))
+        .await
+        .unwrap();
+    assert_eq!(res.into_inner().item.unwrap().title, longest);
+    assert_eq!(titles(&mut items).await, [longest.clone(), longest]);
     d.stop().await;
 }
 

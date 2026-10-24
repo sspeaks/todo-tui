@@ -10,6 +10,7 @@ use jiff::Timestamp;
 use jiff::civil::{ISOWeekDate, Weekday};
 use ulid::Ulid;
 
+use crate::capture::MAX_CAPTURE_BYTES;
 use crate::field::ItemField;
 use crate::ids::{ItemId, Revision};
 use crate::item::{ArchiveReason, Archived, Item, PersonRef, Priority, Waiting};
@@ -239,6 +240,10 @@ fn set_field(item: &mut Item, field: ItemField, value: &FieldValue) -> Result<()
             let title = title.trim();
             if title.is_empty() {
                 return Err(invalid("must not be empty"));
+            }
+            if title.len() > MAX_CAPTURE_BYTES {
+                let limit = MAX_CAPTURE_BYTES / 1024;
+                return Err(invalid(&format!("is longer than {limit} KiB")));
             }
             if title.contains(is_line_break) {
                 return Err(invalid("must be a single line"));
@@ -776,6 +781,17 @@ mod tests {
         // Surrounding line breaks are trimmed away.
         let applied = set(&item(), F::Title, V::String("\nx\n".into())).unwrap();
         assert_eq!(applied.item.core.title, "x");
+        // At most 64 KiB of UTF-8, counted after trimming.
+        let longest = "é".repeat(MAX_CAPTURE_BYTES / 2);
+        let applied = set(&item(), F::Title, V::String(format!(" {longest} "))).unwrap();
+        assert_eq!(applied.item.core.title, longest);
+        assert_eq!(
+            set(&item(), F::Title, V::String(format!("{longest}x"))),
+            Err(MutationError::Invalid {
+                field: F::Title,
+                reason: "is longer than 64 KiB".into()
+            })
+        );
 
         let applied = set(&item(), F::ItemType, V::String(" Bug ".into())).unwrap();
         assert_eq!(applied.item.core.item_type, "Bug");

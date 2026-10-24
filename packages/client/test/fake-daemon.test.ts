@@ -4,6 +4,7 @@ import { BadRequestSchema, ErrorInfoSchema } from "../src/gen/google/rpc/error_d
 import { ArchiveReason, CreatedVia, Priority, Status } from "../src/gen/todo/v1/item_pb.js";
 import { ItemService } from "../src/gen/todo/v1/item_service_pb.js";
 import { FakeDaemon } from "../src/fake-daemon.js";
+import { MAX_CAPTURE_BYTES } from "../src/limits.js";
 import { archiveItem, deleteItem, setStatus, unarchiveItem, undeleteItem, updateItem } from "../src/mutations.js";
 import { ulid } from "../src/ulid.js";
 
@@ -141,6 +142,21 @@ describe("FakeDaemon mutations", () => {
       [client.getItem({ id: "nope" }), "id"],
     ];
     for (const [call, field] of cases) expect(await badField(call)).toBe(field);
+  });
+
+  it("limits capture text and titles to MAX_CAPTURE_BYTES of UTF-8, as the daemon does", async () => {
+    const { daemon, client, a } = setup();
+    // Two bytes per character, then one byte more.
+    const longest = "é".repeat(MAX_CAPTURE_BYTES / 2);
+    const over = `${longest}x`;
+    const capture = (text: string) => client.captureItem({ requestId: ulid(), text, createdVia: CreatedVia.TUI });
+    expect((await capture(longest)).item?.title).toBe(longest);
+    const err = await failure(capture(over));
+    expect(err?.rawMessage).toBe("text: is longer than 64 KiB");
+    expect(await badField(capture(over))).toBe("text");
+    expect(await badField(updateItem(client, { id: a.id, title: over }, ["title"]))).toBe("item.title");
+    expect(daemon.items.get(a.id)?.title).toBe("a");
+    expect((await updateItem(client, { id: a.id, title: ` ${longest} ` }, ["title"])).item?.title).toBe(` ${longest} `);
   });
 
   it("sets status, archives and unarchives", async () => {

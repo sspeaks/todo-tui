@@ -20,7 +20,7 @@ use jiff::fmt::temporal::Pieces;
 use jiff::tz::TimeZone;
 use jiff::{Timestamp, Zoned};
 use serde::{Deserialize, Serialize};
-use todo_core::{CreatedVia, parse_capture};
+use todo_core::{CreatedVia, MAX_CAPTURE_BYTES, parse_capture};
 use todo_store::{CaptureInput, Store, StoreError};
 use ulid::Ulid;
 
@@ -147,8 +147,9 @@ pub(crate) struct Imported {
 /// Imports every entry and truncates the spool, holding its lock
 /// throughout. Each entry is captured from the CLI with its spool id as
 /// both request id and spool id, at its `captured_at`. A line that is not
-/// a valid entry, or whose capture the store refuses, is appended verbatim
-/// to `spool.rejected.jsonl` and logged. Any other store error stops the
+/// a valid entry (text that is blank or over [`MAX_CAPTURE_BYTES`] is not),
+/// or whose capture the store refuses, is appended verbatim to
+/// `spool.rejected.jsonl` and logged. Any other store error stops the
 /// import and leaves both files as they are.
 pub(crate) async fn import(paths: &Paths, store: &Store) -> anyhow::Result<Imported> {
     let spool = paths.spool();
@@ -245,6 +246,10 @@ fn entry_input(line: &[u8], today: Date) -> Result<CaptureInput, String> {
     };
     if entry.text.trim().is_empty() {
         return Err("text is blank".to_owned());
+    }
+    if entry.text.len() > MAX_CAPTURE_BYTES {
+        let limit = MAX_CAPTURE_BYTES / 1024;
+        return Err(format!("text is longer than {limit} KiB"));
     }
     Ok(CaptureInput {
         request_id: spool_id.clone(),
@@ -402,6 +407,27 @@ mod tests {
         assert_eq!(titles(&store).await.get("after the tear"), Some(&1));
         let rejected = std::fs::read_to_string(paths.spool_rejected()).unwrap();
         assert_eq!(rejected, format!("{torn}\n"));
+    }
+
+    #[tokio::test]
+    async fn an_entry_over_the_capture_limit_is_rejected() {
+        let (_home, paths, store) = setup();
+        let longest = "x".repeat(MAX_CAPTURE_BYTES);
+        append(&paths, &SpoolEntry::now(new_ulid(), longest.as_str())).unwrap();
+        let over = SpoolEntry::now(new_ulid(), format!("{longest}y"));
+        append(&paths, &over).unwrap();
+        let done = import(&paths, &store).await.unwrap();
+        assert_eq!(
+            done,
+            Imported {
+                captured: 1,
+                rejected: 1
+            }
+        );
+        assert_eq!(titles(&store).await.get(&longest), Some(&1));
+        let rejected = std::fs::read_to_string(paths.spool_rejected()).unwrap();
+        let line: SpoolEntry = serde_json::from_str(rejected.trim_end()).unwrap();
+        assert_eq!(line, over);
     }
 
     #[test]

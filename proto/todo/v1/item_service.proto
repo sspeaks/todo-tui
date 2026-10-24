@@ -46,6 +46,8 @@ service ItemService {
 message CaptureItemRequest {
   string request_id = 1;
   // Raw capture text, parsed with the inline capture syntax (design 2.3).
+  // Blank text, or text longer than 64 KiB (65536 bytes of UTF-8), fails
+  // with INVALID_ARGUMENT on "text".
   string text = 2;
   // TUI, CLI or MCP; other values are reserved for the daemon.
   CreatedVia created_via = 3;
@@ -72,6 +74,9 @@ message CaptureItemResponse {
 }
 
 message ParseCaptureRequest {
+  // Blank text parses to an empty draft. Text longer than 64 KiB (65536
+  // bytes of UTF-8) fails with INVALID_ARGUMENT on "text", as in
+  // CaptureItem.
   string text = 1;
   // "Now" for relative dates; defaults to the daemon's clock.
   google.protobuf.Timestamp reference_time = 2;
@@ -178,7 +183,9 @@ message UpdateItemRequest {
   // such as priority, takes that value instead). Status fields change only
   // through SetStatus, archived only through Archive/UnarchiveItem, and
   // read-only, derived and remote fields cannot be updated. Setting "waiting"
-  // without waiting.since uses today.
+  // without waiting.since uses today. A title is stored trimmed and must then
+  // be non-empty, one line and at most 64 KiB (65536 bytes of UTF-8);
+  // description has no limit of its own.
   google.protobuf.FieldMask update_mask = 3;
   optional uint64 expected_revision = 4;
 }

@@ -1,11 +1,17 @@
 //! End-to-end tests of the `todo` binary on temp `TODO_TUI_HOME`s.
 
-use std::io::Write as _;
+use std::ffi::OsStr;
+use std::fs::File;
+use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
+use todo_core::MAX_CAPTURE_BYTES;
 use todo_daemon::paths::{Env, Paths};
 use todo_daemon::spool::SpoolEntry;
 use todo_proto::google::r#type::Date;
@@ -143,6 +149,87 @@ fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
         assert!(Instant::now() < deadline, "timed out waiting until {what}");
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+fn no_command_execs_the_tui_entry_with_node() {
+    if Command::new("node").arg("--version").output().is_err() {
+        eprintln!("skipped: node is not on PATH");
+        return;
+    }
+    let h = Home::new();
+    let entry = h.home.join("tui.js");
+    std::fs::create_dir_all(&h.home).unwrap();
+    let stub = "console.log(JSON.stringify([process.argv.slice(2), \
+                process.env.TODO_BIN, process.env.TODO_TUI_HOME])); process.exit(3);";
+    std::fs::write(&entry, stub).unwrap();
+    let run = |todo_bin: Option<&str>| {
+        let mut cmd = h.command(&[]);
+        cmd.env("TODO_TUI_ENTRY", &entry);
+        match todo_bin {
+            Some(bin) => cmd.env("TODO_BIN", bin),
+            None => cmd.env_remove("TODO_BIN"),
+        };
+        cmd.output().unwrap()
+    };
+    let out = run(None);
+    // The TUI's exit status is todo's.
+    assert_eq!(out.status.code(), Some(3), "{}", text(&out.stderr));
+    let (args, bin, home): (Vec<String>, PathBuf, PathBuf) =
+        serde_json::from_slice(&out.stdout).unwrap();
+    assert!(args.is_empty(), "{args:?}");
+    // TODO_BIN is this binary, so the TUI starts its daemon.
+    let exe = Path::new(env!("CARGO_BIN_EXE_todo"));
+    assert_eq!(bin.canonicalize().unwrap(), exe.canonicalize().unwrap());
+    assert_eq!(home, h.home);
+    assert_eq!(text(&out.stderr), "");
+
+    // A TODO_BIN that is set is kept; an empty one is not.
+    let out = run(Some("/elsewhere/todo"));
+    let (_, bin, _): (Vec<String>, String, PathBuf) = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(bin, "/elsewhere/todo");
+    let out = run(Some(""));
+    let (_, bin, _): (Vec<String>, PathBuf, PathBuf) = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(bin.canonicalize().unwrap(), exe.canonicalize().unwrap());
+}
+
+#[test]
+fn a_tui_entry_that_is_missing_is_an_error() {
+    let h = Home::new();
+    std::fs::create_dir_all(&h.home).unwrap();
+    let missing = h.home.join("missing/tui.js");
+    let out = h
+        .command(&[])
+        .env("TODO_TUI_ENTRY", &missing)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(text(&out.stdout), "");
+    assert_eq!(
+        text(&out.stderr),
+        format!(
+            "todo: TODO_TUI_ENTRY is {}, which is not a file\n",
+            missing.display()
+        )
+    );
+    // Without node on PATH.
+    let entry = h.home.join("tui.js");
+    std::fs::write(&entry, "").unwrap();
+    let out = h
+        .command(&[])
+        .env("TODO_TUI_ENTRY", &entry)
+        .env("PATH", h.home.join("empty"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        text(&out.stderr),
+        "todo: cannot run the TUI: node is not on PATH; install Node 24 or newer\n"
+    );
+    // --help still prints help.
+    let out = h.todo(&["--help"]);
+    assert!(out.status.success());
+    assert!(text(&out.stdout).starts_with("A keyboard-driven todo manager\n"));
 }
 
 #[test]
@@ -287,6 +374,133 @@ fn add_without_text_captures_each_line_of_stdin() {
     assert_eq!(text(&out.stdout), "");
 }
 
+/// A pseudo-terminal: its master, to type into, and the path of its slave.
+fn pty() -> (File, PathBuf) {
+    use rustix::io::{FdFlags, fcntl_setfd};
+    use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+    let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).unwrap();
+    fcntl_setfd(&master, FdFlags::CLOEXEC).unwrap();
+    grantpt(&master).unwrap();
+    unlockpt(&master).unwrap();
+    let name = ptsname(&master, Vec::new()).unwrap();
+    let slave = PathBuf::from(OsStr::from_bytes(name.as_bytes()));
+    (master.into(), slave)
+}
+
+/// Waits up to 10s for `child` to exit, then collects its stderr.
+fn exit_of(child: &mut Child) -> (ExitStatus, String) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            child.kill().unwrap();
+            panic!("todo still running after 10s");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    (status, stderr)
+}
+
+/// What `todo add` prints on stderr when stdin is a terminal.
+const TERMINAL_PROMPT: &str =
+    "todo add: each line is captured when you press Enter; end with Ctrl-D\n";
+
+/// Starts `todo add` with the pty `slave` as stdin, and each line of its
+/// stdout as it comes.
+fn add_at(h: &Home, slave: &Path) -> (Child, mpsc::Receiver<String>) {
+    let mut child = h
+        .command(&["add"])
+        .stdin(File::options().read(true).write(true).open(slave).unwrap())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (tx, rx) = mpsc::channel();
+    let stdout = BufReader::new(child.stdout.take().unwrap());
+    std::thread::spawn(move || {
+        for line in stdout.lines() {
+            let _ = tx.send(line.unwrap());
+        }
+    });
+    (child, rx)
+}
+
+/// The next capture `add_at`'s `todo add` prints, without its id.
+fn next_captured(rx: &mpsc::Receiver<String>) -> String {
+    let line = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    captured(&line)[0].to_owned()
+}
+
+#[test]
+fn add_at_a_terminal_captures_each_line_as_it_is_entered() {
+    let h = Home::new();
+    let (mut terminal, slave) = pty();
+
+    let (mut child, rx) = add_at(&h, &slave);
+    terminal.write_all(b"first +1\n").unwrap();
+    assert_eq!(next_captured(&rx), "first  +1");
+    assert_eq!(titles(&h.items()), ["first"]);
+    terminal.write_all(b"\n  \nsecond #x\n").unwrap();
+    assert_eq!(next_captured(&rx), "second  #x");
+    // Ctrl-C loses nothing already entered.
+    let pid = rustix::process::Pid::from_child(&child);
+    rustix::process::kill_process(pid, rustix::process::Signal::INT).unwrap();
+    let (status, stderr) = exit_of(&mut child);
+    assert_eq!(status.signal(), Some(2), "{status:?}");
+    assert_eq!(stderr, TERMINAL_PROMPT);
+    assert_eq!(titles(&h.items()), ["first", "second"]);
+
+    // Ctrl-D at the start of a line ends it.
+    let (mut child, rx) = add_at(&h, &slave);
+    terminal.write_all(b"third\n\x04").unwrap();
+    assert_eq!(next_captured(&rx), "third");
+    let (status, stderr) = exit_of(&mut child);
+    assert!(status.success(), "{status:?}: {stderr}");
+    assert_eq!(stderr, TERMINAL_PROMPT);
+    assert!(rx.recv_timeout(Duration::from_secs(10)).is_err());
+    assert_eq!(titles(&h.items()), ["first", "second", "third"]);
+
+    // After text, Ctrl-D ends the line without a newline, and a second one
+    // ends the input, as with `cat`.
+    let (mut child, rx) = add_at(&h, &slave);
+    terminal.write_all(b"fourth\x04\x04").unwrap();
+    assert_eq!(next_captured(&rx), "fourth");
+    let (status, stderr) = exit_of(&mut child);
+    assert!(status.success(), "{status:?}: {stderr}");
+    assert_eq!(stderr, TERMINAL_PROMPT);
+    assert_eq!(titles(&h.items()), ["first", "second", "third", "fourth"]);
+}
+
+#[test]
+fn stop_does_not_wait_for_the_terminal_add_that_spawned_the_daemon() {
+    let h = Home::new();
+    let (mut terminal, slave) = pty();
+    let (mut child, rx) = add_at(&h, &slave);
+    terminal.write_all(b"first\n").unwrap();
+    assert_eq!(next_captured(&rx), "first");
+    // The daemon is this `todo add`'s child, and it is still waiting for
+    // lines: the daemon must not linger as a zombie once it exits.
+    assert_eq!(h.ok(&["daemon", "stop"]), "todo daemon: stopped\n");
+    // Later lines go to the spool.
+    terminal.write_all(b"second\n\x04").unwrap();
+    let line = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(line, "spooled  second");
+    let (status, stderr) = exit_of(&mut child);
+    assert!(status.success(), "{status:?}: {stderr}");
+    let spool = std::fs::read_to_string(h.paths().spool()).unwrap();
+    let entry: SpoolEntry = serde_json::from_str(spool.trim_end()).unwrap();
+    assert_eq!(entry.text, "second");
+}
+
 #[test]
 fn a_closed_stdout_does_not_stop_the_captures() {
     let h = Home::new();
@@ -308,36 +522,55 @@ fn a_closed_stdout_does_not_stop_the_captures() {
 }
 
 #[test]
-fn a_rejected_line_fails_the_run_but_not_the_other_lines() {
+fn a_line_over_64_kib_fails_the_run_but_not_the_other_lines() {
     let h = Home::new();
-    // Longer than the daemon accepts in one message (4 MiB).
-    let huge = "x".repeat(5 << 20);
-    let input = format!("before\n{huge}\nafter ^2026-10-24\n");
+    // 64 KiB of UTF-8 in two-byte characters is accepted; one byte more is not.
+    let longest = "é".repeat(MAX_CAPTURE_BYTES / 2);
+    let input = format!("before\n{longest}x\n{longest}\nafter ^2026-10-24\n");
     let out = h.todo_with_stdin(&["add"], input.as_bytes());
     assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
     assert_eq!(
         captured(text(&out.stdout)),
-        ["before", "after  ^2026-10-24"]
+        ["before", longest.as_str(), "after  ^2026-10-24"]
     );
     // The rejected line is named, cut short.
-    let stderr = text(&out.stderr);
-    assert_eq!(stderr.lines().count(), 1, "{stderr}");
-    let named = format!("todo: error: NOT CAPTURED: \"{}…\": ", "x".repeat(60));
-    assert!(stderr.starts_with(&named), "{stderr}");
-    assert!(stderr.len() < 1000, "{stderr}");
-    assert_eq!(titles(&h.items()), ["before", "after"]);
+    assert_eq!(
+        text(&out.stderr),
+        format!(
+            "todo: error: NOT CAPTURED: \"{}…\": longer than 64 KiB\n",
+            "é".repeat(60)
+        )
+    );
+    assert_eq!(titles(&h.items()), ["before", longest.as_str(), "after"]);
 }
 
 #[test]
-fn a_capture_whose_reply_exceeds_4_mib_is_reported_as_captured() {
+fn a_capture_over_64_kib_is_neither_sent_nor_spooled() {
     let h = Home::new();
-    // The request fits the daemon's 4 MiB limit; the reply carries the
-    // title twice (the Item and the draft).
-    let long = "y".repeat(5 << 19);
-    let out = h.todo_with_stdin(&["add"], format!("{long}\n").as_bytes());
-    assert!(out.status.success(), "{}", text(&out.stderr));
-    assert_eq!(captured(text(&out.stdout)), [long.as_str()]);
-    assert_eq!(h.items().len(), 1);
+    let over = "y".repeat(MAX_CAPTURE_BYTES + 1);
+    let out = h.todo(&["add", &over]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(text(&out.stdout), "");
+    assert_eq!(
+        text(&out.stderr),
+        format!(
+            "todo: error: NOT CAPTURED: \"{}…\": longer than 64 KiB\n",
+            "y".repeat(60)
+        )
+    );
+    // Not sent: no daemon was started for it.
+    assert!(!socket_in(&h.home.join("run")));
+
+    // Nor spooled while the daemon cannot start.
+    std::fs::create_dir_all(&h.home).unwrap();
+    std::fs::write(h.home.join("run"), "").unwrap();
+    let input = format!("{over}\nkept\n");
+    let out = h.todo_with_stdin(&["add"], input.as_bytes());
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(text(&out.stdout), "spooled  kept\n");
+    let spool = std::fs::read_to_string(h.paths().spool()).unwrap();
+    let entry: SpoolEntry = serde_json::from_str(spool.trim_end()).unwrap();
+    assert_eq!(entry.text, "kept");
 }
 
 #[test]

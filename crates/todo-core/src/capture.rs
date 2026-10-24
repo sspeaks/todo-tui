@@ -10,6 +10,12 @@ use crate::status::Status;
 
 const SIGILS: [char; 5] = ['+', '^', '#', '~', '>'];
 
+/// The most capture text the API takes, in bytes of UTF-8 (design 2.3):
+/// `CaptureItem`, `ParseCapture` and the spool import refuse longer text,
+/// and an update refuses a longer title. [`parse_capture`] itself takes any
+/// length.
+pub const MAX_CAPTURE_BYTES: usize = 64 * 1024;
+
 /// What capture text was parsed into.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureDraft {

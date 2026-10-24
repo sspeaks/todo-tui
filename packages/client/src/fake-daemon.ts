@@ -8,6 +8,7 @@ import { ArchiveReason, type Item, ItemSchema, Status } from "./gen/todo/v1/item
 import { ItemService, type ListItemsRequest, type UpdateItemRequest } from "./gen/todo/v1/item_service_pb.js";
 import { SystemService } from "./gen/todo/v1/system_service_pb.js";
 import { type Change, ChangeSchema, type SubscribeResponse, SubscribeResponseSchema, WatchService } from "./gen/todo/v1/watch_service_pb.js";
+import { MAX_CAPTURE_BYTES } from "./limits.js";
 import { ulid } from "./ulid.js";
 
 type Waiter = (msg: SubscribeResponse | Error) => void;
@@ -40,10 +41,10 @@ const ON_DELETED = new Set(["DeleteItem", "UndeleteItem"]);
  * soft-deleted Items, mutations that change nothing, and ListItems' implicit
  * rules (deleted, archived, done and deferred Items hidden unless asked
  * for), sorted by id. It does not parse captures (the title is the text) or
- * check field values and read-only fields: SetStatus sets only the derived
- * status, and UpdateItem copies the top-level fields its mask names (status
- * and archived paths are refused). BatchMutate and ParseCapture are not
- * implemented.
+ * check field values and read-only fields, except the 64 KiB limit on capture
+ * text and titles: SetStatus sets only the derived status, and UpdateItem
+ * copies the top-level fields its mask names (status and archived paths are
+ * refused). BatchMutate and ParseCapture are not implemented.
  */
 export class FakeDaemon {
   revision = 0n;
@@ -78,6 +79,7 @@ export class FakeDaemon {
         captureItem: (req) => {
           this.check();
           const requestId = requestIdOf(req.requestId);
+          if (overCaptureLimit(req.text)) throw badRequest("text", TOO_LONG);
           if (req.text.trim() === "") throw badRequest("text", "must not be empty");
           const recorded = this.recorded("CaptureItem", requestId);
           if (recorded) return { item: this.get(recorded.id), result: recorded.result };
@@ -112,7 +114,10 @@ export class FakeDaemon {
         updateItem: (req) =>
           this.mutate("UpdateItem", req, "item.id", req.item?.id ?? "", () => {
             const patch = maskedFields(req);
-            return (item) => (equals(ItemSchema, merged(item, patch), item) ? undefined : patch);
+            return (item) => {
+              if (patch.title !== undefined && overCaptureLimit(patch.title.trim())) throw badRequest("item.title", TOO_LONG);
+              return equals(ItemSchema, merged(item, patch), item) ? undefined : patch;
+            };
           }),
         setStatus: (req) =>
           this.mutate("SetStatus", req, "id", req.id, () => (item) => (item.status === req.status ? undefined : { status: req.status })),
@@ -305,6 +310,14 @@ function badRequest(field: string, description: string): ConnectError {
   return new ConnectError(`${field}: ${description}`, Code.InvalidArgument, undefined, [
     { desc: BadRequestSchema, value: { fieldViolations: [{ field, description }] } },
   ]);
+}
+
+const TOO_LONG = `is longer than ${MAX_CAPTURE_BYTES / 1024} KiB`;
+
+/** Whether `text` is over MAX_CAPTURE_BYTES as UTF-8, as protobuf encodes it. */
+function overCaptureLimit(text: string): boolean {
+  // A UTF-16 code unit is at most 3 bytes of UTF-8.
+  return text.length * 3 > MAX_CAPTURE_BYTES && new TextEncoder().encode(text).length > MAX_CAPTURE_BYTES;
 }
 
 const ULID = /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/i;

@@ -10,7 +10,7 @@ pub mod mutation;
 pub mod status;
 pub mod value;
 
-pub use capture::{CaptureDraft, CaptureToken, CaptureTokenKind, parse_capture};
+pub use capture::{CaptureDraft, CaptureToken, CaptureTokenKind, MAX_CAPTURE_BYTES, parse_capture};
 pub use change::{MutationResult, Topic};
 pub use date::{DateError, parse_date};
 pub use field::ItemField;

@@ -1,6 +1,8 @@
 use jiff::civil::Date;
 use jiff::{Timestamp, Zoned};
-use todo_core::{Actor, CreatedVia, ItemId, Mutation, Status as ItemStatus, parse_capture};
+use todo_core::{
+    Actor, CreatedVia, ItemId, MAX_CAPTURE_BYTES, Mutation, Status as ItemStatus, parse_capture,
+};
 use todo_proto::convert::{ConvertError, EnumField, timestamp_from_proto};
 use todo_proto::request;
 use todo_proto::v1::item_service_server::ItemService;
@@ -32,6 +34,7 @@ impl ItemService for Items {
     ) -> Result<Response<CaptureItemResponse>, Status> {
         let req = request.into_inner();
         let request_id = check_request_id(&req.request_id)?;
+        check_capture_length(&req.text)?;
         if req.text.trim().is_empty() {
             return Err(error::bad_request("text", "must not be empty"));
         }
@@ -101,6 +104,7 @@ impl ItemService for Items {
         request: Request<ParseCaptureRequest>,
     ) -> Result<Response<ParseCaptureResponse>, Status> {
         let req = request.into_inner();
+        check_capture_length(&req.text)?;
         let reference = reference_time(req.reference_time.as_ref(), &Zoned::now())?;
         let draft = parse_capture(&req.text, reference.date());
         Ok(Response::new(ParseCaptureResponse {
@@ -342,6 +346,18 @@ fn check_request_id(request_id: &str) -> Result<String, Status> {
 /// of one ULID is one idempotency key; `None` if it is not a ULID.
 pub(crate) fn canonical_ulid(s: &str) -> Option<String> {
     s.parse::<Ulid>().ok().map(|ulid| ulid.to_string())
+}
+
+/// Refuses capture text over [`MAX_CAPTURE_BYTES`], without echoing it.
+fn check_capture_length(text: &str) -> Result<(), Status> {
+    if text.len() > MAX_CAPTURE_BYTES {
+        let limit = MAX_CAPTURE_BYTES / 1024;
+        return Err(error::bad_request(
+            "text",
+            format!("is longer than {limit} KiB"),
+        ));
+    }
+    Ok(())
 }
 
 /// The capture reference time in `now`'s zone: `reference_time` if set

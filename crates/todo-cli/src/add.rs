@@ -3,12 +3,12 @@
 
 use std::error::Error as _;
 use std::fmt::Display;
-use std::io::{IsTerminal as _, Read as _, Write as _};
+use std::io::{BufRead as _, IsTerminal as _, Read as _, Write as _};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use todo_core::new_ulid;
+use todo_core::{MAX_CAPTURE_BYTES, new_ulid};
 use todo_daemon::client::connect;
 use todo_daemon::paths::Paths;
 use todo_daemon::spool::{self, SpoolEntry};
@@ -60,82 +60,165 @@ impl std::fmt::Display for Why {
 }
 
 /// Captures `words` joined with spaces (an error if that is blank) or,
-/// without words, each non-empty line of stdin. Prints
+/// without words, each non-empty line of stdin: as it is entered when stdin
+/// is a terminal, otherwise once all of it is read. Prints
 /// `<short id>  <title>[  <fields>]` per capture and `spooled  <text>` per
-/// spooled one; exits non-zero if any capture was rejected or could not be
-/// spooled.
+/// spooled one; exits non-zero if any capture was rejected, was over
+/// [`MAX_CAPTURE_BYTES`], or could not be spooled.
 pub(crate) async fn add(paths: &Paths, words: Vec<String>) -> anyhow::Result<ExitCode> {
-    let texts = if words.is_empty() {
-        let mut stdin = std::io::stdin();
-        if stdin.is_terminal() {
-            print_err("todo add: reading captures from stdin, one per line; end with Ctrl-D");
-        }
-        let mut input = Vec::new();
-        stdin.read_to_end(&mut input).context("reading stdin")?;
-        let (texts, not_utf8) = capture_lines(&input);
-        for line in not_utf8 {
-            print_err(format_args!(
-                "todo: warning: line {line} is not valid UTF-8; \
-                 its invalid bytes were replaced with U+FFFD"
-            ));
-        }
-        texts
-    } else {
+    let mut sink = Sink::new(paths);
+    if !words.is_empty() {
         let text = words.join(" ");
         // The daemon, or the spool import, would reject it.
         anyhow::ensure!(!text.trim().is_empty(), "nothing to capture");
-        vec![text]
-    };
-    let captures: Vec<Capture> = texts
-        .into_iter()
-        .map(|text| Capture {
-            id: new_ulid(),
-            text,
-        })
-        .collect();
-    if captures.is_empty() {
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    let mut ok = true;
-    match ready(paths).await {
-        Err(why) => ok = spool_all(paths, &captures, &why),
-        Ok(channel) => {
-            // The daemon bounds what it accepts. The reply to a capture it
-            // stored must always decode, or the capture would look lost.
-            let mut items = ItemServiceClient::new(channel).max_decoding_message_size(usize::MAX);
-            for (i, capture) in captures.iter().enumerate() {
-                let request = CaptureItemRequest {
-                    request_id: capture.id.to_string(),
-                    text: capture.text.clone(),
-                    created_via: CreatedVia::Cli.into(),
-                    spool_id: Some(capture.id.to_string()),
-                    ..Default::default()
-                };
-                match call(items.capture_item(request)).await {
-                    Ok(response) => ok &= print_captured(response),
-                    Err(status) if is_transport(&status) => {
-                        let why = Why::Unavailable(describe(&status));
-                        ok &= spool_all(paths, &captures[i..], &why);
-                        break;
-                    }
-                    Err(status) => {
-                        print_err(format_args!(
-                            "todo: error: NOT CAPTURED: {}: {}",
-                            excerpt(&capture.text),
-                            status.message()
-                        ));
-                        ok = false;
-                    }
+        sink.capture(text).await;
+    } else if std::io::stdin().is_terminal() {
+        print_err("todo add: each line is captured when you press Enter; end with Ctrl-D");
+        let mut line = Vec::new();
+        for number in 1.. {
+            line.clear();
+            // Blocks this thread only: the runtime's workers keep the
+            // connection to the daemon going meanwhile.
+            let read = std::io::stdin().lock().read_until(b'\n', &mut line);
+            if read.context("reading stdin")? == 0 {
+                break;
+            }
+            if let Some((text, utf8)) = line_text(&line) {
+                if !utf8 {
+                    warn_not_utf8(number);
                 }
+                sink.capture(text).await;
+            }
+            // Only end of file ends a line without a newline: Ctrl-D after
+            // text, then Ctrl-D again. A terminal reports it once, so a
+            // further read would wait for a third.
+            if !line.ends_with(b"\n") {
+                break;
             }
         }
+    } else {
+        let mut input = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut input)
+            .context("reading stdin")?;
+        let (texts, not_utf8) = capture_lines(&input);
+        for number in not_utf8 {
+            warn_not_utf8(number);
+        }
+        for text in texts {
+            sink.capture(text).await;
+        }
     }
-    Ok(if ok {
+    Ok(if sink.ok {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
     })
+}
+
+/// Where captures go: the daemon, connected on the first capture, until it
+/// becomes unavailable; the spool from then on.
+struct Sink<'a> {
+    paths: &'a Paths,
+    to: To,
+    /// False once a capture was rejected or lost.
+    ok: bool,
+}
+
+enum To {
+    /// Nothing was sent yet.
+    Unconnected,
+    Daemon(ItemServiceClient<Channel>),
+    Spool {
+        why: Why,
+        told: Told,
+    },
+}
+
+/// What stderr has said about spooling so far.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Told {
+    Nothing,
+    Why,
+    /// Why, and where captures are spooled.
+    Where,
+}
+
+impl<'a> Sink<'a> {
+    fn new(paths: &'a Paths) -> Self {
+        Sink {
+            paths,
+            to: To::Unconnected,
+            ok: true,
+        }
+    }
+
+    /// Captures `text`, or spools it, and prints the outcome. Text over
+    /// [`MAX_CAPTURE_BYTES`] is neither sent nor spooled: the daemon and the
+    /// spool import would refuse it.
+    async fn capture(&mut self, text: String) {
+        if text.len() > MAX_CAPTURE_BYTES {
+            print_err(format_args!(
+                "todo: error: NOT CAPTURED: {}: longer than {} KiB",
+                excerpt(&text),
+                MAX_CAPTURE_BYTES / 1024
+            ));
+            self.ok = false;
+            return;
+        }
+        let capture = Capture {
+            id: new_ulid(),
+            text,
+        };
+        if let To::Unconnected = self.to {
+            self.to = match ready(self.paths).await {
+                // The daemon bounds what it accepts. The reply to a capture
+                // it stored must always decode, or the capture would look
+                // lost.
+                Ok(channel) => To::Daemon(
+                    ItemServiceClient::new(channel).max_decoding_message_size(usize::MAX),
+                ),
+                Err(why) => To::Spool {
+                    why,
+                    told: Told::Nothing,
+                },
+            };
+        }
+        if let To::Daemon(items) = &mut self.to {
+            let request = CaptureItemRequest {
+                request_id: capture.id.to_string(),
+                text: capture.text.clone(),
+                created_via: CreatedVia::Cli.into(),
+                spool_id: Some(capture.id.to_string()),
+                ..Default::default()
+            };
+            match call(items.capture_item(request)).await {
+                Ok(response) => {
+                    self.ok &= print_captured(response);
+                    return;
+                }
+                // This capture and the ones after it go to the spool.
+                Err(status) if is_transport(&status) => {
+                    self.to = To::Spool {
+                        why: Why::Unavailable(describe(&status)),
+                        told: Told::Nothing,
+                    };
+                }
+                Err(status) => {
+                    print_err(format_args!(
+                        "todo: error: NOT CAPTURED: {}: {}",
+                        excerpt(&capture.text),
+                        status.message()
+                    ));
+                    self.ok = false;
+                    return;
+                }
+            }
+        }
+        if let To::Spool { why, told } = &mut self.to {
+            self.ok &= spool_one(self.paths, &capture, why, told);
+        }
+    }
 }
 
 /// The captures in stdin: each line trimmed, blank ones skipped, and the
@@ -145,17 +228,33 @@ fn capture_lines(input: &[u8]) -> (Vec<String>, Vec<usize>) {
     let mut texts = Vec::new();
     let mut not_utf8 = Vec::new();
     for (i, line) in input.split(|&b| b == b'\n').enumerate() {
-        let decoded = String::from_utf8_lossy(line);
-        let text = decoded.trim();
-        if text.is_empty() {
+        let Some((text, utf8)) = line_text(line) else {
             continue;
-        }
-        if std::str::from_utf8(line).is_err() {
+        };
+        if !utf8 {
             not_utf8.push(i + 1);
         }
-        texts.push(text.to_owned());
+        texts.push(text);
     }
     (texts, not_utf8)
+}
+
+/// One line of stdin as a capture, trimmed (`None` if blank), and whether
+/// it was valid UTF-8; if not, it is decoded lossily.
+fn line_text(line: &[u8]) -> Option<(String, bool)> {
+    let decoded = String::from_utf8_lossy(line);
+    let text = decoded.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some((text.to_owned(), std::str::from_utf8(line).is_ok()))
+}
+
+fn warn_not_utf8(number: usize) {
+    print_err(format_args!(
+        "todo: warning: line {number} is not valid UTF-8; \
+         its invalid bytes were replaced with U+FFFD"
+    ));
 }
 
 /// `text` quoted for a message, cut to [`EXCERPT_CHARS`] characters and
@@ -394,34 +493,37 @@ fn parsed_fields(draft: &CaptureDraft) -> Vec<String> {
     fields
 }
 
-/// Appends `captures` to the spool, printing `spooled  <text>` for each,
-/// then says on stderr why and where, and which captures were lost because
-/// they could not be appended. Returns false if any was.
-fn spool_all(paths: &Paths, captures: &[Capture], why: &Why) -> bool {
+/// Appends `capture` to the spool and prints `spooled  <text>`, or a
+/// NOT CAPTURED error if it cannot. Unless `told` says it already did,
+/// stderr also says why captures are spooled, and where once one is.
+/// Returns false if the capture was lost.
+fn spool_one(paths: &Paths, capture: &Capture, why: &Why, told: &mut Told) -> bool {
     let path = paths.spool();
-    let mut lost = Vec::new();
-    for capture in captures {
-        match spool::append(paths, &SpoolEntry::now(capture.id, capture.text.as_str())) {
-            Ok(()) => print_out(format_args!("spooled  {}", capture.text)),
-            Err(e) => lost.push((capture, e)),
+    match spool::append(paths, &SpoolEntry::now(capture.id, capture.text.as_str())) {
+        Ok(()) => {
+            print_out(format_args!("spooled  {}", capture.text));
+            if *told < Told::Where {
+                print_err(format_args!(
+                    "todo: {why}; spooled to {}; it will be imported once the daemon is running again",
+                    path.display()
+                ));
+                *told = Told::Where;
+            }
+            true
+        }
+        Err(e) => {
+            if *told == Told::Nothing {
+                print_err(format_args!("todo: {why}"));
+                *told = Told::Why;
+            }
+            print_err(format_args!(
+                "todo: error: NOT CAPTURED: {}: cannot write {}: {e}",
+                excerpt(&capture.text),
+                path.display()
+            ));
+            false
         }
     }
-    if lost.len() < captures.len() {
-        print_err(format_args!(
-            "todo: {why}; spooled to {}; it will be imported once the daemon is running again",
-            path.display()
-        ));
-    } else {
-        print_err(format_args!("todo: {why}"));
-    }
-    for (capture, e) in &lost {
-        print_err(format_args!(
-            "todo: error: NOT CAPTURED: {}: cannot write {}: {e}",
-            excerpt(&capture.text),
-            path.display()
-        ));
-    }
-    lost.is_empty()
 }
 
 #[cfg(test)]

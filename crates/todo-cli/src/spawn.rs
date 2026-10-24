@@ -44,6 +44,17 @@ pub(crate) async fn connect_or_spawn(paths: &Paths) -> anyhow::Result<Channel> {
 /// ~2s) until the socket accepts connections.
 pub(crate) async fn spawn_and_wait(paths: &Paths) -> anyhow::Result<()> {
     let mut child = spawn_detached(paths)?;
+    let listening = wait_until_listening(paths, &mut child).await;
+    // Reap the daemon whenever it exits. While this process runs on (`todo
+    // add` at a terminal), it would otherwise stay a zombie, which
+    // `wait_for_exit` cannot tell from a running daemon.
+    std::thread::spawn(move || child.wait());
+    listening
+}
+
+/// Polls the socket until it accepts connections, or `child` fails, or
+/// [`SPAWN_BUDGET`] runs out.
+async fn wait_until_listening(paths: &Paths, child: &mut Child) -> anyhow::Result<()> {
     let log = paths.daemon_log();
     let deadline = Instant::now() + SPAWN_BUDGET;
     let mut delay = FIRST_DELAY;

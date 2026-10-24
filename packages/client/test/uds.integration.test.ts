@@ -11,6 +11,7 @@ import { BadRequestSchema, ErrorInfoSchema } from "../src/gen/google/rpc/error_d
 import { CreatedVia, type Item } from "../src/gen/todo/v1/item_pb.js";
 import { ClientKind } from "../src/gen/todo/v1/system_service_pb.js";
 import { type TodoConnection, connect, createLiveStore } from "../src/connect.js";
+import { MAX_CAPTURE_BYTES } from "../src/limits.js";
 import type { LiveStore } from "../src/live-store.js";
 import { updateItem } from "../src/mutations.js";
 import { resolvePaths, envFromProcess } from "../src/paths.js";
@@ -136,6 +137,17 @@ describe.skipIf(!TODO_BIN)("UDS integration against $TODO_BIN", { timeout: 60_00
     const bad = ConnectError.from(await other.items.listItems({ pageToken: "garbage" }).catch((e: unknown) => e));
     expect(bad.code).toBe(Code.InvalidArgument);
     expect(bad.findDetails(BadRequestSchema)[0]?.fieldViolations[0]?.field).toBe("page_token");
+  });
+
+  it("agrees with the daemon on MAX_CAPTURE_BYTES", async () => {
+    const h = await home();
+    const conn = await h.open();
+    const capture = (text: string) => conn.items.captureItem({ requestId: ulid(), text, createdVia: CreatedVia.TUI });
+    const longest = "é".repeat(MAX_CAPTURE_BYTES / 2);
+    expect((await capture(longest)).item?.title).toBe(longest);
+    const err = ConnectError.from(await capture(`${longest}x`).catch((e: unknown) => e));
+    expect(err.code).toBe(Code.InvalidArgument);
+    expect(err.findDetails(BadRequestSchema)[0]?.fieldViolations[0]).toMatchObject({ field: "text", description: "is longer than 64 KiB" });
   });
 
   it("decodes ABORTED / REVISION_MISMATCH", async () => {

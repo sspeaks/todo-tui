@@ -26,6 +26,7 @@ git clone https://github.com/sspeaks/todo-tui && cd todo-tui   # or cd into your
 corepack enable                                # once per machine; provides the pinned pnpm
 pnpm install                                   # first pnpm run asks to download pnpm 12.14.0: answer Y
 pnpm gen                                       # generates the TS client code the TUI imports
+pnpm -C tui build                              # bundles the TUI into tui/dist/tui.js
 cargo install --locked --path crates/todo-cli  # builds `todo` into ~/.cargo/bin (a minute or so)
 ```
 
@@ -36,19 +37,21 @@ installed somewhere you cannot write, such as by Nix or a system package. Run
 `Cannot find module …/protoc-gen-es/bin/protoc-gen-es`, run `pnpm install --force`
 and then `pnpm gen` again. See also [Troubleshooting](#troubleshooting).
 
-Capture a todo, then open the TUI:
+Capture a todo, then open the TUI with `todo` and no arguments:
 
 ```console
 $ todo add "call dentist ^fri +2 #home"
 MTTVN5Y1  call dentist  +2 ^2026-10-30 #home
-$ pnpm -C tui dev
+$ todo
 Inbox 1
 › ○ +2  call dentist
 ● live · rev 1 · 1 items                                   j/k move · q quit
 ```
 
-`q` quits the TUI. The first `todo add` (or the TUI) starts the daemon in the
-background, and it keeps running after they exit. `todo daemon stop` stops it.
+`q` quits the TUI. `todo` runs the bundle that `pnpm -C tui build` made in this
+checkout, so keep the checkout where it is. The first `todo add` (or the TUI)
+starts the daemon in the background, and it keeps running after they exit.
+`todo daemon stop` stops it.
 
 ## Using it
 
@@ -65,6 +68,10 @@ title, then the fields it parsed.
 ```
 TBSBZNDG  ask about the invoice  ^2026-10-26 ~"the vendor" >next
 ```
+
+A capture can be up to 64 KiB (65536 bytes of UTF-8). Longer text is neither
+sent nor spooled (below): `todo` prints
+`todo: error: NOT CAPTURED: "<its first 60 characters>…": longer than 64 KiB`.
 
 Plain words need no quotes (`todo a buy milk`), but quote anything with a token,
 preferably in single quotes. Unquoted, the shell gets to some tokens first:
@@ -113,7 +120,8 @@ todo: warning: ^bogus: not a date
 warnings. It exits 1 in two cases:
 
 - The text is blank: `todo: nothing to capture`.
-- A capture was neither stored nor spooled: `todo: error: NOT CAPTURED: …`.
+- A capture was neither stored nor spooled, such as one over 64 KiB:
+  `todo: error: NOT CAPTURED: …`. With several, the others are still captured.
 
 ### Several at once
 
@@ -127,8 +135,11 @@ $ todo add < meeting-notes.txt
 ```
 
 At a terminal, `todo add` with no text prints
-`todo add: reading captures from stdin, one per line; end with Ctrl-D` and waits.
-Nothing is captured until you press Ctrl-D, and Ctrl-C discards what you typed.
+`todo add: each line is captured when you press Enter; end with Ctrl-D`. Each line
+is captured as you enter it, and its result printed, so Ctrl-C loses only lines
+whose result is not printed yet: normally just the one you have not finished, but
+also the rest of a long paste that is still being captured. From a pipe or a file,
+`todo add` reads all of stdin first, then captures the lines.
 
 ### When the daemon is down: the spool
 
@@ -147,17 +158,30 @@ import are moved to `spool.rejected.jsonl` next to it.
 
 ### Seeing your todos: the TUI
 
-There is no `todo list` yet; the TUI is how you see items. From the repo:
+There is no `todo list` yet; the TUI is how you see items. `todo` with no
+arguments opens it: it runs a single-file bundle of the TUI with `node`, which
+must be on `PATH`. Build the bundle once, and again after the TUI changes:
 
 ```sh
-pnpm -C tui dev                        # runs from source
+pnpm -C tui build                      # writes tui/dist/tui.js
+todo
 ```
 
-or build a single-file bundle once and run it from anywhere:
+`todo` uses the first bundle that exists of:
+
+1. `$TODO_TUI_ENTRY`, a path to a `tui.js`. If it is set (and not empty), that
+   file must exist; otherwise `todo` stops with
+   `todo: TODO_TUI_ENTRY is <path>, which is not a file`.
+2. `../share/todo-tui/tui.js` from the directory holding `todo`, for future
+   packages.
+3. `tui/dist/tui.js` in the checkout `todo` was built from. If that is missing
+   too, `todo` stops with
+   ``todo: the TUI is not built; run `pnpm -C <checkout>/tui build` (or set TODO_TUI_ENTRY)``.
+
+To run the TUI from source instead, without building, from the repo:
 
 ```sh
-pnpm -C tui build
-node tui/dist/tui.js
+pnpm -C tui dev
 ```
 
 Keys: `j`/`k` or the arrow keys move, `q` or Ctrl-C quits. Captures made elsewhere
@@ -168,7 +192,9 @@ dates, labels and waiting-on are not displayed. Views, quick-add, the detail pan
 and editing come with M4.
 
 If no daemon is running, the TUI starts one with `todo daemon --detach`, using
-`$TODO_BIN` if it is set and `todo` on `PATH` otherwise. With neither it stops with
+`$TODO_BIN` if it is set and `todo` on `PATH` otherwise. `todo` sets `TODO_BIN` to
+itself unless it is already set, so the TUI starts that `todo`'s daemon. Under
+`pnpm -C tui dev` with neither, it stops with
 `todo-tui: cannot run todo: spawn todo ENOENT`. Give `TODO_BIN` as an absolute path:
 `pnpm -C tui dev` runs from `tui/`, so a relative one does not resolve.
 
@@ -211,7 +237,7 @@ relative one against their own working directories, which differ under
 ```sh
 export TODO_TUI_HOME=$(mktemp -d)
 todo add "try me +1"
-pnpm -C tui dev
+todo
 todo daemon stop
 rm -rf "$TODO_TUI_HOME"; unset TODO_TUI_HOME
 ```
@@ -245,7 +271,7 @@ pnpm smoke            # builds todo, then exercises daemon, CLI and TS client to
 Run `pnpm gen` again after changing `proto/`; the Rust side compiles the protos
 during `cargo build` (that is what needs `protoc`).
 
-`pnpm test` skips the 8 client tests that run against a real daemon unless
+`pnpm test` skips the 9 client tests that run against a real daemon unless
 `TODO_BIN` is an absolute path to a built `todo`:
 `cargo build -p todo-cli && TODO_BIN=$PWD/target/debug/todo pnpm test`. The snippet
 below and `pnpm smoke` assume the default `target/`. If you set
@@ -273,6 +299,11 @@ todo daemon stop
   "Already up to date". Run `pnpm install --force`, then `pnpm gen`.
 - The TUI fails with `Cannot find module …/packages/client/src/gen/…`. Run
   `pnpm gen`.
+- `todo` stops with `todo: the TUI is not built; …`. Run the `pnpm … build` it
+  names, or `pnpm -C tui dev` from the repo.
+- `todo` stops with `todo: cannot run the TUI: node is not on PATH; …`. Install
+  Node 24 or newer.
+- `todo` opens an old TUI after a `git pull`. Run `pnpm -C tui build` again.
 - The TUI stops with `todo-tui: cannot run todo: spawn todo ENOENT`. Put `todo` on
   `PATH` (the `cargo install` step), or set `TODO_BIN` to an absolute path.
 - A rebuilt `todo` still behaves like the old one. Run `todo daemon stop`.

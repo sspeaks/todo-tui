@@ -62,11 +62,11 @@ The TUI is designed for two speeds: **capture in under three seconds**, and **tr
 
 | Path | How | Notes |
 |---|---|---|
-| **CLI one-liner** | `todo add "call dentist ^fri +2"` (alias `todo a`) | Prints the short id and parsed fields, then exits. `todo add` with no argument reads stdin, **one capture per line**, for pasting a list or meeting notes. |
+| **CLI one-liner** | `todo add "call dentist ^fri +2"` (alias `todo a`) | Prints the short id and parsed fields, then exits. `todo add` with no argument reads stdin, **one capture per line**, for pasting a list or meeting notes. At a terminal each line is captured as it is entered, so Ctrl-C loses only lines not yet captured (normally just the one being typed); piped input is read whole first. |
 | **TUI quick-add** | `a` from any view | Inline input at the top of the list, with a **live preview** of parsed tokens as you type. `enter` saves and stays open for the next capture; `esc` closes. |
 | **MCP** | From Claude Code: "add a todo to fix the flaky test" | Uses the same capture call; `created_via = mcp`. |
 
-**Capture never fails.** If the daemon cannot be reached or started within the auto-spawn budget, the CLI appends a line `{ "spool_id": <ULID>, "captured_at": <local timestamp with offset>, "text": "…" }` to `spool.jsonl` in the data directory (7.1), using an exclusive append lock, and exits successfully. On its next start the daemon imports each line with `ParseCapture(text, reference_time = captured_at)` so relative dates resolve against the capture time, sets `created_via = cli`, and skips any `spool_id` it has already imported (crash-safe). The file is truncated after a successful import. Captures are always local first (`inbox`); nothing touches Jira until you promote.
+**Capture never fails for want of a daemon.** If the daemon cannot be reached or started within the auto-spawn budget, the CLI appends a line `{ "spool_id": <ULID>, "captured_at": <local timestamp with offset>, "text": "…" }` to `spool.jsonl` in the data directory (7.1), using an exclusive append lock, and exits successfully. The daemon imports the spool when it starts and every 30 s while it runs: each line with `ParseCapture(text, reference_time = captured_at)` so relative dates resolve against the capture time, `created_via = cli`, skipping any `spool_id` it has already imported (crash-safe). The file is truncated after a successful import; lines it cannot import (malformed, blank, or over the capture limit, 2.3) move to `spool.rejected.jsonl`. Text over the limit is neither sent nor spooled: the CLI reports it `NOT CAPTURED` and exits 1. Captures are always local first (`inbox`); nothing touches Jira until you promote.
 
 **Shell prompt integration**: `todo status --short` prints compact counts (e.g. `📥3 ⏰1 ✦2` = inbox items, overdue-or-due-today items, pending suggestions; zero counts omitted) for prompt or tmux status lines. It must answer from the daemon in well under 50ms, or print nothing.
 
@@ -98,7 +98,9 @@ Future capture surfaces (Raycast, macOS Shortcuts, mobile) are just more gRPC cl
 
 ### 2.3 Inline capture syntax
 
-Parsed by the core (Rust) and exposed as a `ParseCapture(text, reference_time?)` RPC (reference time defaults to now), so CLI, TUI preview, MCP and spool import behave identically. A token is a whitespace-delimited word starting with a sigil; tokens never contain spaces except the quoted `~"…"` form. A token that fails to parse **stays in the title** and the parse result carries a warning (shown in the TUI preview, printed by the CLI). Everything else is the title. `\` escapes a sigil (`\#1 fan`). All sigils are safe unquoted *and* inside double quotes in bash/zsh.
+Parsed by the core (Rust) and exposed as a `ParseCapture(text, reference_time?)` RPC (reference time defaults to now), so CLI, TUI preview, MCP and spool import behave identically. A token is a whitespace-delimited word starting with a sigil; tokens never contain spaces except the quoted `~"…"` form. A token that fails to parse **stays in the title** and the parse result carries a warning (shown in the TUI preview, printed by the CLI). Everything else is the title. `\` escapes a sigil (`\#1 fan`). Capture text is at most **64 KiB** (65536 bytes of UTF-8): `CaptureItem`, `ParseCapture` and the spool import refuse longer text (`INVALID_ARGUMENT` on `text`), and an update refuses a longer title (`item.title`); description has no limit of its own.
+
+On a shell command line, single quotes are the safe form. Unquoted, bash treats `#label` as a comment and `>next` as a redirect, zsh fails on `~name` ("no such user or named directory"), and zsh with `extendedglob` expands `^fri` as a pattern. Double quotes protect the sigils but still expand `$`.
 
 | Token | Meaning | Examples |
 |---|---|---|
@@ -527,7 +529,7 @@ pnpm workspace:
 - **Writes via MCP are allowed** when you use Claude Code interactively: you are directing it, so it is a user action (`created_via = mcp`, actor `user`). This is the one deliberate exception to "Claude only suggests" (Section 6).
 - **`todo mcp --read-only`** exposes only read tools. The daemon's own `claude_code` provider (6.1) always uses this mode, so the background assistant can still only suggest.
 
-**TUI launch**: `todo` with no arguments execs the TUI entrypoint (bundled JS run with Node, located relative to the installed binary or via config). Packaging into a single executable is deferred to Section 8.
+**TUI launch**: `todo` with no arguments execs `node <tui.js>`, the bundled TUI, so the TUI owns the terminal and its exit status. The environment passes through, with `TODO_BIN` set to the running binary unless already set, so the TUI auto-spawns the same daemon. The bundle is the first that exists of: `$TODO_TUI_ENTRY` (when set and non-empty it must exist: a missing file is an error, not a fall-through); `<dir of the binary>/../share/todo-tui/tui.js` (the packaged layout, 8.4); `tui/dist/tui.js` in the source checkout the binary was built from (`target/debug/todo`, `cargo install --path crates/todo-cli`). With none, `todo` says to run `pnpm -C <checkout>/tui build` and exits 1; without `node` on `PATH` it says so and exits 1. A config key (8.2) can join the order once config exists. Packaging into a single executable is deferred to Section 8.
 
 ### 4.7 Repository layout
 
