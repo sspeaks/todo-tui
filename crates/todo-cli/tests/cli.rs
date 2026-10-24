@@ -250,6 +250,25 @@ fn add_prints_the_parsed_fields_and_warnings() {
 }
 
 #[test]
+fn a_capture_sends_its_id_as_request_and_spool_id() {
+    let h = Home::new();
+    h.ok(&["add", "once"]);
+    h.ok(&["daemon", "stop"]);
+    // Recorded as a spool id too, a spooled copy of this capture (if its
+    // reply was lost) is skipped even after the 24h request id window.
+    let db = rusqlite::Connection::open(h.paths().database()).unwrap();
+    let keys: (String, Option<String>) = db
+        .query_row(
+            "SELECT r.request_id, s.spool_id FROM request_ids r
+             LEFT JOIN spool_imports s ON s.op_id = r.op_id",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(keys.1.as_ref(), Some(&keys.0));
+}
+
+#[test]
 fn add_without_text_captures_each_line_of_stdin() {
     let h = Home::new();
     let input = "  first line  \n\n \t \nsecond +1 #x\r\n\nthird";
@@ -300,10 +319,38 @@ fn a_rejected_line_fails_the_run_but_not_the_other_lines() {
         captured(text(&out.stdout)),
         ["before", "after  ^2026-10-24"]
     );
+    // The rejected line is named, cut short.
     let stderr = text(&out.stderr);
     assert_eq!(stderr.lines().count(), 1, "{stderr}");
-    assert!(stderr.starts_with("todo: "), "{stderr}");
+    let named = format!("todo: error: NOT CAPTURED: \"{}…\": ", "x".repeat(60));
+    assert!(stderr.starts_with(&named), "{stderr}");
+    assert!(stderr.len() < 1000, "{stderr}");
     assert_eq!(titles(&h.items()), ["before", "after"]);
+}
+
+#[test]
+fn a_capture_whose_reply_exceeds_4_mib_is_reported_as_captured() {
+    let h = Home::new();
+    // The request fits the daemon's 4 MiB limit; the reply carries the
+    // title twice (the Item and the draft).
+    let long = "y".repeat(5 << 19);
+    let out = h.todo_with_stdin(&["add"], format!("{long}\n").as_bytes());
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(captured(text(&out.stdout)), [long.as_str()]);
+    assert_eq!(h.items().len(), 1);
+}
+
+#[test]
+fn a_stdin_line_that_is_not_utf8_is_captured_with_a_warning() {
+    let h = Home::new();
+    let out = h.todo_with_stdin(&["add"], b"ok\n\ncaf\xe9 au lait\n");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(captured(text(&out.stdout)), ["ok", "caf\u{fffd} au lait"]);
+    assert_eq!(
+        text(&out.stderr),
+        "todo: warning: line 3 is not valid UTF-8; its invalid bytes were replaced with U+FFFD\n"
+    );
+    assert_eq!(titles(&h.items()), ["ok", "caf\u{fffd} au lait"]);
 }
 
 #[test]
@@ -325,7 +372,7 @@ fn captures_are_spooled_while_the_daemon_cannot_start_then_imported_once() {
     let spool = h.paths().spool();
     assert!(
         stderr.ends_with(&format!(
-            "; spooled to {}; it will be imported when the daemon next starts\n",
+            "; spooled to {}; it will be imported once the daemon is running again\n",
             spool.display()
         )),
         "{stderr}"
@@ -388,6 +435,50 @@ fn captures_are_spooled_while_the_daemon_cannot_start_then_imported_once() {
     h.ok(&["daemon", "--detach"]);
     wait_until("the spool is imported again", imported);
     check(&h.items());
+}
+
+#[test]
+fn stop_gives_up_on_a_daemon_that_does_not_answer() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Home::new();
+    let paths = h.paths();
+    std::fs::create_dir_all(&paths.runtime).unwrap();
+    std::fs::set_permissions(&paths.runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::create_dir_all(&paths.data).unwrap();
+    // A live pid, never waited for: the Shutdown call fails first.
+    std::fs::write(&paths.lock, std::process::id().to_string()).unwrap();
+    // A wedged daemon: it accepts connections and never answers.
+    let listener = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            held.push(stream);
+        }
+    });
+    let mut child = h
+        .command(&["daemon", "stop"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() > deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            std::fs::remove_file(&paths.socket).unwrap();
+            panic!("todo daemon stop still waiting after 20s");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let out = child.wait_with_output().unwrap();
+    // So that dropping the home finds no daemon to stop.
+    std::fs::remove_file(&paths.socket).unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        text(&out.stderr),
+        "todo: shutdown failed: no answer within 5s\n"
+    );
 }
 
 #[test]

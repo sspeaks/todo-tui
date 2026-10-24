@@ -96,8 +96,8 @@ async fn stop(paths: &Paths) -> anyhow::Result<()> {
     let pid = spawn::daemon_pid(paths)
         .with_context(|| format!("no daemon pid in {}", paths.lock.display()))?;
     let channel = todo_daemon::client::connect(&paths.socket).await?;
-    SystemServiceClient::new(channel)
-        .shutdown(ShutdownRequest { restart: false })
+    let mut system = SystemServiceClient::new(channel);
+    add::call(system.shutdown(ShutdownRequest { restart: false }))
         .await
         .map_err(|s| anyhow::anyhow!("shutdown failed: {}", s.message()))?;
     spawn::wait_for_exit(pid).await?;

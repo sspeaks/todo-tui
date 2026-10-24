@@ -21,6 +21,7 @@ export interface TodoClients {
 
 export interface TodoConnection extends TodoClients {
   transport: TodoTransport;
+  /** From the latest handshake; each new connection to the daemon repeats it. */
   serverInfo: GetServerInfoResponse;
   /** Spawns the daemon again; LiveStore uses it to recover from a daemon exit. */
   ensureDaemon: () => Promise<void>;
@@ -127,7 +128,10 @@ function daemonPidFor(socketPath: string, env: NodeJS.ProcessEnv): number | unde
 /**
  * Dials the daemon (spawning it if needed) and performs the GetServerInfo
  * handshake (4.2). A daemon older than `requiredApiMinor` gets an upgrade
- * restart unless `autoSpawn` is false.
+ * restart unless `autoSpawn` is false. Every later connection (after the
+ * daemon restarts, say) handshakes again before its first call, so the
+ * daemon keeps counting an interactive client; a daemon that is then too old
+ * fails those calls with a DaemonTooOldError cause.
  */
 export async function connect(opts: ConnectOptions = {}): Promise<TodoConnection> {
   const env = opts.env ?? process.env;
@@ -179,13 +183,19 @@ export async function connect(opts: ConnectOptions = {}): Promise<TodoConnection
     transport.close();
     throw err;
   }
-  return {
+  const conn: TodoConnection = {
     ...clients,
     transport,
     serverInfo,
     ensureDaemon: () => (opts.autoSpawn === false ? Promise.resolve() : spawnDaemon(spawnOpts)),
     close: () => transport.close(),
   };
+  transport.greetEachConnection(`/${SystemService.typeName}/${SystemService.method.getServerInfo.name}`, async () => {
+    const info = await handshake();
+    if (info.apiMinor < requiredApiMinor) throw new DaemonTooOldError(info, requiredApiMinor);
+    conn.serverInfo = info;
+  });
+  return conn;
 }
 
 /** A started LiveStore on this connection that respawns the daemon if it goes away. */

@@ -31,7 +31,7 @@ impl ItemService for Items {
         request: Request<CaptureItemRequest>,
     ) -> Result<Response<CaptureItemResponse>, Status> {
         let req = request.into_inner();
-        check_request_id(&req.request_id)?;
+        let request_id = check_request_id(&req.request_id)?;
         if req.text.trim().is_empty() {
             return Err(error::bad_request("text", "must not be empty"));
         }
@@ -56,18 +56,18 @@ impl ItemService for Items {
                     .map_err(|_| error::bad_request("parent_id", "must be a ULID"))
             })
             .transpose()?;
-        let spool_id = req.spool_id.filter(|s| !s.is_empty());
-        if spool_id
-            .as_ref()
-            .is_some_and(|s| s.parse::<Ulid>().is_err())
-        {
-            return Err(error::bad_request("spool_id", "must be a ULID"));
-        }
+        let spool_id = req
+            .spool_id
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                canonical_ulid(&s).ok_or_else(|| error::bad_request("spool_id", "must be a ULID"))
+            })
+            .transpose()?;
 
         let draft = parse_capture(&req.text, reference.date());
         let parsed = v1::CaptureDraft::from(&draft);
         let input = CaptureInput {
-            request_id: req.request_id,
+            request_id,
             draft,
             created_via,
             parent_id,
@@ -81,6 +81,14 @@ impl ItemService for Items {
             .capture(input)
             .await
             .map_err(|e| error::mutation(e, &Shape::Capture, &[]))?;
+        // A replay returns the Item the original request created at its
+        // reference time, so the draft is the text as parsed then.
+        let created = item.created_at.to_zoned(now.time_zone().clone()).date();
+        let parsed = if created == reference.date() {
+            parsed
+        } else {
+            (&parse_capture(&req.text, created)).into()
+        };
         Ok(Response::new(CaptureItemResponse {
             item: Some(v1::Item::from(item)),
             result: Some(result.into()),
@@ -205,7 +213,7 @@ impl ItemService for Items {
         request: Request<BatchMutateRequest>,
     ) -> Result<Response<BatchMutateResponse>, Status> {
         let req = request.into_inner();
-        check_request_id(&req.request_id)?;
+        let request_id = check_request_id(&req.request_id)?;
         if !(1..=MAX_BATCH).contains(&req.mutations.len()) {
             return Err(error::bad_request(
                 "mutations",
@@ -225,7 +233,7 @@ impl ItemService for Items {
             .map_err(error::convert)?;
         let shape = Shape::Batch(&req.mutations);
         let out = self
-            .mutate(&req.request_id, OpKind::Batch, mutations, &now, &shape)
+            .mutate(&request_id, OpKind::Batch, mutations, &now, &shape)
             .await?;
         Ok(Response::new(BatchMutateResponse {
             items: out.items.into_iter().map(v1::Item::from).collect(),
@@ -287,11 +295,11 @@ impl Items {
         shape: Shape<'static>,
         convert: impl FnOnce(Date) -> Result<Mutation, ConvertError>,
     ) -> Result<(Option<v1::Item>, Option<v1::MutationResult>), Status> {
-        check_request_id(request_id)?;
+        let request_id = check_request_id(request_id)?;
         let now = Zoned::now();
         let mutation = convert(now.date()).map_err(error::convert)?;
         let out = self
-            .mutate(request_id, kind, vec![mutation], &now, &shape)
+            .mutate(&request_id, kind, vec![mutation], &now, &shape)
             .await?;
         let item = out.items.into_iter().next().map(v1::Item::from);
         Ok((item, Some(out.result.into())))
@@ -324,12 +332,16 @@ impl Items {
     }
 }
 
-/// Every mutating request carries a client ULID (design 4.3 rule 4).
-fn check_request_id(request_id: &str) -> Result<(), Status> {
-    request_id
-        .parse::<Ulid>()
-        .map(drop)
-        .map_err(|_| error::bad_request("request_id", "must be a ULID"))
+/// Every mutating request carries a client ULID (design 4.3 rule 4),
+/// returned in canonical form.
+fn check_request_id(request_id: &str) -> Result<String, Status> {
+    canonical_ulid(request_id).ok_or_else(|| error::bad_request("request_id", "must be a ULID"))
+}
+
+/// `s` as the ULID's canonical (upper-case) spelling, so that every spelling
+/// of one ULID is one idempotency key; `None` if it is not a ULID.
+pub(crate) fn canonical_ulid(s: &str) -> Option<String> {
+    s.parse::<Ulid>().ok().map(|ulid| ulid.to_string())
 }
 
 /// The capture reference time in `now`'s zone: `reference_time` if set

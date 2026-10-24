@@ -206,16 +206,73 @@ async fn capture_is_idempotent_on_request_and_spool_id() {
 }
 
 #[tokio::test]
-async fn capture_with_missing_parent_fails() {
+async fn a_spool_id_dedupes_after_the_request_id_is_forgotten() {
     let db = open();
-    let mut child = input("child", 1);
-    let parent = new_ulid();
-    child.parent_id = Some(parent);
-    match db.store.capture(child).await {
-        Err(StoreError::NotFound(id)) => assert_eq!(id, parent),
-        other => panic!("expected NotFound, got {other:?}"),
+    // The CLI sends its capture id as both keys.
+    let id = new_ulid().to_string();
+    let capture = CaptureInput {
+        request_id: id.clone(),
+        spool_id: Some(id.clone()),
+        ..input("once", 1)
+    };
+    let first = db.store.capture(capture.clone()).await.unwrap();
+    let rows = |sql: &'static str| {
+        let id = id.clone();
+        let store = db.store.clone();
+        async move {
+            store
+                .read(move |c| Ok(c.query_row(sql, [id], |r| r.get::<_, i64>(0))?))
+                .await
+                .unwrap()
+        }
+    };
+    let spooled = "SELECT count(*) FROM spool_imports WHERE spool_id = ?1";
+    let requested = "SELECT count(*) FROM request_ids WHERE request_id = ?1";
+    assert_eq!((rows(spooled).await, rows(requested).await), (1, 1));
+
+    // Age the request id out of its 24h window; the next write prunes it.
+    db.store
+        .write(|tx| {
+            tx.conn().execute(
+                "UPDATE request_ids SET at = at - ?1",
+                [25 * 60 * 60 * 1_000_000_000_i64],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let again = db.store.capture(capture).await.unwrap();
+    assert_eq!(again, first);
+    assert_eq!((rows(spooled).await, rows(requested).await), (1, 0));
+    assert_eq!(titles(&db, false).await, ["once"]);
+}
+
+#[tokio::test]
+async fn capture_under_a_missing_or_deleted_parent_fails() {
+    let db = open();
+    // Deleted through raw SQL: the store has no other way to make a tombstone
+    // before mutations are set up.
+    let gone = db.store.capture(input("gone", 1)).await.unwrap().0;
+    set_columns(&db, &gone, "deleted_at = 1").await;
+    let before = snapshot(&db).await;
+    for (parent, reason) in [
+        (new_ulid(), "no such Item"),
+        (gone.id, "the parent is deleted"),
+    ] {
+        let mut child = input("child", 2);
+        child.parent_id = Some(parent);
+        match db.store.capture(child).await {
+            Err(StoreError::Mutation {
+                index: 0,
+                error: MutationError::Invalid { field, reason: got },
+            }) => {
+                assert_eq!(field, ItemField::ParentId);
+                assert_eq!(got, reason);
+            }
+            other => panic!("expected an invalid parent, got {other:?}"),
+        }
     }
-    assert_eq!(db.store.current_revision(), 0);
+    assert_eq!(snapshot(&db).await, before);
 }
 
 async fn set_columns(db: &Db, id: &Item, set: &'static str) {
@@ -1152,12 +1209,27 @@ async fn a_replayed_request_returns_the_original_result_and_current_state() {
     assert_eq!(replay.items, later.items);
     assert_eq!(snapshot(&db).await, before);
 
-    let mut missing = req;
-    missing.mutations[0].id = new_ulid();
-    assert!(matches!(
-        db.store.mutate(missing).await,
-        Err(StoreError::NotFound(_))
-    ));
+    // The request id names an op on `a`; for another Item, existing or not,
+    // it is a different request.
+    let b = capture(&db, "b").await;
+    let before = snapshot(&db).await;
+    for other in [b.id, new_ulid()] {
+        let mut retargeted = req.clone();
+        retargeted.mutations[0].id = other;
+        match db.store.mutate(retargeted).await {
+            Err(StoreError::RequestIdReused) => {}
+            other => panic!("expected RequestIdReused, got {other:?}"),
+        }
+    }
+    assert_eq!(snapshot(&db).await, before);
+
+    // A batch is checked by kind only: its request id records the first
+    // mutation's Item.
+    let batch = mutate(OpKind::Batch, vec![title(a.id, "a4"), title(b.id, "b2")]);
+    let out = db.store.mutate(batch.clone()).await.unwrap();
+    let mut reordered = batch;
+    reordered.mutations.reverse();
+    assert_eq!(db.store.mutate(reordered).await.unwrap().result, out.result);
 }
 
 #[tokio::test]

@@ -1,28 +1,49 @@
-import { type MessageInitShape, create } from "@bufbuild/protobuf";
+import { type MessageInitShape, create, equals } from "@bufbuild/protobuf";
 import { timestampNow } from "@bufbuild/protobuf/wkt";
 import { Code, ConnectError, type Transport, createRouterTransport } from "@connectrpc/connect";
-import { ErrorInfoSchema } from "./gen/google/rpc/error_details_pb.js";
+import { BadRequestSchema, ErrorInfoSchema } from "./gen/google/rpc/error_details_pb.js";
+import type { DateSchema } from "./gen/google/type/date_pb.js";
 import { type MutationResultSchema, Topic } from "./gen/todo/v1/common_pb.js";
 import { ArchiveReason, type Item, ItemSchema, Status } from "./gen/todo/v1/item_pb.js";
 import { ItemService, type ListItemsRequest, type UpdateItemRequest } from "./gen/todo/v1/item_service_pb.js";
 import { SystemService } from "./gen/todo/v1/system_service_pb.js";
 import { type Change, ChangeSchema, type SubscribeResponse, SubscribeResponseSchema, WatchService } from "./gen/todo/v1/watch_service_pb.js";
+import { ulid } from "./ulid.js";
 
 type Waiter = (msg: SubscribeResponse | Error) => void;
 
+type MutationResult = MessageInitShape<typeof MutationResultSchema>;
+
 interface MutationResponse {
   item: Item;
-  result: MessageInitShape<typeof MutationResultSchema>;
+  result: MutationResult;
 }
+
+/** A request remembered by its request_id, for replays. */
+interface Recorded {
+  /** The RPC it was. */
+  rpc: string;
+  /** The Item it targeted (or created). */
+  id: string;
+  result: MutationResult;
+}
+
+/** A soft-deleted Item takes no other mutation (item_service.proto). */
+const ON_DELETED = new Set(["DeleteItem", "UndeleteItem"]);
 
 /**
  * An in-memory daemon over createRouterTransport for tests: ItemService,
  * WatchService with replay / CaughtUp / ResyncRequired, and
- * SystemService.GetServerInfo. ListItems only filters out soft-deleted items
- * (unless include_deleted) and sorts by id. The single-item mutations honour
- * request_id replay and expected_revision but none of the domain rules:
- * SetStatus sets only the derived status, UpdateItem copies the top-level
- * fields its mask names.
+ * SystemService.GetServerInfo. It follows the daemon's ItemService
+ * conventions: ULID request ids and Item ids, request_id replay (the original
+ * result with the current state) and reuse checks, expected_revision,
+ * soft-deleted Items, mutations that change nothing, and ListItems' implicit
+ * rules (deleted, archived, done and deferred Items hidden unless asked
+ * for), sorted by id. It does not parse captures (the title is the text) or
+ * check field values and read-only fields: SetStatus sets only the derived
+ * status, and UpdateItem copies the top-level fields its mask names (status
+ * and archived paths are refused). BatchMutate and ParseCapture are not
+ * implemented.
  */
 export class FakeDaemon {
   revision = 0n;
@@ -39,8 +60,8 @@ export class FakeDaemon {
   readonly calls = { listItems: 0, subscribe: [] as (bigint | undefined)[] };
   readonly transport: Transport;
   private readonly watchers = new Set<Waiter>();
-  /** Mutation responses by request_id, for replays. */
-  private readonly responses = new Map<string, MutationResponse>();
+  /** Requests by request_id (upper case), for replays. */
+  private readonly requests = new Map<string, Recorded>();
   private nextId = 0;
 
   constructor(initial: MessageInitShape<typeof ItemSchema>[] = []) {
@@ -56,15 +77,24 @@ export class FakeDaemon {
       service(ItemService, {
         captureItem: (req) => {
           this.check();
+          const requestId = requestIdOf(req.requestId);
+          if (req.text.trim() === "") throw badRequest("text", "must not be empty");
+          const recorded = this.recorded("CaptureItem", requestId);
+          if (recorded) return { item: this.get(recorded.id), result: recorded.result };
           const item = this.put({ title: req.text, createdVia: req.createdVia });
-          return { item, result: { opId: `op${this.revision}`, revision: this.revision } };
+          return { item, result: this.record("CaptureItem", requestId, item.id) };
         },
         listItems: (req) => {
           this.check();
           this.calls.listItems++;
           this.onListItems?.(req);
+          const f = req.filter;
+          const today = localToday();
           const all = [...this.items.values()]
-            .filter((i) => req.filter?.includeDeleted || i.deletedAt === undefined)
+            .filter((i) => f?.includeDeleted || i.deletedAt === undefined)
+            .filter((i) => f?.includeArchived || i.archived === undefined)
+            .filter((i) => f?.includeDone || (i.status !== Status.DONE && i.status !== Status.CANCELLED))
+            .filter((i) => f?.includeDeferred || i.deferUntil === undefined || dateKey(i.deferUntil) <= today)
             .sort((a, b) => (a.id < b.id ? -1 : 1));
           const size = req.pageSize > 0 ? req.pageSize : this.pageSize;
           const offset = req.pageToken ? Number(req.pageToken) : 0;
@@ -77,14 +107,25 @@ export class FakeDaemon {
         },
         getItem: (req) => {
           this.check();
-          return { item: this.get(req.id), revision: this.revision };
+          return { item: this.get(idOf("id", req.id)), revision: this.revision };
         },
-        updateItem: (req) => this.mutate({ ...req, id: req.item?.id ?? "" }, maskedFields(req)),
-        setStatus: (req) => this.mutate(req, { status: req.status }),
-        archiveItem: (req) => this.mutate(req, { archived: { at: timestampNow(), reason: ArchiveReason.USER } }),
-        unarchiveItem: (req) => this.mutate(req, { archived: undefined }),
-        deleteItem: (req) => this.mutate(req, { deletedAt: timestampNow() }),
-        undeleteItem: (req) => this.mutate(req, { deletedAt: undefined }),
+        updateItem: (req) =>
+          this.mutate("UpdateItem", req, "item.id", req.item?.id ?? "", () => {
+            const patch = maskedFields(req);
+            return (item) => (equals(ItemSchema, merged(item, patch), item) ? undefined : patch);
+          }),
+        setStatus: (req) =>
+          this.mutate("SetStatus", req, "id", req.id, () => (item) => (item.status === req.status ? undefined : { status: req.status })),
+        archiveItem: (req) =>
+          this.mutate("ArchiveItem", req, "id", req.id, () => (item) =>
+            item.archived ? undefined : { archived: { at: timestampNow(), reason: ArchiveReason.USER } },
+          ),
+        unarchiveItem: (req) =>
+          this.mutate("UnarchiveItem", req, "id", req.id, () => (item) => (item.archived ? { archived: undefined } : undefined)),
+        deleteItem: (req) =>
+          this.mutate("DeleteItem", req, "id", req.id, () => (item) => (item.deletedAt ? undefined : { deletedAt: timestampNow() })),
+        undeleteItem: (req) =>
+          this.mutate("UndeleteItem", req, "id", req.id, () => (item) => (item.deletedAt ? { deletedAt: undefined } : undefined)),
       });
       const self = this;
       service(WatchService, {
@@ -134,14 +175,7 @@ export class FakeDaemon {
     this.revision++;
     const id = init.id || `01FAKE${String(++this.nextId).padStart(20, "0")}`;
     const prev = this.items.get(id);
-    let item: Item;
-    if (prev) {
-      const patch = create(ItemSchema, init) as unknown as Record<string, unknown>;
-      item = { ...prev };
-      for (const k of Object.keys(init)) (item as unknown as Record<string, unknown>)[k] = patch[k];
-    } else {
-      item = create(ItemSchema, { status: Status.INBOX, createdAt: timestampNow(), ...init });
-    }
+    const item = prev ? merged(prev, init) : create(ItemSchema, { status: Status.INBOX, createdAt: timestampNow(), ...init });
     item.id = id;
     item.revision = this.revision;
     this.items.set(id, item);
@@ -182,26 +216,62 @@ export class FakeDaemon {
   }
 
   /**
-   * Applies `patch` as a mutation: a replayed request_id returns the first
-   * response, and a stale expected_revision fails with ABORTED.
+   * Runs the single-item mutation `rpc` on the Item `rawId` (the request
+   * field `idPath`), in the daemon's order: the request id and Item id are
+   * checked, then `prepare` checks the rest of the request and returns the
+   * change, then a replay returns the original result with the current
+   * state; otherwise the Item must exist, be at expected_revision and, unless
+   * `rpc` is Delete or UndeleteItem, not be deleted. A change of `undefined`
+   * changes nothing and allocates no revision.
    */
   private mutate(
-    req: { requestId: string; id: string; expectedRevision?: bigint | undefined },
-    patch: MessageInitShape<typeof ItemSchema>,
+    rpc: string,
+    req: { requestId: string; expectedRevision?: bigint | undefined },
+    idPath: string,
+    rawId: string,
+    prepare: () => (item: Item) => MessageInitShape<typeof ItemSchema> | undefined,
   ): MutationResponse {
     this.check();
-    const replay = this.responses.get(req.requestId);
-    if (replay) return replay;
-    const actual = this.get(req.id).revision;
-    if (req.expectedRevision !== undefined && req.expectedRevision !== actual) {
-      throw errorInfo(Code.Aborted, "REVISION_MISMATCH", `item ${req.id} is at revision ${actual}, not ${req.expectedRevision}`, {
-        expected_revision: String(req.expectedRevision),
-        actual_revision: String(actual),
-      });
+    const requestId = requestIdOf(req.requestId);
+    const id = idOf(idPath, rawId);
+    const change = prepare();
+    const recorded = this.recorded(rpc, requestId, id);
+    if (recorded) return { item: this.get(id), result: recorded.result };
+    const item = this.get(id);
+    if (req.expectedRevision !== undefined && req.expectedRevision !== item.revision) {
+      throw errorInfo(
+        Code.Aborted,
+        "REVISION_MISMATCH",
+        `item ${id}: revision conflict: expected ${req.expectedRevision}, found ${item.revision}`,
+        { item_id: id, expected_revision: String(req.expectedRevision), actual_revision: String(item.revision) },
+      );
     }
-    const res = { item: this.update(req.id, patch), result: { opId: `op${this.revision}`, revision: this.revision } };
-    if (req.requestId !== "") this.responses.set(req.requestId, res);
-    return res;
+    if (item.deletedAt !== undefined && !ON_DELETED.has(rpc)) {
+      throw errorInfo(Code.FailedPrecondition, "ITEM_DELETED", `item ${id} is deleted`, { item_id: id });
+    }
+    const patch = change(item);
+    const next = patch === undefined ? item : this.update(id, patch);
+    return { item: next, result: this.record(rpc, requestId, id) };
+  }
+
+  /**
+   * The request recorded under `requestId`, if any. Fails with
+   * INVALID_ARGUMENT when it was another RPC, or a single-item mutation of
+   * an Item other than `id`.
+   */
+  private recorded(rpc: string, requestId: string, id?: string): Recorded | undefined {
+    const recorded = this.requests.get(requestId);
+    if (recorded && (recorded.rpc !== rpc || (id !== undefined && recorded.id !== id))) {
+      throw badRequest("request_id", "was already used for a different request");
+    }
+    return recorded;
+  }
+
+  /** A new op's result at the current revision, remembered for replays. */
+  private record(rpc: string, requestId: string, id: string): MutationResult {
+    const result = { opId: ulid(), revision: this.revision };
+    this.requests.set(requestId, { rpc, id, result });
+    return result;
   }
 
   private get(id: string): Item {
@@ -230,14 +300,66 @@ function errorInfo(code: Code, reason: string, message: string, metadata: Record
   return new ConnectError(message, code, undefined, [{ desc: ErrorInfoSchema, value: { reason, domain: "todo-tui", metadata } }]);
 }
 
-/** The top-level Item fields named by the update mask, taken from the request's item. */
+/** INVALID_ARGUMENT with one BadRequest violation, as the daemon sends them. */
+function badRequest(field: string, description: string): ConnectError {
+  return new ConnectError(`${field}: ${description}`, Code.InvalidArgument, undefined, [
+    { desc: BadRequestSchema, value: { fieldViolations: [{ field, description }] } },
+  ]);
+}
+
+const ULID = /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/i;
+
+/** The request id in canonical (upper) case, so every spelling of it replays. */
+function requestIdOf(requestId: string): string {
+  if (!ULID.test(requestId)) throw badRequest("request_id", "must be a ULID");
+  return requestId.toUpperCase();
+}
+
+/** The Item id at request field `path`, in canonical (upper) case. */
+function idOf(path: string, id: string): string {
+  if (!ULID.test(id)) throw badRequest(path, `invalid ULID ${JSON.stringify(id)}`);
+  return id.toUpperCase();
+}
+
+/** `prev` with the fields `init` names replaced. */
+function merged(prev: Item, init: MessageInitShape<typeof ItemSchema>): Item {
+  const patch = create(ItemSchema, init) as unknown as Record<string, unknown>;
+  const item = { ...prev } as unknown as Record<string, unknown>;
+  for (const k of Object.keys(init)) item[k] = patch[k];
+  return item as unknown as Item;
+}
+
+/** Item fields that change only through SetStatus. */
+const STATUS_PATHS = new Set(["status", "status_category", "resolution_kind", "todo_refinement"]);
+
+/**
+ * The top-level Item fields named by the update mask, taken from the
+ * request's item. Rejects the mask as the daemon does when it is missing,
+ * empty or names an unknown field, a status field or archived.
+ */
 function maskedFields(req: UpdateItemRequest): MessageInitShape<typeof ItemSchema> {
+  if (req.updateMask === undefined) throw badRequest("update_mask", "required field is missing");
+  if (req.updateMask.paths.length === 0) throw badRequest("update_mask", "must not be empty");
   const source = (req.item ?? create(ItemSchema)) as unknown as Record<string, unknown>;
   const patch: Record<string, unknown> = {};
-  for (const path of req.updateMask?.paths ?? []) {
-    const field = ItemSchema.fields.find((f) => f.name === path.split(".")[0]);
-    if (!field) throw new ConnectError(`update_mask: unknown field ${path}`, Code.InvalidArgument);
+  for (const path of req.updateMask.paths) {
+    const top = path.split(".")[0]!;
+    const field = ItemSchema.fields.find((f) => f.name === top);
+    if (!field) throw badRequest("update_mask", `unknown field path ${JSON.stringify(path)}`);
+    if (STATUS_PATHS.has(top)) throw badRequest(`item.${top}`, "changes only through SetStatus");
+    if (top === "archived") throw badRequest("item.archived", "changes only through ArchiveItem and UnarchiveItem");
     patch[field.localName] = source[field.localName];
   }
   return patch as MessageInitShape<typeof ItemSchema>;
+}
+
+/** A date as a sortable `YYYYMMDD` number. */
+function dateKey(d: MessageInitShape<typeof DateSchema>): number {
+  return (d.year ?? 0) * 10_000 + (d.month ?? 0) * 100 + (d.day ?? 0);
+}
+
+/** Today in the local time zone, as a dateKey. */
+function localToday(): number {
+  const now = new Date();
+  return dateKey({ year: now.getFullYear(), month: now.getMonth() + 1, day: now.getDate() });
 }

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use todo_core::{ItemId, MutationError};
+use todo_core::{ItemField, ItemId, MutationError};
 use todo_proto::convert::{ConvertError, item_field_path};
 use todo_proto::v1;
 use todo_store::StoreError;
@@ -110,7 +110,7 @@ pub(crate) fn store(e: StoreError) -> Status {
 /// How a mutating request lays out its mutations, so that a store error
 /// names the request field it is about.
 pub(crate) enum Shape<'a> {
-    /// `CaptureItem`: everything is about `text`.
+    /// `CaptureItem`: everything is about `text`, except the parent.
     Capture,
     /// `UpdateItem`: fields under `item`, repeats in `update_mask`.
     Update,
@@ -125,6 +125,7 @@ impl Shape<'_> {
     /// The request path of `error` in mutation `index`.
     fn path(&self, index: usize, error: &MutationError) -> String {
         match self {
+            Shape::Capture if error.field() == Some(ItemField::ParentId) => "parent_id".to_owned(),
             Shape::Capture => "text".to_owned(),
             Shape::Update => match (error, error.field()) {
                 (MutationError::Duplicate(_), _) => "update_mask".to_owned(),
@@ -205,8 +206,6 @@ fn describe(error: &MutationError) -> String {
 
 #[cfg(test)]
 mod tests {
-    use todo_core::ItemField;
-
     use super::*;
 
     #[test]
@@ -262,5 +261,10 @@ mod tests {
         );
         assert_eq!(batch.path(2, &invalid), "mutations[2].delete_item.id");
         assert_eq!(Shape::Capture.path(0, &invalid), "text");
+        let parent = MutationError::Invalid {
+            field: ItemField::ParentId,
+            reason: "x".into(),
+        };
+        assert_eq!(Shape::Capture.path(0, &parent), "parent_id");
     }
 }

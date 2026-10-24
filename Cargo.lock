@@ -1346,6 +1346,7 @@ dependencies = [
  "clap",
  "hyper-util",
  "jiff",
+ "rusqlite",
  "rustix",
  "serde_json",
  "tempfile",

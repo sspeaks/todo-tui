@@ -10,16 +10,20 @@ import "todo/v1/filter.proto";
 import "todo/v1/item.proto";
 
 // Conventions for every mutating request: request_id = 1 is a client ULID
-// (a replay within 24h returns the original result, even if the Item has
-// changed since); single-item mutations carry `optional uint64
-// expected_revision` and fail with ABORTED (ErrorInfo REVISION_MISMATCH) when
-// the Item's revision differs; responses carry a MutationResult.
+// (a replay within 24h returns the original MutationResult with the Items'
+// current state, even if they have changed since; reusing a request_id for a
+// different request, i.e. another RPC or a single-item mutation of another
+// Item, fails with INVALID_ARGUMENT and a BadRequest on "request_id");
+// single-item mutations carry `optional uint64 expected_revision` and fail
+// with ABORTED (ErrorInfo REVISION_MISMATCH) when the Item's revision
+// differs; responses carry a MutationResult.
 //
 // Mutating a soft-deleted Item fails with FAILED_PRECONDITION (ErrorInfo
-// ITEM_DELETED), except UndeleteItem. A mutation that changes nothing (e.g.
-// archiving an archived Item) succeeds without a new revision. Invalid values
-// and read-only fields fail with INVALID_ARGUMENT and a BadRequest naming the
-// offending field path.
+// ITEM_DELETED), except UndeleteItem, and DeleteItem, which is a no-op on a
+// deleted Item. A mutation that changes nothing (e.g. archiving an archived
+// Item) succeeds without a new revision. Invalid values and read-only fields
+// fail with INVALID_ARGUMENT and a BadRequest naming the offending field
+// path.
 service ItemService {
   rpc CaptureItem(CaptureItemRequest) returns (CaptureItemResponse);
   // Parses capture text without creating anything (the TUI's live preview).
@@ -45,18 +49,25 @@ message CaptureItemRequest {
   string text = 2;
   // TUI, CLI or MCP; other values are reserved for the daemon.
   CreatedVia created_via = 3;
-  // "Now" for relative dates in text; defaults to the daemon's clock. Spool
+  // "Now" for relative dates in text, and the new Item's created_at (where
+  // its staleness signals start); defaults to the daemon's clock. Spool
   // imports pass the original capture time.
   google.protobuf.Timestamp reference_time = 4;
+  // Must name a live Item; a missing or deleted one fails with
+  // INVALID_ARGUMENT on "parent_id".
   optional string parent_id = 5;
-  // Spool entry id; an id already imported is not imported again.
+  // Spool entry id, a ULID: a capture whose spool_id was already captured
+  // (by this RPC or a spool import) returns that capture, with no 24h limit.
+  // The CLI sends its request_id here too, so a spooled copy of a capture
+  // that did reach the daemon is never imported again.
   optional string spool_id = 6;
 }
 
 message CaptureItemResponse {
   Item item = 1;
   MutationResult result = 2;
-  // What the text was parsed into, including any warnings.
+  // What the text was parsed into, including any warnings. A replay returns
+  // the text as parsed against the original request's reference_time.
   CaptureDraft draft = 3;
 }
 

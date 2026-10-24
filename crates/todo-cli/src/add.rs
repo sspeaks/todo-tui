@@ -30,9 +30,13 @@ use crate::spawn;
 /// How long any one RPC may take, so a wedged daemon cannot hang a capture.
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// One capture. Its id is the CaptureItem request id and, if the capture is
-/// spooled, the spool id, so the daemon skips a spooled capture whose
-/// request did reach it.
+/// At most this many characters of a capture's text in an error message.
+const EXCERPT_CHARS: usize = 60;
+
+/// One capture. Its id is the CaptureItem request id and spool id, and the
+/// spool entry's id if the capture is spooled, so the daemon skips a spooled
+/// capture whose request did reach it, even after the request id's 24h
+/// window.
 struct Capture {
     id: Ulid,
     text: String,
@@ -68,7 +72,14 @@ pub(crate) async fn add(paths: &Paths, words: Vec<String>) -> anyhow::Result<Exi
         }
         let mut input = Vec::new();
         stdin.read_to_end(&mut input).context("reading stdin")?;
-        capture_lines(&String::from_utf8_lossy(&input))
+        let (texts, not_utf8) = capture_lines(&input);
+        for line in not_utf8 {
+            print_err(format_args!(
+                "todo: warning: line {line} is not valid UTF-8; \
+                 its invalid bytes were replaced with U+FFFD"
+            ));
+        }
+        texts
     } else {
         let text = words.join(" ");
         // The daemon, or the spool import, would reject it.
@@ -90,12 +101,15 @@ pub(crate) async fn add(paths: &Paths, words: Vec<String>) -> anyhow::Result<Exi
     match ready(paths).await {
         Err(why) => ok = spool_all(paths, &captures, &why),
         Ok(channel) => {
-            let mut items = ItemServiceClient::new(channel);
+            // The daemon bounds what it accepts. The reply to a capture it
+            // stored must always decode, or the capture would look lost.
+            let mut items = ItemServiceClient::new(channel).max_decoding_message_size(usize::MAX);
             for (i, capture) in captures.iter().enumerate() {
                 let request = CaptureItemRequest {
                     request_id: capture.id.to_string(),
                     text: capture.text.clone(),
                     created_via: CreatedVia::Cli.into(),
+                    spool_id: Some(capture.id.to_string()),
                     ..Default::default()
                 };
                 match call(items.capture_item(request)).await {
@@ -106,7 +120,11 @@ pub(crate) async fn add(paths: &Paths, words: Vec<String>) -> anyhow::Result<Exi
                         break;
                     }
                     Err(status) => {
-                        print_err(format_args!("todo: {}", status.message()));
+                        print_err(format_args!(
+                            "todo: error: NOT CAPTURED: {}: {}",
+                            excerpt(&capture.text),
+                            status.message()
+                        ));
                         ok = false;
                     }
                 }
@@ -120,14 +138,33 @@ pub(crate) async fn add(paths: &Paths, words: Vec<String>) -> anyhow::Result<Exi
     })
 }
 
-/// The captures in stdin text: each line trimmed, blank ones skipped.
-fn capture_lines(input: &str) -> Vec<String> {
-    input
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_owned)
-        .collect()
+/// The captures in stdin: each line trimmed, blank ones skipped, and the
+/// numbers (from 1) of the lines that are not valid UTF-8, which are
+/// decoded lossily.
+fn capture_lines(input: &[u8]) -> (Vec<String>, Vec<usize>) {
+    let mut texts = Vec::new();
+    let mut not_utf8 = Vec::new();
+    for (i, line) in input.split(|&b| b == b'\n').enumerate() {
+        let decoded = String::from_utf8_lossy(line);
+        let text = decoded.trim();
+        if text.is_empty() {
+            continue;
+        }
+        if std::str::from_utf8(line).is_err() {
+            not_utf8.push(i + 1);
+        }
+        texts.push(text.to_owned());
+    }
+    (texts, not_utf8)
+}
+
+/// `text` quoted for a message, cut to [`EXCERPT_CHARS`] characters and
+/// marked with an ellipsis.
+fn excerpt(text: &str) -> String {
+    match text.char_indices().nth(EXCERPT_CHARS) {
+        Some((end, _)) => format!("{:?}", format!("{}…", &text[..end])),
+        None => format!("{text:?}"),
+    }
 }
 
 /// A channel to a daemon that serves this build's API: connects (spawning
@@ -240,7 +277,9 @@ fn after_shutdown(result: Result<(), Status>) -> AfterShutdown {
 
 /// Awaits an RPC for at most [`RPC_TIMEOUT`]; running out of time is
 /// DEADLINE_EXCEEDED.
-async fn call<T>(rpc: impl Future<Output = Result<Response<T>, Status>>) -> Result<T, Status> {
+pub(crate) async fn call<T>(
+    rpc: impl Future<Output = Result<Response<T>, Status>>,
+) -> Result<T, Status> {
     match tokio::time::timeout(RPC_TIMEOUT, rpc).await {
         Ok(result) => result.map(Response::into_inner),
         Err(_) => Err(Status::deadline_exceeded(format!(
@@ -369,7 +408,7 @@ fn spool_all(paths: &Paths, captures: &[Capture], why: &Why) -> bool {
     }
     if lost.len() < captures.len() {
         print_err(format_args!(
-            "todo: {why}; spooled to {}; it will be imported when the daemon next starts",
+            "todo: {why}; spooled to {}; it will be imported once the daemon is running again",
             path.display()
         ));
     } else {
@@ -377,8 +416,8 @@ fn spool_all(paths: &Paths, captures: &[Capture], why: &Why) -> bool {
     }
     for (capture, e) in &lost {
         print_err(format_args!(
-            "todo: error: NOT CAPTURED: {:?}: cannot write {}: {e}",
-            capture.text,
+            "todo: error: NOT CAPTURED: {}: cannot write {}: {e}",
+            excerpt(&capture.text),
             path.display()
         ));
     }
@@ -404,12 +443,26 @@ mod tests {
 
     #[test]
     fn stdin_lines_are_trimmed_and_blank_ones_skipped() {
-        let input = "  call dentist +2 \n\n \t \r\nbuy milk\r\nlast without newline";
+        let input = b"  call dentist +2 \n\n \t \r\nbuy milk\r\nlast without newline";
+        let (texts, not_utf8) = capture_lines(input);
         assert_eq!(
-            capture_lines(input),
+            texts,
             ["call dentist +2", "buy milk", "last without newline"]
         );
-        assert!(capture_lines("\n  \n").is_empty());
+        assert!(not_utf8.is_empty());
+        assert_eq!(capture_lines(b"\n  \n"), (vec![], vec![]));
+        let (texts, not_utf8) = capture_lines(b"ok\n\xff\n \xe9t\xe9 \n\n");
+        assert_eq!(texts, ["ok", "\u{fffd}", "\u{fffd}t\u{fffd}"]);
+        assert_eq!(not_utf8, [2, 3]);
+    }
+
+    #[test]
+    fn excerpts_are_cut_on_a_char_boundary() {
+        assert_eq!(excerpt(r#"call "dentist""#), r#""call \"dentist\"""#);
+        let exact = "é".repeat(EXCERPT_CHARS);
+        assert_eq!(excerpt(&exact), format!("\"{exact}\""));
+        let long = excerpt(&"é".repeat(10_000));
+        assert_eq!(long, format!("\"{}…\"", "é".repeat(EXCERPT_CHARS)));
     }
 
     fn free_text(name: &str) -> Option<PersonRef> {

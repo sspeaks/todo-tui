@@ -11,15 +11,19 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { ErrorInfoSchema } from "../src/gen/google/rpc/error_details_pb.js";
 import { ItemSchema } from "../src/gen/todo/v1/item_pb.js";
 import { ItemService } from "../src/gen/todo/v1/item_service_pb.js";
-import { SystemService } from "../src/gen/todo/v1/system_service_pb.js";
+import { ClientKind, SystemService } from "../src/gen/todo/v1/system_service_pb.js";
 import { WatchService } from "../src/gen/todo/v1/watch_service_pb.js";
-import { connect } from "../src/connect.js";
+import { DaemonTooOldError, connect } from "../src/connect.js";
 import { isConnectionFailure } from "../src/spawn.js";
 import { UnsafeRuntimeDirError, checkRuntimeDir, createTodoTransport, guardedDirs } from "../src/transport.js";
 
 let dir: string;
 let socket: string;
 let server: http2.Http2Server;
+/** What GetServerInfo answers with. */
+let serverApiMinor = 5;
+/** The client_kind of every GetServerInfo call. */
+const helloKinds: ClientKind[] = [];
 
 beforeAll(async () => {
   dir = mkdtempSync(join(tmpdir(), "tt-"));
@@ -29,12 +33,13 @@ beforeAll(async () => {
       routes: ({ service }) => {
         service(SystemService, {
           getServerInfo: (req) => {
+            helloKinds.push(req.clientKind);
             if (req.requiredApiMinor > 5) {
               throw new ConnectError("too new", Code.FailedPrecondition, undefined, [
                 { desc: ErrorInfoSchema, value: { reason: "API_MINOR", domain: "todo.v1", metadata: { have: "5" } } },
               ]);
             }
-            return { daemonVersion: "node-test", apiMinor: 5 };
+            return { daemonVersion: "node-test", apiMinor: serverApiMinor };
           },
           shutdown: () => ({}),
         });
@@ -135,6 +140,50 @@ describe("createTodoTransport over a Unix socket", () => {
     const conn = await connect({ socketPath: socket, autoSpawn: false });
     expect(conn.serverInfo.apiMinor).toBe(5);
     conn.close();
+  });
+
+  it("connect() handshakes again first on every new connection", async () => {
+    // Each call's path, by the server-side HTTP/2 session it arrived on.
+    const sessions: http2.Http2Session[] = [];
+    const calls: string[][] = [];
+    const onStream = (stream: http2.ServerHttp2Stream, headers: http2.IncomingHttpHeaders) => {
+      let i = sessions.indexOf(stream.session!);
+      if (i < 0) i = sessions.push(stream.session!) - 1;
+      (calls[i] ??= []).push(String(headers[":path"]).split("/").pop()!);
+    };
+    // As the daemon does when it restarts.
+    const dropAll = async () => {
+      for (const session of sessions) session.destroy();
+      await new Promise((res) => setTimeout(res, 50));
+    };
+    server.on("stream", onStream);
+    helloKinds.length = 0;
+    try {
+      const conn = await connect({
+        socketPath: socket,
+        autoSpawn: false,
+        clientKind: ClientKind.INTERACTIVE,
+        requiredApiMinor: 5,
+      });
+      await conn.items.listItems({ pageSize: 1 });
+      await dropAll();
+      await Promise.all([conn.items.listItems({ pageSize: 1 }), conn.items.captureItem({})]);
+      expect(calls[0]).toEqual(["GetServerInfo", "ListItems"]);
+      expect(calls[1]?.[0]).toBe("GetServerInfo");
+      expect(calls[1]?.slice(1).sort()).toEqual(["CaptureItem", "ListItems"]);
+      expect(helloKinds).toEqual([ClientKind.INTERACTIVE, ClientKind.INTERACTIVE]);
+
+      // A daemon too old for this client fails every call.
+      serverApiMinor = 4;
+      await dropAll();
+      const err = await conn.items.listItems({ pageSize: 1 }).catch((e: unknown) => e);
+      expect(ConnectError.from(err).cause).toBeInstanceOf(DaemonTooOldError);
+      expect(calls[2]).toEqual(["GetServerInfo"]);
+      conn.close();
+    } finally {
+      serverApiMinor = 5;
+      server.off("stream", onStream);
+    }
   });
 
   it("connect() fails fast when autoSpawn is off and nothing listens", async () => {

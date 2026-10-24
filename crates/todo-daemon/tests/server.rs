@@ -382,6 +382,29 @@ async fn capture_replay_returns_the_original() {
         .unwrap()
         .into_inner();
     assert_eq!(page.items.len(), 1);
+
+    // The draft is the original parse: relative dates resolve against the
+    // original reference time, not the replay's.
+    let reference: jiff::Timestamp = "2026-01-15T12:00:00Z".parse().unwrap();
+    let req = CaptureItemRequest {
+        reference_time: Some(timestamp_to_proto(reference)),
+        ..capture_req("renew passport ^tomorrow ~dana")
+    };
+    let first = items.capture_item(req.clone()).await.unwrap().into_inner();
+    let day = reference.to_zoned(TimeZone::system()).date();
+    let due = date_to_proto(day.tomorrow().unwrap());
+    assert_eq!(first.draft.as_ref().unwrap().due_date, Some(due));
+    let later: jiff::Timestamp = "2026-03-01T12:00:00Z".parse().unwrap();
+    for reference_time in [None, Some(timestamp_to_proto(later))] {
+        let replay = CaptureItemRequest {
+            reference_time,
+            ..req.clone()
+        };
+        let again = items.capture_item(replay).await.unwrap().into_inner();
+        assert_eq!(again.result, first.result);
+        assert_eq!(again.draft, first.draft);
+        assert_eq!(again.item.unwrap().due_date, Some(due));
+    }
     d.stop().await;
 }
 
@@ -587,6 +610,58 @@ async fn capture_checks_created_via_and_reference_time() {
     };
     let status = items.capture_item(req).await.unwrap_err();
     assert_eq!(violation(&status).0, "spool_id");
+    d.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn capture_under_a_missing_or_deleted_parent_names_parent_id() {
+    let d = start().await;
+    let mut items = d.items().await;
+    let parent = capture(&mut items, "parent").await;
+    let child = items
+        .capture_item(CaptureItemRequest {
+            parent_id: Some(parent.id.clone()),
+            ..capture_req("child")
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .item
+        .unwrap();
+    assert_eq!(child.parent_id.as_deref(), Some(parent.id.as_str()));
+
+    let other = capture(&mut items, "other").await;
+    items.delete_item(delete_req(&parent.id)).await.unwrap();
+    // As UpdateItem reports the same parent: the request's argument is bad,
+    // no Item it targets is missing.
+    for (parent_id, reason) in [
+        (parent.id.clone(), "the parent is deleted"),
+        (rid(), "no such Item"),
+    ] {
+        let req = CaptureItemRequest {
+            parent_id: Some(parent_id.clone()),
+            ..capture_req("orphan")
+        };
+        let status = items.capture_item(req).await.unwrap_err();
+        assert_eq!(
+            violation(&status),
+            ("parent_id".to_owned(), reason.to_owned())
+        );
+        let update = update_req(
+            &other.id,
+            Item {
+                parent_id: Some(parent_id),
+                ..Default::default()
+            },
+            &["parent_id"],
+        );
+        let status = items.update_item(update).await.unwrap_err();
+        assert_eq!(
+            violation(&status),
+            ("item.parent_id".to_owned(), reason.to_owned())
+        );
+    }
+    assert_eq!(titles(&mut items).await, ["child", "other"]);
     d.stop().await;
 }
 
@@ -925,7 +1000,7 @@ async fn set_status_archive_and_delete() {
         .await
         .unwrap()
         .into_inner();
-    assert!(deleted.item.unwrap().deleted_at.is_some());
+    assert!(deleted.item.as_ref().unwrap().deleted_at.is_some());
     assert!(titles(&mut items).await.is_empty());
     let with_deleted = ListItemsRequest {
         filter: Some(Filter {
@@ -936,18 +1011,38 @@ async fn set_status_archive_and_delete() {
     };
     let page = items.list_items(with_deleted).await.unwrap().into_inner();
     assert_eq!(page.items.len(), 1);
+    // Every mutation of a deleted Item fails except UndeleteItem, and
+    // DeleteItem, which changes nothing.
     for status in [
+        items
+            .update_item(update_req(&a.id, titled("zombie"), &["title"]))
+            .await
+            .unwrap_err(),
         items
             .set_status(status_req(&a.id, Status::Done))
             .await
             .unwrap_err(),
         items.archive_item(archive_req(&a.id)).await.unwrap_err(),
+        items
+            .unarchive_item(unarchive_req(&a.id))
+            .await
+            .unwrap_err(),
     ] {
         assert_eq!(
             error_info(&status, Code::FailedPrecondition, "ITEM_DELETED")["item_id"],
             a.id
         );
     }
+    let again = items
+        .delete_item(delete_req(&a.id))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(again.item, deleted.item);
+    assert_eq!(
+        again.result.unwrap().revision,
+        deleted.result.unwrap().revision
+    );
     let undeleted = items
         .undelete_item(undelete_req(&a.id))
         .await
@@ -1009,7 +1104,15 @@ async fn a_request_id_replays_its_own_request_only() {
     assert_eq!(replay.result, first.result);
     assert_eq!(replay.item.unwrap().status, Status::Next as i32);
 
+    let b = capture(&mut items, "b").await;
     let reused = [
+        items
+            .set_status(SetStatusRequest {
+                id: b.id.clone(),
+                ..req.clone()
+            })
+            .await
+            .unwrap_err(),
         items
             .archive_item(ArchiveItemRequest {
                 request_id: req.request_id.clone(),
@@ -1042,7 +1145,59 @@ async fn a_request_id_replays_its_own_request_only() {
         );
     }
     assert_eq!(get(&mut items, &a.id).await.archived, None);
-    assert_eq!(titles(&mut items).await, ["a"]);
+    assert_eq!(get(&mut items, &b.id).await.status, Status::Inbox as i32);
+    assert_eq!(titles(&mut items).await, ["a", "b"]);
+    d.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn idempotency_keys_match_in_any_ulid_spelling() {
+    let d = start().await;
+    let mut items = d.items().await;
+    let req = capture_req("once");
+    let first = items.capture_item(req.clone()).await.unwrap().into_inner();
+    let lower = CaptureItemRequest {
+        request_id: req.request_id.to_ascii_lowercase(),
+        ..req
+    };
+    let again = items.capture_item(lower).await.unwrap().into_inner();
+    assert_eq!(again.result, first.result);
+
+    let spool_id = rid();
+    let spooled = CaptureItemRequest {
+        spool_id: Some(spool_id.clone()),
+        ..capture_req("spooled")
+    };
+    let first_spooled = items.capture_item(spooled).await.unwrap().into_inner();
+    let respooled = CaptureItemRequest {
+        spool_id: Some(spool_id.to_ascii_lowercase()),
+        ..capture_req("spooled")
+    };
+    let again = items.capture_item(respooled).await.unwrap().into_inner();
+    assert_eq!(again.result, first_spooled.result);
+    assert_eq!(titles(&mut items).await, ["once", "spooled"]);
+
+    let id = first.item.unwrap().id;
+    let done = status_req(&id, Status::Done);
+    let first = items.set_status(done.clone()).await.unwrap().into_inner();
+    let lower = SetStatusRequest {
+        request_id: done.request_id.to_ascii_lowercase(),
+        ..done.clone()
+    };
+    let again = items.set_status(lower).await.unwrap().into_inner();
+    assert_eq!(again.result, first.result);
+    let batch = batch_req(vec![batched(mutation::Kind::SetStatus(done))]);
+    let first = items
+        .batch_mutate(batch.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    let lower = BatchMutateRequest {
+        request_id: batch.request_id.to_ascii_lowercase(),
+        ..batch
+    };
+    let again = items.batch_mutate(lower).await.unwrap().into_inner();
+    assert_eq!(again.result, first.result);
     d.stop().await;
 }
 

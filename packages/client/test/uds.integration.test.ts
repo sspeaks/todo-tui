@@ -187,6 +187,11 @@ describe.skipIf(!TODO_BIN)("UDS integration against $TODO_BIN", { timeout: 60_00
     await waitFor(() => store.getConnection().state === "reconnecting");
     // The store's ensureDaemon respawns it; `todo add` would too.
     await waitFor(() => store.getConnection().state === "live", 10_000);
+    // The new daemon still counts the store's connection as interactive (4.2).
+    const other = await h.open(ClientKind.ONESHOT);
+    const refused = ConnectError.from(await other.system.shutdown({ restart: true }).catch((e: unknown) => e));
+    expect(refused.code).toBe(Code.FailedPrecondition);
+    expect(refused.findDetails(ErrorInfoSchema)[0]?.reason).toBe("INTERACTIVE_CLIENTS_CONNECTED");
     await h.add("after");
     await waitFor(() => view.getSnapshot().items.some((i) => i.title === "after"));
     expect(store.getConnection().revision).toBeGreaterThan(rev);

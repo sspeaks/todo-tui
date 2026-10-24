@@ -53,8 +53,9 @@ pub enum StoreError {
         error: MutationError,
     },
     /// The request id is recorded for an op of another kind (a capture, or a
-    /// mutation of another [`OpKind`]): the client reused it for a different
-    /// request, and replaying the original would answer the wrong call.
+    /// mutation of another [`OpKind`]) or, for a single-item mutation, for
+    /// another Item: the client reused it for a different request, and
+    /// replaying the original would answer the wrong call.
     #[error("the request id was already used for a different request")]
     RequestIdReused,
     #[error("invalid page token")]
@@ -116,6 +117,7 @@ pub struct CaptureInput {
     /// tokens and warnings are not stored.
     pub draft: CaptureDraft,
     pub created_via: CreatedVia,
+    /// A missing or deleted parent fails with [`StoreError::Mutation`].
     pub parent_id: Option<ItemId>,
     /// Spool entry id; a spool id already imported returns the original result.
     pub spool_id: Option<String>,
@@ -433,8 +435,10 @@ impl Store {
     /// nothing still records its op, at the current revision. Idempotent on
     /// `request_id`: a replay returns the original result with the Items'
     /// current state, without checking `expected_revision` or writing. A
-    /// `request_id` recorded by a capture or a mutation of another
-    /// [`OpKind`] fails with [`StoreError::RequestIdReused`].
+    /// `request_id` recorded by a capture, by a mutation of another
+    /// [`OpKind`] or, for a single-item kind, by a mutation of another Item
+    /// fails with [`StoreError::RequestIdReused`]. A [`OpKind::Batch`]
+    /// replay is matched by kind only, not by the Items it names.
     pub async fn mutate(&self, input: MutateInput) -> Result<MutateOutput> {
         self.write(move |tx| mutate_tx(tx, input)).await
     }
@@ -707,13 +711,13 @@ fn capture_tx(tx: &mut WriteTx<'_>, input: CaptureInput) -> Result<(Item, Mutati
     {
         return Err(invalid(people_unsupported(ItemField::WaitingOn)));
     }
-    if let Some(parent) = input.parent_id {
-        let exists = conn
-            .prepare_cached("SELECT 1 FROM items WHERE id = ?1 AND deleted_at IS NULL")?
-            .exists([parent.to_string()])?;
-        if !exists {
-            return Err(StoreError::NotFound(parent));
-        }
+    if let Some(parent) = input.parent_id
+        && let Some(reason) = Batch::default().unusable_parent(conn, parent)?
+    {
+        return Err(invalid(MutationError::Invalid {
+            field: ItemField::ParentId,
+            reason: reason.to_owned(),
+        }));
     }
 
     let revision = tx.next_revision();
@@ -818,6 +822,16 @@ impl Batch {
         .transpose()
     }
 
+    /// Why `parent` cannot be any Item's parent (it is missing or deleted),
+    /// if it cannot.
+    fn unusable_parent(&self, conn: &Connection, parent: ItemId) -> Result<Option<&'static str>> {
+        Ok(match self.parent_of(conn, parent)? {
+            None => Some("no such Item"),
+            Some((_, true)) => Some("the parent is deleted"),
+            Some(_) => None,
+        })
+    }
+
     /// Why `parent` cannot become `id`'s parent, if it cannot.
     fn parent_problem(
         &self,
@@ -825,10 +839,8 @@ impl Batch {
         id: ItemId,
         parent: ItemId,
     ) -> Result<Option<&'static str>> {
-        match self.parent_of(conn, parent)? {
-            None => return Ok(Some("no such Item")),
-            Some((_, true)) => return Ok(Some("the parent is deleted")),
-            Some(_) => {}
+        if let Some(reason) = self.unusable_parent(conn, parent)? {
+            return Ok(Some(reason));
         }
         let mut seen = HashSet::new();
         let mut next = Some(parent);
@@ -889,8 +901,17 @@ fn mutate_tx(tx: &mut WriteTx<'_>, input: MutateInput) -> Result<MutateOutput> {
     let conn = tx.conn();
     prune_request_ids(conn, op.at)?;
     if let Some(request_id) = op.request_id
-        && let Some((op_id, revision, _)) = recorded_op(conn, REQUEST_SQL, request_id, op.kind)?
+        && let Some((op_id, revision, item_id)) =
+            recorded_op(conn, REQUEST_SQL, request_id, op.kind)?
     {
+        // A single-item op recorded its Item, so the same request id on
+        // another Item is a different request. A batch recorded only its
+        // first Item and is matched by kind alone.
+        if input.kind != OpKind::Batch
+            && item_id != input.mutations.first().map(|m| m.id.to_string())
+        {
+            return Err(StoreError::RequestIdReused);
+        }
         let items = input
             .mutations
             .iter()

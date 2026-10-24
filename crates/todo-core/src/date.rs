@@ -124,7 +124,8 @@ fn relative(s: &str, today: Date) -> Result<Date, String> {
         .map_err(|_| OUT_OF_RANGE.to_owned())
 }
 
-/// `YYYY-MM-DD`, or `None` when `s` does not have that shape.
+/// `YYYY-MM-DD`, or `None` when `s` does not have that shape. Years run
+/// from 1, as in `google.type.Date`, where year 0 means "no year".
 fn absolute(s: &str) -> Option<Result<Date, String>> {
     let b = s.as_bytes();
     let shaped = b.len() == 10
@@ -144,6 +145,9 @@ fn absolute(s: &str) -> Option<Result<Date, String>> {
         s[5..7].parse().ok()?,
         s[8..10].parse().ok()?,
     );
+    if year == 0 {
+        return Some(Err("the year must be 1 to 9999".to_owned()));
+    }
     Some(Date::new(year, month, day).map_err(|_| "no such date".to_owned()))
 }
 
@@ -346,6 +350,9 @@ mod tests {
             ("2026-13-01", "no such date"),
             ("2026-00-10", "no such date"),
             ("2025-02-29", "no such date"),
+            // google.type.Date reads year 0 as "no year".
+            ("0000-01-01", "the year must be 1 to 9999"),
+            ("0000-02-29", "the year must be 1 to 9999"),
             ("nov", "a month needs a day, e.g. nov2"),
             ("mon2", NOT_A_DATE),
             ("no2", NOT_A_DATE),

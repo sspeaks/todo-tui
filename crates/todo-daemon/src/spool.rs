@@ -8,11 +8,11 @@
 //! Imports are idempotent per spool id: a crash before the truncate only
 //! repeats them.
 
-use std::fs::{DirBuilder, File, OpenOptions};
+use std::fs::{DirBuilder, File, OpenOptions, TryLockError};
 use std::io::{self, Read as _, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, FileExt as _, OpenOptionsExt as _};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use jiff::civil::Date;
@@ -25,11 +25,17 @@ use todo_store::{CaptureInput, Store, StoreError};
 use ulid::Ulid;
 
 use crate::paths::Paths;
-use crate::service::item::storable;
+use crate::service::item::{canonical_ulid, storable};
 use crate::shutdown::ShutdownSignal;
 
 /// How often a running daemon looks for new entries.
 pub(crate) const INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long [`append`] waits for the spool's lock, which an import holds
+/// while it runs, before it gives up.
+const LOCK_WAIT: Duration = Duration::from_secs(10);
+/// How often [`append`] tries the lock meanwhile.
+const LOCK_RETRY: Duration = Duration::from_millis(20);
 
 /// One line of the spool: `{"spool_id":…,"captured_at":…,"text":…}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,9 +65,15 @@ impl SpoolEntry {
 }
 
 /// Appends `entry` as one line and syncs it, holding the spool's exclusive
-/// lock (so this blocks while an import runs). Creates the data directory
-/// (mode 0700) and the spool (mode 0600) as needed.
+/// lock (so this waits while an import runs, for up to 10s; then it fails
+/// with `TimedOut`). Creates the data directory (mode 0700) and the spool
+/// (mode 0600) as needed.
 pub fn append(paths: &Paths, entry: &SpoolEntry) -> io::Result<()> {
+    append_within(paths, entry, LOCK_WAIT)
+}
+
+/// [`append`], waiting at most `wait` for the lock.
+fn append_within(paths: &Paths, entry: &SpoolEntry, wait: Duration) -> io::Result<()> {
     let mut line = serde_json::to_vec(entry)?;
     line.push(b'\n');
     DirBuilder::new()
@@ -69,7 +81,7 @@ pub fn append(paths: &Paths, entry: &SpoolEntry) -> io::Result<()> {
         .mode(0o700)
         .create(&paths.data)?;
     let mut file = open_append(&paths.spool())?;
-    file.lock()?;
+    lock_within(&file, wait)?;
     // A writer that died mid-line left it torn: end it first, or this entry
     // would join it and be rejected with it.
     if !ends_a_line(&file)? {
@@ -78,6 +90,27 @@ pub fn append(paths: &Paths, entry: &SpoolEntry) -> io::Result<()> {
     file.write_all(&line)?;
     file.sync_data()?;
     file.unlock()
+}
+
+/// Takes `file`'s exclusive lock, retrying every [`LOCK_RETRY`] for up to
+/// `wait`, so a wedged importer cannot hang a capture.
+fn lock_within(file: &File, wait: Duration) -> io::Result<()> {
+    let deadline = Instant::now() + wait;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(LOCK_RETRY);
+            }
+            Err(TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("the spool is still locked after {wait:?}"),
+                ));
+            }
+            Err(TryLockError::Error(e)) => return Err(e),
+        }
+    }
 }
 
 /// Opens `path` to append to it (and read its tail), creating it with mode
@@ -204,9 +237,9 @@ fn lock_and_read(path: &Path) -> io::Result<Option<(File, Vec<u8>)>> {
 fn entry_input(line: &[u8], today: Date) -> Result<CaptureInput, String> {
     let entry: SpoolEntry =
         serde_json::from_slice(line).map_err(|e| format!("not a spool entry: {e}"))?;
-    if entry.spool_id.parse::<Ulid>().is_err() {
+    let Some(spool_id) = canonical_ulid(&entry.spool_id) else {
         return Err("spool_id is not a ULID".to_owned());
-    }
+    };
     let Some((at, day)) = captured_at(&entry.captured_at) else {
         return Err("captured_at is not a storable RFC 3339 time with an offset".to_owned());
     };
@@ -214,11 +247,11 @@ fn entry_input(line: &[u8], today: Date) -> Result<CaptureInput, String> {
         return Err("text is blank".to_owned());
     }
     Ok(CaptureInput {
-        request_id: entry.spool_id.clone(),
+        request_id: spool_id.clone(),
         draft: parse_capture(&entry.text, day),
         created_via: CreatedVia::Cli,
         parent_id: None,
-        spool_id: Some(entry.spool_id),
+        spool_id: Some(spool_id),
         now: at,
         today,
     })
@@ -371,6 +404,57 @@ mod tests {
         assert_eq!(rejected, format!("{torn}\n"));
     }
 
+    #[test]
+    fn an_append_gives_up_on_a_lock_held_too_long() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = paths_in(home.path());
+        append(&paths, &SpoolEntry::now(new_ulid(), "first")).unwrap();
+        let before = std::fs::read(paths.spool()).unwrap();
+        // As an import holds it.
+        let holder = File::open(paths.spool()).unwrap();
+        holder.lock().unwrap();
+        let wait = Duration::from_millis(200);
+        let start = Instant::now();
+        let entry = SpoolEntry::now(new_ulid(), "second");
+        let err = append_within(&paths, &entry, wait).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(err.to_string(), "the spool is still locked after 200ms");
+        assert!(start.elapsed() >= wait, "{:?}", start.elapsed());
+        assert_eq!(std::fs::read(paths.spool()).unwrap(), before);
+
+        // Released within the wait, the append goes through.
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            holder.unlock().unwrap();
+        });
+        append_within(&paths, &entry, Duration::from_secs(10)).unwrap();
+        release.join().unwrap();
+        let content = std::fs::read_to_string(paths.spool()).unwrap();
+        assert_eq!(content.lines().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_spool_id_is_imported_once_in_any_spelling() {
+        let (_home, paths, store) = setup();
+        let entry = SpoolEntry::now(new_ulid(), "once");
+        append(&paths, &entry).unwrap();
+        import(&paths, &store).await.unwrap();
+        let lower = SpoolEntry {
+            spool_id: entry.spool_id.to_ascii_lowercase(),
+            ..entry
+        };
+        append(&paths, &lower).unwrap();
+        let done = import(&paths, &store).await.unwrap();
+        assert_eq!(
+            done,
+            Imported {
+                captured: 1,
+                rejected: 0
+            }
+        );
+        assert_eq!(titles(&store).await.get("once"), Some(&1));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn appends_racing_an_import_are_kept_for_the_next_one() {
         const BEFORE: usize = 200;
@@ -395,6 +479,9 @@ mod tests {
         let mut imported = 0;
         while writers.iter().any(|w| !w.is_finished()) {
             imported += import(&paths, &store).await.unwrap().captured;
+            // A daemon pauses between imports. Appends poll for the lock, so
+            // a pause longer than their retry gives each waiting one a turn.
+            tokio::time::sleep(LOCK_RETRY + Duration::from_millis(5)).await;
         }
         for w in writers {
             w.join().unwrap();

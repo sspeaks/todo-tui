@@ -15,6 +15,14 @@ export interface TodoTransport extends Transport {
   readonly socketPath: string;
   /** Closes the HTTP/2 session and every open stream. A later call re-dials. */
   close(): void;
+  /**
+   * From now on, awaits `hello` before the first other call on each new
+   * connection, so the daemon learns every connection's client kind (the
+   * GetServerInfo handshake, 4.2). Calls to `helloPath` (hello's own) go
+   * straight through; a failed hello fails the call that waited for it. The
+   * current connection counts as greeted.
+   */
+  greetEachConnection(helloPath: string, hello: () => Promise<void>): void;
 }
 
 export class UnsafeRuntimeDirError extends Error {
@@ -62,16 +70,53 @@ function dial(socketPath: string): Socket {
   return netConnect(socketPath);
 }
 
+/** An Http2SessionManager that runs a hello before other calls on each connection it opens. */
+class GreetingSessionManager extends Http2SessionManager {
+  /** Connections dialed so far. */
+  dials = 0;
+  /** The dial whose connection the hello last succeeded on. */
+  greeted = 0;
+  hello: { path: string; send: () => Promise<void> } | undefined;
+  private greeting: Promise<void> | undefined;
+
+  override async request(...args: Parameters<Http2SessionManager["request"]>): ReturnType<Http2SessionManager["request"]> {
+    const [, path] = args;
+    if (this.hello && path !== this.hello.path) await this.greet(this.hello.send);
+    return super.request(...args);
+  }
+
+  private async greet(send: () => Promise<void>): Promise<void> {
+    // Opens or verifies the connection now, so any dial it takes happens first.
+    await this.connect();
+    while (this.greeted !== this.dials) {
+      const dial = this.dials;
+      this.greeting ??= send()
+        .then(() => {
+          this.greeted = dial;
+        })
+        .finally(() => {
+          this.greeting = undefined;
+        });
+      await this.greeting;
+    }
+  }
+}
+
 /** gRPC over HTTP/2 over the daemon's Unix socket; `:authority` is localhost (4.2). */
 export function createTodoTransport(socketPath: string, opts: TodoTransportOptions = {}): TodoTransport {
-  const sessionManager = new Http2SessionManager(
+  const sessionManager: GreetingSessionManager = new GreetingSessionManager(
     "http://localhost",
     {
       pingIntervalMs: opts.pingIntervalMs ?? 15_000,
       pingTimeoutMs: opts.pingTimeoutMs ?? 5_000,
       pingIdleConnection: false,
     },
-    { createConnection: () => dial(socketPath) },
+    {
+      createConnection: () => {
+        sessionManager.dials++;
+        return dial(socketPath);
+      },
+    },
   );
   const transport = createGrpcTransport({
     baseUrl: "http://localhost",
@@ -83,5 +128,9 @@ export function createTodoTransport(socketPath: string, opts: TodoTransportOptio
     stream: transport.stream.bind(transport),
     socketPath,
     close: () => sessionManager.abort(),
+    greetEachConnection: (path, send) => {
+      sessionManager.hello = { path, send };
+      sessionManager.greeted = sessionManager.dials;
+    },
   };
 }

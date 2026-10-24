@@ -589,6 +589,11 @@ mod tests {
             ("x ^feb30", "x ^feb30", "^feb30: february has no day 30"),
             ("x ^^fri", "x ^^fri", "^^fri: not a date"),
             (
+                "x ^0000-03-01",
+                "x ^0000-03-01",
+                "^0000-03-01: the year must be 1 to 9999",
+            ),
+            (
                 "x >later",
                 "x >later",
                 ">later: status must be >next or >someday",
