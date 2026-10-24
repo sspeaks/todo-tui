@@ -53,6 +53,46 @@ checkout, so keep the checkout where it is. The first `todo add` (or the TUI)
 starts the daemon in the background, and it keeps running after they exit.
 `todo daemon stop` stops it.
 
+## Install with Nix
+
+With Nix (flakes enabled) you can skip the toolchain above. The flake builds `todo`
+and the TUI bundle, and gives `todo` its own Node 24 for the TUI.
+
+```sh
+nix profile add 'git+file:///absolute/path/to/todo-tui?ref=main'   # your checkout
+nix profile add github:sspeaks/todo-tui                            # once it is pushed
+```
+
+`?ref=main` builds the last commit on `main`, so half-finished work in the working
+tree is never installed. Without it (a bare `git+file://…`, or `.`), Nix also picks
+up uncommitted edits to tracked files and new files once they are `git add`ed.
+Untracked files are never built.
+
+To try it without installing, use `nix run` with the same URL and put arguments
+after `--`, for example
+`nix run 'git+file:///absolute/path/to/todo-tui?ref=main' -- add "call dentist ^fri"`.
+In the checkout, `nix run .` runs the working tree and `nix build` leaves it in
+`./result`.
+
+After new commits on `main` (or a push), upgrade, then stop the daemon: it keeps
+running the old build until it stops, and the next `todo add` or TUI starts the new
+one.
+
+```sh
+nix profile upgrade todo-tui   # the name `nix profile list` shows (the checkout's directory name)
+todo daemon stop
+```
+
+If you installed `todo` with `cargo install` before (Quick start), that copy in
+`~/.cargo/bin` usually comes earlier on `PATH` than the Nix profile, so it keeps
+running. To switch to the Nix one, stop the old daemon and remove the cargo copy:
+
+```sh
+todo daemon stop
+cargo uninstall todo-cli
+hash -r; command -v todo   # now ~/.nix-profile/bin/todo
+```
+
 ## Using it
 
 ### Capture
@@ -254,6 +294,13 @@ rm -rf "$TODO_TUI_HOME"; unset TODO_TUI_HOME
 
 Requires the same as [Quick start](#quick-start): rustup, Node 24 with corepack
 (`corepack enable`), and `protoc` 3.15 or newer on `PATH`.
+
+With Nix, `nix develop` replaces that setup: it opens a shell with cargo, rustc,
+clippy, rustfmt, rust-analyzer, protoc, Node 24, pnpm and buf on `PATH`. Its Rust is
+nixpkgs' and can be newer than the 1.97 in `rust-toolchain.toml` that CI uses, so
+clippy may report lints CI does not. pnpm still runs the version pinned in
+`package.json`. When `pnpm-lock.yaml` changes, update the hash in `flake.nix` (the
+comment at its top says how).
 
 ```sh
 pnpm install

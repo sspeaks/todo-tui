@@ -4,3 +4,5 @@ dist/
 *.tsbuildinfo
 packages/client/src/gen/
 .DS_Store
+result
+result-*
