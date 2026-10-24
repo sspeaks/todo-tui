@@ -93,6 +93,29 @@ pub(crate) fn store(e: StoreError) -> Status {
             bad_request("request_id", "was already used for a different request")
         }
         StoreError::InvalidPageToken => bad_request("page_token", e.to_string()),
+        // M2 phase 3 maps these per RPC; these arms are the defaults.
+        StoreError::UndoStackChanged { expected, top } => error_info(
+            Code::Aborted,
+            "UNDO_STACK_CHANGED",
+            e.to_string(),
+            [
+                ("expected_op_id", expected.to_string()),
+                (
+                    "top_op_id",
+                    top.map(|id| id.to_string()).unwrap_or_default(),
+                ),
+            ],
+        ),
+        StoreError::ParentDeleted { item_id, parent_id } => error_info(
+            Code::FailedPrecondition,
+            "PARENT_DELETED",
+            e.to_string(),
+            [
+                ("item_id", item_id.to_string()),
+                ("parent_id", parent_id.to_string()),
+            ],
+        ),
+        StoreError::RelationEnd { .. } => bad_request("relation", e.to_string()),
         StoreError::SchemaTooNew { .. } => error_info(
             Code::FailedPrecondition,
             "SCHEMA_TOO_NEW",
@@ -100,7 +123,7 @@ pub(crate) fn store(e: StoreError) -> Status {
             [],
         ),
         StoreError::Closed => error_info(Code::Unavailable, "SHUTTING_DOWN", e.to_string(), []),
-        StoreError::Sqlite(_) | StoreError::Corrupt(_) => {
+        StoreError::Sqlite(_) | StoreError::Corrupt(_) | StoreError::NotAMutation(_) => {
             tracing::error!(error = %e, "store failure");
             error_info(Code::Internal, "STORE", e.to_string(), [])
         }

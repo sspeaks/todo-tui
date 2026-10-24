@@ -5,15 +5,18 @@ use jiff::civil::{Date, date};
 use jiff::{SignedDuration, Timestamp};
 use rusqlite::Connection;
 use todo_core::{
-    Actor, CaptureDraft, CreatedVia, FieldChange, FieldUpdate, FieldValue, Item, ItemField, ItemId,
-    Mutation, MutationError, MutationOp, PersonRef, Priority, Revision, StalenessSignals, Status,
-    StatusFields, Topic, Waiting, new_ulid,
+    Actor, ArchiveReason, Archived, CaptureDraft, CreatedVia, FieldChange, FieldUpdate, FieldValue,
+    Item, ItemField, ItemId, Mutation, MutationError, MutationOp, PersonRef, Priority, Relation,
+    RelationKind, ResolutionKind, Revision, SkipReason, StalenessSignals, Status, StatusCategory,
+    StatusFields, TodoRefinement, Topic, Waiting, new_ulid,
 };
 use todo_store::{
-    CaptureInput, ChangesSinceError, Expired, ListQuery, MutateInput, OpKind, Resource,
-    SCHEMA_VERSION, Store, StoreError,
+    CaptureInput, ChangesSinceError, EndProblem, Expired, ListQuery, MutateInput, MutateOutput,
+    OpKind, RelationInput, RelationOutput, Resource, SCHEMA_VERSION, Store, StoreError, UndoInput,
+    UndoOutput, UndoSkipRow, UndoState,
 };
 use tokio::sync::broadcast::error::TryRecvError;
+use ulid::Ulid;
 
 struct Db {
     _dir: tempfile::TempDir,
@@ -73,6 +76,7 @@ async fn migrates_an_empty_database() {
         "changes",
         "request_ids",
         "spool_imports",
+        "relations",
     ] {
         let n: i64 = conn
             .query_row(
@@ -807,13 +811,14 @@ struct EventRow {
     change: FieldChange,
 }
 
-/// The events of an op, in insertion order, with `old`/`new` decoded.
+/// The field events (`set` and `derived`) of an op, in op order, with
+/// `old`/`new` decoded.
 async fn events(db: &Db, op_id: ulid::Ulid) -> Vec<EventRow> {
     db.store
         .read(move |c| {
             let mut stmt = c.prepare(
                 "SELECT item_id, actor, kind, field, old, new FROM events
-                 WHERE op_id = ?1 ORDER BY rowid",
+                 WHERE op_id = ?1 AND kind IN ('set', 'derived') ORDER BY ord",
             )?;
             let rows = stmt.query_map([op_id.to_string()], |r| {
                 let decode = |json: String| serde_json::from_str(&json).unwrap();
@@ -918,13 +923,29 @@ async fn mutate_records_one_op_with_an_event_per_changed_field() {
                 FieldValue::Cleared,
                 FieldValue::Date(date(2026, 2, 1)),
             ),
+            // The staleness signals before and after, last.
+            EventRow {
+                kind: "derived".into(),
+                ..event(
+                    ItemField::Staleness,
+                    FieldValue::Staleness(item.derived.staleness),
+                    FieldValue::Staleness(after.derived.staleness),
+                )
+            },
         ]
     );
+    assert_eq!(
+        after.derived.staleness,
+        StalenessSignals {
+            last_user_touch_at: Some(ts(1_000)),
+            ..item.derived.staleness
+        }
+    );
     assert_eq!(change_rows(&db, 1).await, [(2, item.id.to_string(), false)]);
-    // Nothing else: one op, three events, one change, one request id.
+    // Nothing else: one op, four events, one change, one request id.
     assert_eq!(
         snapshot(&db).await.1,
-        [ops + 1, events_n + 3, changes + 1, requests + 1]
+        [ops + 1, events_n + 4, changes + 1, requests + 1]
     );
 
     // Broadcast after commit: an independent reader already sees the row.
@@ -1021,7 +1042,7 @@ async fn ops_and_events_record_their_actor() {
     let db = open();
     let item = capture(&db, "x").await;
     let suggestion = new_ulid();
-    for (actor, name, expected) in [
+    for (at, (actor, name, expected)) in (1_000..).zip([
         (Actor::User, "a", "user".to_owned()),
         (Actor::Sync, "b", "sync".to_owned()),
         (Actor::System, "c", "system".to_owned()),
@@ -1030,14 +1051,20 @@ async fn ops_and_events_record_their_actor() {
             "d",
             format!("suggestion:{suggestion}"),
         ),
-    ] {
+    ]) {
         let mut req = mutate(OpKind::Update, vec![title(item.id, name)]);
         req.actor = actor;
+        req.now = ts(at);
         let out = db.store.mutate(req).await.unwrap();
         assert_eq!(op_row(&db, out.result.op_id).await.1, expected);
         let events = events(&db, out.result.op_id).await;
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].actor, expected);
+        // The user and suggestions also touch the staleness signals.
+        let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+        match actor {
+            Actor::User | Actor::Suggestion(_) => assert_eq!(kinds, ["set", "derived"]),
+            Actor::Sync | Actor::System => assert_eq!(kinds, ["set"]),
+        }
+        assert!(events.iter().all(|e| e.actor == expected));
     }
 }
 
@@ -1139,7 +1166,14 @@ async fn an_item_mutated_twice_in_a_batch_gets_one_revision() {
         .into_iter()
         .map(|e| e.change.field)
         .collect();
-    assert_eq!(fields, [ItemField::Title, ItemField::TodoRefinement]);
+    assert_eq!(
+        fields,
+        [
+            ItemField::Title,
+            ItemField::TodoRefinement,
+            ItemField::Staleness
+        ]
+    );
 }
 
 #[tokio::test]
@@ -1600,7 +1634,7 @@ async fn an_estimate_must_fit_its_column() {
     let stored = db.store.get_item(a.id, today()).await.unwrap().item;
     assert_eq!(stored.core.remaining_estimate, Some(longest));
     assert_eq!(stored, out.items[0]);
-    let [event] = events(&db, out.result.op_id).await.try_into().unwrap();
+    let [event, _derived] = events(&db, out.result.op_id).await.try_into().unwrap();
     assert_eq!(event.change.new, FieldValue::Duration(longest));
 }
 
@@ -1672,4 +1706,1902 @@ async fn get_item_reads_missing_deleted_and_merged_items() {
         db.store.get_item(a.id, today()).await,
         Err(StoreError::Corrupt(_))
     ));
+}
+
+// ---- M2: the undo stack, parent rules and relations ------------------------
+
+fn undo_input(at: i64) -> UndoInput {
+    UndoInput {
+        request_id: new_ulid().to_string(),
+        expected_op_id: None,
+        now: ts(at),
+        today: today(),
+    }
+}
+
+async fn undo(db: &Db) -> UndoOutput {
+    db.store.undo(undo_input(2_000)).await.unwrap()
+}
+
+async fn redo(db: &Db) -> UndoOutput {
+    db.store.redo(undo_input(3_000)).await.unwrap()
+}
+
+async fn get(db: &Db, id: ItemId) -> Item {
+    db.store.get_item(id, today()).await.unwrap().item
+}
+
+/// Mutates as `actor` at second `at`.
+async fn run(
+    db: &Db,
+    actor: Actor,
+    at: i64,
+    kind: OpKind,
+    mutations: Vec<Mutation>,
+) -> MutateOutput {
+    let mut req = mutate(kind, mutations);
+    req.actor = actor;
+    req.now = ts(at);
+    db.store.mutate(req).await.unwrap()
+}
+
+/// A user capture and its op.
+async fn capture_op(db: &Db, title: &str) -> (Item, Ulid) {
+    let (item, result) = db.store.capture(input(title, 1)).await.unwrap();
+    (item, result.op_id)
+}
+
+async fn capture_under(db: &Db, title: &str, parent: ItemId) -> Item {
+    let mut req = input(title, 1);
+    req.parent_id = Some(parent);
+    db.store.capture(req).await.unwrap().0
+}
+
+/// The entries undo and redo would act on.
+async fn tops(db: &Db) -> (Option<Ulid>, Option<Ulid>) {
+    let UndoState { undo, redo } = db.store.undo_state().await.unwrap();
+    (undo.map(|e| e.op_id), redo.map(|e| e.op_id))
+}
+
+/// `(undo_state, summary)` of an `ops` row.
+async fn op_stack(db: &Db, op_id: Ulid) -> (Option<String>, Option<String>) {
+    db.store
+        .read(move |c| {
+            Ok(c.query_row(
+                "SELECT undo_state, summary FROM ops WHERE id = ?1",
+                [op_id.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+        .await
+        .unwrap()
+}
+
+async fn undo_state_of(db: &Db, op_id: Ulid) -> Option<String> {
+    op_stack(db, op_id).await.0
+}
+
+/// The Items whose `deleted_at` an op set, in op order.
+async fn deleted_at_events(db: &Db, op_id: Ulid) -> Vec<String> {
+    events(db, op_id)
+        .await
+        .into_iter()
+        .filter(|e| e.change.field == ItemField::DeletedAt)
+        .map(|e| e.item_id)
+        .collect()
+}
+
+/// The parent invariant (design 3.7): no live Item has a deleted parent.
+async fn assert_no_live_orphans(db: &Db) {
+    let orphans: Vec<String> = db
+        .store
+        .read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT child.id FROM items child JOIN items parent ON parent.id = child.parent_id
+                 WHERE child.deleted_at IS NULL AND parent.deleted_at IS NOT NULL",
+            )?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        orphans,
+        Vec::<String>::new(),
+        "live Items under deleted parents"
+    );
+}
+
+fn skip(item_id: ItemId, fields: &[ItemField], reason: SkipReason) -> UndoSkipRow {
+    UndoSkipRow {
+        item_id,
+        fields: fields.to_vec(),
+        reason,
+        relation: None,
+    }
+}
+
+/// The Item without the write metadata that undo and redo move forward.
+fn content(item: &Item) -> Item {
+    Item {
+        updated_at: Timestamp::UNIX_EPOCH,
+        revision: 0,
+        ..item.clone()
+    }
+}
+
+fn update(id: ItemId, updates: &[(ItemField, FieldValue)]) -> Mutation {
+    let updates = updates
+        .iter()
+        .map(|(field, value)| FieldUpdate {
+            field: *field,
+            value: value.clone(),
+        })
+        .collect();
+    mutation(id, MutationOp::Update(updates))
+}
+
+fn status(id: ItemId, status: Status) -> Mutation {
+    mutation(id, MutationOp::SetStatus(status))
+}
+
+fn high() -> FieldValue {
+    FieldValue::Priority(Priority::High)
+}
+
+#[tokio::test]
+async fn mutate_takes_only_mutations() {
+    let db = open();
+    let x = capture(&db, "x").await;
+    let before = snapshot(&db).await;
+    for req in [
+        mutate(
+            OpKind::Update,
+            vec![mutation(x.id, MutationOp::Restore(vec![]))],
+        ),
+        mutate(OpKind::Undo, vec![title(x.id, "y")]),
+        mutate(OpKind::Capture, vec![title(x.id, "y")]),
+        mutate(OpKind::AddRelation, vec![title(x.id, "y")]),
+    ] {
+        match db.store.mutate(req).await {
+            Err(StoreError::NotAMutation(_)) => {}
+            other => panic!("expected NotAMutation, got {other:?}"),
+        }
+    }
+    assert_eq!(snapshot(&db).await, before);
+}
+
+#[tokio::test]
+async fn events_are_written_in_mutation_order_with_staleness_last() {
+    let db = open();
+    let x = capture(&db, "x").await;
+    let y = capture(&db, "y").await;
+    let out = run(
+        &db,
+        Actor::User,
+        1_000,
+        OpKind::Batch,
+        vec![
+            title(x.id, "x2"),
+            title(y.id, "y2"),
+            set(x.id, ItemField::Priority, high()),
+        ],
+    )
+    .await;
+    let op_id = out.result.op_id.to_string();
+    let rows: Vec<(String, String, u32, i64)> = db
+        .store
+        .read(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT item_id, kind, field, ord FROM events WHERE op_id = ?1 ORDER BY ord",
+            )?;
+            let rows = stmt.query_map([op_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .await
+        .unwrap();
+    let row = |item: &Item, kind: &str, field: ItemField, ord| {
+        (item.id.to_string(), kind.to_owned(), field.number(), ord)
+    };
+    assert_eq!(
+        rows,
+        [
+            row(&x, "set", ItemField::Title, 0),
+            row(&y, "set", ItemField::Title, 1),
+            row(&x, "set", ItemField::Priority, 2),
+            row(&x, "derived", ItemField::Staleness, 3),
+            row(&y, "derived", ItemField::Staleness, 4),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn undo_restores_what_still_matches_and_reports_the_rest() {
+    let db = open();
+    let (x, captured) = capture_op(&db, "a").await;
+    let edit = run(
+        &db,
+        Actor::User,
+        1_000,
+        OpKind::Update,
+        vec![update(
+            x.id,
+            &[
+                (ItemField::Title, FieldValue::String("b".into())),
+                (ItemField::Priority, high()),
+            ],
+        )],
+    )
+    .await;
+    assert_eq!(tops(&db).await, (Some(edit.result.op_id), None));
+    // Off the stack: the title changes since.
+    run(
+        &db,
+        Actor::System,
+        1_500,
+        OpKind::Update,
+        vec![title(x.id, "c")],
+    )
+    .await;
+    let revision = db.store.current_revision();
+
+    let out = undo(&db).await;
+    let after = get(&db, x.id).await;
+    assert_eq!(after.core.title, "c");
+    assert_eq!(after.core.priority, Priority::None);
+    // Restored, not refreshed: an undo is no user touch.
+    assert_eq!(after.derived.staleness, x.derived.staleness);
+    assert_eq!(after.updated_at, ts(2_000));
+    assert_eq!(after.revision, revision + 1);
+    assert_eq!(out.result.revision, revision + 1);
+    assert_eq!(out.items, std::slice::from_ref(&after));
+    assert_eq!(
+        out.skipped,
+        [skip(x.id, &[ItemField::Title], SkipReason::ChangedSince)]
+    );
+    let entry = out.entry.unwrap();
+    assert_eq!(entry.op_id, edit.result.op_id);
+    assert_eq!(entry.kind, OpKind::Update);
+    assert_eq!(entry.item_ids, [x.id]);
+    assert_eq!(entry.description, "edit \"b\"");
+    assert_eq!(op_row(&db, out.result.op_id).await.0, "undo");
+    assert_eq!(
+        op_stack(&db, out.result.op_id).await,
+        (None, Some("undo: edit \"b\"".into()))
+    );
+    let kinds: Vec<(String, String)> = events(&db, out.result.op_id)
+        .await
+        .into_iter()
+        .map(|e| (e.kind, e.actor))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("set".into(), "user".into()),
+            ("derived".into(), "user".into())
+        ]
+    );
+    assert_eq!(tops(&db).await, (Some(captured), Some(edit.result.op_id)));
+
+    // The redo re-applies what the undo restored, and only that.
+    let out = redo(&db).await;
+    assert_eq!(out.skipped, []);
+    let redone = get(&db, x.id).await;
+    assert_eq!(
+        (redone.core.title.as_str(), redone.core.priority),
+        ("c", Priority::High)
+    );
+    assert_eq!(tops(&db).await, (Some(edit.result.op_id), None));
+}
+
+#[tokio::test]
+async fn the_status_triple_is_restored_and_skipped_as_one_unit() {
+    let db = open();
+    // Done with the refinement kept at inbox, then moved to next: undoing by
+    // SetStatus(done) would keep `next`; the recorded triple does not.
+    let x = capture(&db, "x").await;
+    run(
+        &db,
+        Actor::System,
+        500,
+        OpKind::SetStatus,
+        vec![status(x.id, Status::Done)],
+    )
+    .await;
+    run(
+        &db,
+        Actor::User,
+        1_000,
+        OpKind::SetStatus,
+        vec![status(x.id, Status::Next)],
+    )
+    .await;
+    let out = undo(&db).await;
+    assert_eq!(out.skipped, []);
+    let done = StatusFields {
+        status_category: StatusCategory::Done,
+        resolution_kind: Some(ResolutionKind::Done),
+        todo_refinement: TodoRefinement::Inbox,
+    };
+    assert_eq!(get(&db, x.id).await.status_fields(), done);
+    redo(&db).await;
+    assert_eq!(get(&db, x.id).await.status(), Status::Next);
+
+    // The resolution changed since: the whole triple stays, the rest of the
+    // op is undone.
+    let y = capture(&db, "y").await;
+    let entry = run(
+        &db,
+        Actor::User,
+        1_000,
+        OpKind::Batch,
+        vec![
+            status(y.id, Status::Done),
+            set(y.id, ItemField::Priority, high()),
+        ],
+    )
+    .await;
+    run(
+        &db,
+        Actor::System,
+        1_500,
+        OpKind::SetStatus,
+        vec![status(y.id, Status::Cancelled)],
+    )
+    .await;
+    let out = undo(&db).await;
+    assert_eq!(out.entry.unwrap().op_id, entry.result.op_id);
+    assert_eq!(
+        out.skipped,
+        [skip(
+            y.id,
+            &[ItemField::StatusCategory, ItemField::ResolutionKind],
+            SkipReason::ChangedSince
+        )]
+    );
+    let y = get(&db, y.id).await;
+    assert_eq!(y.status(), Status::Cancelled);
+    assert_eq!(y.core.priority, Priority::None);
+}
+
+#[tokio::test]
+async fn matching_is_by_value_exact_for_floats_and_unordered_for_labels() {
+    let db = open();
+    let x = capture(&db, "a").await;
+    let labels = |l: &[&str]| FieldValue::StringSet(l.iter().map(|&s| s.to_owned()).collect());
+    run(
+        &db,
+        Actor::User,
+        1_000,
+        OpKind::Update,
+        vec![update(
+            x.id,
+            &[
+                (ItemField::Title, FieldValue::String("b".into())),
+                (ItemField::StoryPoints, FieldValue::Number(0.1 + 0.2)),
+                (ItemField::Labels, labels(&["x", "y"])),
+            ],
+        )],
+    )
+    .await;
+    // Off the stack: the title changes and changes back (ABA), the labels
+    // are reordered.
+    run(
+        &db,
+        Actor::System,
+        1_100,
+        OpKind::Update,
+        vec![title(x.id, "c")],
+    )
+    .await;
+    run(
+        &db,
+        Actor::System,
+        1_200,
+        OpKind::Update,
+        vec![update(
+            x.id,
+            &[
+                (ItemField::Title, FieldValue::String("b".into())),
+                (ItemField::Labels, labels(&["y", "x"])),
+            ],
+        )],
+    )
+    .await;
+    assert_eq!(get(&db, x.id).await.core.labels, ["y", "x"]);
+    let out = undo(&db).await;
+    assert_eq!(out.skipped, []);
+    let back = get(&db, x.id).await;
+    assert_eq!(back.core.title, "a");
+    assert_eq!(back.core.story_points, None);
+    assert_eq!(back.core.labels, Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn undoing_a_capture_soft_deletes_it_and_replays_do_not_recreate_it() {
+    let db = open();
+    let mut req = input("call dentist", 100);
+    req.spool_id = Some("spool-1".into());
+    let (item, captured) = db.store.capture(req.clone()).await.unwrap();
+    assert_eq!(tops(&db).await, (Some(captured.op_id), None));
+
+    let out = undo(&db).await;
+    let entry = out.entry.unwrap();
+    assert_eq!(
+        (entry.op_id, entry.kind, entry.description.as_str()),
+        (captured.op_id, OpKind::Capture, "capture \"call dentist\"")
+    );
+    assert_eq!(entry.item_ids, [item.id]);
+    let [deleted] = <[Item; 1]>::try_from(out.items).unwrap();
+    assert_eq!(deleted.id, item.id);
+    assert_eq!(deleted.derived.deleted_at, Some(ts(2_000)));
+    assert_eq!(titles(&db, false).await, Vec::<String>::new());
+
+    // A late retry of the capture, by request id or by spool id, answers
+    // with the tombstone instead of capturing again.
+    assert_eq!(
+        db.store.capture(req.clone()).await.unwrap(),
+        (deleted.clone(), captured)
+    );
+    req.request_id = new_ulid().to_string();
+    assert_eq!(
+        db.store.capture(req).await.unwrap(),
+        (deleted.clone(), captured)
+    );
+    assert_eq!(titles(&db, true).await, ["call dentist"]);
+
+    // Redo undeletes the same Item.
+    let out = redo(&db).await;
+    let [back] = <[Item; 1]>::try_from(out.items).unwrap();
+    assert_eq!(content(&back), content(&item));
+    assert_eq!(tops(&db).await, (Some(captured.op_id), None));
+}
+
+#[tokio::test]
+async fn restores_write_the_recorded_archive_and_deletion_times() {
+    let db = open();
+    let x = capture(&db, "x").await;
+    set_columns(
+        &db,
+        &x,
+        "archived_at = 500000000000, archived_reason = 'auto_done'",
+    )
+    .await;
+    run(
+        &db,
+        Actor::User,
+        1_000,
+        OpKind::Unarchive,
+        vec![mutation(x.id, MutationOp::Unarchive)],
+    )
+    .await;
+    undo(&db).await;
+    assert_eq!(
+        get(&db, x.id).await.overlay.archived,
+        Some(Archived {
+            at: ts(500),
+            reason: ArchiveReason::AutoDone
+        })
+    );
+
+    let y = capture(&db, "y").await;
+    run(
+        &db,
+        Actor::User,
+        1_000,
+        OpKind::Delete,
+        vec![mutation(y.id, MutationOp::Delete)],
+    )
+    .await;
+    undo(&db).await;
+    assert!(!get(&db, y.id).await.is_deleted());
+    redo(&db).await;
+    assert_eq!(get(&db, y.id).await.derived.deleted_at, Some(ts(1_000)));
+}
+
+#[tokio::test]
+async fn undo_of_an_edit_then_a_delete_restores_both() {
+    let db = open();
+    let x = capture(&db, "a").await;
+    run(
+        &db,
+        Actor::User,
+        1_000,
+        OpKind::Batch,
+        vec![title(x.id, "b"), mutation(x.id, MutationOp::Delete)],
+    )
+    .await;
+    let out = undo(&db).await;
+    assert_eq!(out.skipped, []);
+    assert_eq!(content(&get(&db, x.id).await), content(&x));
+}
+
+#[tokio::test]
+async fn undo_of_a_reparenting_batch_runs_in_reverse() {
+    let db = open();
+    let p = capture(&db, "p").await;
+    let c = capture(&db, "c").await;
+    run(
+        &db,
+        Actor::User,
+        1_000,
+        OpKind::Update,
+        vec![parent(p.id, c.id)],
+    )
+    .await;
+    // Swap: p leaves c, then c goes under p. Undone in this order, p would
+    // go back under c while c is still under p.
+    run(
+        &db,
+        Actor::User,
+        1_000,
+        OpKind::Batch,
+        vec![
+            set(p.id, ItemField::ParentId, FieldValue::Cleared),
+            parent(c.id, p.id),
+        ],
+    )
+    .await;
+    let out = undo(&db).await;
+    assert_eq!(out.skipped, []);
+    assert_eq!(get(&db, p.id).await.core.parent_id, Some(c.id));
+    assert_eq!(get(&db, c.id).await.core.parent_id, None);
+    let out = redo(&db).await;
+    assert_eq!(out.skipped, []);
+    assert_eq!(get(&db, p.id).await.core.parent_id, None);
+    assert_eq!(get(&db, c.id).await.core.parent_id, Some(p.id));
+    assert_no_live_orphans(&db).await;
+}
+
+#[tokio::test]
+async fn an_op_that_changes_nothing_is_no_entry_and_keeps_redo() {
+    let db = open();
+    let (x, captured) = capture_op(&db, "a").await;
+    let edit = run(
+        &db,
+        Actor::User,
+        1_000,
+        OpKind::Update,
+        vec![title(x.id, "b")],
+    )
+    .await;
+    undo(&db).await;
+    assert_eq!(tops(&db).await, (Some(captured), Some(edit.result.op_id)));
+
+    let noop = run(
+        &db,
+        Actor::User,
+        1_000,
+        OpKind::Unarchive,
+        vec![mutation(x.id, MutationOp::Unarchive)],
+    )
+    .await;
+    assert_eq!(undo_state_of(&db, noop.result.op_id).await, None);
+    assert_eq!(tops(&db).await, (Some(captured), Some(edit.result.op_id)));
+    redo(&db).await;
+    assert_eq!(get(&db, x.id).await.core.title, "b");
+}
+
+#[tokio::test]
+async fn undo_of_an_edit_to_a_since_deleted_item_drops_the_entry() {
+    let db = open();
+    let (x, captured) = capture_op(&db, "a").await;
+    let edit = run(
+        &db,
+        Actor::User,
+        1_000,
+        OpKind::Update,
+        vec![title(x.id, "b")],
+    )
+    .await;
+    run(
+        &db,
+        Actor::System,
+        1_500,
+        OpKind::Delete,
+        vec![mutation(x.id, MutationOp::Delete)],
+    )
+    .await;
+    let (revision, [ops, events_n, changes, requests], items) = snapshot(&db).await;
+
+    let out = undo(&db).await;
+    assert_eq!(out.entry.map(|e| e.op_id), Some(edit.result.op_id));
+    assert_eq!(out.items, []);
+    assert_eq!(
+        out.skipped,
+        [skip(x.id, &[ItemField::Title], SkipReason::ItemDeleted)]
+    );
+    assert_eq!(out.result.revision, revision);
+    // Only the undo op and its request id are recorded; no Item is written.
+    assert_eq!(
+        snapshot(&db).await,
+        (revision, [ops + 1, events_n, changes, requests + 1], items)
+    );
+    assert_eq!(
+        undo_state_of(&db, edit.result.op_id).await.as_deref(),
+        Some("dropped")
+    );
+    // Off both stacks.
+    assert_eq!(tops(&db).await, (Some(captured), None));
+}
+
+#[tokio::test]
+async fn a_new_entry_clears_redo_and_off_stack_ops_do_not() {
+    let db = open();
+    let x = capture(&db, "a").await;
+    let y = capture(&db, "y").await;
+    let edit = run(
+        &db,
+        Actor::User,
+        1_000,
+        OpKind::Update,
+        vec![title(x.id, "b")],
+    )
+    .await;
+    undo(&db).await;
+
+    // A system op on another field, and a system capture, leave redo alone.
+    run(
+        &db,
+        Actor::System,
+        1_500,
+        OpKind::Update,
+        vec![set(x.id, ItemField::Priority, high())],
+    )
+    .await;
+    let mut restored = input("restored", 1);
+    restored.created_via = CreatedVia::Restore;
+    db.store.capture(restored).await.unwrap();
+    assert_eq!(tops(&db).await.1, Some(edit.result.op_id));
+    let out = redo(&db).await;
+    assert_eq!(out.skipped, []);
+    let x2 = get(&db, x.id).await;
+    assert_eq!(
+        (x2.core.title.as_str(), x2.core.priority),
+        ("b", Priority::High)
+    );
+
+    // A new user op clears it.
+    undo(&db).await;
+    let other = run(
+        &db,
+        Actor::User,
+        1_000,
+        OpKind::Update,
+        vec![title(y.id, "y2")],
+    )
+    .await;
+    assert_eq!(tops(&db).await, (Some(other.result.op_id), None));
+    assert_eq!(
+        undo_state_of(&db, edit.result.op_id).await.as_deref(),
+        Some("discarded")
+    );
+    let out = redo(&db).await;
+    assert_eq!(out.entry, None);
+    assert_eq!(get(&db, x.id).await.core.title, "a");
+}
+
+#[tokio::test]
+async fn a_partial_redo_restores_what_still_matches() {
+    let db = open();
+    let x = capture(&db, "a").await;
+    run(
+        &db,
+        Actor::User,
+        1_000,
+        OpKind::Update,
+        vec![update(
+            x.id,
+            &[
+                (ItemField::Title, FieldValue::String("b".into())),
+                (ItemField::Priority, high()),
+            ],
+        )],
+    )
+    .await;
+    undo(&db).await;
+    run(
+        &db,
+        Actor::System,
+        2_500,
+        OpKind::Update,
+        vec![title(x.id, "c")],
+    )
+    .await;
+    let out = redo(&db).await;
+    assert_eq!(
+        out.skipped,
+        [skip(x.id, &[ItemField::Title], SkipReason::ChangedSince)]
+    );
+    let redone = get(&db, x.id).await;
+    assert_eq!(
+        (redone.core.title.as_str(), redone.core.priority),
+        ("c", Priority::High)
+    );
+    assert_eq!(redone.derived.staleness.last_user_touch_at, Some(ts(1_000)));
+    // The next undo reverts what the redo did, and only that.
+    let out = undo(&db).await;
+    assert_eq!(out.skipped, []);
+    let undone = get(&db, x.id).await;
+    assert_eq!(
+        (undone.core.title.as_str(), undone.core.priority),
+        ("c", Priority::None)
+    );
+}
+
+fn reopen(db: Db) -> Db {
+    let Db { _dir, path, store } = db;
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    Db { _dir, path, store }
+}
+
+#[tokio::test]
+async fn the_stacks_survive_reopening_the_store() {
+    let mut db = open();
+    let (x, captured) = capture_op(&db, "a").await;
+    let first = run(
+        &db,
+        Actor::User,
+        1_000,
+        OpKind::Update,
+        vec![title(x.id, "b")],
+    )
+    .await;
+    let second = run(
+        &db,
+        Actor::User,
+        1_000,
+        OpKind::Update,
+        vec![title(x.id, "c")],
+    )
+    .await;
+    db = reopen(db);
+    assert_eq!(undo(&db).await.entry.unwrap().op_id, second.result.op_id);
+    db = reopen(db);
+    assert_eq!(undo(&db).await.entry.unwrap().op_id, first.result.op_id);
+    db = reopen(db);
+    assert_eq!(get(&db, x.id).await.core.title, "a");
+    assert_eq!(tops(&db).await, (Some(captured), Some(first.result.op_id)));
+    redo(&db).await;
+    db = reopen(db);
+    redo(&db).await;
+    assert_eq!(get(&db, x.id).await.core.title, "c");
+    assert_eq!(tops(&db).await, (Some(second.result.op_id), None));
+}
+
+#[tokio::test]
+async fn the_stack_is_lifo_and_undo_and_redo_are_not_entries() {
+    let db = open();
+    let (x, captured) = capture_op(&db, "a").await;
+    let ops = [
+        run(
+            &db,
+            Actor::User,
+            1_000,
+            OpKind::Update,
+            vec![title(x.id, "b")],
+        )
+        .await,
+        run(
+            &db,
+            Actor::Suggestion(new_ulid()),
+            1_000,
+            OpKind::Update,
+            vec![set(x.id, ItemField::Priority, high())],
+        )
+        .await,
+        run(
+            &db,
+            Actor::User,
+            1_000,
+            OpKind::Archive,
+            vec![mutation(x.id, MutationOp::Archive)],
+        )
+        .await,
+    ]
+    .map(|out| out.result.op_id);
+    for &op in ops.iter().rev() {
+        assert_eq!(undo(&db).await.entry.unwrap().op_id, op);
+    }
+    assert_eq!(tops(&db).await, (Some(captured), Some(ops[0])));
+    for &op in &ops[..2] {
+        assert_eq!(redo(&db).await.entry.unwrap().op_id, op);
+    }
+    assert_eq!(tops(&db).await, (Some(ops[1]), Some(ops[2])));
+    let x2 = get(&db, x.id).await;
+    assert_eq!(
+        (x2.core.title.as_str(), x2.core.priority),
+        ("b", Priority::High)
+    );
+    assert_eq!(x2.overlay.archived, None);
+    let entries: i64 = db
+        .store
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM ops WHERE undo_state IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(entries, 4);
+}
+
+#[tokio::test]
+async fn the_expected_entry_guards_undo_and_redo() {
+    let db = open();
+    let guarded = |expected| UndoInput {
+        expected_op_id: Some(expected),
+        ..undo_input(2_000)
+    };
+    let changed = |result: Result<UndoOutput, StoreError>| match result {
+        Err(StoreError::UndoStackChanged { expected, top }) => (expected, top),
+        other => panic!("expected UndoStackChanged, got {other:?}"),
+    };
+    // Empty stacks.
+    let stray = new_ulid();
+    assert_eq!(changed(db.store.undo(guarded(stray)).await), (stray, None));
+    assert_eq!(changed(db.store.redo(guarded(stray)).await), (stray, None));
+
+    let (x, captured) = capture_op(&db, "a").await;
+    let edit = run(
+        &db,
+        Actor::User,
+        1_000,
+        OpKind::Update,
+        vec![title(x.id, "b")],
+    )
+    .await;
+    let edit = edit.result.op_id;
+    let before = snapshot(&db).await;
+    assert_eq!(
+        changed(db.store.undo(guarded(captured)).await),
+        (captured, Some(edit))
+    );
+    assert_eq!(snapshot(&db).await, before);
+    let out = db.store.undo(guarded(edit)).await.unwrap();
+    assert_eq!(out.entry.unwrap().op_id, edit);
+
+    assert_eq!(
+        changed(db.store.redo(guarded(captured)).await),
+        (captured, Some(edit))
+    );
+    db.store.redo(guarded(edit)).await.unwrap();
+    assert_eq!(get(&db, x.id).await.core.title, "b");
+}
+
+#[tokio::test]
+async fn undo_and_redo_round_trip() {
+    let db = open();
+    let x = capture(&db, "a").await;
+    let waiting = Waiting {
+        on: PersonRef::FreeText("the vendor".into()),
+        reason: "quote".into(),
+        since: date(2026, 2, 20),
+        follow_up_on: None,
+    };
+    run(
+        &db,
+        Actor::User,
+        1_000,
+        OpKind::Batch,
+        vec![
+            update(
+                x.id,
+                &[
+                    (ItemField::Title, FieldValue::String("b".into())),
+                    (
+                        ItemField::Labels,
+                        FieldValue::StringSet(vec!["l1".into(), "l2".into()]),
+                    ),
+                    (ItemField::StoryPoints, FieldValue::Number(2.5)),
+                    (ItemField::Waiting, FieldValue::Waiting(waiting)),
+                ],
+            ),
+            status(x.id, Status::Next),
+            status(x.id, Status::Done),
+            set(
+                x.id,
+                ItemField::WaitingReason,
+                FieldValue::String("contract".into()),
+            ),
+            mutation(x.id, MutationOp::Archive),
+        ],
+    )
+    .await;
+    let done = get(&db, x.id).await;
+    assert_eq!(done.status(), Status::Done);
+    for round in 0..2 {
+        let out = db.store.undo(undo_input(2_000 + round)).await.unwrap();
+        assert_eq!(out.skipped, []);
+        assert_eq!(content(&get(&db, x.id).await), content(&x), "round {round}");
+        let out = db.store.redo(undo_input(3_000 + round)).await.unwrap();
+        assert_eq!(out.skipped, []);
+        assert_eq!(
+            content(&get(&db, x.id).await),
+            content(&done),
+            "round {round}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn undo_and_redo_are_idempotent_on_their_request_id() {
+    let db = open();
+    let x = capture(&db, "a").await;
+    run(
+        &db,
+        Actor::User,
+        1_000,
+        OpKind::Update,
+        vec![update(
+            x.id,
+            &[
+                (ItemField::Title, FieldValue::String("b".into())),
+                (ItemField::Priority, high()),
+            ],
+        )],
+    )
+    .await;
+    run(
+        &db,
+        Actor::System,
+        1_500,
+        OpKind::Update,
+        vec![title(x.id, "c")],
+    )
+    .await;
+    let req = undo_input(2_000);
+    let first = db.store.undo(req.clone()).await.unwrap();
+    assert_eq!(first.skipped.len(), 1);
+    let before = snapshot(&db).await;
+    let tops_before = tops(&db).await;
+    // The same response, without undoing the next entry.
+    assert_eq!(db.store.undo(req.clone()).await.unwrap(), first);
+    assert_eq!(snapshot(&db).await, before);
+    assert_eq!(tops(&db).await, tops_before);
+    // Undo and redo share the request id namespace.
+    match db.store.redo(req.clone()).await {
+        Err(StoreError::RequestIdReused) => {}
+        other => panic!("expected RequestIdReused, got {other:?}"),
+    }
+    let reused = MutateInput {
+        request_id: req.request_id.clone(),
+        ..mutate(OpKind::Update, vec![title(x.id, "d")])
+    };
+    match db.store.mutate(reused).await {
+        Err(StoreError::RequestIdReused) => {}
+        other => panic!("expected RequestIdReused, got {other:?}"),
+    }
+    assert_eq!(snapshot(&db).await, before);
+
+    // An undo of an empty stack is recorded too: retried after a new op, it
+    // still undoes nothing.
+    let db = open();
+    let empty = undo_input(2_000);
+    let out = db.store.undo(empty.clone()).await.unwrap();
+    assert_eq!((out.entry.clone(), out.items.len()), (None, 0));
+    assert_eq!(
+        op_stack(&db, out.result.op_id).await.1.as_deref(),
+        Some("nothing to undo")
+    );
+    let (y, captured) = capture_op(&db, "y").await;
+    assert_eq!(db.store.undo(empty).await.unwrap(), out);
+    assert!(!get(&db, y.id).await.is_deleted());
+    assert_eq!(tops(&db).await, (Some(captured), None));
+}
+
+#[tokio::test]
+async fn undo_restores_staleness_only_with_its_content() {
+    let db = open();
+    let x = db.store.capture(input("x", 100)).await.unwrap().0;
+    run(
+        &db,
+        Actor::User,
+        200,
+        OpKind::SetStatus,
+        vec![status(x.id, Status::Next)],
+    )
+    .await;
+    let moved = get(&db, x.id).await;
+    assert_eq!(moved.derived.staleness.status_entered_at, Some(ts(200)));
+    db.store.undo(undo_input(300)).await.unwrap();
+    let back = get(&db, x.id).await;
+    assert_eq!(back.derived.staleness, x.derived.staleness);
+    assert_eq!(back.derived.staleness.status_entered_at, Some(ts(100)));
+    assert_eq!(back.updated_at, ts(300));
+    db.store.redo(undo_input(400)).await.unwrap();
+    assert_eq!(
+        get(&db, x.id).await.derived.staleness,
+        moved.derived.staleness
+    );
+
+    // The status unit is skipped, so status_entered_at stays, even though it
+    // still holds the op's value (the system op ran at the same instant);
+    // the touch follows the restored priority.
+    let y = db.store.capture(input("y", 100)).await.unwrap().0;
+    run(
+        &db,
+        Actor::User,
+        200,
+        OpKind::Batch,
+        vec![
+            status(y.id, Status::Done),
+            set(y.id, ItemField::Priority, high()),
+        ],
+    )
+    .await;
+    run(
+        &db,
+        Actor::System,
+        200,
+        OpKind::SetStatus,
+        vec![status(y.id, Status::Cancelled)],
+    )
+    .await;
+    let out = db.store.undo(undo_input(300)).await.unwrap();
+    assert_eq!(out.skipped.len(), 1);
+    let y2 = get(&db, y.id).await;
+    assert_eq!(y2.core.priority, Priority::None);
+    assert_eq!(y2.derived.staleness.status_entered_at, Some(ts(200)));
+    assert_eq!(y2.derived.staleness.last_user_touch_at, Some(ts(100)));
+}
+
+#[tokio::test]
+async fn undo_restores_the_staleness_of_items_it_deletes() {
+    // Delete, then undelete, with a subtask the delete took along. Undoing
+    // the undelete deletes both again with the touches they had as
+    // tombstones, so undoing the delete then finds its own touches and
+    // restores the ones from before: nothing keeps a touch of an undone op.
+    let db = open();
+    let p = db.store.capture(input("p", 100)).await.unwrap().0;
+    let mut req = input("c", 100);
+    req.parent_id = Some(p.id);
+    let c = db.store.capture(req).await.unwrap().0;
+    let delete = vec![mutation(p.id, MutationOp::Delete)];
+    run(&db, Actor::User, 200, OpKind::Delete, delete).await;
+    let deleted = [get(&db, p.id).await, get(&db, c.id).await];
+    let undelete = vec![mutation(p.id, MutationOp::Undelete)];
+    run(&db, Actor::User, 300, OpKind::Undelete, undelete).await;
+    let undeleted = [get(&db, p.id).await, get(&db, c.id).await];
+    assert_eq!(
+        undeleted[1].derived.staleness.last_user_touch_at,
+        Some(ts(300))
+    );
+    let touches = |items: &[Item]| -> Vec<StalenessSignals> {
+        items.iter().map(|i| i.derived.staleness).collect()
+    };
+
+    db.store.undo(undo_input(400)).await.unwrap();
+    let now = [get(&db, p.id).await, get(&db, c.id).await];
+    assert!(now.iter().all(Item::is_deleted));
+    assert_eq!(touches(&now), touches(&deleted));
+    let out = db.store.undo(undo_input(500)).await.unwrap();
+    assert_eq!(out.skipped, []);
+    let now = [get(&db, p.id).await, get(&db, c.id).await];
+    assert_eq!(touches(&now), touches(&[p.clone(), c.clone()]));
+    assert_no_live_orphans(&db).await;
+
+    db.store.redo(undo_input(600)).await.unwrap();
+    let now = [get(&db, p.id).await, get(&db, c.id).await];
+    assert_eq!(touches(&now), touches(&deleted));
+    let out = db.store.redo(undo_input(700)).await.unwrap();
+    assert_eq!(out.skipped, []);
+    let now = [get(&db, p.id).await, get(&db, c.id).await];
+    assert_eq!(touches(&now), touches(&undeleted));
+    assert_no_live_orphans(&db).await;
+}
+
+#[tokio::test]
+async fn delete_cascades_to_live_descendants_and_undelete_brings_them_back() {
+    let db = open();
+    let a = capture(&db, "a").await;
+    let b = capture_under(&db, "b", a.id).await;
+    let c = capture_under(&db, "c", b.id).await;
+    let e = capture_under(&db, "e", b.id).await;
+    let d = capture(&db, "d").await;
+    run(
+        &db,
+        Actor::User,
+        500,
+        OpKind::Delete,
+        vec![mutation(e.id, MutationOp::Delete)],
+    )
+    .await;
+    let since = db.store.current_revision();
+
+    let delete = run(
+        &db,
+        Actor::User,
+        1_000,
+        OpKind::Delete,
+        vec![mutation(a.id, MutationOp::Delete)],
+    )
+    .await;
+    assert_eq!(delete.items.len(), 1);
+    for id in [a.id, b.id, c.id] {
+        assert_eq!(get(&db, id).await.derived.deleted_at, Some(ts(1_000)));
+    }
+    assert_eq!(get(&db, e.id).await.derived.deleted_at, Some(ts(500)));
+    assert!(!get(&db, d.id).await.is_deleted());
+    // Deepest first, then the Item; a revision and change row each.
+    let ids = |items: &[&Item]| items.iter().map(|i| i.id.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        deleted_at_events(&db, delete.result.op_id).await,
+        ids(&[&c, &b, &a])
+    );
+    let mut changed: Vec<String> = change_rows(&db, since as i64)
+        .await
+        .into_iter()
+        .map(|(_, id, _)| id)
+        .collect();
+    changed.sort();
+    let mut want = ids(&[&a, &b, &c]);
+    want.sort();
+    assert_eq!(changed, want);
+    assert_eq!(
+        op_stack(&db, delete.result.op_id).await,
+        (
+            Some("done".into()),
+            Some("delete \"a\" and 2 subtasks".into())
+        )
+    );
+    assert_no_live_orphans(&db).await;
+
+    // Undo undeletes top-down; e stays deleted.
+    let out = undo(&db).await;
+    assert_eq!(out.skipped, []);
+    assert_eq!(
+        deleted_at_events(&db, out.result.op_id).await,
+        ids(&[&a, &b, &c])
+    );
+    assert_eq!(
+        out.items.iter().map(|i| i.id).collect::<Vec<_>>(),
+        [a.id, b.id, c.id]
+    );
+    for id in [a.id, b.id, c.id] {
+        assert!(!get(&db, id).await.is_deleted());
+    }
+    assert!(get(&db, e.id).await.is_deleted());
+    assert_no_live_orphans(&db).await;
+
+    // Redo deletes bottom-up, with the original deleted_at.
+    let out = redo(&db).await;
+    assert_eq!(out.skipped, []);
+    assert_eq!(
+        deleted_at_events(&db, out.result.op_id).await,
+        ids(&[&c, &b, &a])
+    );
+    for id in [a.id, b.id, c.id] {
+        assert_eq!(get(&db, id).await.derived.deleted_at, Some(ts(1_000)));
+    }
+    assert_no_live_orphans(&db).await;
+
+    // UndeleteItem restores what the Item's delete took, and only that.
+    let undelete = run(
+        &db,
+        Actor::User,
+        4_000,
+        OpKind::Undelete,
+        vec![mutation(a.id, MutationOp::Undelete)],
+    )
+    .await;
+    assert_eq!(
+        deleted_at_events(&db, undelete.result.op_id).await,
+        ids(&[&a, &b, &c])
+    );
+    for id in [a.id, b.id, c.id] {
+        assert!(!get(&db, id).await.is_deleted());
+    }
+    assert!(get(&db, e.id).await.is_deleted());
+    assert_eq!(
+        op_stack(&db, undelete.result.op_id).await.1.as_deref(),
+        Some("undelete \"a\" and 2 subtasks")
+    );
+    assert_no_live_orphans(&db).await;
+
+    // A child cannot come back while its parent is deleted.
+    run(
+        &db,
+        Actor::User,
+        5_000,
+        OpKind::Delete,
+        vec![mutation(a.id, MutationOp::Delete)],
+    )
+    .await;
+    let before = snapshot(&db).await;
+    for (child, parent) in [(c.id, b.id), (e.id, b.id)] {
+        let req = mutate(
+            OpKind::Undelete,
+            vec![mutation(child, MutationOp::Undelete)],
+        );
+        match db.store.mutate(req).await {
+            Err(StoreError::ParentDeleted { item_id, parent_id }) => {
+                assert_eq!((item_id, parent_id), (child, parent));
+            }
+            other => panic!("expected ParentDeleted, got {other:?}"),
+        }
+    }
+    assert_eq!(snapshot(&db).await, before);
+    assert_no_live_orphans(&db).await;
+}
+
+#[tokio::test]
+async fn the_cascade_follows_the_batch_working_copies() {
+    let db = open();
+    let a = capture(&db, "a").await;
+    let b = capture_under(&db, "b", a.id).await;
+    let x = capture(&db, "x").await;
+    // x moves under a and goes with it; b moves out and stays.
+    run(
+        &db,
+        Actor::User,
+        1_000,
+        OpKind::Batch,
+        vec![
+            parent(x.id, a.id),
+            set(b.id, ItemField::ParentId, FieldValue::Cleared),
+            mutation(a.id, MutationOp::Delete),
+        ],
+    )
+    .await;
+    assert!(get(&db, x.id).await.is_deleted());
+    assert!(!get(&db, b.id).await.is_deleted());
+    assert_no_live_orphans(&db).await;
+
+    // Deleted and undeleted in one batch: the cascade comes back with it.
+    run(
+        &db,
+        Actor::User,
+        2_000,
+        OpKind::Undelete,
+        vec![mutation(a.id, MutationOp::Undelete)],
+    )
+    .await;
+    assert!(!get(&db, x.id).await.is_deleted());
+    run(
+        &db,
+        Actor::User,
+        3_000,
+        OpKind::Batch,
+        vec![
+            mutation(a.id, MutationOp::Delete),
+            mutation(a.id, MutationOp::Undelete),
+        ],
+    )
+    .await;
+    assert!(!get(&db, x.id).await.is_deleted());
+    // A child undeleted after its parent was deleted in the same batch.
+    let before = snapshot(&db).await;
+    let req = mutate(
+        OpKind::Batch,
+        vec![
+            mutation(a.id, MutationOp::Delete),
+            mutation(x.id, MutationOp::Undelete),
+        ],
+    );
+    match db.store.mutate(req).await {
+        Err(StoreError::ParentDeleted { item_id, parent_id }) => {
+            assert_eq!((item_id, parent_id), (x.id, a.id));
+        }
+        other => panic!("expected ParentDeleted, got {other:?}"),
+    }
+    assert_eq!(snapshot(&db).await, before);
+    assert_no_live_orphans(&db).await;
+}
+
+#[tokio::test]
+async fn undo_never_leaves_a_live_item_under_a_deleted_parent() {
+    let db = open();
+    // Undoing the capture would delete p, whose child arrived off the stack.
+    let (p, captured) = capture_op(&db, "p").await;
+    let mut child = input("c", 2);
+    child.parent_id = Some(p.id);
+    child.created_via = CreatedVia::Restore;
+    db.store.capture(child).await.unwrap();
+    assert_eq!(tops(&db).await, (Some(captured), None));
+    let out = undo(&db).await;
+    let invalid = |reason: &str| SkipReason::Invalid(reason.into());
+    assert_eq!(
+        out.skipped,
+        [skip(
+            p.id,
+            &[ItemField::DeletedAt],
+            invalid("the Item has live subtasks")
+        )]
+    );
+    assert_eq!(
+        undo_state_of(&db, captured).await.as_deref(),
+        Some("dropped")
+    );
+    assert!(!get(&db, p.id).await.is_deleted());
+    assert_no_live_orphans(&db).await;
+
+    // Undoing a delete under a parent deleted since.
+    let q = capture(&db, "q").await;
+    let r = capture_under(&db, "r", q.id).await;
+    run(
+        &db,
+        Actor::User,
+        1_000,
+        OpKind::Delete,
+        vec![mutation(r.id, MutationOp::Delete)],
+    )
+    .await;
+    run(
+        &db,
+        Actor::System,
+        1_500,
+        OpKind::Delete,
+        vec![mutation(q.id, MutationOp::Delete)],
+    )
+    .await;
+    let out = undo(&db).await;
+    assert_eq!(
+        out.skipped,
+        [skip(
+            r.id,
+            &[ItemField::DeletedAt],
+            invalid("the parent is deleted")
+        )]
+    );
+    assert!(get(&db, r.id).await.is_deleted());
+
+    // Undoing a move away from a parent deleted since.
+    let s = capture(&db, "s").await;
+    let t = capture_under(&db, "t", s.id).await;
+    run(
+        &db,
+        Actor::User,
+        1_000,
+        OpKind::Update,
+        vec![set(t.id, ItemField::ParentId, FieldValue::Cleared)],
+    )
+    .await;
+    run(
+        &db,
+        Actor::System,
+        1_500,
+        OpKind::Delete,
+        vec![mutation(s.id, MutationOp::Delete)],
+    )
+    .await;
+    let out = undo(&db).await;
+    assert_eq!(
+        out.skipped,
+        [skip(
+            t.id,
+            &[ItemField::ParentId],
+            invalid("the parent is deleted")
+        )]
+    );
+    assert_eq!(get(&db, t.id).await.core.parent_id, None);
+    assert_no_live_orphans(&db).await;
+}
+
+fn relation(from: &Item, to: &Item, kind: RelationKind) -> Relation {
+    Relation::new(from.id, to.id, kind).unwrap()
+}
+
+fn relation_input(relation: Relation) -> RelationInput {
+    RelationInput {
+        request_id: new_ulid().to_string(),
+        relation,
+        now: ts(1_000),
+        today: today(),
+    }
+}
+
+async fn add(db: &Db, relation: Relation) -> RelationOutput {
+    db.store
+        .add_relation(relation_input(relation))
+        .await
+        .unwrap()
+}
+
+async fn remove(db: &Db, relation: Relation) -> RelationOutput {
+    db.store
+        .remove_relation(relation_input(relation))
+        .await
+        .unwrap()
+}
+
+/// `(item_id, kind, old, new)` of an op's relation events.
+async fn relation_events(
+    db: &Db,
+    op_id: Ulid,
+) -> Vec<(String, String, Option<String>, Option<String>)> {
+    db.store
+        .read(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT item_id, kind, old, new FROM events
+                 WHERE op_id = ?1 AND kind LIKE 'relation_%' ORDER BY ord",
+            )?;
+            let rows = stmt.query_map([op_id.to_string()], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn relations_change_as_ops_on_both_ends() {
+    let db = open();
+    let a = capture(&db, "a").await;
+    let b = capture(&db, "b").await;
+    let c = capture(&db, "c").await;
+    let blocks = relation(&a, &b, RelationKind::Blocks);
+    let mut rx = db.store.subscribe();
+    let req = relation_input(blocks);
+    let out = db.store.add_relation(req.clone()).await.unwrap();
+    assert_eq!(out.result.revision, 5);
+    assert_eq!((out.from_item.id, out.to_item.id), (a.id, b.id));
+    assert_eq!((out.from_item.revision, out.to_item.revision), (4, 5));
+    assert_eq!(out.from_item.updated_at, ts(1_000));
+    assert_eq!(
+        (
+            out.from_item.relations.as_slice(),
+            out.to_item.relations.as_slice()
+        ),
+        ([blocks].as_slice(), [blocks].as_slice())
+    );
+    assert_eq!(
+        change_rows(&db, 3).await,
+        [(4, a.id.to_string(), false), (5, b.id.to_string(), false)]
+    );
+    let change = rx.try_recv().unwrap();
+    assert_eq!(
+        change.resource,
+        Some(Resource::Item(out.from_item.clone().into()))
+    );
+    let json = serde_json::to_string(&blocks).unwrap();
+    assert_eq!(
+        relation_events(&db, out.result.op_id).await,
+        [(
+            a.id.to_string(),
+            "relation_add".into(),
+            None,
+            Some(json.clone())
+        )]
+    );
+    assert_eq!(op_row(&db, out.result.op_id).await.0, "add_relation");
+    assert_eq!(
+        op_stack(&db, out.result.op_id).await,
+        (
+            Some("done".into()),
+            Some("relate \"a\" blocks \"b\"".into())
+        )
+    );
+    // A replay, and a request id reused for another relation.
+    assert_eq!(
+        db.store.add_relation(req.clone()).await.unwrap(),
+        RelationOutput { ..out.clone() }
+    );
+    let other = RelationInput {
+        relation: relation(&c, &b, RelationKind::Blocks),
+        ..req.clone()
+    };
+    match db.store.add_relation(other).await {
+        Err(StoreError::RequestIdReused) => {}
+        other => panic!("expected RequestIdReused, got {other:?}"),
+    }
+
+    // Adding it again changes nothing and is no entry.
+    let (revision, [ops, events_n, changes, requests], items) = snapshot(&db).await;
+    let again = add(&db, blocks).await;
+    assert_eq!(again.result.revision, revision);
+    assert_eq!(undo_state_of(&db, again.result.op_id).await, None);
+    assert_eq!(
+        snapshot(&db).await,
+        (revision, [ops + 1, events_n, changes, requests + 1], items)
+    );
+    assert_eq!(tops(&db).await.0, Some(out.result.op_id));
+
+    // relates_to is symmetric: stored once, from the lower id.
+    let relates = Relation::new(c.id, a.id, RelationKind::RelatesTo).unwrap();
+    assert_eq!(
+        relates,
+        Relation::new(a.id, c.id, RelationKind::RelatesTo).unwrap()
+    );
+    let out = add(&db, relates).await;
+    assert_eq!(out.from_item.id, a.id.min(c.id));
+    assert_eq!(out.to_item.id, a.id.max(c.id));
+    let stored: (String, String) = db
+        .store
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT from_id, to_id FROM relations WHERE kind = 'relates_to'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        stored,
+        (a.id.min(c.id).to_string(), a.id.max(c.id).to_string())
+    );
+
+    // Every read attaches both ends' relations, sorted.
+    let mut on_a = vec![blocks, relates];
+    on_a.sort();
+    assert_eq!(get(&db, a.id).await.relations, on_a);
+    assert_eq!(get(&db, b.id).await.relations, [blocks]);
+    assert_eq!(get(&db, c.id).await.relations, [relates]);
+    let page = db.store.list_items(ListQuery::default()).await.unwrap();
+    let mut listed: Vec<(ItemId, Vec<Relation>)> = page
+        .items
+        .into_iter()
+        .map(|i| (i.id, i.relations))
+        .collect();
+    listed.sort();
+    let mut want = vec![
+        (a.id, on_a.clone()),
+        (b.id, vec![blocks]),
+        (c.id, vec![relates]),
+    ];
+    want.sort();
+    assert_eq!(listed, want);
+    let replayed = db.store.changes_since(3).await.unwrap();
+    let last = replayed
+        .iter()
+        .rev()
+        .find(|ch| ch.id == a.id.to_string())
+        .unwrap();
+    match &last.resource {
+        Some(Resource::Item(item)) => assert_eq!(item.relations, on_a),
+        other => panic!("expected an Item, got {other:?}"),
+    }
+
+    // Both ends must exist and, to add, be live.
+    let missing = new_ulid();
+    let end = |result: Result<RelationOutput, StoreError>| match result {
+        Err(StoreError::RelationEnd { item_id, problem }) => (item_id, problem),
+        other => panic!("expected RelationEnd, got {other:?}"),
+    };
+    let before = snapshot(&db).await;
+    let to_missing = Relation::new(a.id, missing, RelationKind::Blocks).unwrap();
+    assert_eq!(
+        end(db.store.add_relation(relation_input(to_missing)).await),
+        (missing, EndProblem::Missing)
+    );
+    assert_eq!(
+        end(db.store.remove_relation(relation_input(to_missing)).await),
+        (missing, EndProblem::Missing)
+    );
+    assert_eq!(snapshot(&db).await, before);
+    run(
+        &db,
+        Actor::User,
+        1_500,
+        OpKind::Delete,
+        vec![mutation(b.id, MutationOp::Delete)],
+    )
+    .await;
+    for deleted_end in [
+        relation(&b, &c, RelationKind::Duplicates),
+        relation(&c, &b, RelationKind::Blocks),
+    ] {
+        assert_eq!(
+            end(db.store.add_relation(relation_input(deleted_end)).await),
+            (b.id, EndProblem::Deleted)
+        );
+    }
+
+    // Kept when an end is deleted, and removable then.
+    assert_eq!(get(&db, a.id).await.relations, on_a);
+    assert_eq!(get(&db, b.id).await.relations, [blocks]);
+    let revision = db.store.current_revision();
+    let out = remove(&db, blocks).await;
+    assert_eq!(out.result.revision, revision + 2);
+    assert!(out.to_item.is_deleted());
+    assert_eq!(out.to_item.relations, []);
+    assert_eq!(out.from_item.relations, [relates]);
+    assert_eq!(
+        relation_events(&db, out.result.op_id).await,
+        [(a.id.to_string(), "relation_remove".into(), Some(json), None)]
+    );
+    assert_eq!(
+        op_stack(&db, out.result.op_id).await.1.as_deref(),
+        Some("unrelate \"a\" blocks \"b\"")
+    );
+    // Removing a relation that does not exist changes nothing.
+    let again = remove(&db, blocks).await;
+    assert_eq!(again.result.revision, revision + 2);
+    assert_eq!(undo_state_of(&db, again.result.op_id).await, None);
+}
+
+#[tokio::test]
+async fn relation_changes_undo_and_redo() {
+    let db = open();
+    let a = capture(&db, "a").await;
+    let b = capture(&db, "b").await;
+    let blocks = relation(&a, &b, RelationKind::Blocks);
+    let added = add(&db, blocks).await;
+    let out = undo(&db).await;
+    assert_eq!(out.entry.unwrap().op_id, added.result.op_id);
+    assert_eq!(out.skipped, []);
+    assert_eq!(
+        out.items.iter().map(|i| i.id).collect::<Vec<_>>(),
+        [a.id, b.id]
+    );
+    assert!(out.items.iter().all(|i| i.relations.is_empty()));
+    assert_eq!(get(&db, a.id).await.relations, []);
+    redo(&db).await;
+    assert_eq!(get(&db, b.id).await.relations, [blocks]);
+
+    let removed = remove(&db, blocks).await;
+    assert_eq!(undo(&db).await.entry.unwrap().op_id, removed.result.op_id);
+    assert_eq!(get(&db, a.id).await.relations, [blocks]);
+    redo(&db).await;
+    assert_eq!(get(&db, a.id).await.relations, []);
+
+    // A relation changed since (here behind the store's back) is skipped.
+    let added = add(&db, blocks).await;
+    db.store
+        .write(|tx| {
+            tx.conn().execute("DELETE FROM relations", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let out = undo(&db).await;
+    assert_eq!(
+        out.skipped,
+        [UndoSkipRow {
+            item_id: a.id,
+            fields: vec![],
+            reason: SkipReason::ChangedSince,
+            relation: Some(blocks),
+        }]
+    );
+    assert_eq!(
+        undo_state_of(&db, added.result.op_id).await.as_deref(),
+        Some("dropped")
+    );
+
+    // Undo and redo may change relations of deleted Items.
+    add(&db, blocks).await;
+    run(
+        &db,
+        Actor::System,
+        1_500,
+        OpKind::Delete,
+        vec![mutation(b.id, MutationOp::Delete)],
+    )
+    .await;
+    let out = undo(&db).await;
+    assert_eq!(out.skipped, []);
+    assert_eq!(get(&db, b.id).await.relations, []);
+    redo(&db).await;
+    assert_eq!(get(&db, b.id).await.relations, [blocks]);
+}
+
+#[tokio::test]
+async fn ops_record_their_summary() {
+    let db = open();
+    let summary_of = |op| op_stack(&db, op);
+    let long = "x".repeat(50);
+    let (a, captured) = capture_op(&db, &long).await;
+    assert_eq!(
+        summary_of(captured).await.1,
+        Some(format!("capture \"{}…\"", "x".repeat(39)))
+    );
+    let b = capture(&db, "b").await;
+    let c = capture(&db, "c").await;
+    let rows = [
+        (
+            OpKind::Batch,
+            vec![
+                status(a.id, Status::Done),
+                status(b.id, Status::Done),
+                status(c.id, Status::Done),
+            ],
+            "mark done (3 items)",
+        ),
+        (
+            OpKind::SetStatus,
+            vec![status(b.id, Status::InProgress)],
+            "start \"b\"",
+        ),
+        (
+            OpKind::Batch,
+            vec![title(b.id, "b2"), mutation(c.id, MutationOp::Archive)],
+            "change 2 items",
+        ),
+        (OpKind::Update, vec![title(c.id, "c2")], "edit \"c2\""),
+        (
+            OpKind::Batch,
+            vec![
+                mutation(b.id, MutationOp::Archive),
+                mutation(c.id, MutationOp::Unarchive),
+            ],
+            "change 2 items",
+        ),
+    ];
+    for (kind, mutations, want) in rows {
+        let out = run(&db, Actor::User, 1_000, kind, mutations).await;
+        assert_eq!(summary_of(out.result.op_id).await.1.as_deref(), Some(want));
+    }
+    let related = add(&db, relation(&b, &c, RelationKind::Duplicates)).await;
+    assert_eq!(
+        summary_of(related.result.op_id).await.1.as_deref(),
+        Some("relate \"b2\" duplicates \"c2\"")
+    );
+    let out = undo(&db).await;
+    assert_eq!(
+        out.entry.unwrap().description,
+        "relate \"b2\" duplicates \"c2\""
+    );
+    assert_eq!(
+        summary_of(out.result.op_id).await.1.as_deref(),
+        Some("undo: relate \"b2\" duplicates \"c2\"")
+    );
+    let out = redo(&db).await;
+    assert_eq!(
+        summary_of(out.result.op_id).await.1.as_deref(),
+        Some("redo: relate \"b2\" duplicates \"c2\"")
+    );
+    let state = db.store.undo_state().await.unwrap();
+    let entry = state.undo.unwrap();
+    assert_eq!(
+        (entry.kind, entry.item_ids.as_slice()),
+        (OpKind::AddRelation, [b.id, c.id].as_slice())
+    );
+    assert_eq!(state.redo, None);
+}
+
+#[tokio::test]
+async fn a_summary_counts_only_the_subtasks_the_op_does_not_name() {
+    // Deleting a parent together with its own subtasks (a multi-select) reads
+    // the same in either order; only the subtask nobody named is counted.
+    let db = open();
+    for parent_first in [true, false] {
+        let p = capture(&db, "p").await;
+        let c = capture_under(&db, "c", p.id).await;
+        let d = capture_under(&db, "d", p.id).await;
+        let mut mutations = vec![
+            mutation(p.id, MutationOp::Delete),
+            mutation(c.id, MutationOp::Delete),
+        ];
+        if !parent_first {
+            mutations.reverse();
+        }
+        let out = run(&db, Actor::User, 1_000, OpKind::Batch, mutations).await;
+        assert!(get(&db, d.id).await.is_deleted());
+        assert_eq!(
+            op_stack(&db, out.result.op_id).await.1.as_deref(),
+            Some("delete 2 items and 1 subtask"),
+            "parent first: {parent_first}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn migrates_an_m1_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("todo.db");
+    let item = "01JB8X4Z5Q6R7S8T9V0W1X2Y3Z";
+    let (capture_op, update_op) = ("01JB8X4Z5Q6R7S8T9V0W1X2Y40", "01JB8X4Z5Q6R7S8T9V0W1X2Y41");
+    {
+        // The M1 schema with M1 rows: a capture and an update of two fields,
+        // whose event ids sort against their insertion order.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(include_str!("../migrations/0001_init.sql"))
+            .unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute_batch(&format!(
+            r#"
+            INSERT INTO items (id, created_via, created_at, updated_at, revision, title,
+                               status_category, priority, last_user_touch_at, status_entered_at)
+            VALUES ('{item}', 'cli', 1000, 2000, 2, 'renamed', 'todo', 'high', 2000, 1000);
+            INSERT INTO ops (id, kind, actor, at, request_id, revision) VALUES
+                ('{capture_op}', 'capture', 'user', 1000, 'r1', 1),
+                ('{update_op}', 'update', 'user', 2000, 'r2', 2);
+            INSERT INTO events (id, op_id, item_id, at, actor, kind, field, old, new) VALUES
+                ('E9', '{capture_op}', '{item}', 1000, 'user', 'create', NULL, NULL, '"call"'),
+                ('E8', '{update_op}', '{item}', 2000, 'user', 'set', 10,
+                 '{{"string":"call"}}', '{{"string":"renamed"}}'),
+                ('E7', '{update_op}', '{item}', 2000, 'user', 'set', 16,
+                 '{{"priority":"none"}}', '{{"priority":"high"}}');
+            UPDATE meta SET revision = 2;
+            "#
+        ))
+        .unwrap();
+    }
+    let db = Db {
+        store: Store::open(&path).unwrap(),
+        path,
+        _dir: dir,
+    };
+    let rows = |sql: &'static str| {
+        let store = db.store.clone();
+        async move {
+            store
+                .read(move |c| {
+                    let mut stmt = c.prepare(sql)?;
+                    let rows = stmt.query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, Option<i64>>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                        ))
+                    })?;
+                    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+                })
+                .await
+                .unwrap()
+        }
+    };
+    let version: u32 = Connection::open(&db.path)
+        .unwrap()
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+    // seq follows insertion; no old op is on the stack.
+    assert_eq!(
+        rows("SELECT id, seq, undo_state FROM ops ORDER BY seq").await,
+        [
+            (capture_op.to_owned(), Some(1), None),
+            (update_op.to_owned(), Some(2), None)
+        ]
+    );
+    // ord numbers each op's events in insertion order.
+    assert_eq!(
+        rows("SELECT id, ord, op_id FROM events ORDER BY op_id, ord").await,
+        [
+            ("E9".to_owned(), Some(0), Some(capture_op.to_owned())),
+            ("E8".to_owned(), Some(0), Some(update_op.to_owned())),
+            ("E7".to_owned(), Some(1), Some(update_op.to_owned())),
+        ]
+    );
+    assert_eq!(db.store.undo_state().await.unwrap(), UndoState::default());
+    assert_eq!(undo(&db).await.entry, None);
+
+    // New ops work on the old data and are undoable.
+    let id: ItemId = item.parse().unwrap();
+    let out = run(
+        &db,
+        Actor::User,
+        3_000,
+        OpKind::Update,
+        vec![title(id, "again")],
+    )
+    .await;
+    assert_eq!(tops(&db).await, (Some(out.result.op_id), None));
+    assert_eq!(undo(&db).await.entry.unwrap().op_id, out.result.op_id);
+    let back = get(&db, id).await;
+    assert_eq!(
+        (back.core.title.as_str(), back.core.priority),
+        ("renamed", Priority::High)
+    );
+    assert_eq!(back.relations, []);
+    assert_eq!(
+        rows("SELECT id, seq, undo_state FROM ops ORDER BY seq")
+            .await
+            .into_iter()
+            .map(|(_, seq, state)| (seq, state))
+            .collect::<Vec<_>>(),
+        [
+            (Some(1), None),
+            (Some(2), None),
+            (Some(3), None),
+            (Some(4), Some("undone".to_owned())),
+            (Some(5), None)
+        ]
+    );
+    // Relations work too.
+    let other = capture(&db, "other").await;
+    add(
+        &db,
+        Relation::new(id, other.id, RelationKind::RelatesTo).unwrap(),
+    )
+    .await;
+    assert_eq!(get(&db, id).await.relations.len(), 1);
 }

@@ -661,7 +661,8 @@ async fn capture_under_a_missing_or_deleted_parent_names_parent_id() {
             ("item.parent_id".to_owned(), reason.to_owned())
         );
     }
-    assert_eq!(titles(&mut items).await, ["child", "other"]);
+    // Deleting the parent took its child with it (design 3.7).
+    assert_eq!(titles(&mut items).await, ["other"]);
     d.stop().await;
 }
 

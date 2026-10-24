@@ -5,9 +5,12 @@
 //! call; reads run on a small pool of read-only connections (WAL mode).
 
 mod codec;
+mod relation;
 mod schema;
+mod summary;
+mod undo;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,9 +21,9 @@ use jiff::Timestamp;
 use jiff::civil::Date;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use todo_core::{
-    Actor, ApplyCtx, CaptureDraft, CreatedVia, FieldChange, FieldValue, Item, ItemField, ItemId,
-    Mutation, MutationError, MutationResult, PersonRef, Revision, Status, StatusFields, Topic,
-    apply, new_ulid,
+    Actor, Applied, ApplyCtx, CaptureDraft, CreatedVia, FieldChange, FieldValue, Item, ItemField,
+    ItemId, Mutation, MutationError, MutationOp, MutationResult, PersonRef, Relation, Revision,
+    SkipReason, Status, StatusFields, Topic, apply, new_ulid,
 };
 use tokio::sync::{Semaphore, broadcast, oneshot};
 use ulid::Ulid;
@@ -30,6 +33,7 @@ use codec::{
     rev_to_sql, ts_to_sql,
 };
 pub use schema::SCHEMA_VERSION;
+use summary::Action;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -60,10 +64,48 @@ pub enum StoreError {
     RequestIdReused,
     #[error("invalid page token")]
     InvalidPageToken,
+    /// [`Store::undo`] or [`Store::redo`] was guarded by `expected`, but the
+    /// entry it would act on is `top` (`None`: that stack is empty). Nothing
+    /// is written. The daemon maps it to ABORTED with ErrorInfo
+    /// `UNDO_STACK_CHANGED` (`expected_op_id`, and `top_op_id`, empty for
+    /// `None`).
+    #[error("the undo stack changed: expected entry {expected}, found {top:?}")]
+    UndoStackChanged { expected: Ulid, top: Option<Ulid> },
+    /// Undeleting `item_id` while its parent `parent_id` is deleted (design
+    /// 3.7): the parent must be undeleted first. The daemon maps it to
+    /// FAILED_PRECONDITION with ErrorInfo `PARENT_DELETED` (`item_id`,
+    /// `parent_id`).
+    #[error("item {item_id}: its parent {parent_id} is deleted")]
+    ParentDeleted { item_id: ItemId, parent_id: ItemId },
+    /// A relation end names no Item, or (for an add) a deleted one. The store
+    /// sees the canonical [`Relation`], whose ends a `relates_to` may have
+    /// swapped, so the daemon maps by the end of the *request* that `item_id`
+    /// is: the request's `from_id` gives NOT_FOUND (ErrorInfo
+    /// `ITEM_NOT_FOUND`) or FAILED_PRECONDITION (ErrorInfo `ITEM_DELETED`),
+    /// its `to_id` INVALID_ARGUMENT on `relation.to_id`.
+    #[error("relation end {item_id} {problem}")]
+    RelationEnd {
+        item_id: ItemId,
+        problem: EndProblem,
+    },
+    /// [`Store::mutate`] was handed something that is not a mutation: a
+    /// [`MutationOp::Restore`] (internal to undo and redo) or an [`OpKind`]
+    /// of another call. A bug in the caller; the daemon maps it to INTERNAL.
+    #[error("not a mutation: {0}")]
+    NotAMutation(&'static str),
     #[error("corrupt row: {0}")]
     Corrupt(String),
     #[error("store is closed")]
     Closed,
+}
+
+/// What is wrong with a relation end ([`StoreError::RelationEnd`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum EndProblem {
+    #[error("names no item")]
+    Missing,
+    #[error("is deleted")]
+    Deleted,
 }
 
 pub type Result<T, E = StoreError> = std::result::Result<T, E>;
@@ -127,9 +169,11 @@ pub struct CaptureInput {
     pub today: Date,
 }
 
-/// What an op does, recorded as `ops.kind`.
+/// What an op does, recorded as `ops.kind` (proto `OpKind`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpKind {
+    /// [`Store::capture`], including spool imports.
+    Capture,
     Update,
     SetStatus,
     Archive,
@@ -138,6 +182,26 @@ pub enum OpKind {
     Undelete,
     /// `BatchMutate`.
     Batch,
+    Undo,
+    Redo,
+    AddRelation,
+    RemoveRelation,
+}
+
+impl OpKind {
+    /// The kinds [`Store::mutate`] records.
+    fn is_mutation(self) -> bool {
+        matches!(
+            self,
+            OpKind::Update
+                | OpKind::SetStatus
+                | OpKind::Archive
+                | OpKind::Unarchive
+                | OpKind::Delete
+                | OpKind::Undelete
+                | OpKind::Batch
+        )
+    }
 }
 
 /// Input for [`Store::mutate`].
@@ -158,8 +222,90 @@ pub struct MutateInput {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MutateOutput {
     /// One per mutation, in request order, each in its state after the
-    /// whole batch.
+    /// whole batch. Descendants a delete or undelete cascaded to are not
+    /// listed; their changes arrive on the change stream.
     pub items: Vec<Item>,
+    pub result: MutationResult,
+}
+
+/// Input for [`Store::undo`] and [`Store::redo`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndoInput {
+    /// Client ULID for idempotency (24h window); empty for none. Undo and
+    /// redo share the namespace of every other call.
+    pub request_id: String,
+    /// The entry the caller means to act on ([`UndoState`]); another one, or
+    /// an empty stack, fails with [`StoreError::UndoStackChanged`].
+    pub expected_op_id: Option<Ulid>,
+    /// `updated_at` of the Items it changes, and the soft delete that undoes
+    /// a capture. Recorded values are restored exactly, never this.
+    pub now: Timestamp,
+    /// "Today" in the user's zone, for `is_overdue` on the returned Items.
+    pub today: Date,
+}
+
+/// An undo stack entry (proto `OpSummary`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpSummaryRow {
+    pub op_id: Ulid,
+    pub kind: OpKind,
+    /// The Items the op changed, in the order of its events (both ends of a
+    /// relation).
+    pub item_ids: Vec<ItemId>,
+    /// When the op was recorded (wall clock).
+    pub at: Timestamp,
+    /// Toast text, e.g. `mark done (3 items)`.
+    pub description: String,
+}
+
+/// A change [`Store::undo`] or [`Store::redo`] left as it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndoSkipRow {
+    /// The Item; for a relation step, the relation's `from` end.
+    pub item_id: ItemId,
+    /// The fields restored together, in order (the status triple is one
+    /// unit); empty for a relation step.
+    pub fields: Vec<ItemField>,
+    pub reason: SkipReason,
+    /// The relation a relation step did not add or remove.
+    pub relation: Option<Relation>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UndoOutput {
+    /// The undo or redo op; at the current revision when it changed nothing.
+    pub result: MutationResult,
+    /// The entry undone, redone or dropped; `None` when the stack was empty.
+    pub entry: Option<OpSummaryRow>,
+    /// The Items it changed, in their state after it, in event order.
+    pub items: Vec<Item>,
+    pub skipped: Vec<UndoSkipRow>,
+}
+
+/// The entries [`Store::undo`] and [`Store::redo`] would act on next.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UndoState {
+    pub undo: Option<OpSummaryRow>,
+    pub redo: Option<OpSummaryRow>,
+}
+
+/// Input for [`Store::add_relation`] and [`Store::remove_relation`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationInput {
+    /// Client ULID for idempotency (24h window); empty for none.
+    pub request_id: String,
+    pub relation: Relation,
+    /// `updated_at` of both ends when the relation changes.
+    pub now: Timestamp,
+    /// "Today" in the user's zone, for `is_overdue` on the returned Items.
+    pub today: Date,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelationOutput {
+    /// The relation's ends as stored, in their state after the op.
+    pub from_item: Item,
+    pub to_item: Item,
     pub result: MutationResult,
 }
 
@@ -274,8 +420,6 @@ const REQUEST_SQL: &str = "SELECT r.op_id, r.revision, r.item_id, ops.kind
      FROM request_ids r JOIN ops ON ops.id = r.op_id WHERE r.request_id = ?1";
 const SPOOL_SQL: &str = "SELECT s.op_id, s.revision, s.item_id, ops.kind
      FROM spool_imports s JOIN ops ON ops.id = s.op_id WHERE s.spool_id = ?1";
-/// `ops.kind` of a capture.
-const CAPTURE_KIND: &str = "capture";
 
 /// State the writer thread shares with handles.
 struct Shared {
@@ -420,11 +564,12 @@ impl Store {
         }
     }
 
-    /// Creates an Item from a parsed draft (one op, one revision).
+    /// Creates an Item from a parsed draft (one op, one revision). A capture
+    /// by the user is an undo stack entry; undoing it soft-deletes the Item.
     /// Idempotent on `request_id` and on `spool_id`: a replay returns the
-    /// original result with the Item's current state, without writing. A
-    /// `request_id` recorded by [`Store::mutate`] fails with
-    /// [`StoreError::RequestIdReused`].
+    /// original result with the Item's current state, without writing (an
+    /// undone capture stays deleted). A `request_id` recorded by another
+    /// kind of op fails with [`StoreError::RequestIdReused`].
     pub async fn capture(&self, input: CaptureInput) -> Result<(Item, MutationResult)> {
         self.write(move |tx| capture_tx(tx, input)).await
     }
@@ -439,8 +584,61 @@ impl Store {
     /// [`OpKind`] or, for a single-item kind, by a mutation of another Item
     /// fails with [`StoreError::RequestIdReused`]. A [`OpKind::Batch`]
     /// replay is matched by kind only, not by the Items it names.
+    ///
+    /// Parent rules (design 3.7): a delete also soft-deletes every live
+    /// descendant, with the same `deleted_at`; an undelete also restores the
+    /// descendants the Item's delete took with it, and fails with
+    /// [`StoreError::ParentDeleted`] while the Item's parent is deleted. No
+    /// live Item ever has a deleted parent.
+    ///
+    /// An op by the user or a suggestion that writes an event becomes the
+    /// top undo stack entry and discards the redo stack (design 3.10).
+    /// [`MutationOp::Restore`] and the kinds of other calls fail with
+    /// [`StoreError::NotAMutation`].
     pub async fn mutate(&self, input: MutateInput) -> Result<MutateOutput> {
         self.write(move |tx| mutate_tx(tx, input)).await
+    }
+
+    /// Reverts the top undo stack entry as a new op (kind `undo`, actor
+    /// user) and moves it to the redo stack (design 3.10). Each recorded
+    /// change is restored only where the field still holds the value the
+    /// entry wrote; the rest is reported in [`UndoOutput::skipped`]. When
+    /// nothing is restored the entry is dropped from both stacks and no Item
+    /// is written. With an empty stack it succeeds with no entry. Idempotent
+    /// on `request_id` (a replay returns the original entry and skips, with
+    /// the Items' current state); see [`UndoInput::expected_op_id`].
+    pub async fn undo(&self, input: UndoInput) -> Result<UndoOutput> {
+        self.write(move |tx| undo::undo_tx(tx, input, false)).await
+    }
+
+    /// Re-applies the most recently undone entry, by reverting what its last
+    /// undo restored under the same guard, and moves it back to the undo
+    /// stack. Otherwise as [`Store::undo`].
+    pub async fn redo(&self, input: UndoInput) -> Result<UndoOutput> {
+        self.write(move |tx| undo::undo_tx(tx, input, true)).await
+    }
+
+    /// The entries [`Store::undo`] and [`Store::redo`] would act on next.
+    pub async fn undo_state(&self) -> Result<UndoState> {
+        self.read(undo::undo_state_tx).await
+    }
+
+    /// Adds a relation (design 3.6) as one op that gives both ends a new
+    /// revision. Both ends must exist and be live
+    /// ([`StoreError::RelationEnd`]). Adding a relation that exists changes
+    /// nothing. Idempotent on `request_id` like a single-item mutation of the
+    /// relation's `from` end.
+    pub async fn add_relation(&self, input: RelationInput) -> Result<RelationOutput> {
+        self.write(move |tx| relation::relation_tx(tx, input, true))
+            .await
+    }
+
+    /// Removes a relation, as [`Store::add_relation`] adds one. Either end
+    /// may be deleted; removing a relation that does not exist changes
+    /// nothing.
+    pub async fn remove_relation(&self, input: RelationInput) -> Result<RelationOutput> {
+        self.write(move |tx| relation::relation_tx(tx, input, false))
+            .await
     }
 
     /// The Item `id`, read with its revision. A soft-deleted Item is returned
@@ -526,47 +724,79 @@ fn actor_for(via: CreatedVia) -> Actor {
 /// share.
 struct OpRow<'a> {
     id: Ulid,
-    kind: &'static str,
+    kind: OpKind,
     actor: String,
+    /// Whether the op becomes an undo stack entry once it writes an event:
+    /// its actor is the user or a suggestion, and it is not an undo or redo.
+    stackable: bool,
     /// When the write happened (wall clock), for `ops`, `events` and
     /// `request_ids`.
     at: i64,
     request_id: Option<&'a str>,
+    /// `ops.summary`, the toast text.
+    summary: String,
+    /// `ops.entry_op`: the entry an undo or redo acted on.
+    entry_op: Option<Ulid>,
+    /// `ops.report`: the JSON of the changes an undo or redo skipped.
+    report: Option<String>,
 }
 
 impl<'a> OpRow<'a> {
     /// A new op; an empty `request_id` means none.
-    fn new(kind: &'static str, actor: Actor, request_id: &'a str) -> Result<Self> {
+    fn new(kind: OpKind, actor: Actor, request_id: &'a str) -> Result<Self> {
         Ok(OpRow {
             id: new_ulid(),
             kind,
             actor: codec::actor_to_sql(actor),
+            stackable: matches!(actor, Actor::User | Actor::Suggestion(_))
+                && !matches!(kind, OpKind::Undo | OpKind::Redo),
             at: ts_to_sql(Timestamp::now())?,
             request_id: (!request_id.is_empty()).then_some(request_id),
+            summary: String::new(),
+            entry_op: None,
+            report: None,
         })
     }
 
-    /// `revision` is the last revision the op allocates (the current one if
-    /// it allocates none).
-    fn insert(&self, conn: &Connection, revision: Revision) -> Result<()> {
+    /// Inserts the op with the next `seq`. `revision` is the last revision
+    /// the op allocates (the current one if it allocates none), and `events`
+    /// how many events it writes: a stackable op with events is pushed onto
+    /// the undo stack, which discards the redo stack (design 3.10).
+    fn insert(&self, conn: &Connection, revision: Revision, events: usize) -> Result<()> {
+        let entry = self.stackable && events > 0;
+        if entry {
+            conn.prepare_cached(
+                "UPDATE ops SET undo_state = 'discarded' WHERE undo_state = 'undone'",
+            )?
+            .execute([])?;
+        }
         conn.prepare_cached(
-            "INSERT INTO ops (id, kind, actor, at, request_id, revision)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO ops (id, kind, actor, at, request_id, revision, seq, undo_state,
+                              entry_op, summary, report)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, (SELECT COALESCE(MAX(seq), 0) + 1 FROM ops),
+                     ?7, ?8, ?9, ?10)",
         )?
         .execute(params![
             self.id.to_string(),
-            self.kind,
+            self.kind.as_sql(),
             self.actor,
             self.at,
             self.request_id,
-            rev_to_sql(revision)?
+            rev_to_sql(revision)?,
+            entry.then_some("done"),
+            self.entry_op.map(|id| id.to_string()),
+            self.summary,
+            self.report
         ])?;
         Ok(())
     }
 
+    /// Inserts the op's event number `ord` (0, 1, ... across its Items).
+    #[allow(clippy::too_many_arguments)]
     fn insert_event(
         &self,
         conn: &Connection,
+        ord: usize,
         item_id: &str,
         kind: &str,
         field: Option<ItemField>,
@@ -574,8 +804,8 @@ impl<'a> OpRow<'a> {
         new: Option<String>,
     ) -> Result<()> {
         conn.prepare_cached(
-            "INSERT INTO events (id, op_id, item_id, at, actor, kind, field, old, new)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO events (id, op_id, item_id, at, actor, kind, field, old, new, ord)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )?
         .execute(params![
             new_ulid().to_string(),
@@ -586,7 +816,8 @@ impl<'a> OpRow<'a> {
             kind,
             field.map(ItemField::number),
             old,
-            new
+            new,
+            ord as i64
         ])?;
         Ok(())
     }
@@ -625,12 +856,12 @@ fn prune_request_ids(conn: &Connection, now: i64) -> Result<()> {
 
 /// The op recorded under an idempotency key by `sql` ([`REQUEST_SQL`] or
 /// [`SPOOL_SQL`]): its id, revision and Item id. Fails with
-/// [`StoreError::RequestIdReused`] when that op's `ops.kind` is not `kind`.
+/// [`StoreError::RequestIdReused`] when that op is not of `kind`.
 fn recorded_op(
     conn: &Connection,
     sql: &str,
     key: &str,
-    kind: &str,
+    kind: OpKind,
 ) -> Result<Option<(Ulid, Revision, Option<String>)>> {
     let Some((op_id, revision, item_id, recorded_kind)) = conn
         .prepare_cached(sql)?
@@ -646,13 +877,23 @@ fn recorded_op(
     else {
         return Ok(None);
     };
-    if recorded_kind != kind {
+    if recorded_kind != kind.as_sql() {
         return Err(StoreError::RequestIdReused);
     }
     let op_id = op_id
         .parse()
         .map_err(|_| StoreError::Corrupt(format!("bad op id {op_id:?}")))?;
     Ok(Some((op_id, rev_from_sql(revision)?, item_id)))
+}
+
+/// The Items `ids`, in their current state with their relations.
+fn load_items(conn: &Connection, ids: &[ItemId], today: Date) -> Result<Vec<Item>> {
+    let mut items = ids
+        .iter()
+        .map(|&id| load_item(conn, &id.to_string(), Some(today))?.ok_or(StoreError::NotFound(id)))
+        .collect::<Result<Vec<_>>>()?;
+    relation::attach(conn, &mut items)?;
+    Ok(items)
 }
 
 /// The original result of an idempotent capture, if any.
@@ -662,14 +903,21 @@ fn capture_replay(
     key: &str,
     today: Date,
 ) -> Result<Option<(Item, MutationResult)>> {
-    let Some((op_id, revision, item_id)) = recorded_op(conn, sql, key, CAPTURE_KIND)? else {
+    let Some((op_id, revision, item_id)) = recorded_op(conn, sql, key, OpKind::Capture)? else {
         return Ok(None);
     };
     let item_id = item_id
         .ok_or_else(|| StoreError::Corrupt(format!("request {key} did not create an item")))?;
-    let item = load_item(conn, &item_id, Some(today))?.ok_or_else(|| {
-        StoreError::Corrupt(format!("item {item_id} for request {key} is missing"))
-    })?;
+    let item_id = codec::item_id_from_str(&item_id)?;
+    let [item] = load_items(conn, &[item_id], today)
+        .map_err(|e| match e {
+            StoreError::NotFound(_) => {
+                StoreError::Corrupt(format!("item {item_id} for request {key} is missing"))
+            }
+            e => e,
+        })?
+        .try_into()
+        .expect("one id, one item");
     Ok(Some((item, MutationResult { op_id, revision })))
 }
 
@@ -683,7 +931,7 @@ fn people_unsupported(field: ItemField) -> MutationError {
 
 fn capture_tx(tx: &mut WriteTx<'_>, input: CaptureInput) -> Result<(Item, MutationResult)> {
     let actor = actor_for(input.created_via);
-    let op = OpRow::new(CAPTURE_KIND, actor, &input.request_id)?;
+    let mut op = OpRow::new(OpKind::Capture, actor, &input.request_id)?;
     let conn = tx.conn();
     prune_request_ids(conn, op.at)?;
     if let Some(request_id) = op.request_id
@@ -738,11 +986,13 @@ fn capture_tx(tx: &mut WriteTx<'_>, input: CaptureInput) -> Result<(Item, Mutati
     item.overlay.waiting = draft.waiting;
     item.derived.is_overdue = is_overdue(&item, Some(input.today));
     let item_id = item.id.to_string();
+    op.summary = summary::capture(&item.core.title);
 
     codec::insert_item(conn, &item)?;
-    op.insert(conn, revision)?;
+    op.insert(conn, revision, 1)?;
     op.insert_event(
         conn,
+        0,
         &item_id,
         "create",
         None,
@@ -779,13 +1029,40 @@ fn capture_tx(tx: &mut WriteTx<'_>, input: CaptureInput) -> Result<(Item, Mutati
     ))
 }
 
-/// The working copies of the Items a batch has loaded, in first-touch order,
-/// with the changes applied to each so far.
+/// An event of the op being built, in op order. The `derived` events are
+/// added when the op is written.
+// Nearly every event is a `Set`; boxing it would only add allocations.
+#[allow(clippy::large_enum_variant)]
+enum NewEvent {
+    Set {
+        item_id: ItemId,
+        change: FieldChange,
+    },
+    RelationAdd(Relation),
+    RelationRemove(Relation),
+}
+
+/// Which op last soft-deleted an Item: the one being built, or a stored one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeletedBy {
+    ThisOp,
+    Op(String),
+}
+
+/// The working copies of the Items an op has loaded, in first-touch order,
+/// with the events it has made so far.
 #[derive(Default)]
 struct Batch {
     items: Vec<Item>,
-    changes: Vec<Vec<FieldChange>>,
+    /// Each Item as loaded, to tell which ones the op changed.
+    loaded: Vec<Item>,
     slots: HashMap<ItemId, usize>,
+    /// Slots that get a revision even if their Item compares equal: the
+    /// ones with events, and relation ends.
+    dirty: HashSet<usize>,
+    events: Vec<NewEvent>,
+    /// Items this op soft-deleted and has not undeleted since.
+    deleted_here: HashSet<ItemId>,
 }
 
 impl Batch {
@@ -796,10 +1073,40 @@ impl Batch {
         }
         let item =
             load_item(conn, &id.to_string(), Some(today))?.ok_or(StoreError::NotFound(id))?;
+        self.loaded.push(item.clone());
         self.items.push(item);
-        self.changes.push(Vec::new());
         self.slots.insert(id, self.items.len() - 1);
         Ok(self.items.len() - 1)
+    }
+
+    /// Takes `applied` as the slot's Item, with an event per change.
+    fn record(&mut self, slot: usize, applied: Applied) {
+        let item_id = applied.item.id;
+        for change in &applied.changes {
+            if change.field == ItemField::DeletedAt {
+                match change.new {
+                    FieldValue::Cleared => self.deleted_here.remove(&item_id),
+                    _ => self.deleted_here.insert(item_id),
+                };
+            }
+        }
+        if !applied.changes.is_empty() {
+            self.dirty.insert(slot);
+        }
+        self.events.extend(
+            applied
+                .changes
+                .into_iter()
+                .map(|change| NewEvent::Set { item_id, change }),
+        );
+        self.items[slot] = applied.item;
+    }
+
+    /// The touched slots, in first-touch order: changed, or with events.
+    fn touched(&self) -> Vec<usize> {
+        (0..self.items.len())
+            .filter(|&slot| self.dirty.contains(&slot) || self.items[slot] != self.loaded[slot])
+            .collect()
     }
 
     /// `id`'s parent and whether it is deleted, as of this point in the
@@ -820,6 +1127,119 @@ impl Batch {
             Ok((parent, deleted))
         })
         .transpose()
+    }
+
+    /// Whether `id` is a deleted Item, as of this point in the batch.
+    fn is_deleted(&self, conn: &Connection, id: ItemId) -> Result<bool> {
+        Ok(self
+            .parent_of(conn, id)?
+            .is_some_and(|(_, deleted)| deleted))
+    }
+
+    /// `id`'s children and whether each is deleted, as of this point in the
+    /// batch: stored children the batch has not moved away, then working
+    /// copies the batch moved under `id`.
+    fn children(&self, conn: &Connection, id: ItemId) -> Result<Vec<(ItemId, bool)>> {
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, deleted_at IS NOT NULL FROM items WHERE parent_id = ?1
+             ORDER BY created_at, id",
+        )?;
+        let mut rows = stmt.query([id.to_string()])?;
+        let mut children = Vec::new();
+        while let Some(row) = rows.next()? {
+            let child = codec::item_id_from_str(&row.get::<_, String>(0)?)?;
+            match self.slots.get(&child) {
+                Some(&slot) => {
+                    let item = &self.items[slot];
+                    if item.core.parent_id == Some(id) {
+                        children.push((child, item.is_deleted()));
+                    }
+                }
+                None => children.push((child, row.get(1)?)),
+            }
+        }
+        for item in &self.items {
+            if item.core.parent_id == Some(id) && !children.iter().any(|(c, _)| *c == item.id) {
+                children.push((item.id, item.is_deleted()));
+            }
+        }
+        Ok(children)
+    }
+
+    /// `id`'s live descendants, top-down (breadth first).
+    fn live_descendants(&self, conn: &Connection, id: ItemId) -> Result<Vec<ItemId>> {
+        let mut seen = HashSet::from([id]);
+        let mut queue = VecDeque::from([id]);
+        let mut out = Vec::new();
+        while let Some(parent) = queue.pop_front() {
+            for (child, deleted) in self.children(conn, parent)? {
+                if deleted {
+                    continue;
+                }
+                if !seen.insert(child) {
+                    return Err(StoreError::Corrupt(format!(
+                        "the descendants of {id} loop at {child}"
+                    )));
+                }
+                out.push(child);
+                queue.push_back(child);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The op of `id`'s latest `deleted_at` event, as of this point in the
+    /// batch; `None` for an Item never deleted through an op.
+    fn deleted_by(&self, conn: &Connection, id: ItemId) -> Result<Option<DeletedBy>> {
+        if self.deleted_here.contains(&id) {
+            return Ok(Some(DeletedBy::ThisOp));
+        }
+        let op = conn
+            .prepare_cached(
+                "SELECT e.op_id FROM events e JOIN ops ON ops.id = e.op_id
+                 WHERE e.item_id = ?1 AND e.kind = 'set' AND e.field = ?2
+                 ORDER BY ops.seq DESC, e.ord DESC LIMIT 1",
+            )?
+            .query_row(
+                params![id.to_string(), ItemField::DeletedAt.number()],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(op.map(DeletedBy::Op))
+    }
+
+    /// Undeletes, top-down, the descendants of the just undeleted `id` that
+    /// `by` deleted, stopping at the ones it did not. Returns them.
+    fn undelete_descendants(
+        &mut self,
+        conn: &Connection,
+        id: ItemId,
+        by: &DeletedBy,
+        ctx: &ApplyCtx,
+        today: Date,
+    ) -> Result<Vec<ItemId>> {
+        let mut seen = HashSet::from([id]);
+        let mut queue = VecDeque::from([id]);
+        let mut restored = Vec::new();
+        while let Some(parent) = queue.pop_front() {
+            for (child, deleted) in self.children(conn, parent)? {
+                if !deleted || self.deleted_by(conn, child)?.as_ref() != Some(by) {
+                    continue;
+                }
+                if !seen.insert(child) {
+                    return Err(StoreError::Corrupt(format!(
+                        "the descendants of {id} loop at {child}"
+                    )));
+                }
+                let slot = self.load(conn, child, today)?;
+                let applied = apply(&self.items[slot], &MutationOp::Undelete, ctx)
+                    .map_err(|e| StoreError::Corrupt(format!("undeleting {child}: {e}")))?;
+                self.record(slot, applied);
+                restored.push(child);
+                queue.push_back(child);
+            }
+        }
+        Ok(restored)
     }
 
     /// Why `parent` cannot be any Item's parent (it is missing or deleted),
@@ -895,8 +1315,125 @@ impl Batch {
     }
 }
 
+/// Writes the op a [`Batch`] built: the `ops` row (onto the undo stack if it
+/// is an entry, see [`OpRow::insert`]); one revision, `items` row and
+/// `changes` row per touched Item, in first-touch order; the events in op
+/// order; and one `derived` event per touched Item whose staleness signals
+/// changed. Attaches every working copy's relations. Returns the op's last
+/// revision (the current one if it allocates none) and the touched slots in
+/// the order their events first name them.
+fn write_op(
+    tx: &mut WriteTx<'_>,
+    op: &OpRow<'_>,
+    batch: &mut Batch,
+    today: Date,
+) -> Result<(Revision, Vec<usize>)> {
+    let touched = batch.touched();
+    let derived: Vec<usize> = touched
+        .iter()
+        .copied()
+        .filter(|&slot| batch.items[slot].derived.staleness != batch.loaded[slot].derived.staleness)
+        .collect();
+    let revision = tx.next_revision() + touched.len() as Revision - 1;
+    op.insert(tx.conn(), revision, batch.events.len() + derived.len())?;
+    for item in &mut batch.items {
+        item.derived.is_overdue = is_overdue(item, Some(today));
+    }
+    relation::attach(tx.conn(), &mut batch.items)?;
+    for &slot in &touched {
+        let item = &mut batch.items[slot];
+        item.revision = tx.next_revision();
+        codec::update_item(tx.conn(), item)?;
+        let resource = Resource::Item(Arc::new(item.clone()));
+        tx.record_change(Topic::Item, &item.id.to_string(), false, Some(resource))?;
+    }
+    debug_assert_eq!(tx.next_revision() - 1, revision);
+
+    let conn = tx.conn();
+    let mut order: Vec<ItemId> = Vec::new();
+    let mut named = |id: ItemId| {
+        if !order.contains(&id) {
+            order.push(id);
+        }
+    };
+    let mut ord = 0;
+    for event in &batch.events {
+        match event {
+            NewEvent::Set { item_id, change } => {
+                named(*item_id);
+                op.insert_event(
+                    conn,
+                    ord,
+                    &item_id.to_string(),
+                    "set",
+                    Some(change.field),
+                    Some(codec::value_to_sql(&change.old)?),
+                    Some(codec::value_to_sql(&change.new)?),
+                )?;
+            }
+            NewEvent::RelationAdd(relation) | NewEvent::RelationRemove(relation) => {
+                named(relation.from());
+                named(relation.to());
+                let json = Some(codec::relation_to_sql(relation)?);
+                let (kind, old, new) = match event {
+                    NewEvent::RelationAdd(_) => ("relation_add", None, json),
+                    _ => ("relation_remove", json, None),
+                };
+                op.insert_event(
+                    conn,
+                    ord,
+                    &relation.from().to_string(),
+                    kind,
+                    None,
+                    old,
+                    new,
+                )?;
+            }
+        }
+        ord += 1;
+    }
+    for &slot in &derived {
+        let item_id = batch.items[slot].id;
+        named(item_id);
+        op.insert_event(
+            conn,
+            ord,
+            &item_id.to_string(),
+            "derived",
+            Some(ItemField::Staleness),
+            Some(codec::staleness_to_sql(
+                batch.loaded[slot].derived.staleness,
+            )?),
+            Some(codec::staleness_to_sql(
+                batch.items[slot].derived.staleness,
+            )?),
+        )?;
+        ord += 1;
+    }
+    let mut slots: Vec<usize> = order.iter().map(|id| batch.slots[id]).collect();
+    // Every touched Item has an event; this only keeps the list complete.
+    for slot in touched {
+        if !slots.contains(&slot) {
+            slots.push(slot);
+        }
+    }
+    Ok((revision, slots))
+}
+
 fn mutate_tx(tx: &mut WriteTx<'_>, input: MutateInput) -> Result<MutateOutput> {
-    let op = OpRow::new(input.kind.as_sql(), input.actor, &input.request_id)?;
+    if !input.kind.is_mutation() {
+        return Err(StoreError::NotAMutation("the op kind of another call"));
+    }
+    if input
+        .mutations
+        .iter()
+        .any(|m| matches!(m.op, MutationOp::Restore(_)))
+    {
+        return Err(StoreError::NotAMutation(
+            "Restore is internal to undo and redo",
+        ));
+    }
+    let mut op = OpRow::new(input.kind, input.actor, &input.request_id)?;
     let today = input.today;
     let conn = tx.conn();
     prune_request_ids(conn, op.at)?;
@@ -912,15 +1449,9 @@ fn mutate_tx(tx: &mut WriteTx<'_>, input: MutateInput) -> Result<MutateOutput> {
         {
             return Err(StoreError::RequestIdReused);
         }
-        let items = input
-            .mutations
-            .iter()
-            .map(|m| {
-                load_item(conn, &m.id.to_string(), Some(today))?.ok_or(StoreError::NotFound(m.id))
-            })
-            .collect::<Result<_>>()?;
+        let ids: Vec<ItemId> = input.mutations.iter().map(|m| m.id).collect();
         return Ok(MutateOutput {
-            items,
+            items: load_items(conn, &ids, today)?,
             result: MutationResult { op_id, revision },
         });
     }
@@ -931,6 +1462,11 @@ fn mutate_tx(tx: &mut WriteTx<'_>, input: MutateInput) -> Result<MutateOutput> {
     };
     let mut batch = Batch::default();
     let mut slots = Vec::with_capacity(input.mutations.len());
+    // For the summary: the Items a cascade took along that no mutation
+    // names, so deleting a parent with its own subtasks reads the same in
+    // either order.
+    let named: HashSet<ItemId> = input.mutations.iter().map(|m| m.id).collect();
+    let mut subtasks = HashSet::new();
     for (index, m) in input.mutations.iter().enumerate() {
         let slot = batch.load(conn, m.id, today)?;
         // `apply` never changes `revision`, so this is the stored one.
@@ -945,43 +1481,68 @@ fn mutate_tx(tx: &mut WriteTx<'_>, input: MutateInput) -> Result<MutateOutput> {
             });
         }
         let invalid = |error| StoreError::Mutation { index, error };
+        // Read before an undelete replaces it.
+        let deleted_by = match m.op {
+            MutationOp::Undelete => batch.deleted_by(conn, m.id)?,
+            _ => None,
+        };
         let applied = apply(&batch.items[slot], &m.op, &ctx).map_err(invalid)?;
         if let Some(error) = batch.change_error(conn, m.id, &applied.changes)? {
             return Err(invalid(error));
         }
-        batch.items[slot] = applied.item;
-        batch.changes[slot].extend(applied.changes);
+        let changed = !applied.changes.is_empty();
+        match m.op {
+            MutationOp::Delete if changed => {
+                // The live descendants go too, deepest first, then the Item:
+                // undo works in reverse, so it undeletes top-down.
+                let descendants = batch.live_descendants(conn, m.id)?;
+                for &id in descendants.iter().rev() {
+                    let slot = batch.load(conn, id, today)?;
+                    let applied =
+                        apply(&batch.items[slot], &MutationOp::Delete, &ctx).map_err(invalid)?;
+                    batch.record(slot, applied);
+                }
+                subtasks.extend(descendants.into_iter().filter(|id| !named.contains(id)));
+                batch.record(slot, applied);
+            }
+            MutationOp::Undelete if changed => {
+                if let Some(parent_id) = applied.item.core.parent_id
+                    && batch.is_deleted(conn, parent_id)?
+                {
+                    return Err(StoreError::ParentDeleted {
+                        item_id: m.id,
+                        parent_id,
+                    });
+                }
+                batch.record(slot, applied);
+                if let Some(by) = deleted_by {
+                    let restored = batch.undelete_descendants(conn, m.id, &by, &ctx, today)?;
+                    subtasks.extend(restored.into_iter().filter(|id| !named.contains(id)));
+                }
+            }
+            _ => batch.record(slot, applied),
+        }
         slots.push(slot);
     }
 
-    let touched: Vec<usize> = (0..batch.items.len())
-        .filter(|&slot| !batch.changes[slot].is_empty())
+    let actions: Vec<(Action, ItemId, &str)> = input
+        .mutations
+        .iter()
+        .zip(&slots)
+        .map(|(m, &slot)| {
+            let action = match m.op {
+                MutationOp::SetStatus(status) => Action::SetStatus(status),
+                MutationOp::Archive => Action::Archive,
+                MutationOp::Unarchive => Action::Unarchive,
+                MutationOp::Delete => Action::Delete,
+                MutationOp::Undelete => Action::Undelete,
+                MutationOp::Update(_) | MutationOp::Restore(_) => Action::Edit,
+            };
+            (action, m.id, batch.items[slot].core.title.as_str())
+        })
         .collect();
-    // The last revision this op allocates; the current one when it allocates none.
-    let revision = tx.next_revision() + touched.len() as Revision - 1;
-    op.insert(tx.conn(), revision)?;
-    for item in &mut batch.items {
-        item.derived.is_overdue = is_overdue(item, Some(today));
-    }
-    for slot in touched {
-        let item = &mut batch.items[slot];
-        item.revision = tx.next_revision();
-        let item_id = item.id.to_string();
-        codec::update_item(tx.conn(), item)?;
-        for change in &batch.changes[slot] {
-            op.insert_event(
-                tx.conn(),
-                &item_id,
-                "set",
-                Some(change.field),
-                Some(codec::value_to_sql(&change.old)?),
-                Some(codec::value_to_sql(&change.new)?),
-            )?;
-        }
-        let resource = Resource::Item(Arc::new(item.clone()));
-        tx.record_change(Topic::Item, &item_id, false, Some(resource))?;
-    }
-    debug_assert_eq!(tx.next_revision() - 1, revision);
+    op.summary = summary::mutation(&actions, subtasks.len());
+    let (revision, _) = write_op(tx, &op, &mut batch, today)?;
     let first = input.mutations.first().map(|m| m.id.to_string());
     op.insert_request_id(tx.conn(), revision, first.as_deref())?;
     Ok(MutateOutput {
@@ -1011,6 +1572,7 @@ fn get_item_tx(conn: &Connection, id: ItemId, today: Date) -> Result<GetItemOutp
             StoreError::Corrupt(format!("{} is merged into missing item {target}", item.id))
         })?;
     }
+    relation::attach(&tx, std::slice::from_mut(&mut item))?;
     Ok(GetItemOutput {
         resolved_from: (item.id != id).then_some(id),
         item,
@@ -1156,6 +1718,7 @@ fn list_items_tx(conn: &Connection, query: ListQuery) -> Result<ItemPage> {
         items.push(item_from_row(row, Some(today))?);
         last_created_at = row.get(created_at_col)?;
     }
+    relation::attach(&tx, &mut items)?;
     let next_page_token = match items.last() {
         Some(last) if has_more => Some(
             PageToken {
@@ -1192,7 +1755,6 @@ fn changes_since_tx(
     }
 
     let today = today_local();
-    let mut items: HashMap<String, Option<Arc<Item>>> = HashMap::new();
     let mut stmt = tx
         .prepare_cached(
             "SELECT revision, topic, resource_id, deleted FROM changes
@@ -1200,36 +1762,41 @@ fn changes_since_tx(
         )
         .map_err(StoreError::from)?;
     let mut rows = stmt.query([rev_to_sql(since)?]).map_err(StoreError::from)?;
-    let mut out = Vec::new();
+    let mut changes = Vec::new();
+    // Each Item is loaded once, and their relations in one query.
+    let mut slots: HashMap<String, usize> = HashMap::new();
+    let mut items: Vec<Item> = Vec::new();
     while let Some(row) = rows.next().map_err(StoreError::from)? {
         let revision = rev_from_sql(row.get(0).map_err(StoreError::from)?)?;
         let topic = Topic::from_sql(&row.get::<_, String>(1).map_err(StoreError::from)?)?;
         let id: String = row.get(2).map_err(StoreError::from)?;
         let deleted: bool = row.get(3).map_err(StoreError::from)?;
-        let resource = match topic {
-            Topic::Item if !deleted => {
-                let item = match items.get(&id) {
-                    Some(item) => item.clone(),
-                    None => {
-                        let item = load_item(&tx, &id, Some(today))?.map(Arc::new);
-                        items.insert(id.clone(), item.clone());
-                        item
-                    }
-                };
-                let item = item.ok_or_else(|| {
-                    StoreError::Corrupt(format!("change {revision} names missing item {id}"))
-                })?;
-                Some(Resource::Item(item))
-            }
+        let slot = match topic {
+            Topic::Item if !deleted => Some(match slots.get(&id) {
+                Some(&slot) => slot,
+                None => {
+                    let item = load_item(&tx, &id, Some(today))?.ok_or_else(|| {
+                        StoreError::Corrupt(format!("change {revision} names missing item {id}"))
+                    })?;
+                    items.push(item);
+                    slots.insert(id.clone(), items.len() - 1);
+                    items.len() - 1
+                }
+            }),
             _ => None,
         };
-        out.push(ChangeRow {
+        changes.push((revision, topic, id, deleted, slot));
+    }
+    relation::attach(&tx, &mut items)?;
+    let items: Vec<Arc<Item>> = items.into_iter().map(Arc::new).collect();
+    Ok(changes
+        .into_iter()
+        .map(|(revision, topic, id, deleted, slot)| ChangeRow {
             revision,
             topic,
             id,
             deleted,
-            resource,
-        });
-    }
-    Ok(out)
+            resource: slot.map(|slot| Resource::Item(Arc::clone(&items[slot]))),
+        })
+        .collect())
 }

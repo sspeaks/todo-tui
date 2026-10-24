@@ -8,7 +8,10 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use crate::{Result, StoreError};
 
 /// Migration `i` takes the schema from version `i` to `i + 1`.
-const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_init.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/0001_init.sql"),
+    include_str!("../migrations/0002_undo_relations.sql"),
+];
 
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
 

@@ -7,8 +7,9 @@ use jiff::{SignedDuration, Timestamp};
 use rusqlite::{Connection, OptionalExtension, Row, ToSql, named_params};
 use todo_core::{
     Actor, ArchiveReason, Archived, CoreFields, CreatedVia, DerivedFields, FieldValue, Item,
-    ItemField, ItemId, ItemRecurrence, LinkState, OverlayFields, PersonRef, Priority, RemoteLink,
-    ResolutionKind, StalenessSignals, Status, StatusCategory, TodoRefinement, Topic, Waiting,
+    ItemField, ItemId, ItemRecurrence, LinkState, OverlayFields, PersonRef, Priority, Relation,
+    RelationKind, RemoteLink, ResolutionKind, StalenessSignals, Status, StatusCategory,
+    TodoRefinement, Topic, Waiting,
 };
 
 use crate::{OpKind, Result, StoreError};
@@ -111,6 +112,7 @@ sql_enum!(Topic, "topic", {
     Topic::Config => "config",
 });
 sql_enum!(OpKind, "op_kind", {
+    OpKind::Capture => "capture",
     OpKind::Update => "update",
     OpKind::SetStatus => "set_status",
     OpKind::Archive => "archive",
@@ -118,6 +120,15 @@ sql_enum!(OpKind, "op_kind", {
     OpKind::Delete => "delete",
     OpKind::Undelete => "undelete",
     OpKind::Batch => "batch",
+    OpKind::Undo => "undo",
+    OpKind::Redo => "redo",
+    OpKind::AddRelation => "add_relation",
+    OpKind::RemoveRelation => "remove_relation",
+});
+sql_enum!(RelationKind, "relation_kind", {
+    RelationKind::Blocks => "blocks",
+    RelationKind::Duplicates => "duplicates",
+    RelationKind::RelatesTo => "relates_to",
 });
 
 pub(crate) fn rev_to_sql(r: u64) -> Result<i64> {
@@ -541,6 +552,45 @@ pub(crate) fn update_item(conn: &Connection, item: &Item) -> Result<()> {
 /// A [`FieldValue`] as stored in `events.old` and `events.new`.
 pub(crate) fn value_to_sql(value: &FieldValue) -> Result<String> {
     serde_json::to_string(value).map_err(corrupt)
+}
+
+pub(crate) fn value_from_sql(json: &str) -> Result<FieldValue> {
+    serde_json::from_str(json).map_err(corrupt)
+}
+
+/// A `derived` event's `old` or `new`: the signals as a
+/// [`FieldValue::Staleness`], even when empty.
+pub(crate) fn staleness_to_sql(signals: StalenessSignals) -> Result<String> {
+    value_to_sql(&FieldValue::Staleness(signals))
+}
+
+pub(crate) fn staleness_from_sql(json: &str) -> Result<StalenessSignals> {
+    match value_from_sql(json)? {
+        FieldValue::Staleness(signals) => Ok(signals),
+        FieldValue::Cleared => Ok(StalenessSignals::default()),
+        other => Err(corrupt(format_args!("staleness event holds {other:?}"))),
+    }
+}
+
+/// The payload of a `relation_add` or `relation_remove` event.
+pub(crate) fn relation_to_sql(relation: &Relation) -> Result<String> {
+    serde_json::to_string(relation).map_err(corrupt)
+}
+
+pub(crate) fn relation_from_sql(json: &str) -> Result<Relation> {
+    serde_json::from_str(json).map_err(corrupt)
+}
+
+/// A `relations` row; the table keeps relations canonical.
+pub(crate) fn relation_from_row(from: &str, to: &str, kind: &str) -> Result<Relation> {
+    let (from, to) = (ulid_from_sql(from)?, ulid_from_sql(to)?);
+    let relation = Relation::new(from, to, RelationKind::from_sql(kind)?).map_err(corrupt)?;
+    if (relation.from(), relation.to()) != (from, to) {
+        return Err(corrupt(format_args!(
+            "relation {from} {to} is not canonical"
+        )));
+    }
+    Ok(relation)
 }
 
 /// `ops.actor` and `events.actor`: `user`, `sync`, `system` or
