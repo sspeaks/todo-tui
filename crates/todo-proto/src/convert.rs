@@ -6,7 +6,9 @@
 //! `effective_priority`) are emitted on the way out and ignored on the way in;
 //! unknown values in the derived `pending_fields` are dropped.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::fmt;
 
 use jiff::civil::{Date, ISOWeekDate, Weekday};
 use jiff::{SignedDuration, Timestamp};
@@ -16,29 +18,60 @@ use ulid::Ulid;
 use crate::google::r#type as gtype;
 use crate::v1;
 
+/// Each variant carries the offending field as a path relative to the
+/// converted message (`item.waiting.since`); [`ConvertError::within`] makes
+/// it relative to an enclosing message.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ConvertError {
     #[error("{0}: required field is missing")]
-    Missing(&'static str),
+    Missing(Cow<'static, str>),
     #[error("{0}: invalid ULID {1:?}")]
-    InvalidId(&'static str, String),
+    InvalidId(Cow<'static, str>, String),
     #[error("{0}: value must not be UNSPECIFIED")]
-    Unspecified(&'static str),
+    Unspecified(Cow<'static, str>),
     #[error("{0}: unknown enum value {1}")]
-    UnknownEnum(&'static str, i32),
+    UnknownEnum(Cow<'static, str>, i32),
     #[error("{0}: {1}")]
-    Invalid(&'static str, String),
+    Invalid(Cow<'static, str>, String),
 }
 
-type Result<T, E = ConvertError> = std::result::Result<T, E>;
+impl ConvertError {
+    /// The offending field's path.
+    pub fn path(&self) -> &str {
+        match self {
+            ConvertError::Missing(path)
+            | ConvertError::InvalidId(path, _)
+            | ConvertError::Unspecified(path)
+            | ConvertError::UnknownEnum(path, _)
+            | ConvertError::Invalid(path, _) => path,
+        }
+    }
 
-fn parse_id(field: &'static str, s: &str) -> Result<Ulid> {
+    /// Prefixes the path with the field holding the converted message:
+    /// `title` within `item` is `item.title`, and that within `mutations[3]`
+    /// is `mutations[3].item.title`.
+    pub fn within(mut self, prefix: impl fmt::Display) -> Self {
+        let path = match &mut self {
+            ConvertError::Missing(path)
+            | ConvertError::InvalidId(path, _)
+            | ConvertError::Unspecified(path)
+            | ConvertError::UnknownEnum(path, _)
+            | ConvertError::Invalid(path, _) => path,
+        };
+        *path = format!("{prefix}.{path}").into();
+        self
+    }
+}
+
+pub(crate) type Result<T, E = ConvertError> = std::result::Result<T, E>;
+
+pub(crate) fn parse_id(field: &'static str, s: &str) -> Result<Ulid> {
     s.parse()
-        .map_err(|_| ConvertError::InvalidId(field, s.to_owned()))
+        .map_err(|_| ConvertError::InvalidId(field.into(), s.to_owned()))
 }
 
-fn require<T>(field: &'static str, v: Option<T>) -> Result<T> {
-    v.ok_or(ConvertError::Missing(field))
+pub(crate) fn require<T>(field: &'static str, v: Option<T>) -> Result<T> {
+    v.ok_or(ConvertError::Missing(field.into()))
 }
 
 // ---- scalars ------------------------------------------------------------
@@ -46,7 +79,10 @@ fn require<T>(field: &'static str, v: Option<T>) -> Result<T> {
 const NANOS_PER_SEC: i32 = 1_000_000_000;
 
 /// Proto3 limit on `google.protobuf.Duration.seconds` (about 10,000 years).
-const MAX_DURATION_SECS: i64 = 315_576_000_000;
+const MAX_DURATION_SECS: u64 = 315_576_000_000;
+
+/// 0001-01-01T00:00:00Z, the earliest `google.protobuf.Timestamp`.
+const MIN_TIMESTAMP_SECS: i64 = -62_135_596_800;
 
 /// `nanos` is always in `0..1e9`, as proto3 requires, also before the epoch.
 pub fn timestamp_to_proto(t: Timestamp) -> prost_types::Timestamp {
@@ -61,11 +97,18 @@ pub fn timestamp_to_proto(t: Timestamp) -> prost_types::Timestamp {
 pub fn timestamp_from_proto(field: &'static str, t: &prost_types::Timestamp) -> Result<Timestamp> {
     if !(0..NANOS_PER_SEC).contains(&t.nanos) {
         return Err(ConvertError::Invalid(
-            field,
+            field.into(),
             format!("nanos {} out of range", t.nanos),
         ));
     }
-    Timestamp::new(t.seconds, t.nanos).map_err(|e| ConvertError::Invalid(field, e.to_string()))
+    if t.seconds < MIN_TIMESTAMP_SECS {
+        return Err(ConvertError::Invalid(
+            field.into(),
+            "before 0001-01-01T00:00:00Z".into(),
+        ));
+    }
+    Timestamp::new(t.seconds, t.nanos)
+        .map_err(|e| ConvertError::Invalid(field.into(), e.to_string()))
 }
 
 pub fn date_to_proto(d: Date) -> gtype::Date {
@@ -76,9 +119,13 @@ pub fn date_to_proto(d: Date) -> gtype::Date {
     }
 }
 
-/// Only full dates are accepted (no year-less or day-less dates).
+/// Only full dates are accepted (no year-less or day-less dates), in years
+/// 1 to 9999 as `google.type.Date` allows.
 pub fn date_from_proto(field: &'static str, d: &gtype::Date) -> Result<Date> {
-    let invalid = |e: String| ConvertError::Invalid(field, e);
+    let invalid = |e: String| ConvertError::Invalid(field.into(), e);
+    if !(1..=9999).contains(&d.year) {
+        return Err(invalid(format!("year {} is not in 1..=9999", d.year)));
+    }
     let year = i16::try_from(d.year).map_err(|e| invalid(e.to_string()))?;
     let month = i8::try_from(d.month).map_err(|e| invalid(e.to_string()))?;
     let day = i8::try_from(d.day).map_err(|e| invalid(e.to_string()))?;
@@ -96,11 +143,12 @@ pub fn duration_from_proto(
     field: &'static str,
     d: &prost_types::Duration,
 ) -> Result<SignedDuration> {
-    let invalid = |msg: &str| Err(ConvertError::Invalid(field, msg.into()));
-    if d.nanos.abs() >= NANOS_PER_SEC {
+    let invalid = |msg: &str| Err(ConvertError::Invalid(field.into(), msg.into()));
+    // unsigned_abs: abs() overflows on i32::MIN / i64::MIN.
+    if d.nanos.unsigned_abs() >= NANOS_PER_SEC as u32 {
         return invalid("nanos out of range");
     }
-    if d.seconds.abs() > MAX_DURATION_SECS {
+    if d.seconds.unsigned_abs() > MAX_DURATION_SECS {
         return invalid("seconds out of range");
     }
     if d.seconds != 0 && d.nanos != 0 && (d.seconds < 0) != (d.nanos < 0) {
@@ -175,7 +223,7 @@ macro_rules! enum_map {
                 match v {
                     $(<$proto>::$p => Ok(<$core>::$c),)+
                     #[allow(unreachable_patterns)]
-                    _ => Err(ConvertError::Unspecified($name)),
+                    _ => Err(ConvertError::Unspecified($name.into())),
                 }
             }
         }
@@ -183,8 +231,9 @@ macro_rules! enum_map {
         impl EnumField for $core {
             type Proto = $proto;
             fn from_i32(field: &'static str, v: i32) -> Result<Self> {
-                let p = <$proto>::try_from(v).map_err(|_| ConvertError::UnknownEnum(field, v))?;
-                <$core>::try_from(p).map_err(|_| ConvertError::Unspecified(field))
+                let p = <$proto>::try_from(v)
+                    .map_err(|_| ConvertError::UnknownEnum(field.into(), v))?;
+                <$core>::try_from(p).map_err(|_| ConvertError::Unspecified(field.into()))
             }
             fn to_i32(self) -> i32 {
                 <$proto>::from(self) as i32
@@ -230,6 +279,9 @@ enum_map!(core::ArchiveReason, v1::ArchiveReason, "archive_reason", {
 enum_map!(core::LinkState, v1::LinkState, "link_state", {
     Pending => Pending, Ok => Ok, Broken => Broken,
 });
+enum_map!(core::CaptureTokenKind, v1::CaptureTokenKind, "capture_token_kind", {
+    Priority => Priority, DueDate => DueDate, Label => Label, Waiting => Waiting, Status => Status,
+});
 
 impl From<core::ItemField> for v1::ItemField {
     fn from(f: core::ItemField) -> Self {
@@ -241,7 +293,7 @@ impl From<core::ItemField> for v1::ItemField {
 impl TryFrom<v1::ItemField> for core::ItemField {
     type Error = ConvertError;
     fn try_from(f: v1::ItemField) -> Result<Self> {
-        core::ItemField::from_number(f as u32).ok_or(ConvertError::Unspecified("item_field"))
+        core::ItemField::from_number(f as u32).ok_or(ConvertError::Unspecified("item_field".into()))
     }
 }
 
@@ -252,9 +304,9 @@ impl EnumField for core::ItemField {
             .ok()
             .and_then(core::ItemField::from_number)
             .ok_or(if v == 0 {
-                ConvertError::Unspecified(field)
+                ConvertError::Unspecified(field.into())
             } else {
-                ConvertError::UnknownEnum(field, v)
+                ConvertError::UnknownEnum(field.into(), v)
             })
     }
     fn to_i32(self) -> i32 {
@@ -296,7 +348,8 @@ impl From<&core::PersonRef> for v1::PersonRef {
 
 /// An ISO week string, `YYYY-Www` with a week that exists in that year.
 pub fn iso_week_from_proto(field: &'static str, s: &str) -> Result<String> {
-    let invalid = || ConvertError::Invalid(field, format!("{s:?} is not an ISO week (YYYY-Www)"));
+    let invalid =
+        || ConvertError::Invalid(field.into(), format!("{s:?} is not an ISO week (YYYY-Www)"));
     let (year, week) = s.split_once("-W").ok_or_else(invalid)?;
     if year.len() != 4
         || week.len() != 2
@@ -316,13 +369,13 @@ fn person_id_from_proto(field: &'static str, p: &v1::PersonRef) -> Result<core::
     match require(field, p.r#ref.as_ref())? {
         Ref::PersonId(id) => Ok(core::PersonRef::Person(parse_id(field, id)?)),
         Ref::FreeText(_) => Err(ConvertError::Invalid(
-            field,
+            field.into(),
             "free text only valid for waiting.on".into(),
         )),
     }
 }
 
-fn person_from_proto(field: &'static str, p: &v1::PersonRef) -> Result<core::PersonRef> {
+pub(crate) fn person_from_proto(field: &'static str, p: &v1::PersonRef) -> Result<core::PersonRef> {
     use v1::person_ref::Ref;
     match require(field, p.r#ref.as_ref())? {
         Ref::PersonId(id) => Ok(core::PersonRef::Person(parse_id(field, id)?)),
@@ -653,8 +706,218 @@ impl TryFrom<v1::Item> for core::Item {
     }
 }
 
+// ---- field values -------------------------------------------------------
+
+impl From<&core::FieldValue> for v1::FieldValue {
+    fn from(v: &core::FieldValue) -> Self {
+        use core::FieldValue as V;
+        use v1::field_value::Kind as K;
+        let kind = match v {
+            V::Cleared => K::Cleared(()),
+            V::String(s) => K::StringValue(s.clone()),
+            V::Markdown(s) => K::MarkdownValue(s.clone()),
+            V::Bool(b) => K::BoolValue(*b),
+            V::Number(n) => K::NumberValue(*n),
+            V::Uint(n) => K::UintValue(*n),
+            V::Date(d) => K::DateValue(date_to_proto(*d)),
+            V::Timestamp(t) => K::TimestampValue(timestamp_to_proto(*t)),
+            V::Duration(d) => K::DurationValue(duration_to_proto(*d)),
+            V::StringSet(values) => K::StringSet(v1::StringSet {
+                values: values.clone(),
+            }),
+            V::Person(p) => K::Person(p.into()),
+            V::ItemId(id) => K::ItemId(id.to_string()),
+            V::IsoWeek(w) => K::IsoWeek(w.clone()),
+            V::Priority(p) => K::Priority(p.to_i32()),
+            V::Status(s) => K::Status(s.to_i32()),
+            V::StatusCategory(c) => K::StatusCategory(c.to_i32()),
+            V::ResolutionKind(r) => K::ResolutionKind(r.to_i32()),
+            V::TodoRefinement(r) => K::TodoRefinement(r.to_i32()),
+            V::CreatedVia(c) => K::CreatedVia(c.to_i32()),
+            V::ArchiveReason(r) => K::ArchiveReason(r.to_i32()),
+            V::LinkState(s) => K::LinkState(s.to_i32()),
+            V::ItemFieldSet(fields) => K::ItemFieldSet(v1::ItemFieldSet {
+                fields: fields.iter().map(|f| f.to_i32()).collect(),
+            }),
+            V::Waiting(w) => K::Waiting(w.into()),
+            V::Archived(a) => K::Archived(a.into()),
+            V::Recurrence(r) => K::Recurrence(r.into()),
+            V::RemoteLink(l) => K::RemoteLink(l.into()),
+            V::Staleness(s) => K::Staleness(s.into()),
+        };
+        Self { kind: Some(kind) }
+    }
+}
+
+/// The `FieldValue` at `field`. Errors name the oneof case below `field`
+/// (`value.date_value`, `value.waiting.since`, and `value.kind` when no case
+/// is set). A value is checked on its own, not against any `ItemField`: free
+/// text is a valid `person`, and core decides where it may go.
+pub fn field_value_from_proto(field: &'static str, v: &v1::FieldValue) -> Result<core::FieldValue> {
+    field_value(v).map_err(|e| e.within(field))
+}
+
+fn field_value(v: &v1::FieldValue) -> Result<core::FieldValue> {
+    use core::FieldValue as V;
+    use v1::field_value::Kind as K;
+    Ok(match require("kind", v.kind.as_ref())? {
+        K::Cleared(()) => V::Cleared,
+        K::StringValue(s) => V::String(s.clone()),
+        K::MarkdownValue(s) => V::Markdown(s.clone()),
+        K::BoolValue(b) => V::Bool(*b),
+        K::NumberValue(n) => V::Number(*n),
+        K::UintValue(n) => V::Uint(*n),
+        K::DateValue(d) => V::Date(date_from_proto("date_value", d)?),
+        K::TimestampValue(t) => V::Timestamp(timestamp_from_proto("timestamp_value", t)?),
+        K::DurationValue(d) => V::Duration(duration_from_proto("duration_value", d)?),
+        K::StringSet(s) => V::StringSet(s.values.clone()),
+        K::Person(p) => V::Person(person_from_proto("person", p)?),
+        K::ItemId(id) => V::ItemId(parse_id("item_id", id)?),
+        K::IsoWeek(w) => V::IsoWeek(iso_week_from_proto("iso_week", w)?),
+        K::Priority(p) => V::Priority(EnumField::from_i32("priority", *p)?),
+        K::Status(s) => V::Status(EnumField::from_i32("status", *s)?),
+        K::StatusCategory(c) => V::StatusCategory(EnumField::from_i32("status_category", *c)?),
+        K::ResolutionKind(r) => V::ResolutionKind(EnumField::from_i32("resolution_kind", *r)?),
+        K::TodoRefinement(r) => V::TodoRefinement(EnumField::from_i32("todo_refinement", *r)?),
+        K::CreatedVia(c) => V::CreatedVia(EnumField::from_i32("created_via", *c)?),
+        K::ArchiveReason(r) => V::ArchiveReason(EnumField::from_i32("archive_reason", *r)?),
+        K::LinkState(s) => V::LinkState(EnumField::from_i32("link_state", *s)?),
+        K::ItemFieldSet(s) => V::ItemFieldSet(
+            s.fields
+                .iter()
+                .map(|&f| EnumField::from_i32("item_field_set.fields", f))
+                .collect::<Result<_>>()?,
+        ),
+        K::Waiting(w) => V::Waiting(w.try_into()?),
+        K::Archived(a) => V::Archived(a.try_into()?),
+        K::Recurrence(r) => V::Recurrence(r.try_into()?),
+        K::RemoteLink(l) => V::RemoteLink(l.try_into()?),
+        K::Staleness(s) => V::Staleness(s.try_into()?),
+    })
+}
+
+// ---- field paths --------------------------------------------------------
+
+/// The `FieldMask` path of `field`: its `todo.v1.Item` field name, dotted
+/// for a field inside an Item sub-message (`waiting.follow_up_on`).
+pub fn item_field_path(field: core::ItemField) -> &'static str {
+    use core::ItemField as F;
+    match field {
+        F::Id => "id",
+        F::CreatedVia => "created_via",
+        F::CreatedAt => "created_at",
+        F::UpdatedAt => "updated_at",
+        F::Revision => "revision",
+        F::RemoteLink => "remote_link",
+        F::Title => "title",
+        F::Description => "description",
+        F::ItemType => "item_type",
+        F::StatusCategory => "status_category",
+        F::ResolutionKind => "resolution_kind",
+        F::RemoteStatusName => "remote_status_name",
+        F::Priority => "priority",
+        F::Assignee => "assignee",
+        F::Reporter => "reporter",
+        F::Labels => "labels",
+        F::Components => "components",
+        F::FixVersions => "fix_versions",
+        F::DueDate => "due_date",
+        F::ParentId => "parent_id",
+        F::Sprint => "sprint",
+        F::StoryPoints => "story_points",
+        F::OriginalEstimate => "original_estimate",
+        F::RemainingEstimate => "remaining_estimate",
+        F::Resolution => "resolution",
+        F::RemoteCreatedAt => "remote_created_at",
+        F::RemoteUpdatedAt => "remote_updated_at",
+        F::TodoRefinement => "todo_refinement",
+        F::Waiting => "waiting",
+        F::DeferUntil => "defer_until",
+        F::PrivateNotes => "private_notes",
+        F::FocusWeek => "focus_week",
+        F::LocalPriorityOverride => "local_priority_override",
+        F::Archived => "archived",
+        F::Recurrence => "recurrence",
+        F::RemoteExtras => "remote_extras",
+        F::Status => "status",
+        F::EffectivePriority => "effective_priority",
+        F::IsMine => "is_mine",
+        F::PendingFields => "pending_fields",
+        F::HasConflict => "has_conflict",
+        F::HasPushFailure => "has_push_failure",
+        F::DescriptionLossy => "description_lossy",
+        F::DescriptionDirty => "description_dirty",
+        F::Staleness => "staleness",
+        F::Scopes => "scopes",
+        F::DeletedAt => "deleted_at",
+        F::MergedInto => "merged_into",
+        F::IsOverdue => "is_overdue",
+        F::WaitingOn => "waiting.on",
+        F::WaitingReason => "waiting.reason",
+        F::WaitingSince => "waiting.since",
+        F::WaitingFollowUpOn => "waiting.follow_up_on",
+        F::ArchivedAt => "archived.at",
+        F::ArchivedReason => "archived.reason",
+        F::RemoteLinkTrackerKind => "remote_link.tracker_kind",
+        F::RemoteLinkInstanceId => "remote_link.instance_id",
+        F::RemoteLinkRemoteId => "remote_link.remote_id",
+        F::RemoteLinkKey => "remote_link.key",
+        F::RemoteLinkUrl => "remote_link.url",
+        F::RemoteLinkLastPulledVersion => "remote_link.last_pulled_version",
+        F::RemoteLinkLinkState => "remote_link.link_state",
+        F::RemoteLinkPinned => "remote_link.pinned",
+        F::RecurrenceSeriesId => "recurrence.series_id",
+        F::RecurrenceOccurrenceDate => "recurrence.occurrence_date",
+        F::StalenessLastUserTouchAt => "staleness.last_user_touch_at",
+        F::StalenessLastRemoteChangeAt => "staleness.last_remote_change_at",
+        F::StalenessStatusEnteredAt => "staleness.status_entered_at",
+        F::StalenessWaitingSince => "staleness.waiting_since",
+    }
+}
+
+/// The field a `FieldMask` path names; `None` for an unknown path.
+pub fn item_field_from_path(path: &str) -> Option<core::ItemField> {
+    core::ItemField::ALL
+        .iter()
+        .copied()
+        .find(|&f| item_field_path(f) == path)
+}
+
+// ---- capture ------------------------------------------------------------
+
+impl From<&core::CaptureToken> for v1::CaptureToken {
+    fn from(t: &core::CaptureToken) -> Self {
+        // No capture text is 4 GiB long; saturate rather than panic.
+        let offset = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        Self {
+            start: offset(t.start),
+            end: offset(t.end),
+            kind: t.kind.to_i32(),
+            applied: t.applied,
+            warning: t.warning.clone().unwrap_or_default(),
+        }
+    }
+}
+
+impl From<&core::CaptureDraft> for v1::CaptureDraft {
+    fn from(d: &core::CaptureDraft) -> Self {
+        Self {
+            title: d.title.clone(),
+            priority: d.priority.to_i32(),
+            due_date: d.due_date.map(date_to_proto),
+            labels: d.labels.clone(),
+            waiting_on: d.waiting.as_ref().map(|w| (&w.on).into()),
+            status: d.status.to_i32(),
+            tokens: d.tokens.iter().map(Into::into).collect(),
+            warnings: d.warnings.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
     use jiff::civil::date;
     use prost::Message;
@@ -786,28 +1049,28 @@ mod tests {
         p.id = "nope".into();
         assert!(matches!(
             core::Item::try_from(&p),
-            Err(ConvertError::InvalidId("id", _))
+            Err(ConvertError::InvalidId(f, _)) if f == "id"
         ));
 
         let mut p = good.clone();
         p.priority = 0;
         assert_eq!(
             core::Item::try_from(&p),
-            Err(ConvertError::Unspecified("priority"))
+            Err(ConvertError::Unspecified("priority".into()))
         );
 
         let mut p = good.clone();
         p.priority = 99;
         assert_eq!(
             core::Item::try_from(&p),
-            Err(ConvertError::UnknownEnum("priority", 99))
+            Err(ConvertError::UnknownEnum("priority".into(), 99))
         );
 
         let mut p = good.clone();
         p.created_at = None;
         assert_eq!(
             core::Item::try_from(&p),
-            Err(ConvertError::Missing("created_at"))
+            Err(ConvertError::Missing("created_at".into()))
         );
 
         let mut p = good;
@@ -818,7 +1081,7 @@ mod tests {
         });
         assert!(matches!(
             core::Item::try_from(&p),
-            Err(ConvertError::Invalid("due_date", _))
+            Err(ConvertError::Invalid(f, _)) if f == "due_date"
         ));
     }
 
@@ -836,13 +1099,13 @@ mod tests {
         p.assignee = Some(free_text.clone());
         assert!(matches!(
             core::Item::try_from(&p),
-            Err(ConvertError::Invalid("assignee", _))
+            Err(ConvertError::Invalid(f, _)) if f == "assignee"
         ));
         let mut p = good.clone();
         p.reporter = Some(free_text);
         assert!(matches!(
             core::Item::try_from(&p),
-            Err(ConvertError::Invalid("reporter", _))
+            Err(ConvertError::Invalid(f, _)) if f == "reporter"
         ));
 
         for bad in [
@@ -859,7 +1122,7 @@ mod tests {
             assert!(
                 matches!(
                     core::Item::try_from(&p),
-                    Err(ConvertError::Invalid("focus_week", _))
+                    Err(ConvertError::Invalid(f, _)) if f == "focus_week"
                 ),
                 "{bad}"
             );
@@ -894,12 +1157,41 @@ mod tests {
             nanos: -1,
         };
         assert!(timestamp_from_proto("t", &neg).is_err());
+        // 0001-01-01T00:00:00Z is the earliest proto3 Timestamp.
+        let first = prost_types::Timestamp {
+            seconds: -62_135_596_800,
+            nanos: 0,
+        };
+        assert!(timestamp_from_proto("t", &first).is_ok());
+        let before = prost_types::Timestamp {
+            seconds: first.seconds - 1,
+            nanos: 999_999_999,
+        };
+        assert!(timestamp_from_proto("t", &before).is_err());
+
+        // Year 0 is google.type.Date's "no year"; years are 1..=9999.
+        for year in [0, -1, -9999, 10_000] {
+            let d = gtype::Date {
+                year,
+                month: 10,
+                day: 24,
+            };
+            assert!(date_from_proto("d", &d).is_err(), "{year}");
+        }
+        for year in [1, 9999] {
+            let d = date(year as i16, 10, 24);
+            assert_eq!(date_from_proto("d", &date_to_proto(d)), Ok(d));
+        }
 
         for (seconds, nanos) in [
             (i64::MAX, 1_500_000_000),
             (0, 1_000_000_000),
             (315_576_000_001, 0),
             (1, -1),
+            (i64::MIN, 0),
+            (i64::MIN, -1),
+            (0, i32::MIN),
+            (-1, i32::MIN),
         ] {
             let d = prost_types::Duration { seconds, nanos };
             assert!(duration_from_proto("d", &d).is_err(), "{seconds} {nanos}");
@@ -966,5 +1258,263 @@ mod tests {
             v1::Item::decode(back.encode_to_vec().as_slice()).unwrap(),
             proto
         );
+    }
+
+    #[test]
+    fn error_paths_compose() {
+        let e = ConvertError::Missing("title".into()).within("item");
+        assert_eq!(e, ConvertError::Missing("item.title".into()));
+        let e = e
+            .within("update_item")
+            .within(format_args!("mutations[{}]", 3));
+        assert_eq!(e.path(), "mutations[3].update_item.item.title");
+        assert_eq!(
+            e.to_string(),
+            "mutations[3].update_item.item.title: required field is missing"
+        );
+
+        let rows = [
+            (
+                ConvertError::InvalidId("id".into(), "nope".into()),
+                ConvertError::InvalidId("set_status.id".into(), "nope".into()),
+            ),
+            (
+                ConvertError::Unspecified("status".into()),
+                ConvertError::Unspecified("set_status.status".into()),
+            ),
+            (
+                ConvertError::UnknownEnum("status".into(), 9),
+                ConvertError::UnknownEnum("set_status.status".into(), 9),
+            ),
+            (
+                ConvertError::Invalid("request_id".into(), "x".into()),
+                ConvertError::Invalid("set_status.request_id".into(), "x".into()),
+            ),
+        ];
+        for (e, want) in rows {
+            assert_eq!(e.within("set_status"), want);
+        }
+    }
+
+    /// One value of every `FieldValue` variant.
+    fn field_values() -> Vec<core::FieldValue> {
+        use todo_core::FieldValue as V;
+        let item = full_item();
+        vec![
+            V::Cleared,
+            V::String("Fix \"flaky\" test".into()),
+            V::Markdown("# Notes\n\n- a\n".into()),
+            V::Bool(true),
+            V::Number(2.5),
+            V::Uint(u64::MAX),
+            V::Date(date(2026, 10, 24)),
+            V::Timestamp(Timestamp::new(-5, -123_456_789).unwrap()),
+            V::Duration(SignedDuration::new(-90, -5)),
+            V::StringSet(vec!["b".into(), "a".into()]),
+            V::Person(core::PersonRef::Person(new_ulid())),
+            V::Person(core::PersonRef::FreeText("Dana".into())),
+            V::ItemId(new_ulid()),
+            V::IsoWeek("2026-W53".into()),
+            V::Priority(core::Priority::None),
+            V::Status(Status::InProgress),
+            V::StatusCategory(core::StatusCategory::Done),
+            V::ResolutionKind(core::ResolutionKind::Cancelled),
+            V::TodoRefinement(core::TodoRefinement::Someday),
+            V::CreatedVia(core::CreatedVia::RemoteImport),
+            V::ArchiveReason(core::ArchiveReason::AutoDone),
+            V::LinkState(core::LinkState::Broken),
+            V::ItemFieldSet(vec![ItemField::WaitingOn, ItemField::Title]),
+            V::Waiting(item.overlay.waiting.clone().unwrap()),
+            V::Archived(item.overlay.archived.unwrap()),
+            V::Recurrence(item.overlay.recurrence.clone().unwrap()),
+            V::RemoteLink(item.remote_link.clone().unwrap()),
+            V::Staleness(item.derived.staleness),
+        ]
+    }
+
+    #[test]
+    fn field_values_round_trip_through_proto_and_wire() {
+        let mut cases = HashSet::new();
+        for value in field_values() {
+            let proto = v1::FieldValue::from(&value);
+            let decoded = v1::FieldValue::decode(proto.encode_to_vec().as_slice()).unwrap();
+            assert_eq!(decoded, proto);
+            assert_eq!(field_value_from_proto("value", &decoded), Ok(value));
+            cases.insert(std::mem::discriminant(proto.kind.as_ref().unwrap()));
+        }
+        let pool = DescriptorPool::decode(crate::FILE_DESCRIPTOR_SET).unwrap();
+        let desc = pool.get_message_by_name("todo.v1.FieldValue").unwrap();
+        let oneof = desc.oneofs().next().unwrap();
+        assert_eq!(cases.len(), oneof.fields().count());
+    }
+
+    #[test]
+    fn field_value_errors_name_the_case() {
+        use v1::field_value::Kind as K;
+        let fails = |kind: Option<K>| {
+            field_value_from_proto("value", &v1::FieldValue { kind }).unwrap_err()
+        };
+        let bad_date = gtype::Date {
+            year: 2026,
+            month: 2,
+            day: 30,
+        };
+        assert_eq!(fails(None), ConvertError::Missing("value.kind".into()));
+        assert_eq!(
+            fails(Some(K::ItemId("nope".into()))),
+            ConvertError::InvalidId("value.item_id".into(), "nope".into())
+        );
+        assert_eq!(
+            fails(Some(K::Person(v1::PersonRef::default()))),
+            ConvertError::Missing("value.person".into())
+        );
+        assert_eq!(
+            fails(Some(K::Priority(99))),
+            ConvertError::UnknownEnum("value.priority".into(), 99)
+        );
+        assert_eq!(
+            fails(Some(K::Status(0))),
+            ConvertError::Unspecified("value.status".into())
+        );
+        assert_eq!(
+            fails(Some(K::LinkState(0))),
+            ConvertError::Unspecified("value.link_state".into())
+        );
+        assert_eq!(
+            fails(Some(K::ItemFieldSet(v1::ItemFieldSet {
+                fields: vec![ItemField::Title.to_i32(), 9],
+            }))),
+            ConvertError::UnknownEnum("value.item_field_set.fields".into(), 9)
+        );
+        assert_eq!(
+            fails(Some(K::Waiting(v1::Waiting::default()))),
+            ConvertError::Missing("value.waiting.on".into())
+        );
+        assert_eq!(
+            fails(Some(K::Archived(v1::Archived {
+                at: Some(timestamp_to_proto(ts(1))),
+                reason: 0,
+            }))),
+            ConvertError::Unspecified("value.archived.reason".into())
+        );
+        let invalid = [
+            (K::IsoWeek("2025-W53".into()), "value.iso_week"),
+            (K::DateValue(bad_date), "value.date_value"),
+            (
+                K::TimestampValue(prost_types::Timestamp {
+                    seconds: 0,
+                    nanos: -1,
+                }),
+                "value.timestamp_value",
+            ),
+            (
+                K::DurationValue(prost_types::Duration {
+                    seconds: 1,
+                    nanos: -1,
+                }),
+                "value.duration_value",
+            ),
+        ];
+        for (kind, path) in invalid {
+            let err = fails(Some(kind));
+            assert!(matches!(err, ConvertError::Invalid(..)), "{err}");
+            assert_eq!(err.path(), path);
+        }
+    }
+
+    #[test]
+    fn item_field_paths_name_item_fields() {
+        let pool = DescriptorPool::decode(crate::FILE_DESCRIPTOR_SET).unwrap();
+        let item = pool.get_message_by_name("todo.v1.Item").unwrap();
+        let mut seen = HashSet::new();
+        for &f in ItemField::ALL {
+            let path = item_field_path(f);
+            assert!(seen.insert(path), "{path} twice");
+            assert_eq!(item_field_from_path(path), Some(f), "{path}");
+            // The ItemField number is the field numbers along the path.
+            let mut message = Some(item.clone());
+            let mut number = 0;
+            for name in path.split('.') {
+                let field = message
+                    .and_then(|m| m.get_field_by_name(name))
+                    .unwrap_or_else(|| panic!("{path}: no field {name}"));
+                number = number * 1000 + field.number();
+                message = field.kind().as_message().cloned();
+            }
+            assert_eq!(number, f.number(), "{path}");
+        }
+        for bad in [
+            "",
+            "*",
+            "Title",
+            "dueDate",
+            "item.title",
+            "waiting.",
+            ".title",
+            "waiting.bogus",
+            "title.x",
+        ] {
+            assert_eq!(item_field_from_path(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn capture_drafts_convert() {
+        use v1::CaptureTokenKind as K;
+        let text = "call dentist +2 ^2026-11-02 #home ~dana >next +9";
+        let draft = core::parse_capture(text, date(2026, 10, 22));
+        let p = v1::CaptureDraft::from(&draft);
+        assert_eq!(p.title, "call dentist +9");
+        assert_eq!(p.priority, v1::Priority::High as i32);
+        assert_eq!(p.due_date, Some(date_to_proto(date(2026, 11, 2))));
+        assert_eq!(p.labels, ["home"]);
+        assert_eq!(
+            p.waiting_on,
+            Some(v1::PersonRef::from(&core::PersonRef::FreeText(
+                "dana".into()
+            )))
+        );
+        assert_eq!(p.status, v1::Status::Next as i32);
+        let warning = "+9: priority must be +1 to +5";
+        assert_eq!(p.warnings, [warning]);
+        let token = |start, end, kind: K, warning: &str| v1::CaptureToken {
+            start,
+            end,
+            kind: kind as i32,
+            applied: warning.is_empty(),
+            warning: warning.into(),
+        };
+        assert_eq!(
+            p.tokens,
+            [
+                token(13, 15, K::Priority, ""),
+                token(16, 27, K::DueDate, ""),
+                token(28, 33, K::Label, ""),
+                token(34, 39, K::Waiting, ""),
+                token(40, 45, K::Status, ""),
+                token(46, 48, K::Priority, warning),
+            ]
+        );
+
+        let p = v1::CaptureDraft::from(&core::parse_capture("call dentist", date(2026, 10, 22)));
+        assert_eq!(
+            p,
+            v1::CaptureDraft {
+                title: "call dentist".into(),
+                priority: v1::Priority::None as i32,
+                status: v1::Status::Inbox as i32,
+                ..Default::default()
+            }
+        );
+
+        let huge = core::CaptureToken {
+            start: usize::MAX,
+            end: usize::MAX,
+            kind: core::CaptureTokenKind::Label,
+            applied: true,
+            warning: None,
+        };
+        let p = v1::CaptureToken::from(&huge);
+        assert_eq!((p.start, p.end), (u32::MAX, u32::MAX));
     }
 }

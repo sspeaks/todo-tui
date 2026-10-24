@@ -1,6 +1,7 @@
 // Used by scripts/smoke.sh: connects (auto-spawning the daemon), subscribes
 // from the ListItems revision, prints READY, then prints the first changed
-// item as protobuf JSON and exits. TODO_TUI_HOME / TODO_BIN come from the env.
+// item as protobuf JSON and exits. With --list it prints every item instead.
+// TODO_TUI_HOME / TODO_BIN come from the env.
 import { toJsonString } from "@bufbuild/protobuf";
 import { ConnectError } from "@connectrpc/connect";
 import { ItemSchema } from "../src/gen/todo/v1/item_pb.js";
@@ -8,7 +9,18 @@ import { connect } from "../src/connect.js";
 
 const timeoutMs = Number(process.env.SMOKE_TIMEOUT_MS ?? 15_000);
 
-async function main(): Promise<number> {
+async function list(): Promise<number> {
+  const conn = await connect();
+  try {
+    const { items } = await conn.items.listItems({ pageSize: 1000 });
+    for (const item of items) process.stdout.write(`${toJsonString(ItemSchema, item)}\n`);
+    return 0;
+  } finally {
+    conn.close();
+  }
+}
+
+async function watch(): Promise<number> {
   const conn = await connect();
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(new Error(`no item change within ${timeoutMs}ms`)), timeoutMs);
@@ -32,7 +44,7 @@ async function main(): Promise<number> {
   }
 }
 
-main().then(
+(process.argv.includes("--list") ? list() : watch()).then(
   (code) => process.exit(code),
   (err: unknown) => {
     const reason = err instanceof ConnectError ? `${err.code}: ${err.rawMessage}` : String(err);

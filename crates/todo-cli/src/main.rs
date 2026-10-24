@@ -1,18 +1,15 @@
 //! The `todo` binary.
 
+mod add;
 mod spawn;
 
 use std::process::ExitCode;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
-use todo_core::new_ulid;
 use todo_daemon::paths::{Env, Paths};
-use todo_proto::v1::item_service_client::ItemServiceClient;
+use todo_proto::v1::ShutdownRequest;
 use todo_proto::v1::system_service_client::SystemServiceClient;
-use todo_proto::v1::{
-    CaptureItemRequest, ClientKind, CreatedVia, GetServerInfoRequest, ShutdownRequest,
-};
 
 #[derive(Parser)]
 #[command(name = "todo", version, about = "A keyboard-driven todo manager")]
@@ -27,8 +24,9 @@ enum Command {
     /// Capture an Item into the inbox.
     #[command(visible_alias = "a")]
     Add {
-        /// The capture text; several words are joined with spaces.
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        /// The capture text; several words are joined with spaces. Without
+        /// it, each non-empty line of stdin is one capture.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         text: Vec<String>,
     },
     /// Run the daemon (in the foreground unless --detach).
@@ -57,7 +55,7 @@ fn main() -> ExitCode {
         }
     };
     match runtime.block_on(dispatch(cli.command)) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(e) => {
             eprintln!("todo: {e:#}");
             ExitCode::FAILURE
@@ -65,14 +63,14 @@ fn main() -> ExitCode {
     }
 }
 
-async fn dispatch(command: Command) -> anyhow::Result<()> {
+async fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
     let paths = Paths::resolve(&Env::from_process())?;
     match command {
-        Command::Add { text } => add(&paths, text.join(" ")).await,
+        Command::Add { text } => return add::add(&paths, text).await,
         Command::Daemon {
             action: Some(DaemonAction::Stop),
             ..
-        } => stop(&paths).await,
+        } => stop(&paths).await?,
         Command::Daemon { detach: true, .. } => {
             if spawn::is_listening(&paths.socket).await {
                 println!("todo daemon: already running");
@@ -80,45 +78,14 @@ async fn dispatch(command: Command) -> anyhow::Result<()> {
                 spawn::spawn_and_wait(&paths).await?;
                 println!("todo daemon: started");
             }
-            Ok(())
         }
         Command::Daemon { detach: false, .. } => {
             if todo_daemon::run(paths).await? == todo_daemon::Exit::AlreadyRunning {
                 println!("todo daemon: already running");
             }
-            Ok(())
         }
     }
-}
-
-async fn add(paths: &Paths, text: String) -> anyhow::Result<()> {
-    let channel = spawn::connect_or_spawn(paths).await?;
-    SystemServiceClient::new(channel.clone())
-        .get_server_info(GetServerInfoRequest {
-            client_kind: ClientKind::Oneshot.into(),
-            client_version: env!("CARGO_PKG_VERSION").to_owned(),
-            required_api_minor: 0,
-        })
-        .await
-        .context("handshake failed")?;
-    let response = ItemServiceClient::new(channel)
-        .capture_item(CaptureItemRequest {
-            request_id: new_ulid().to_string(),
-            text,
-            created_via: CreatedVia::Cli.into(),
-            ..Default::default()
-        })
-        .await
-        .map_err(|s| anyhow::anyhow!("{}", s.message()))?
-        .into_inner();
-    let item = response.item.context("daemon returned no item")?;
-    println!("{}  {}", short_id(&item.id), item.title);
-    Ok(())
-}
-
-/// The ULID's random tail, which tells captures from the same second apart.
-fn short_id(id: &str) -> &str {
-    id.get(id.len().saturating_sub(8)..).unwrap_or(id)
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn stop(paths: &Paths) -> anyhow::Result<()> {
@@ -156,12 +123,8 @@ mod tests {
                 ..
             }
         ));
-        assert!(Cli::try_parse_from(["todo", "add"]).is_err());
-    }
-
-    #[test]
-    fn short_id_is_the_tail() {
-        assert_eq!(short_id("01JB0000000000000000ABCDEF"), "00ABCDEF");
-        assert_eq!(short_id("xy"), "xy");
+        // Without text, `add` reads stdin.
+        let cli = Cli::try_parse_from(["todo", "add"]).unwrap();
+        assert!(matches!(cli.command, Command::Add { text } if text.is_empty()));
     }
 }

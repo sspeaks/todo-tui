@@ -20,6 +20,7 @@ use crate::client;
 use crate::conn::Clients;
 use crate::paths::Paths;
 use crate::service::{Ctx, item::Items, system::System, watch::Watch};
+use crate::spool;
 
 /// How long in-flight work may take once shutdown starts (design 4.2).
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
@@ -103,6 +104,8 @@ impl Daemon {
 
     /// Serves until shutdown is triggered (by a handle or the `Shutdown`
     /// RPC), then drains for up to 10s, removes the socket and releases the lock.
+    /// Meanwhile imports the capture spool in the background: right away,
+    /// then whenever it fills (design 2.1).
     pub async fn serve(self) -> anyhow::Result<()> {
         let Daemon {
             paths,
@@ -112,6 +115,12 @@ impl Daemon {
             _lock,
         } = self;
         let clients = Clients::default();
+        let spool = tokio::spawn(spool::run(
+            paths.clone(),
+            store.clone(),
+            shutdown.signal(),
+            spool::INTERVAL,
+        ));
         let ctx = Ctx {
             store,
             clients: clients.clone(),
@@ -148,6 +157,10 @@ impl Daemon {
                 Ok(())
             }
         };
+        // An interrupted import is safe: what it captured is recorded by
+        // spool id, and the spool is only truncated once it completes.
+        spool.abort();
+        let _ = spool.await;
         let _ = fs::remove_file(&paths.socket);
         tracing::info!("daemon stopped");
         result

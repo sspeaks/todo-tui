@@ -18,7 +18,14 @@ export {
 export { type Date as ProtoDate, DateSchema as ProtoDateSchema } from "./gen/google/type/date_pb.js";
 
 export { type MessageInitShape, clone, create, equals, fromJson, toJson, toJsonString } from "@bufbuild/protobuf";
-export { type Timestamp, timestampDate, timestampFromDate, timestampNow } from "@bufbuild/protobuf/wkt";
+export {
+  type FieldMask,
+  FieldMaskSchema,
+  type Timestamp,
+  timestampDate,
+  timestampFromDate,
+  timestampNow,
+} from "@bufbuild/protobuf/wkt";
 export {
   type CallOptions,
   type Client,
@@ -35,4 +42,6 @@ export * from "./transport.js";
 export * from "./spawn.js";
 export * from "./connect.js";
 export * from "./live-store.js";
+export * from "./ulid.js";
+export * from "./mutations.js";
 export * from "./fake-daemon.js";

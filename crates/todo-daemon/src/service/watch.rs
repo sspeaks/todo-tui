@@ -160,11 +160,12 @@ mod tests {
             store
                 .capture(CaptureInput {
                     request_id: todo_core::new_ulid().to_string(),
-                    title: format!("item {i}"),
+                    draft: todo_core::CaptureDraft::from_title(format!("item {i}")),
                     created_via: CreatedVia::Cli,
                     parent_id: None,
                     spool_id: None,
                     now: jiff::Timestamp::now(),
+                    today: jiff::Zoned::now().date(),
                 })
                 .await
                 .unwrap();

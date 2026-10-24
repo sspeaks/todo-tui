@@ -4,14 +4,14 @@ use std::collections::BTreeMap;
 
 use jiff::civil::Date;
 use jiff::{SignedDuration, Timestamp};
-use rusqlite::{Connection, OptionalExtension, Row, named_params};
+use rusqlite::{Connection, OptionalExtension, Row, ToSql, named_params};
 use todo_core::{
-    ArchiveReason, Archived, CoreFields, CreatedVia, DerivedFields, Item, ItemField, ItemId,
-    ItemRecurrence, LinkState, OverlayFields, PersonRef, Priority, RemoteLink, ResolutionKind,
-    StalenessSignals, Status, StatusCategory, TodoRefinement, Topic, Waiting,
+    Actor, ArchiveReason, Archived, CoreFields, CreatedVia, DerivedFields, FieldValue, Item,
+    ItemField, ItemId, ItemRecurrence, LinkState, OverlayFields, PersonRef, Priority, RemoteLink,
+    ResolutionKind, StalenessSignals, Status, StatusCategory, TodoRefinement, Topic, Waiting,
 };
 
-use crate::{Result, StoreError};
+use crate::{OpKind, Result, StoreError};
 
 fn corrupt(what: impl std::fmt::Display) -> StoreError {
     StoreError::Corrupt(what.to_string())
@@ -110,6 +110,15 @@ sql_enum!(Topic, "topic", {
     Topic::Review => "review",
     Topic::Config => "config",
 });
+sql_enum!(OpKind, "op_kind", {
+    OpKind::Update => "update",
+    OpKind::SetStatus => "set_status",
+    OpKind::Archive => "archive",
+    OpKind::Unarchive => "unarchive",
+    OpKind::Delete => "delete",
+    OpKind::Undelete => "undelete",
+    OpKind::Batch => "batch",
+});
 
 pub(crate) fn rev_to_sql(r: u64) -> Result<i64> {
     i64::try_from(r).map_err(|_| corrupt(format_args!("revision {r} out of range")))
@@ -136,7 +145,7 @@ fn opt_ts_from_sql(ns: Option<i64>) -> Result<Option<Timestamp>> {
     ns.map(ts_from_sql).transpose()
 }
 
-fn dur_to_sql(d: Option<SignedDuration>) -> Result<Option<i64>> {
+pub(crate) fn dur_to_sql(d: Option<SignedDuration>) -> Result<Option<i64>> {
     d.map(|d| {
         i64::try_from(d.as_nanos()).map_err(|_| corrupt(format_args!("duration {d} out of range")))
     })
@@ -412,7 +421,13 @@ pub(crate) fn load_item(conn: &Connection, id: &str, today: Option<Date>) -> Res
         .transpose()
 }
 
-pub(crate) fn insert_item(conn: &Connection, item: &Item) -> Result<()> {
+/// Calls `f` with every written `items` column as a named parameter
+/// (`:<column>`). [`insert_item`] and [`update_item`] build their SQL from
+/// these names, so the two cannot drift.
+fn with_item_params<T>(
+    item: &Item,
+    f: impl FnOnce(&[(&str, &dyn ToSql)]) -> Result<T>,
+) -> Result<T> {
     let link = item.remote_link.as_ref();
     let core = &item.core;
     let ov = &item.overlay;
@@ -423,51 +438,20 @@ pub(crate) fn insert_item(conn: &Connection, item: &Item) -> Result<()> {
     let (waiting_on_id, waiting_on_text) = person_cols(&waiting_on);
     let pending: Vec<u32> = d.pending_fields.iter().map(|f| f.number()).collect();
 
-    conn.prepare_cached(
-        "INSERT INTO items (
-            id, created_via, created_at, updated_at, revision,
-            remote_tracker_kind, remote_instance_id, remote_id, remote_key, remote_url,
-            remote_last_pulled_version, remote_link_state, remote_pinned,
-            title, description, item_type, status_category, resolution_kind, remote_status_name,
-            priority, assignee_person_id, assignee_text, reporter_person_id, reporter_text,
-            labels, components, fix_versions, due_date, parent_id, sprint, story_points,
-            original_estimate, remaining_estimate, resolution, remote_created_at, remote_updated_at,
-            todo_refinement, waiting_on_person_id, waiting_on_text, waiting_reason, waiting_since,
-            waiting_follow_up_on, defer_until, private_notes, focus_week, local_priority_override,
-            archived_at, archived_reason, recurrence_series_id, recurrence_occurrence_date,
-            remote_extras, is_mine, pending_fields, has_conflict, has_push_failure,
-            description_lossy, description_dirty, last_user_touch_at, last_remote_change_at,
-            status_entered_at, staleness_waiting_since, scopes, deleted_at, merged_into
-        ) VALUES (
-            :id, :created_via, :created_at, :updated_at, :revision,
-            :tracker_kind, :instance_id, :remote_id, :key, :url,
-            :last_pulled_version, :link_state, :pinned,
-            :title, :description, :item_type, :status_category, :resolution_kind, :remote_status_name,
-            :priority, :assignee_id, :assignee_text, :reporter_id, :reporter_text,
-            :labels, :components, :fix_versions, :due_date, :parent_id, :sprint, :story_points,
-            :original_estimate, :remaining_estimate, :resolution, :remote_created_at, :remote_updated_at,
-            :todo_refinement, :waiting_on_id, :waiting_on_text, :waiting_reason, :waiting_since,
-            :waiting_follow_up_on, :defer_until, :private_notes, :focus_week, :local_priority_override,
-            :archived_at, :archived_reason, :series_id, :occurrence_date,
-            :remote_extras, :is_mine, :pending_fields, :has_conflict, :has_push_failure,
-            :description_lossy, :description_dirty, :last_user_touch_at, :last_remote_change_at,
-            :status_entered_at, :staleness_waiting_since, :scopes, :deleted_at, :merged_into
-        )",
-    )?
-    .execute(named_params! {
+    f(named_params! {
         ":id": item.id.to_string(),
         ":created_via": item.created_via.as_sql(),
         ":created_at": ts_to_sql(item.created_at)?,
         ":updated_at": ts_to_sql(item.updated_at)?,
         ":revision": rev_to_sql(item.revision)?,
-        ":tracker_kind": link.map(|l| &l.tracker_kind),
-        ":instance_id": link.map(|l| &l.instance_id),
+        ":remote_tracker_kind": link.map(|l| &l.tracker_kind),
+        ":remote_instance_id": link.map(|l| &l.instance_id),
         ":remote_id": link.map(|l| &l.remote_id),
-        ":key": link.map(|l| &l.key),
-        ":url": link.map(|l| &l.url),
-        ":last_pulled_version": opt_ts_to_sql(link.and_then(|l| l.last_pulled_version))?,
-        ":link_state": link.map(|l| l.link_state.as_sql()),
-        ":pinned": link.is_some_and(|l| l.pinned),
+        ":remote_key": link.map(|l| &l.key),
+        ":remote_url": link.map(|l| &l.url),
+        ":remote_last_pulled_version": opt_ts_to_sql(link.and_then(|l| l.last_pulled_version))?,
+        ":remote_link_state": link.map(|l| l.link_state.as_sql()),
+        ":remote_pinned": link.is_some_and(|l| l.pinned),
         ":title": core.title,
         ":description": core.description,
         ":item_type": core.item_type,
@@ -475,9 +459,9 @@ pub(crate) fn insert_item(conn: &Connection, item: &Item) -> Result<()> {
         ":resolution_kind": core.resolution_kind.map(SqlEnum::as_sql),
         ":remote_status_name": core.remote_status_name,
         ":priority": core.priority.as_sql(),
-        ":assignee_id": assignee_id,
+        ":assignee_person_id": assignee_id,
         ":assignee_text": assignee_text,
-        ":reporter_id": reporter_id,
+        ":reporter_person_id": reporter_id,
         ":reporter_text": reporter_text,
         ":labels": strings_to_sql(&core.labels),
         ":components": strings_to_sql(&core.components),
@@ -492,7 +476,7 @@ pub(crate) fn insert_item(conn: &Connection, item: &Item) -> Result<()> {
         ":remote_created_at": opt_ts_to_sql(core.remote_created_at)?,
         ":remote_updated_at": opt_ts_to_sql(core.remote_updated_at)?,
         ":todo_refinement": ov.todo_refinement.as_sql(),
-        ":waiting_on_id": waiting_on_id,
+        ":waiting_on_person_id": waiting_on_id,
         ":waiting_on_text": waiting_on_text,
         ":waiting_reason": ov.waiting.as_ref().map(|w| &w.reason),
         ":waiting_since": ov.waiting.as_ref().map(|w| date_to_sql(w.since)),
@@ -503,8 +487,8 @@ pub(crate) fn insert_item(conn: &Connection, item: &Item) -> Result<()> {
         ":local_priority_override": ov.local_priority_override.map(SqlEnum::as_sql),
         ":archived_at": opt_ts_to_sql(ov.archived.map(|a| a.at))?,
         ":archived_reason": ov.archived.map(|a| a.reason.as_sql()),
-        ":series_id": ov.recurrence.as_ref().map(|r| r.series_id.to_string()),
-        ":occurrence_date": ov.recurrence.as_ref().and_then(|r| r.occurrence_date).map(date_to_sql),
+        ":recurrence_series_id": ov.recurrence.as_ref().map(|r| r.series_id.to_string()),
+        ":recurrence_occurrence_date": ov.recurrence.as_ref().and_then(|r| r.occurrence_date).map(date_to_sql),
         ":remote_extras": serde_json::to_string(&item.remote_extras).map_err(corrupt)?,
         ":is_mine": d.is_mine,
         ":pending_fields": serde_json::Value::from(pending).to_string(),
@@ -519,8 +503,54 @@ pub(crate) fn insert_item(conn: &Connection, item: &Item) -> Result<()> {
         ":scopes": strings_to_sql(&d.scopes),
         ":deleted_at": opt_ts_to_sql(d.deleted_at)?,
         ":merged_into": d.merged_into.map(|m| m.to_string()),
+    })
+}
+
+pub(crate) fn insert_item(conn: &Connection, item: &Item) -> Result<()> {
+    with_item_params(item, |params| {
+        let names: Vec<&str> = params.iter().map(|(name, _)| *name).collect();
+        let columns: Vec<&str> = names.iter().map(|name| &name[1..]).collect();
+        let sql = format!(
+            "INSERT INTO items ({}) VALUES ({})",
+            columns.join(", "),
+            names.join(", ")
+        );
+        conn.prepare_cached(&sql)?.execute(params)?;
+        Ok(())
+    })
+}
+
+/// Writes every column of the existing row `item.id`.
+pub(crate) fn update_item(conn: &Connection, item: &Item) -> Result<()> {
+    let updated = with_item_params(item, |params| {
+        let set: Vec<String> = params
+            .iter()
+            .filter(|(name, _)| *name != ":id")
+            .map(|(name, _)| format!("{} = {name}", &name[1..]))
+            .collect();
+        let sql = format!("UPDATE items SET {} WHERE id = :id", set.join(", "));
+        Ok(conn.prepare_cached(&sql)?.execute(params)?)
     })?;
+    if updated != 1 {
+        return Err(StoreError::NotFound(item.id));
+    }
     Ok(())
+}
+
+/// A [`FieldValue`] as stored in `events.old` and `events.new`.
+pub(crate) fn value_to_sql(value: &FieldValue) -> Result<String> {
+    serde_json::to_string(value).map_err(corrupt)
+}
+
+/// `ops.actor` and `events.actor`: `user`, `sync`, `system` or
+/// `suggestion:<ulid>`.
+pub(crate) fn actor_to_sql(actor: Actor) -> String {
+    match actor {
+        Actor::User => "user".to_owned(),
+        Actor::Sync => "sync".to_owned(),
+        Actor::System => "system".to_owned(),
+        Actor::Suggestion(id) => format!("suggestion:{id}"),
+    }
 }
 
 pub(crate) fn item_id_from_str(s: &str) -> Result<ItemId> {

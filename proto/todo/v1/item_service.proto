@@ -2,24 +2,48 @@ syntax = "proto3";
 
 package todo.v1;
 
+import "google/protobuf/field_mask.proto";
 import "google/protobuf/timestamp.proto";
+import "google/type/date.proto";
 import "todo/v1/common.proto";
 import "todo/v1/filter.proto";
 import "todo/v1/item.proto";
 
 // Conventions for every mutating request: request_id = 1 is a client ULID
-// (a replay within 24h returns the original result); single-item mutations
-// carry `optional uint64 expected_revision` and fail with ABORTED when the
-// Item's revision differs; responses carry a MutationResult.
+// (a replay within 24h returns the original result, even if the Item has
+// changed since); single-item mutations carry `optional uint64
+// expected_revision` and fail with ABORTED (ErrorInfo REVISION_MISMATCH) when
+// the Item's revision differs; responses carry a MutationResult.
+//
+// Mutating a soft-deleted Item fails with FAILED_PRECONDITION (ErrorInfo
+// ITEM_DELETED), except UndeleteItem. A mutation that changes nothing (e.g.
+// archiving an archived Item) succeeds without a new revision. Invalid values
+// and read-only fields fail with INVALID_ARGUMENT and a BadRequest naming the
+// offending field path.
 service ItemService {
   rpc CaptureItem(CaptureItemRequest) returns (CaptureItemResponse);
+  // Parses capture text without creating anything (the TUI's live preview).
+  rpc ParseCapture(ParseCaptureRequest) returns (ParseCaptureResponse);
+  rpc GetItem(GetItemRequest) returns (GetItemResponse);
   rpc ListItems(ListItemsRequest) returns (ListItemsResponse);
+  rpc UpdateItem(UpdateItemRequest) returns (UpdateItemResponse);
+  rpc SetStatus(SetStatusRequest) returns (SetStatusResponse);
+  rpc ArchiveItem(ArchiveItemRequest) returns (ArchiveItemResponse);
+  rpc UnarchiveItem(UnarchiveItemRequest) returns (UnarchiveItemResponse);
+  // Soft delete (design 3.7): the Item stays as a tombstone with deleted_at
+  // set and is hidden from every view. Never deletes in a tracker.
+  rpc DeleteItem(DeleteItemRequest) returns (DeleteItemResponse);
+  rpc UndeleteItem(UndeleteItemRequest) returns (UndeleteItemResponse);
+  // Applies the mutations atomically as one op (one undo step): either all
+  // succeed or none is applied.
+  rpc BatchMutate(BatchMutateRequest) returns (BatchMutateResponse);
 }
 
 message CaptureItemRequest {
   string request_id = 1;
-  // Raw capture text. In P0 it becomes the title verbatim.
+  // Raw capture text, parsed with the inline capture syntax (design 2.3).
   string text = 2;
+  // TUI, CLI or MCP; other values are reserved for the daemon.
   CreatedVia created_via = 3;
   // "Now" for relative dates in text; defaults to the daemon's clock. Spool
   // imports pass the original capture time.
@@ -32,6 +56,78 @@ message CaptureItemRequest {
 message CaptureItemResponse {
   Item item = 1;
   MutationResult result = 2;
+  // What the text was parsed into, including any warnings.
+  CaptureDraft draft = 3;
+}
+
+message ParseCaptureRequest {
+  string text = 1;
+  // "Now" for relative dates; defaults to the daemon's clock.
+  google.protobuf.Timestamp reference_time = 2;
+}
+
+message ParseCaptureResponse {
+  CaptureDraft draft = 1;
+}
+
+// The result of parsing capture text (design 2.3). A token that fails to
+// parse stays in the title and adds a warning. When no title words remain,
+// the whole text is kept as the title and no token is applied.
+message CaptureDraft {
+  string title = 1;
+  // PRIORITY_NONE without a +N token.
+  Priority priority = 2;
+  google.type.Date due_date = 3;
+  repeated string labels = 4;
+  // Unset without a ~ token. Free text until People exist.
+  PersonRef waiting_on = 5;
+  // STATUS_INBOX unless a >next / >someday token says otherwise.
+  Status status = 6;
+  // Every sigil token in text order, applied or not.
+  repeated CaptureToken tokens = 7;
+  // Human-readable warnings, in text order.
+  repeated string warnings = 8;
+}
+
+message CaptureToken {
+  // Offsets into the text in Unicode code points (not bytes or UTF-16
+  // units); end is exclusive.
+  uint32 start = 1;
+  uint32 end = 2;
+  CaptureTokenKind kind = 3;
+  // False when the token did not parse and stayed in the title, or was
+  // overridden by a later token of the same kind.
+  bool applied = 4;
+  // Why the token was not applied; empty when applied.
+  string warning = 5;
+}
+
+enum CaptureTokenKind {
+  CAPTURE_TOKEN_KIND_UNSPECIFIED = 0;
+  // +1 .. +5
+  CAPTURE_TOKEN_KIND_PRIORITY = 1;
+  // ^<date>
+  CAPTURE_TOKEN_KIND_DUE_DATE = 2;
+  // #<label>
+  CAPTURE_TOKEN_KIND_LABEL = 3;
+  // ~<person> or ~"<free text>"
+  CAPTURE_TOKEN_KIND_WAITING = 4;
+  // >next / >someday
+  CAPTURE_TOKEN_KIND_STATUS = 5;
+}
+
+message GetItemRequest {
+  string id = 1;
+}
+
+message GetItemResponse {
+  // A soft-deleted Item is returned with deleted_at set. An Item merged into
+  // another resolves to the merge target.
+  Item item = 1;
+  // The revision this was read at.
+  uint64 revision = 2;
+  // Set when id named a merged Item: the id that was requested.
+  optional string resolved_from = 3;
 }
 
 message ListItemsRequest {
@@ -57,4 +153,114 @@ message ListItemsResponse {
   string next_page_token = 2;
   // The revision this page was read at (later pages may report a higher one).
   uint64 revision = 3;
+}
+
+// Partial update (design 4.3 rule 2). Only the paths in update_mask are
+// written; everything else in item is ignored.
+message UpdateItemRequest {
+  string request_id = 1;
+  // item.id names the Item; the masked fields carry the new values.
+  Item item = 2;
+  // Item field paths, e.g. "title", "due_date", "waiting" or
+  // "waiting.follow_up_on". Must not be empty; "*" is not supported. A path
+  // whose field is unset in item clears it (a field with a domain "none",
+  // such as priority, takes that value instead). Status fields change only
+  // through SetStatus, archived only through Archive/UnarchiveItem, and
+  // read-only, derived and remote fields cannot be updated. Setting "waiting"
+  // without waiting.since uses today.
+  google.protobuf.FieldMask update_mask = 3;
+  optional uint64 expected_revision = 4;
+}
+
+message UpdateItemResponse {
+  Item item = 1;
+  MutationResult result = 2;
+}
+
+// Sets the derived 6-value status, which the daemon decomposes into
+// status_category, resolution_kind and todo_refinement (design 3.4).
+message SetStatusRequest {
+  string request_id = 1;
+  string id = 2;
+  Status status = 3;
+  optional uint64 expected_revision = 4;
+}
+
+message SetStatusResponse {
+  Item item = 1;
+  MutationResult result = 2;
+}
+
+// Archives with reason ARCHIVE_REASON_USER.
+message ArchiveItemRequest {
+  string request_id = 1;
+  string id = 2;
+  optional uint64 expected_revision = 3;
+}
+
+message ArchiveItemResponse {
+  Item item = 1;
+  MutationResult result = 2;
+}
+
+message UnarchiveItemRequest {
+  string request_id = 1;
+  string id = 2;
+  optional uint64 expected_revision = 3;
+}
+
+message UnarchiveItemResponse {
+  Item item = 1;
+  MutationResult result = 2;
+}
+
+message DeleteItemRequest {
+  string request_id = 1;
+  string id = 2;
+  optional uint64 expected_revision = 3;
+}
+
+message DeleteItemResponse {
+  // The tombstone, with deleted_at set.
+  Item item = 1;
+  MutationResult result = 2;
+}
+
+message UndeleteItemRequest {
+  string request_id = 1;
+  string id = 2;
+  optional uint64 expected_revision = 3;
+}
+
+message UndeleteItemResponse {
+  Item item = 1;
+  MutationResult result = 2;
+}
+
+message BatchMutateRequest {
+  string request_id = 1;
+  // At most 1000. Mutations apply in order; several may target one Item, and
+  // each expected_revision is checked against the Item as it was before the
+  // batch.
+  repeated Mutation mutations = 2;
+}
+
+// One single-item mutation within a batch. The nested request_id must be
+// empty: the batch's request_id covers the whole op.
+message Mutation {
+  oneof kind {
+    UpdateItemRequest update_item = 1;
+    SetStatusRequest set_status = 2;
+    ArchiveItemRequest archive_item = 3;
+    UnarchiveItemRequest unarchive_item = 4;
+    DeleteItemRequest delete_item = 5;
+    UndeleteItemRequest undelete_item = 6;
+  }
+}
+
+message BatchMutateResponse {
+  // One per mutation, in request order, each in its state after the whole
+  // batch (an Item mutated twice appears twice, identically).
+  repeated Item items = 1;
+  MutationResult result = 2;
 }

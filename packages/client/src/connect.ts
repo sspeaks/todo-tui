@@ -1,15 +1,16 @@
 import { dirname } from "node:path";
-import { type Client, type Transport, createClient } from "@connectrpc/connect";
+import { Code, ConnectError, type Client, type Transport, createClient } from "@connectrpc/connect";
+import { ErrorInfoSchema } from "./gen/google/rpc/error_details_pb.js";
 import { ItemService } from "./gen/todo/v1/item_service_pb.js";
 import { ClientKind, type GetServerInfoResponse, SystemService } from "./gen/todo/v1/system_service_pb.js";
 import { WatchService } from "./gen/todo/v1/watch_service_pb.js";
 import { LiveStore, type LiveStoreOptions } from "./live-store.js";
-import { defaultSocketPath } from "./paths.js";
-import { spawnDaemon, withAutoSpawn } from "./spawn.js";
+import { defaultSocketPath, envFromProcess, resolvePaths } from "./paths.js";
+import { isConnectionFailure, readDaemonPid, spawnDaemon, waitForDaemonExit, withAutoSpawn } from "./spawn.js";
 import { type TodoTransport, type TodoTransportOptions, UnsafeRuntimeDirError, checkRuntimeDir, createTodoTransport } from "./transport.js";
 
 /** The api_minor this client was built against. */
-export const CLIENT_API_MINOR = 0;
+export const CLIENT_API_MINOR = 1;
 export const CLIENT_VERSION = "0.1.0";
 
 export interface TodoClients {
@@ -44,9 +45,19 @@ export class DaemonTooOldError extends Error {
   constructor(
     readonly serverInfo: GetServerInfoResponse,
     readonly requiredApiMinor: number,
+    options?: ErrorOptions,
   ) {
-    super(`daemon ${serverInfo.daemonVersion} has api_minor ${serverInfo.apiMinor}, client needs ${requiredApiMinor}`);
+    super(`daemon ${serverInfo.daemonVersion} has api_minor ${serverInfo.apiMinor}, client needs ${requiredApiMinor}`, options);
     this.name = "DaemonTooOldError";
+  }
+}
+
+/** The daemon is too old and refused the upgrade restart: other interactive clients are connected (4.2). */
+export class DaemonRestartRefusedError extends DaemonTooOldError {
+  constructor(serverInfo: GetServerInfoResponse, requiredApiMinor: number, options?: ErrorOptions) {
+    super(serverInfo, requiredApiMinor, options);
+    this.message = `restart required (${this.message}); close other todo sessions first`;
+    this.name = "DaemonRestartRefusedError";
   }
 }
 
@@ -58,7 +69,66 @@ export function createClients(transport: Transport): TodoClients {
   };
 }
 
-/** Dials the daemon (spawning it if needed) and performs the GetServerInfo handshake (4.2). */
+/** The steps of an upgrade restart; injectable for tests. */
+export interface UpgradeRestartSteps {
+  /** SystemService.Shutdown({ restart: true }) on the old daemon. */
+  shutdown: () => Promise<unknown>;
+  /** Resolves once the old daemon has exited. */
+  waitForExit: () => Promise<void>;
+  spawn: () => Promise<void>;
+  handshake: () => Promise<GetServerInfoResponse>;
+}
+
+function isRestartRefused(err: unknown): boolean {
+  return (
+    err instanceof ConnectError &&
+    err.code === Code.FailedPrecondition &&
+    err.findDetails(ErrorInfoSchema).some((d) => d.reason === "INTERACTIVE_CLIENTS_CONNECTED")
+  );
+}
+
+/**
+ * Upgrade restart (4.2) of a daemon whose api_minor is below
+ * `requiredApiMinor`: shuts it down, waits for it to exit, spawns it again
+ * and repeats the handshake once. A shutdown that fails because the daemon is
+ * already gone counts as done. Returns the new daemon's server info.
+ */
+export async function upgradeRestart(
+  serverInfo: GetServerInfoResponse,
+  requiredApiMinor: number,
+  steps: UpgradeRestartSteps,
+): Promise<GetServerInfoResponse> {
+  try {
+    await steps.shutdown();
+  } catch (err) {
+    if (isRestartRefused(err)) throw new DaemonRestartRefusedError(serverInfo, requiredApiMinor, { cause: err });
+    if (!isConnectionFailure(err)) throw err;
+  }
+  await steps.waitForExit();
+  await steps.spawn();
+  const info = await steps.handshake();
+  if (info.apiMinor < requiredApiMinor) throw new DaemonTooOldError(info, requiredApiMinor);
+  return info;
+}
+
+/**
+ * The pid in the daemon lock, read only when `socketPath` is the socket `env`
+ * resolves to: a lock elsewhere belongs to some other daemon.
+ */
+function daemonPidFor(socketPath: string, env: NodeJS.ProcessEnv): number | undefined {
+  try {
+    const paths = resolvePaths(envFromProcess(env));
+    return paths.socket === socketPath ? readDaemonPid(paths.lock) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Dials the daemon (spawning it if needed) and performs the GetServerInfo
+ * handshake (4.2). A daemon older than `requiredApiMinor` gets an upgrade
+ * restart unless `autoSpawn` is false.
+ */
 export async function connect(opts: ConnectOptions = {}): Promise<TodoConnection> {
   const env = opts.env ?? process.env;
   const socketPath = opts.socketPath ?? defaultSocketPath(env);
@@ -91,13 +161,23 @@ export async function connect(opts: ConnectOptions = {}): Promise<TodoConnection
       ...(opts.autoSpawn !== undefined && { autoSpawn: opts.autoSpawn }),
       ...(opts.spawnBudgetMs !== undefined && { budgetMs: opts.spawnBudgetMs }),
     });
+    if (serverInfo.apiMinor < requiredApiMinor) {
+      if (opts.autoSpawn === false) throw new DaemonTooOldError(serverInfo, requiredApiMinor);
+      const pid = daemonPidFor(socketPath, env);
+      serverInfo = await upgradeRestart(serverInfo, requiredApiMinor, {
+        shutdown: () => clients.system.shutdown({ restart: true }, { timeoutMs: 15_000 }),
+        waitForExit: () => {
+          // Let go of the old daemon; the next handshake dials afresh.
+          transport.close();
+          return waitForDaemonExit(pid, socketPath);
+        },
+        spawn: () => spawnDaemon(spawnOpts),
+        handshake,
+      });
+    }
   } catch (err) {
     transport.close();
     throw err;
-  }
-  if (serverInfo.apiMinor < requiredApiMinor) {
-    transport.close();
-    throw new DaemonTooOldError(serverInfo, requiredApiMinor);
   }
   return {
     ...clients,

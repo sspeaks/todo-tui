@@ -1,7 +1,10 @@
 //! Status storage and derivation (design 3.4).
 
+use serde::{Deserialize, Serialize};
+
 /// Core: tracker status category.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StatusCategory {
     Todo,
     InProgress,
@@ -9,14 +12,16 @@ pub enum StatusCategory {
 }
 
 /// Core: set only while the category is `Done`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ResolutionKind {
     Done,
     Cancelled,
 }
 
 /// Overlay: meaningful only while the category is `Todo`; retained otherwise.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TodoRefinement {
     #[default]
     Inbox,
@@ -25,7 +30,8 @@ pub enum TodoRefinement {
 }
 
 /// The derived 6-value status clients see and set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Status {
     Inbox,
     Next,

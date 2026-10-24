@@ -1,4 +1,6 @@
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { connect as netConnect } from "node:net";
 import { Code, ConnectError } from "@connectrpc/connect";
 
 /** `$TODO_BIN`, else `todo` from PATH. */
@@ -54,6 +56,56 @@ export function isConnectionFailure(err: unknown): boolean {
 }
 
 export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/** The pid the running daemon recorded in its lock file (Paths.lock), as the Rust CLI reads it. */
+export function readDaemonPid(lockPath: string): number | undefined {
+  try {
+    const text = readFileSync(lockPath, "utf8").trim();
+    const pid = Number(text);
+    return /^\d+$/.test(text) && pid > 0 && pid <= 0x7fffffff ? pid : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** True while something accepts connections on `socketPath`. */
+export function isListening(socketPath: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = netConnect(socketPath);
+    socket.once("connect", () => {
+      socket.destroy();
+      resolve(true);
+    });
+    socket.once("error", () => resolve(false));
+  });
+}
+
+/**
+ * Waits for the daemon to exit: until `pid` is gone when it is known (ESRCH,
+ * or EPERM once the pid belongs to another user), otherwise until
+ * `socketPath` stops accepting connections. Like the Rust CLI it never takes
+ * the lock to probe it. Throws after `timeoutMs`.
+ */
+export async function waitForDaemonExit(pid: number | undefined, socketPath: string, timeoutMs = 15_000): Promise<void> {
+  const running = async () => {
+    if (pid === undefined) return isListening(socketPath);
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const deadline = Date.now() + timeoutMs;
+  let delay = 20;
+  while (await running()) {
+    if (Date.now() >= deadline) {
+      throw new Error(`daemon${pid === undefined ? "" : ` (pid ${pid})`} still running after ${timeoutMs}ms`);
+    }
+    await sleep(delay);
+    delay = Math.min(delay * 2, 200);
+  }
+}
 
 /**
  * Calls `attempt` until it stops failing with a connection error, spawning the

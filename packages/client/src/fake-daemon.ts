@@ -1,18 +1,28 @@
 import { type MessageInitShape, create } from "@bufbuild/protobuf";
 import { timestampNow } from "@bufbuild/protobuf/wkt";
 import { Code, ConnectError, type Transport, createRouterTransport } from "@connectrpc/connect";
-import { Topic } from "./gen/todo/v1/common_pb.js";
-import { type Item, ItemSchema, Status } from "./gen/todo/v1/item_pb.js";
-import { ItemService, type ListItemsRequest } from "./gen/todo/v1/item_service_pb.js";
+import { ErrorInfoSchema } from "./gen/google/rpc/error_details_pb.js";
+import { type MutationResultSchema, Topic } from "./gen/todo/v1/common_pb.js";
+import { ArchiveReason, type Item, ItemSchema, Status } from "./gen/todo/v1/item_pb.js";
+import { ItemService, type ListItemsRequest, type UpdateItemRequest } from "./gen/todo/v1/item_service_pb.js";
 import { SystemService } from "./gen/todo/v1/system_service_pb.js";
 import { type Change, ChangeSchema, type SubscribeResponse, SubscribeResponseSchema, WatchService } from "./gen/todo/v1/watch_service_pb.js";
 
 type Waiter = (msg: SubscribeResponse | Error) => void;
 
+interface MutationResponse {
+  item: Item;
+  result: MessageInitShape<typeof MutationResultSchema>;
+}
+
 /**
- * An in-memory daemon over createRouterTransport for tests: ItemService
- * (no filtering; items sorted by id; deleted items omitted), WatchService with
- * replay / CaughtUp / ResyncRequired, and SystemService.GetServerInfo.
+ * An in-memory daemon over createRouterTransport for tests: ItemService,
+ * WatchService with replay / CaughtUp / ResyncRequired, and
+ * SystemService.GetServerInfo. ListItems only filters out soft-deleted items
+ * (unless include_deleted) and sorts by id. The single-item mutations honour
+ * request_id replay and expected_revision but none of the domain rules:
+ * SetStatus sets only the derived status, UpdateItem copies the top-level
+ * fields its mask names.
  */
 export class FakeDaemon {
   revision = 0n;
@@ -25,10 +35,12 @@ export class FakeDaemon {
   pageSize = 1000;
   /** Runs before every ListItems; throw from it to fail that call. */
   onListItems: ((req: ListItemsRequest) => void) | undefined;
-  apiMinor = 0;
+  apiMinor = 1;
   readonly calls = { listItems: 0, subscribe: [] as (bigint | undefined)[] };
   readonly transport: Transport;
   private readonly watchers = new Set<Waiter>();
+  /** Mutation responses by request_id, for replays. */
+  private readonly responses = new Map<string, MutationResponse>();
   private nextId = 0;
 
   constructor(initial: MessageInitShape<typeof ItemSchema>[] = []) {
@@ -51,7 +63,9 @@ export class FakeDaemon {
           this.check();
           this.calls.listItems++;
           this.onListItems?.(req);
-          const all = [...this.items.values()].sort((a, b) => (a.id < b.id ? -1 : 1));
+          const all = [...this.items.values()]
+            .filter((i) => req.filter?.includeDeleted || i.deletedAt === undefined)
+            .sort((a, b) => (a.id < b.id ? -1 : 1));
           const size = req.pageSize > 0 ? req.pageSize : this.pageSize;
           const offset = req.pageToken ? Number(req.pageToken) : 0;
           const end = offset + size;
@@ -61,6 +75,16 @@ export class FakeDaemon {
             revision: this.revision,
           };
         },
+        getItem: (req) => {
+          this.check();
+          return { item: this.get(req.id), revision: this.revision };
+        },
+        updateItem: (req) => this.mutate({ ...req, id: req.item?.id ?? "" }, maskedFields(req)),
+        setStatus: (req) => this.mutate(req, { status: req.status }),
+        archiveItem: (req) => this.mutate(req, { archived: { at: timestampNow(), reason: ArchiveReason.USER } }),
+        unarchiveItem: (req) => this.mutate(req, { archived: undefined }),
+        deleteItem: (req) => this.mutate(req, { deletedAt: timestampNow() }),
+        undeleteItem: (req) => this.mutate(req, { deletedAt: undefined }),
       });
       const self = this;
       service(WatchService, {
@@ -157,6 +181,35 @@ export class FakeDaemon {
     this.replayFloor = this.revision;
   }
 
+  /**
+   * Applies `patch` as a mutation: a replayed request_id returns the first
+   * response, and a stale expected_revision fails with ABORTED.
+   */
+  private mutate(
+    req: { requestId: string; id: string; expectedRevision?: bigint | undefined },
+    patch: MessageInitShape<typeof ItemSchema>,
+  ): MutationResponse {
+    this.check();
+    const replay = this.responses.get(req.requestId);
+    if (replay) return replay;
+    const actual = this.get(req.id).revision;
+    if (req.expectedRevision !== undefined && req.expectedRevision !== actual) {
+      throw errorInfo(Code.Aborted, "REVISION_MISMATCH", `item ${req.id} is at revision ${actual}, not ${req.expectedRevision}`, {
+        expected_revision: String(req.expectedRevision),
+        actual_revision: String(actual),
+      });
+    }
+    const res = { item: this.update(req.id, patch), result: { opId: `op${this.revision}`, revision: this.revision } };
+    if (req.requestId !== "") this.responses.set(req.requestId, res);
+    return res;
+  }
+
+  private get(id: string): Item {
+    const item = this.items.get(id);
+    if (!item) throw errorInfo(Code.NotFound, "ITEM_NOT_FOUND", `item ${id} not found`, { item_id: id });
+    return item;
+  }
+
   private publish(init: MessageInitShape<typeof ChangeSchema>): void {
     const change = create(ChangeSchema, init);
     this.changes.push(change);
@@ -170,4 +223,21 @@ export class FakeDaemon {
 
 function msg(message: MessageInitShape<typeof SubscribeResponseSchema>["message"]): SubscribeResponse {
   return create(SubscribeResponseSchema, { message });
+}
+
+/** An error with an ErrorInfo detail, as the daemon sends them. */
+function errorInfo(code: Code, reason: string, message: string, metadata: Record<string, string>): ConnectError {
+  return new ConnectError(message, code, undefined, [{ desc: ErrorInfoSchema, value: { reason, domain: "todo-tui", metadata } }]);
+}
+
+/** The top-level Item fields named by the update mask, taken from the request's item. */
+function maskedFields(req: UpdateItemRequest): MessageInitShape<typeof ItemSchema> {
+  const source = (req.item ?? create(ItemSchema)) as unknown as Record<string, unknown>;
+  const patch: Record<string, unknown> = {};
+  for (const path of req.updateMask?.paths ?? []) {
+    const field = ItemSchema.fields.find((f) => f.name === path.split(".")[0]);
+    if (!field) throw new ConnectError(`update_mask: unknown field ${path}`, Code.InvalidArgument);
+    patch[field.localName] = source[field.localName];
+  }
+  return patch as MessageInitShape<typeof ItemSchema>;
 }

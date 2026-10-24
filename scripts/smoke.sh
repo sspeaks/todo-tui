@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# P0 smoke test (plan S0.9): auto-spawn, a TS watcher over Subscribe, the
-# single-daemon lock under parallel --detach, and the long-path socket fallback.
+# Smoke test: auto-spawn, a TS watcher over Subscribe, the single-daemon lock
+# under parallel --detach, the long-path socket fallback (P0), parsed capture
+# and the capture spool round trip (P1 M1).
 # Usage: scripts/smoke.sh   (TODO_BIN overrides the binary; default: cargo build)
 set -euo pipefail
 
@@ -74,6 +75,11 @@ start_watcher() {
   fail "watcher never printed READY"
 }
 
+# Prints every item as protobuf JSON, one per line.
+list_items() {
+  (cd "$repo/packages/client" && corepack pnpm exec tsx scripts/smoke-watch.ts --list)
+}
+
 wait_watcher_sees() {
   local out=$1 title=$2
   wait "$watcher_pid" || { cat "$out.err" >&2; fail "watcher failed"; }
@@ -124,4 +130,41 @@ fallback=/tmp/todo-tui-$(id -u)/h-$(sha8 "$long")/daemon.sock
 start_watcher "$root/watch2.out"
 "$TODO_BIN" add "long watcher" >/dev/null
 wait_watcher_sees "$root/watch2.out" "long watcher"
+"$TODO_BIN" daemon stop >/dev/null
+
+# 4. `todo add` parses the capture syntax and prints the parsed fields; the TS
+#    watcher sees them on the Item.
+step "parsed capture"
+home=$root/parsed
+new_home "$home"
+export TODO_TUI_HOME=$home
+start_watcher "$root/watch3.out"
+out=$("$TODO_BIN" add "call dentist ^2026-10-24 +2 #home")
+re='^[0-9A-Z]{8}  call dentist  \+2 \^2026-10-24 #home$'
+[[ $out =~ $re ]] || fail "unexpected add output: $out"
+wait_watcher_sees "$root/watch3.out" "call dentist"
+for field in '"priority":"PRIORITY_HIGH"' '"dueDate":{"year":2026,"month":10,"day":24}' '"labels":["home"]'; do
+  grep -qF "$field" "$root/watch3.out" || { cat "$root/watch3.out" >&2; fail "watcher item lacks $field"; }
+done
+"$TODO_BIN" daemon stop >/dev/null
+
+# 5. With the daemon down and unable to start (a file where its runtime dir
+#    belongs), `todo add` spools and succeeds; the next daemon imports it.
+step "spool round trip"
+home=$root/spool
+new_home "$home"
+export TODO_TUI_HOME=$home
+: >"$home/run"
+out=$("$TODO_BIN" add "spooled item ^2026-10-24 #later" 2>"$root/spool.err") \
+  || { cat "$root/spool.err" >&2; fail "add failed while the daemon could not start"; }
+[[ $out == "spooled  spooled item ^2026-10-24 #later" ]] || fail "unexpected add output: $out"
+grep -qF "spooled to $home/data/spool.jsonl" "$root/spool.err" || { cat "$root/spool.err" >&2; fail "add did not say where it spooled"; }
+[[ $(wc -l <"$home/data/spool.jsonl" | tr -d ' ') == 1 ]] || fail "expected one spool line"
+rm "$home/run"
+"$TODO_BIN" daemon --detach >/dev/null
+for _ in $(seq 1 50); do [[ -s $home/data/spool.jsonl ]] || break; sleep 0.1; done
+[[ -s $home/data/spool.jsonl ]] && fail "the daemon did not import the spool"
+list_items >"$root/spool.items" || fail "listing items failed"
+[[ $(grep -c '"title":"spooled item"' "$root/spool.items") == 1 ]] || { cat "$root/spool.items" >&2; fail "spooled item not imported exactly once"; }
+grep -qF '"labels":["later"]' "$root/spool.items" || { cat "$root/spool.items" >&2; fail "spooled item lost its label"; }
 "$TODO_BIN" daemon stop >/dev/null

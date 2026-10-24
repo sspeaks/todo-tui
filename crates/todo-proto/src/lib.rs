@@ -1,6 +1,7 @@
 //! Generated todo.v1 protobuf code and core conversions.
 
 pub mod convert;
+pub mod request;
 
 /// `google.*` types compiled from the vendored protos.
 #[allow(clippy::all)]
@@ -25,4 +26,4 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/todo_descriptor.bin"));
 
 /// The `api_minor` this build serves (design 4.2).
-pub const API_MINOR: u32 = 0;
+pub const API_MINOR: u32 = 1;

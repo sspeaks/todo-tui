@@ -36,6 +36,9 @@ message Change {
   Topic topic = 2;
   // Resource id.
   string id = 3;
+  // The resource no longer exists. A soft-deleted Item is not deleted in this
+  // sense: it arrives with deleted = false and Item.deleted_at set, so an
+  // undelete is an ordinary change too.
   bool deleted = 4;
   // The full resource, unless deleted.
   oneof resource {

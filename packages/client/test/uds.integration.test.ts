@@ -12,11 +12,11 @@ import { CreatedVia, type Item } from "../src/gen/todo/v1/item_pb.js";
 import { ClientKind } from "../src/gen/todo/v1/system_service_pb.js";
 import { type TodoConnection, connect, createLiveStore } from "../src/connect.js";
 import type { LiveStore } from "../src/live-store.js";
+import { updateItem } from "../src/mutations.js";
 import { resolvePaths, envFromProcess } from "../src/paths.js";
+import { ulid } from "../src/ulid.js";
 
 const TODO_BIN = process.env.TODO_BIN;
-let ulidSeq = 0;
-const ulid = () => `01J${String(++ulidSeq).padStart(23, "0")}`;
 const run = promisify(execFile);
 
 async function waitFor(cond: () => boolean, timeoutMs = 5000): Promise<void> {
@@ -46,7 +46,8 @@ async function home() {
   cleanups.push(async () => {
     for (const c of conns) c.close();
     try {
-      const c = await connect({ env, autoSpawn: false, clientKind: ClientKind.ONESHOT });
+      // Any api_minor will do for a shutdown.
+      const c = await connect({ env, autoSpawn: false, clientKind: ClientKind.ONESHOT, requiredApiMinor: 0 });
       await c.system.shutdown({}).catch(() => {});
       c.close();
     } catch {
@@ -137,8 +138,23 @@ describe.skipIf(!TODO_BIN)("UDS integration against $TODO_BIN", { timeout: 60_00
     expect(bad.findDetails(BadRequestSchema)[0]?.fieldViolations[0]?.field).toBe("page_token");
   });
 
-  // P0 has no mutation taking expected_revision, so REVISION_MISMATCH is unreachable.
-  it.skip("decodes ABORTED / REVISION_MISMATCH", () => {});
+  it("decodes ABORTED / REVISION_MISMATCH", async () => {
+    const h = await home();
+    const conn = await h.open();
+    const { item } = await conn.items.captureItem({ createdVia: CreatedVia.TUI, requestId: ulid(), text: "edit me" });
+    const { id, revision } = item!;
+
+    const rename = (expectedRevision: bigint) =>
+      updateItem(conn.items, { id, title: "renamed" }, ["title"], { expectedRevision });
+    const err = ConnectError.from(await rename(revision + 1n).catch((e: unknown) => e));
+    expect(err.code).toBe(Code.Aborted);
+    expect(err.findDetails(ErrorInfoSchema)[0]?.reason).toBe("REVISION_MISMATCH");
+    expect((await conn.items.getItem({ id })).item?.title).toBe("edit me");
+
+    const ok = await rename(revision);
+    expect(ok.item?.title).toBe("renamed");
+    expect(ok.item?.revision).toBeGreaterThan(revision);
+  });
 
   it("lists 5k items", async () => {
     const h = await home();

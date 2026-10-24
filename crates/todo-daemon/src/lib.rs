@@ -8,6 +8,7 @@ pub mod paths;
 mod server;
 mod service;
 mod shutdown;
+pub mod spool;
 
 pub use server::{Daemon, Exit, Started, run};
 pub use shutdown::ShutdownHandle;

@@ -291,6 +291,7 @@ export class LiveStore {
     const seen = this.seen.get(change.id);
     if (seen === undefined || change.revision >= seen) {
       this.seen.set(change.id, change.revision);
+      // A hard removal. A soft delete is an ordinary change with deleted_at set.
       if (change.deleted) {
         this.items.delete(change.id);
       } else if (change.resource.case === "item") {
@@ -343,13 +344,17 @@ export class LiveView {
   private refs = 0;
   private snap: ViewSnapshot = { status: "loading", items: [], revision: 0n };
   private snapVersion = -1;
+  /** Soft-deleted Items stay in the store (getItem) but only these views show them. */
+  private readonly includeDeleted: boolean;
 
   constructor(
     private readonly store: LiveStore,
     private readonly key: string,
     /** @internal */
     readonly request: ListItemsRequest,
-  ) {}
+  ) {
+    this.includeDeleted = request.filter?.includeDeleted ?? false;
+  }
 
   get needsLoad(): boolean {
     return !this.loaded || this.status === "error" || this.stale;
@@ -426,7 +431,7 @@ export class LiveView {
     const items: Item[] = [];
     for (const id of this.ids) {
       const item = this.store.getItem(id);
-      if (item) items.push(item);
+      if (item && (this.includeDeleted || item.deletedAt === undefined)) items.push(item);
     }
     const prev = this.snap;
     const same =

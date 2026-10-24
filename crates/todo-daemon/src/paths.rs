@@ -208,6 +208,17 @@ impl Paths {
     pub fn daemon_log(&self) -> PathBuf {
         self.logs.join("daemon.log")
     }
+
+    /// Captures the CLI could not deliver, one JSON object per line
+    /// (design 2.1), in [`Paths::data`].
+    pub fn spool(&self) -> PathBuf {
+        self.data.join("spool.jsonl")
+    }
+
+    /// Spool lines the daemon could not import, kept verbatim.
+    pub fn spool_rejected(&self) -> PathBuf {
+        self.data.join("spool.rejected.jsonl")
+    }
 }
 
 const SOCKET_NAME: &str = "daemon.sock";

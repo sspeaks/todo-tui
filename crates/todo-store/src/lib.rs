@@ -7,7 +7,7 @@
 mod codec;
 mod schema;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,13 +15,19 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
 use jiff::Timestamp;
+use jiff::civil::Date;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use todo_core::{CreatedVia, Item, ItemId, MutationResult, Revision, Status, Topic, new_ulid};
+use todo_core::{
+    Actor, ApplyCtx, CaptureDraft, CreatedVia, FieldChange, FieldValue, Item, ItemField, ItemId,
+    Mutation, MutationError, MutationResult, PersonRef, Revision, Status, StatusFields, Topic,
+    apply, new_ulid,
+};
 use tokio::sync::{Semaphore, broadcast, oneshot};
+use ulid::Ulid;
 
 use codec::{
-    ITEM_COLUMNS, SqlEnum, date_to_sql, item_from_row, load_item, rev_from_sql, rev_to_sql,
-    ts_to_sql,
+    ITEM_COLUMNS, SqlEnum, date_to_sql, is_overdue, item_from_row, load_item, rev_from_sql,
+    rev_to_sql, ts_to_sql,
 };
 pub use schema::SCHEMA_VERSION;
 
@@ -33,11 +39,24 @@ pub enum StoreError {
     SchemaTooNew { found: u32, supported: u32 },
     #[error("item {0} not found")]
     NotFound(ItemId),
-    #[error("revision conflict: expected {expected}, found {actual}")]
+    #[error("item {id}: revision conflict: expected {expected}, found {actual}")]
     RevisionMismatch {
+        id: ItemId,
         expected: Revision,
         actual: Revision,
     },
+    /// Mutation `index` of a batch (0 for a capture) is invalid.
+    #[error("mutation {index}: {error}")]
+    Mutation {
+        index: usize,
+        #[source]
+        error: MutationError,
+    },
+    /// The request id is recorded for an op of another kind (a capture, or a
+    /// mutation of another [`OpKind`]): the client reused it for a different
+    /// request, and replaying the original would answer the wrong call.
+    #[error("the request id was already used for a different request")]
+    RequestIdReused,
     #[error("invalid page token")]
     InvalidPageToken,
     #[error("corrupt row: {0}")]
@@ -93,13 +112,63 @@ pub struct ChangeRow {
 pub struct CaptureInput {
     /// Client ULID for idempotency (24h window).
     pub request_id: String,
-    pub title: String,
+    /// The parsed text. An empty title fails with [`StoreError::Mutation`];
+    /// tokens and warnings are not stored.
+    pub draft: CaptureDraft,
     pub created_via: CreatedVia,
     pub parent_id: Option<ItemId>,
     /// Spool entry id; a spool id already imported returns the original result.
     pub spool_id: Option<String>,
     /// Creation time; the daemon passes the capture's reference time or now.
     pub now: Timestamp,
+    /// "Today" in the user's zone, for `is_overdue` on the returned Item.
+    pub today: Date,
+}
+
+/// What an op does, recorded as `ops.kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpKind {
+    Update,
+    SetStatus,
+    Archive,
+    Unarchive,
+    Delete,
+    Undelete,
+    /// `BatchMutate`.
+    Batch,
+}
+
+/// Input for [`Store::mutate`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct MutateInput {
+    /// Client ULID for idempotency (24h window); empty for none.
+    pub request_id: String,
+    pub actor: Actor,
+    pub kind: OpKind,
+    /// Applied in order; several may target one Item.
+    pub mutations: Vec<Mutation>,
+    /// The mutation time, for `updated_at` and the staleness signals.
+    pub now: Timestamp,
+    /// "Today" in the user's zone, for `is_overdue` on the returned Items.
+    pub today: Date,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MutateOutput {
+    /// One per mutation, in request order, each in its state after the
+    /// whole batch.
+    pub items: Vec<Item>,
+    pub result: MutationResult,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GetItemOutput {
+    pub item: Item,
+    /// The revision this was read at.
+    pub revision: Revision,
+    /// The requested id when it named a merged Item; `item` is then the end
+    /// of its merge chain.
+    pub resolved_from: Option<ItemId>,
 }
 
 /// P0 query: the implicit view rules and paging. P1 replaces this with a
@@ -199,6 +268,12 @@ const BROADCAST_CAPACITY: usize = 1024;
 const DEFAULT_PAGE_SIZE: u32 = 100;
 const MAX_PAGE_SIZE: u32 = 1000;
 const REQUEST_ID_TTL_NS: i64 = 24 * 60 * 60 * 1_000_000_000;
+const REQUEST_SQL: &str = "SELECT r.op_id, r.revision, r.item_id, ops.kind
+     FROM request_ids r JOIN ops ON ops.id = r.op_id WHERE r.request_id = ?1";
+const SPOOL_SQL: &str = "SELECT s.op_id, s.revision, s.item_id, ops.kind
+     FROM spool_imports s JOIN ops ON ops.id = s.op_id WHERE s.spool_id = ?1";
+/// `ops.kind` of a capture.
+const CAPTURE_KIND: &str = "capture";
 
 /// State the writer thread shares with handles.
 struct Shared {
@@ -343,11 +418,32 @@ impl Store {
         }
     }
 
-    /// Creates an inbox Item (one op, one revision). Idempotent on
-    /// `request_id` and on `spool_id`: a replay returns the original Item and
-    /// result without writing.
+    /// Creates an Item from a parsed draft (one op, one revision).
+    /// Idempotent on `request_id` and on `spool_id`: a replay returns the
+    /// original result with the Item's current state, without writing. A
+    /// `request_id` recorded by [`Store::mutate`] fails with
+    /// [`StoreError::RequestIdReused`].
     pub async fn capture(&self, input: CaptureInput) -> Result<(Item, MutationResult)> {
         self.write(move |tx| capture_tx(tx, input)).await
+    }
+
+    /// Applies the mutations in order as one op, all or nothing. Each touched
+    /// Item gets one revision (contiguous, in first-touch order) and one
+    /// `changes` row, and each changed field one event. A batch that changes
+    /// nothing still records its op, at the current revision. Idempotent on
+    /// `request_id`: a replay returns the original result with the Items'
+    /// current state, without checking `expected_revision` or writing. A
+    /// `request_id` recorded by a capture or a mutation of another
+    /// [`OpKind`] fails with [`StoreError::RequestIdReused`].
+    pub async fn mutate(&self, input: MutateInput) -> Result<MutateOutput> {
+        self.write(move |tx| mutate_tx(tx, input)).await
+    }
+
+    /// The Item `id`, read with its revision. A soft-deleted Item is returned
+    /// with `deleted_at` set; a merged Item resolves to the end of its merge
+    /// chain.
+    pub async fn get_item(&self, id: ItemId, today: Date) -> Result<GetItemOutput> {
+        self.read(move |conn| get_item_tx(conn, id, today)).await
     }
 
     /// Lists Items matching `query`, ordered by `created_at` then id.
@@ -414,12 +510,145 @@ where
     Ok(value)
 }
 
-fn actor_for(via: CreatedVia) -> &'static str {
+fn actor_for(via: CreatedVia) -> Actor {
     match via {
-        CreatedVia::Tui | CreatedVia::Cli | CreatedVia::Mcp | CreatedVia::Split => "user",
-        CreatedVia::RemoteImport => "sync",
-        CreatedVia::Restore | CreatedVia::Recurrence => "system",
+        CreatedVia::Tui | CreatedVia::Cli | CreatedVia::Mcp | CreatedVia::Split => Actor::User,
+        CreatedVia::RemoteImport => Actor::Sync,
+        CreatedVia::Restore | CreatedVia::Recurrence => Actor::System,
     }
+}
+
+/// The `ops` row of one write, and what its events and `request_ids` row
+/// share.
+struct OpRow<'a> {
+    id: Ulid,
+    kind: &'static str,
+    actor: String,
+    /// When the write happened (wall clock), for `ops`, `events` and
+    /// `request_ids`.
+    at: i64,
+    request_id: Option<&'a str>,
+}
+
+impl<'a> OpRow<'a> {
+    /// A new op; an empty `request_id` means none.
+    fn new(kind: &'static str, actor: Actor, request_id: &'a str) -> Result<Self> {
+        Ok(OpRow {
+            id: new_ulid(),
+            kind,
+            actor: codec::actor_to_sql(actor),
+            at: ts_to_sql(Timestamp::now())?,
+            request_id: (!request_id.is_empty()).then_some(request_id),
+        })
+    }
+
+    /// `revision` is the last revision the op allocates (the current one if
+    /// it allocates none).
+    fn insert(&self, conn: &Connection, revision: Revision) -> Result<()> {
+        conn.prepare_cached(
+            "INSERT INTO ops (id, kind, actor, at, request_id, revision)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?
+        .execute(params![
+            self.id.to_string(),
+            self.kind,
+            self.actor,
+            self.at,
+            self.request_id,
+            rev_to_sql(revision)?
+        ])?;
+        Ok(())
+    }
+
+    fn insert_event(
+        &self,
+        conn: &Connection,
+        item_id: &str,
+        kind: &str,
+        field: Option<ItemField>,
+        old: Option<String>,
+        new: Option<String>,
+    ) -> Result<()> {
+        conn.prepare_cached(
+            "INSERT INTO events (id, op_id, item_id, at, actor, kind, field, old, new)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )?
+        .execute(params![
+            new_ulid().to_string(),
+            self.id.to_string(),
+            item_id,
+            self.at,
+            self.actor,
+            kind,
+            field.map(ItemField::number),
+            old,
+            new
+        ])?;
+        Ok(())
+    }
+
+    /// Remembers the request id, if any, for replays.
+    fn insert_request_id(
+        &self,
+        conn: &Connection,
+        revision: Revision,
+        item_id: Option<&str>,
+    ) -> Result<()> {
+        let Some(request_id) = self.request_id else {
+            return Ok(());
+        };
+        conn.prepare_cached(
+            "INSERT INTO request_ids (request_id, op_id, revision, item_id, at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?
+        .execute(params![
+            request_id,
+            self.id.to_string(),
+            rev_to_sql(revision)?,
+            item_id,
+            self.at
+        ])?;
+        Ok(())
+    }
+}
+
+/// Forgets request ids older than the 24h idempotency window.
+fn prune_request_ids(conn: &Connection, now: i64) -> Result<()> {
+    conn.prepare_cached("DELETE FROM request_ids WHERE at < ?1")?
+        .execute([now - REQUEST_ID_TTL_NS])?;
+    Ok(())
+}
+
+/// The op recorded under an idempotency key by `sql` ([`REQUEST_SQL`] or
+/// [`SPOOL_SQL`]): its id, revision and Item id. Fails with
+/// [`StoreError::RequestIdReused`] when that op's `ops.kind` is not `kind`.
+fn recorded_op(
+    conn: &Connection,
+    sql: &str,
+    key: &str,
+    kind: &str,
+) -> Result<Option<(Ulid, Revision, Option<String>)>> {
+    let Some((op_id, revision, item_id, recorded_kind)) = conn
+        .prepare_cached(sql)?
+        .query_row([key], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    if recorded_kind != kind {
+        return Err(StoreError::RequestIdReused);
+    }
+    let op_id = op_id
+        .parse()
+        .map_err(|_| StoreError::Corrupt(format!("bad op id {op_id:?}")))?;
+    Ok(Some((op_id, rev_from_sql(revision)?, item_id)))
 }
 
 /// The original result of an idempotent capture, if any.
@@ -427,54 +656,56 @@ fn capture_replay(
     conn: &Connection,
     sql: &str,
     key: &str,
+    today: Date,
 ) -> Result<Option<(Item, MutationResult)>> {
-    let Some((op_id, revision, item_id)) = conn
-        .prepare_cached(sql)?
-        .query_row([key], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, Option<String>>(2)?,
-            ))
-        })
-        .optional()?
-    else {
+    let Some((op_id, revision, item_id)) = recorded_op(conn, sql, key, CAPTURE_KIND)? else {
         return Ok(None);
     };
     let item_id = item_id
         .ok_or_else(|| StoreError::Corrupt(format!("request {key} did not create an item")))?;
-    let item = load_item(conn, &item_id, None)?.ok_or_else(|| {
+    let item = load_item(conn, &item_id, Some(today))?.ok_or_else(|| {
         StoreError::Corrupt(format!("item {item_id} for request {key} is missing"))
     })?;
-    let revision = rev_from_sql(revision)?;
-    let op_id = op_id
-        .parse()
-        .map_err(|_| StoreError::Corrupt(format!("bad op id {op_id:?}")))?;
     Ok(Some((item, MutationResult { op_id, revision })))
 }
 
+/// People arrive in a later milestone; until then only free text is stored.
+fn people_unsupported(field: ItemField) -> MutationError {
+    MutationError::Unsupported {
+        field,
+        reason: "people are not available yet".to_owned(),
+    }
+}
+
 fn capture_tx(tx: &mut WriteTx<'_>, input: CaptureInput) -> Result<(Item, MutationResult)> {
-    let now = ts_to_sql(Timestamp::now())?;
+    let actor = actor_for(input.created_via);
+    let op = OpRow::new(CAPTURE_KIND, actor, &input.request_id)?;
     let conn = tx.conn();
-    conn.prepare_cached("DELETE FROM request_ids WHERE at < ?1")?
-        .execute([now - REQUEST_ID_TTL_NS])?;
-    if !input.request_id.is_empty()
-        && let Some(replay) = capture_replay(
-            conn,
-            "SELECT op_id, revision, item_id FROM request_ids WHERE request_id = ?1",
-            &input.request_id,
-        )?
+    prune_request_ids(conn, op.at)?;
+    if let Some(request_id) = op.request_id
+        && let Some(replay) = capture_replay(conn, REQUEST_SQL, request_id, input.today)?
     {
         return Ok(replay);
     }
     if let Some(spool_id) = &input.spool_id
-        && let Some(replay) = capture_replay(
-            conn,
-            "SELECT op_id, revision, item_id FROM spool_imports WHERE spool_id = ?1",
-            spool_id,
-        )?
+        && let Some(replay) = capture_replay(conn, SPOOL_SQL, spool_id, input.today)?
     {
         return Ok(replay);
+    }
+    let draft = input.draft;
+    let invalid = |error| StoreError::Mutation { index: 0, error };
+    if draft.title.trim().is_empty() {
+        return Err(invalid(MutationError::Invalid {
+            field: ItemField::Title,
+            reason: "must not be empty".to_owned(),
+        }));
+    }
+    if draft
+        .waiting
+        .as_ref()
+        .is_some_and(|w| matches!(w.on, PersonRef::Person(_)))
+    {
+        return Err(invalid(people_unsupported(ItemField::WaitingOn)));
     }
     if let Some(parent) = input.parent_id {
         let exists = conn
@@ -485,57 +716,36 @@ fn capture_tx(tx: &mut WriteTx<'_>, input: CaptureInput) -> Result<(Item, Mutati
         }
     }
 
-    let op_id = new_ulid();
     let revision = tx.next_revision();
-    let mut item = Item::new_capture(new_ulid(), input.title, input.created_via, input.now);
+    let now = input.now;
+    let mut item = Item::new_capture(new_ulid(), draft.title, input.created_via, now);
     item.revision = revision;
     item.core.parent_id = input.parent_id;
-    item.derived.staleness.status_entered_at = Some(input.now);
-    if actor_for(input.created_via) == "user" {
-        item.derived.staleness.last_user_touch_at = Some(input.now);
+    item.core.priority = draft.priority;
+    item.core.due_date = draft.due_date;
+    item.core.labels = draft.labels;
+    item.set_status_fields(StatusFields::from_status(draft.status));
+    let staleness = &mut item.derived.staleness;
+    staleness.status_entered_at = Some(now);
+    staleness.waiting_since = draft.waiting.is_some().then_some(now);
+    if actor == Actor::User {
+        staleness.last_user_touch_at = Some(now);
     }
+    item.overlay.waiting = draft.waiting;
+    item.derived.is_overdue = is_overdue(&item, Some(input.today));
     let item_id = item.id.to_string();
-    let op_str = op_id.to_string();
-    let actor = actor_for(input.created_via);
-    let request_id = (!input.request_id.is_empty()).then_some(input.request_id.as_str());
 
     codec::insert_item(conn, &item)?;
-    conn.prepare_cached(
-        "INSERT INTO ops (id, kind, actor, at, request_id, revision)
-         VALUES (?1, 'capture', ?2, ?3, ?4, ?5)",
-    )?
-    .execute(params![
-        op_str,
-        actor,
-        now,
-        request_id,
-        rev_to_sql(revision)?
-    ])?;
-    conn.prepare_cached(
-        "INSERT INTO events (id, op_id, item_id, at, actor, kind, new)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'create', ?6)",
-    )?
-    .execute(params![
-        new_ulid().to_string(),
-        op_str,
-        item_id,
-        now,
-        actor,
-        serde_json::Value::from(item.core.title.as_str()).to_string(),
-    ])?;
-    if let Some(request_id) = request_id {
-        conn.prepare_cached(
-            "INSERT INTO request_ids (request_id, op_id, revision, item_id, at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-        )?
-        .execute(params![
-            request_id,
-            op_str,
-            rev_to_sql(revision)?,
-            item_id,
-            now
-        ])?;
-    }
+    op.insert(conn, revision)?;
+    op.insert_event(
+        conn,
+        &item_id,
+        "create",
+        None,
+        None,
+        Some(serde_json::Value::from(item.core.title.as_str()).to_string()),
+    )?;
+    op.insert_request_id(conn, revision, Some(&item_id))?;
     if let Some(spool_id) = &input.spool_id {
         conn.prepare_cached(
             "INSERT INTO spool_imports (spool_id, op_id, revision, item_id, at)
@@ -543,10 +753,10 @@ fn capture_tx(tx: &mut WriteTx<'_>, input: CaptureInput) -> Result<(Item, Mutati
         )?
         .execute(params![
             spool_id,
-            op_str,
+            op.id.to_string(),
             rev_to_sql(revision)?,
             item_id,
-            now
+            op.at
         ])?;
     }
     let recorded = tx.record_change(
@@ -556,7 +766,235 @@ fn capture_tx(tx: &mut WriteTx<'_>, input: CaptureInput) -> Result<(Item, Mutati
         Some(Resource::Item(Arc::new(item.clone()))),
     )?;
     debug_assert_eq!(recorded, revision);
-    Ok((item, MutationResult { op_id, revision }))
+    Ok((
+        item,
+        MutationResult {
+            op_id: op.id,
+            revision,
+        },
+    ))
+}
+
+/// The working copies of the Items a batch has loaded, in first-touch order,
+/// with the changes applied to each so far.
+#[derive(Default)]
+struct Batch {
+    items: Vec<Item>,
+    changes: Vec<Vec<FieldChange>>,
+    slots: HashMap<ItemId, usize>,
+}
+
+impl Batch {
+    /// The slot of `id`'s working copy, loading it on first use.
+    fn load(&mut self, conn: &Connection, id: ItemId, today: Date) -> Result<usize> {
+        if let Some(&slot) = self.slots.get(&id) {
+            return Ok(slot);
+        }
+        let item =
+            load_item(conn, &id.to_string(), Some(today))?.ok_or(StoreError::NotFound(id))?;
+        self.items.push(item);
+        self.changes.push(Vec::new());
+        self.slots.insert(id, self.items.len() - 1);
+        Ok(self.items.len() - 1)
+    }
+
+    /// `id`'s parent and whether it is deleted, as of this point in the
+    /// batch; `None` when no such Item exists.
+    fn parent_of(&self, conn: &Connection, id: ItemId) -> Result<Option<(Option<ItemId>, bool)>> {
+        if let Some(&slot) = self.slots.get(&id) {
+            let item = &self.items[slot];
+            return Ok(Some((item.core.parent_id, item.is_deleted())));
+        }
+        let row = conn
+            .prepare_cached("SELECT parent_id, deleted_at IS NOT NULL FROM items WHERE id = ?1")?
+            .query_row([id.to_string()], |r| {
+                Ok((r.get::<_, Option<String>>(0)?, r.get::<_, bool>(1)?))
+            })
+            .optional()?;
+        row.map(|(parent, deleted)| {
+            let parent = parent.as_deref().map(codec::item_id_from_str).transpose()?;
+            Ok((parent, deleted))
+        })
+        .transpose()
+    }
+
+    /// Why `parent` cannot become `id`'s parent, if it cannot.
+    fn parent_problem(
+        &self,
+        conn: &Connection,
+        id: ItemId,
+        parent: ItemId,
+    ) -> Result<Option<&'static str>> {
+        match self.parent_of(conn, parent)? {
+            None => return Ok(Some("no such Item")),
+            Some((_, true)) => return Ok(Some("the parent is deleted")),
+            Some(_) => {}
+        }
+        let mut seen = HashSet::new();
+        let mut next = Some(parent);
+        while let Some(ancestor) = next {
+            if ancestor == id {
+                return Ok(Some("would create a cycle"));
+            }
+            if !seen.insert(ancestor) {
+                return Err(StoreError::Corrupt(format!(
+                    "the parent chain of {parent} loops at {ancestor}"
+                )));
+            }
+            next = self.parent_of(conn, ancestor)?.and_then(|(p, _)| p);
+        }
+        Ok(None)
+    }
+
+    /// The first change to `id` the database cannot take: a parent that is
+    /// missing, deleted or a descendant, a person, or a duration too long for
+    /// its nanosecond column.
+    fn change_error(
+        &self,
+        conn: &Connection,
+        id: ItemId,
+        changes: &[FieldChange],
+    ) -> Result<Option<MutationError>> {
+        for change in changes {
+            let error = match &change.new {
+                FieldValue::ItemId(parent) if change.field == ItemField::ParentId => self
+                    .parent_problem(conn, id, *parent)?
+                    .map(|reason| MutationError::Invalid {
+                        field: change.field,
+                        reason: reason.to_owned(),
+                    }),
+                FieldValue::Person(PersonRef::Person(_)) => Some(people_unsupported(change.field)),
+                FieldValue::Waiting(w) if matches!(w.on, PersonRef::Person(_)) => {
+                    Some(people_unsupported(ItemField::WaitingOn))
+                }
+                FieldValue::Duration(d) if codec::dur_to_sql(Some(*d)).is_err() => {
+                    Some(MutationError::Invalid {
+                        field: change.field,
+                        reason: "too long to store".to_owned(),
+                    })
+                }
+                _ => None,
+            };
+            if error.is_some() {
+                return Ok(error);
+            }
+        }
+        Ok(None)
+    }
+}
+
+fn mutate_tx(tx: &mut WriteTx<'_>, input: MutateInput) -> Result<MutateOutput> {
+    let op = OpRow::new(input.kind.as_sql(), input.actor, &input.request_id)?;
+    let today = input.today;
+    let conn = tx.conn();
+    prune_request_ids(conn, op.at)?;
+    if let Some(request_id) = op.request_id
+        && let Some((op_id, revision, _)) = recorded_op(conn, REQUEST_SQL, request_id, op.kind)?
+    {
+        let items = input
+            .mutations
+            .iter()
+            .map(|m| {
+                load_item(conn, &m.id.to_string(), Some(today))?.ok_or(StoreError::NotFound(m.id))
+            })
+            .collect::<Result<_>>()?;
+        return Ok(MutateOutput {
+            items,
+            result: MutationResult { op_id, revision },
+        });
+    }
+
+    let ctx = ApplyCtx {
+        now: input.now,
+        actor: input.actor,
+    };
+    let mut batch = Batch::default();
+    let mut slots = Vec::with_capacity(input.mutations.len());
+    for (index, m) in input.mutations.iter().enumerate() {
+        let slot = batch.load(conn, m.id, today)?;
+        // `apply` never changes `revision`, so this is the stored one.
+        let stored = batch.items[slot].revision;
+        if let Some(expected) = m.expected_revision
+            && expected != stored
+        {
+            return Err(StoreError::RevisionMismatch {
+                id: m.id,
+                expected,
+                actual: stored,
+            });
+        }
+        let invalid = |error| StoreError::Mutation { index, error };
+        let applied = apply(&batch.items[slot], &m.op, &ctx).map_err(invalid)?;
+        if let Some(error) = batch.change_error(conn, m.id, &applied.changes)? {
+            return Err(invalid(error));
+        }
+        batch.items[slot] = applied.item;
+        batch.changes[slot].extend(applied.changes);
+        slots.push(slot);
+    }
+
+    let touched: Vec<usize> = (0..batch.items.len())
+        .filter(|&slot| !batch.changes[slot].is_empty())
+        .collect();
+    // The last revision this op allocates; the current one when it allocates none.
+    let revision = tx.next_revision() + touched.len() as Revision - 1;
+    op.insert(tx.conn(), revision)?;
+    for item in &mut batch.items {
+        item.derived.is_overdue = is_overdue(item, Some(today));
+    }
+    for slot in touched {
+        let item = &mut batch.items[slot];
+        item.revision = tx.next_revision();
+        let item_id = item.id.to_string();
+        codec::update_item(tx.conn(), item)?;
+        for change in &batch.changes[slot] {
+            op.insert_event(
+                tx.conn(),
+                &item_id,
+                "set",
+                Some(change.field),
+                Some(codec::value_to_sql(&change.old)?),
+                Some(codec::value_to_sql(&change.new)?),
+            )?;
+        }
+        let resource = Resource::Item(Arc::new(item.clone()));
+        tx.record_change(Topic::Item, &item_id, false, Some(resource))?;
+    }
+    debug_assert_eq!(tx.next_revision() - 1, revision);
+    let first = input.mutations.first().map(|m| m.id.to_string());
+    op.insert_request_id(tx.conn(), revision, first.as_deref())?;
+    Ok(MutateOutput {
+        items: slots
+            .into_iter()
+            .map(|slot| batch.items[slot].clone())
+            .collect(),
+        result: MutationResult {
+            op_id: op.id,
+            revision,
+        },
+    })
+}
+
+fn get_item_tx(conn: &Connection, id: ItemId, today: Date) -> Result<GetItemOutput> {
+    let tx = conn.unchecked_transaction()?;
+    let revision = current_revision_in(&tx)?;
+    let mut item = load_item(&tx, &id.to_string(), Some(today))?.ok_or(StoreError::NotFound(id))?;
+    let mut seen = HashSet::from([id]);
+    while let Some(target) = item.derived.merged_into {
+        if !seen.insert(target) {
+            return Err(StoreError::Corrupt(format!(
+                "the merge chain of {id} loops at {target}"
+            )));
+        }
+        item = load_item(&tx, &target.to_string(), Some(today))?.ok_or_else(|| {
+            StoreError::Corrupt(format!("{} is merged into missing item {target}", item.id))
+        })?;
+    }
+    Ok(GetItemOutput {
+        resolved_from: (item.id != id).then_some(id),
+        item,
+        revision,
+    })
 }
 
 /// `p2.<query fingerprint>.<created_at ns>.<id>`: the last key, bound to the

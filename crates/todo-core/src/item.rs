@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use jiff::civil::Date;
 use jiff::{SignedDuration, Timestamp};
+use serde::{Deserialize, Serialize};
 
 use crate::field::ItemField;
 use crate::ids::{ItemId, PersonId, Revision};
@@ -11,7 +12,10 @@ use crate::status::{ResolutionKind, Status, StatusCategory, StatusFields, TodoRe
 
 /// `None` sorts after `Lowest` in views; the derived `Ord` here is by rank
 /// (`None` lowest) and is not a sort order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum Priority {
     #[default]
     None,
@@ -22,7 +26,8 @@ pub enum Priority {
     Highest,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CreatedVia {
     Tui,
     Cli,
@@ -33,7 +38,8 @@ pub enum CreatedVia {
     Recurrence,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ArchiveReason {
     User,
     LeftScope,
@@ -41,21 +47,23 @@ pub enum ArchiveReason {
     AutoDone,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LinkState {
     Pending,
     Ok,
     Broken,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PersonRef {
     Person(PersonId),
     /// Only valid for `waiting.on`.
     FreeText(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Waiting {
     pub on: PersonRef,
     pub reason: String,
@@ -63,13 +71,13 @@ pub struct Waiting {
     pub follow_up_on: Option<Date>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Archived {
     pub at: Timestamp,
     pub reason: ArchiveReason,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteLink {
     pub tracker_kind: String,
     pub instance_id: String,
@@ -83,13 +91,13 @@ pub struct RemoteLink {
     pub pinned: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ItemRecurrence {
     pub series_id: ulid::Ulid,
     pub occurrence_date: Option<Date>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct StalenessSignals {
     pub last_user_touch_at: Option<Timestamp>,
     pub last_remote_change_at: Option<Timestamp>,

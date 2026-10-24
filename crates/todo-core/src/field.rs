@@ -1,3 +1,6 @@
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
 /// Addressable Item fields. The discriminant is the `todo.v1.ItemField`
 /// number: the Item field number for top-level fields (below 1000), and
 /// `parent * 1000 + sub` for a field inside an Item sub-message.
@@ -170,6 +173,21 @@ impl ItemField {
     }
 }
 
+/// Serialized as the `todo.v1.ItemField` number, which never changes.
+impl Serialize for ItemField {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u32(self.number())
+    }
+}
+
+impl<'de> Deserialize<'de> for ItemField {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let n = u32::deserialize(deserializer)?;
+        ItemField::from_number(n)
+            .ok_or_else(|| D::Error::custom(format_args!("unknown ItemField number {n}")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,5 +209,19 @@ mod tests {
             ItemField::RemoteLinkPinned.parent(),
             Some(ItemField::RemoteLink)
         );
+    }
+
+    #[test]
+    fn serializes_as_its_number() {
+        assert_eq!(
+            serde_json::to_string(&ItemField::WaitingOn).unwrap(),
+            "41001"
+        );
+        assert_eq!(
+            serde_json::from_str::<ItemField>("16").unwrap(),
+            ItemField::Priority
+        );
+        assert!(serde_json::from_str::<ItemField>("9").is_err());
+        assert!(serde_json::from_str::<ItemField>("\"title\"").is_err());
     }
 }

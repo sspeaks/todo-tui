@@ -1,9 +1,11 @@
 import { create } from "@bufbuild/protobuf";
-import { Code, ConnectError } from "@connectrpc/connect";
+import { Code, ConnectError, createClient } from "@connectrpc/connect";
 import { afterEach, describe, expect, it } from "vitest";
 import { ItemSchema } from "../src/gen/todo/v1/item_pb.js";
+import { ItemService } from "../src/gen/todo/v1/item_service_pb.js";
 import { FakeDaemon } from "../src/fake-daemon.js";
 import { LiveStore, type LiveStoreOptions } from "../src/live-store.js";
+import { deleteItem, undeleteItem } from "../src/mutations.js";
 
 async function waitFor(cond: () => boolean, timeoutMs = 2000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -64,6 +66,56 @@ describe("LiveStore", () => {
     daemon.put({ title: "new" });
     await waitFor(() => titles(store).includes("new"));
     expect(store.getConnection().revision).toBe(daemon.revision);
+  });
+
+  it("hides a soft-deleted item from views at once but keeps it in getItem", async () => {
+    // No re-query within the test: what the views show comes from the store.
+    const { daemon, store } = setup(2, { debounceMs: 60_000 });
+    const items = createClient(ItemService, daemon.transport);
+    const view = store.view();
+    const withDeleted = store.view({ filter: { includeDeleted: true } });
+    store.start();
+    await waitFor(() => store.getConnection().state === "live");
+    const [a, b] = view.getSnapshot().items;
+
+    await deleteItem(items, a!.id);
+    await waitFor(() => store.getItem(a!.id)?.deletedAt !== undefined);
+    const snap = view.getSnapshot();
+    expect(snap.items).toEqual([b]);
+    expect(withDeleted.getSnapshot().items.map((i) => i.id)).toEqual([a!.id, b!.id]);
+    expect(store.getItem(a!.id)?.title).toBe("item 0");
+
+    // Snapshots stay stable while the view's visible contents do not change.
+    daemon.put({ title: "elsewhere" });
+    await waitFor(() => store.getConnection().revision === daemon.revision);
+    expect(view.getSnapshot()).toBe(snap);
+
+    await undeleteItem(items, a!.id);
+    await waitFor(() => view.getSnapshot().items.length === 2);
+    expect(view.getSnapshot().items.map((i) => i.id)).toEqual([a!.id, b!.id]);
+  });
+
+  it("re-shows an undeleted item after the re-query dropped it", async () => {
+    const { daemon, store } = setup(2);
+    const items = createClient(ItemService, daemon.transport);
+    const view = store.view();
+    const withDeleted = store.view({ filter: { includeDeleted: true } });
+    store.start();
+    await waitFor(() => store.getConnection().state === "live");
+    const [a] = view.getSnapshot().items;
+
+    const calls = daemon.calls.listItems;
+    await deleteItem(items, a!.id);
+    await waitFor(() => daemon.calls.listItems >= calls + 2);
+    await waitFor(() => !view.ids.includes(a!.id));
+    expect(titles(store)).toEqual(["item 1"]);
+    expect(withDeleted.getSnapshot().items.map((i) => i.title)).toEqual(["item 0", "item 1"]);
+    expect(store.getItem(a!.id)?.deletedAt).toBeDefined();
+
+    await undeleteItem(items, a!.id);
+    await waitFor(() => titles(store).includes("item 0"));
+    expect(titles(store)).toEqual(["item 0", "item 1"]);
+    expect(store.getItem(a!.id)?.deletedAt).toBeUndefined();
   });
 
   it("debounces bursts of changes into one ListItems", async () => {

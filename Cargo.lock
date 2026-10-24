@@ -1347,12 +1347,14 @@ dependencies = [
  "hyper-util",
  "jiff",
  "rustix",
+ "serde_json",
  "tempfile",
  "todo-core",
  "todo-daemon",
  "todo-proto",
  "tokio",
  "tonic",
+ "tonic-types",
  "tower",
  "tracing",
  "ulid",
@@ -1363,7 +1365,9 @@ name = "todo-core"
 version = "0.1.0"
 dependencies = [
  "jiff",
+ "serde",
  "serde_json",
+ "thiserror",
  "ulid",
 ]
 
