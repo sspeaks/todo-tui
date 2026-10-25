@@ -102,10 +102,12 @@ impl Daemon {
         self.shutdown.clone()
     }
 
-    /// Serves until shutdown is triggered (by a handle or the `Shutdown`
-    /// RPC), then drains for up to 10s, removes the socket and releases the lock.
-    /// Meanwhile imports the capture spool in the background: right away,
-    /// then whenever it fills (design 2.1).
+    /// Imports the capture spool (design 2.1), then serves until shutdown is
+    /// triggered (by a handle or the `Shutdown` RPC), then drains for up to
+    /// 10s, removes the socket and releases the lock. Meanwhile imports the
+    /// spool again whenever it fills. The spooled captures are undo stack
+    /// entries, so they are imported before any call is served: the first
+    /// Undo finds them on the stack, and none lands on top of a later op.
     pub async fn serve(self) -> anyhow::Result<()> {
         let Daemon {
             paths,
@@ -115,6 +117,7 @@ impl Daemon {
             _lock,
         } = self;
         let clients = Clients::default();
+        spool::import_logged(&paths, &store).await;
         let spool = tokio::spawn(spool::run(
             paths.clone(),
             store.clone(),

@@ -40,9 +40,11 @@ import "todo/v1/relation.proto";
 // not the current time. The staleness signals are restored only together
 // with the content they belong to, also on an Item the Undo or Redo itself
 // deletes, and are never reported in `skipped`. Relation steps are undone
-// and redone also when an end is deleted. An Undo or Redo that restores
-// nothing drops the entry from both stacks. Undo, Redo and the relation
-// RPCs are not BatchMutate mutations.
+// and redone also when an end is deleted. Like a BatchMutate, an Undo or
+// Redo keeps the parent rule where it leaves the Items, not after each
+// step; a step that would break it there is skipped as no longer valid. An
+// Undo or Redo that restores nothing drops the entry from both stacks.
+// Undo, Redo and the relation RPCs are not BatchMutate mutations.
 service ItemService {
   rpc CaptureItem(CaptureItemRequest) returns (CaptureItemResponse);
   // Parses capture text without creating anything (the TUI's live preview).
@@ -356,7 +358,8 @@ message UndoResponse {
   MutationResult result = 1;
   // The entry undone or dropped; unset when the stack was empty.
   OpSummary entry = 2;
-  // The Items the undo changed, in their state after it.
+  // The Items the undo changed, in their state after it. Empty with entry
+  // set when it restored nothing, which dropped the entry.
   repeated Item items = 3;
   // The changes left as they were.
   repeated UndoSkip skipped = 4;
@@ -375,7 +378,8 @@ message RedoResponse {
   MutationResult result = 1;
   // The entry redone or dropped; unset when the stack was empty.
   OpSummary entry = 2;
-  // The Items the redo changed, in their state after it.
+  // The Items the redo changed, in their state after it. Empty with entry
+  // set when it restored nothing, which dropped the entry.
   repeated Item items = 3;
   // The changes left as they were.
   repeated UndoSkip skipped = 4;

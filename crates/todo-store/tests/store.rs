@@ -3151,8 +3151,8 @@ async fn a_batch_that_undeletes_a_child_first_undoes_and_redoes_whole() {
         live.push(content(&get(&db, id).await));
     }
 
-    // Undo deletes the subtasks before their parents, whatever the order
-    // the batch undeleted them in.
+    // Undo runs in reverse, through the moment the parent is deleted and
+    // its subtask is live, as the batch did.
     let out = undo(&db).await;
     assert_eq!(out.entry.unwrap().op_id, batch.result.op_id);
     assert_eq!(out.skipped, []);
@@ -3258,6 +3258,159 @@ async fn undo_never_leaves_a_live_item_under_a_deleted_parent() {
         )]
     );
     assert_eq!(get(&db, t.id).await.core.parent_id, None);
+    assert_no_live_orphans(&db).await;
+}
+
+/// The parent rule holds for where an undo leaves the Items, not for each
+/// step: a batch may pass through "live under a deleted parent", and so may
+/// its undo, in reverse.
+#[tokio::test]
+async fn undo_checks_the_parent_rule_once_it_is_done() {
+    let db = open();
+    let p = capture(&db, "p").await;
+    let c = capture_under(&db, "c", p.id).await;
+    let q = capture(&db, "q").await;
+    let delete_p = run(
+        &db,
+        Actor::User,
+        100,
+        OpKind::Delete,
+        vec![mutation(p.id, MutationOp::Delete)],
+    )
+    .await;
+    let deleted = [
+        content(&get(&db, p.id).await),
+        content(&get(&db, c.id).await),
+    ];
+    let state = async || {
+        [
+            content(&get(&db, p.id).await),
+            content(&get(&db, c.id).await),
+        ]
+    };
+
+    // c comes back for a moment under its deleted parent, and goes again:
+    // the batch is accepted, and its undo gives c its first deleted_at back.
+    for (n, mutations) in [
+        vec![
+            mutation(c.id, MutationOp::Undelete),
+            mutation(c.id, MutationOp::Delete),
+        ],
+        vec![
+            mutation(c.id, MutationOp::Undelete),
+            title(c.id, "c2"),
+            mutation(c.id, MutationOp::Delete),
+        ],
+        // Moved out from under it and deleted there.
+        vec![
+            mutation(c.id, MutationOp::Undelete),
+            parent(c.id, q.id),
+            mutation(c.id, MutationOp::Delete),
+        ],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let at = 300 + n as i64;
+        let batch = run(&db, Actor::User, at, OpKind::Batch, mutations).await;
+        assert_eq!(get(&db, c.id).await.derived.deleted_at, Some(ts(at)));
+        let after = state().await;
+        let out = undo(&db).await;
+        assert_eq!(out.entry.unwrap().op_id, batch.result.op_id, "{n}");
+        assert_eq!(out.skipped, [], "{n}");
+        assert_eq!(state().await, deleted, "{n}");
+        assert_no_live_orphans(&db).await;
+        let out = redo(&db).await;
+        assert_eq!(out.skipped, [], "{n}");
+        assert_eq!(state().await, after, "{n}");
+        assert_no_live_orphans(&db).await;
+        assert_eq!(undo(&db).await.skipped, [], "{n}");
+    }
+
+    // c kept its first deleted_at, so undoing the delete brings it back.
+    let out = undo(&db).await;
+    assert_eq!(out.entry.unwrap().op_id, delete_p.result.op_id);
+    assert_eq!(out.skipped, []);
+    assert!(!get(&db, p.id).await.is_deleted());
+    assert!(!get(&db, c.id).await.is_deleted());
+    assert_eq!(get(&db, c.id).await.core.parent_id, Some(p.id));
+    assert_no_live_orphans(&db).await;
+
+    // Undeleted under a deleted parent and moved to a live one: undo moves
+    // it back, deleted, and the delete's undo brings both back.
+    let delete_p = run(
+        &db,
+        Actor::User,
+        400,
+        OpKind::Delete,
+        vec![mutation(p.id, MutationOp::Delete)],
+    )
+    .await;
+    let deleted = state().await;
+    run(
+        &db,
+        Actor::User,
+        500,
+        OpKind::Batch,
+        vec![mutation(c.id, MutationOp::Undelete), parent(c.id, q.id)],
+    )
+    .await;
+    assert_eq!(undo(&db).await.skipped, []);
+    assert_eq!(state().await, deleted);
+    assert_no_live_orphans(&db).await;
+    let out = undo(&db).await;
+    assert_eq!(out.entry.unwrap().op_id, delete_p.result.op_id);
+    assert_eq!(out.skipped, []);
+    assert!(!get(&db, c.id).await.is_deleted());
+    assert_eq!(get(&db, c.id).await.core.parent_id, Some(p.id));
+    assert_no_live_orphans(&db).await;
+}
+
+/// A batch that deletes a parent and then undeletes and deletes its child
+/// undoes exactly, with nothing reported.
+#[tokio::test]
+async fn undo_reports_only_what_it_leaves_alone() {
+    let db = open();
+    let p = capture(&db, "p").await;
+    let c = capture_under(&db, "c", p.id).await;
+    let before = [
+        content(&get(&db, p.id).await),
+        content(&get(&db, c.id).await),
+    ];
+    run(
+        &db,
+        Actor::User,
+        300,
+        OpKind::Batch,
+        vec![
+            mutation(p.id, MutationOp::Delete),
+            mutation(c.id, MutationOp::Undelete),
+            mutation(c.id, MutationOp::Delete),
+        ],
+    )
+    .await;
+    let after = [
+        content(&get(&db, p.id).await),
+        content(&get(&db, c.id).await),
+    ];
+    let out = undo(&db).await;
+    assert_eq!(out.skipped, []);
+    assert_eq!(
+        [
+            content(&get(&db, p.id).await),
+            content(&get(&db, c.id).await)
+        ],
+        before
+    );
+    let out = redo(&db).await;
+    assert_eq!(out.skipped, []);
+    assert_eq!(
+        [
+            content(&get(&db, p.id).await),
+            content(&get(&db, c.id).await)
+        ],
+        after
+    );
     assert_no_live_orphans(&db).await;
 }
 

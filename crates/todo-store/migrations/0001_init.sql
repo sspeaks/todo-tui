@@ -1,4 +1,5 @@
--- Initial schema. Editable until the first release (D10).
+-- Initial schema. Databases have applied it: change the schema in a new
+-- migration, never here (design 7.2).
 -- Encodings: timestamps and durations are INTEGER nanoseconds (Unix epoch for
 -- instants); civil dates are TEXT 'YYYY-MM-DD'; enums are snake_case TEXT;
 -- string sets and maps are JSON TEXT; ids are ULID TEXT.

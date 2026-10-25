@@ -1,4 +1,6 @@
-//! Connections and embedded migrations (D10).
+//! Connections and embedded migrations (D10). Forward only: each schema
+//! change is a new migration, as databases have applied the earlier ones
+//! (design 7.2).
 
 use std::path::Path;
 use std::time::Duration;

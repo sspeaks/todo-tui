@@ -410,15 +410,15 @@ export function undoRelationsConformance(open: () => Promise<UndoTarget>): void 
       const both = await batchMutate(items, [undelete(c.item.id), undelete(p.item.id)]);
       expect(both.items.map((i) => i.deletedAt)).toEqual([undefined, undefined]);
       expect((await state()).undo).toMatchObject({ opId: both.result?.opId, kind: OpKind.BATCH, description: "undelete 2 items" });
-      // Its undo comes to the parent's delete while the subtask is still
-      // live; that step waits for the subtask's.
+      // Its undo, in reverse, deletes the parent while the subtask is
+      // still live, as the rule holds where the undo leaves them.
       const undone = await undo(items, { expectedOpId: both.result!.opId });
       expect(undone.skipped).toEqual([]);
-      expect(ids(undone.items)).toEqual([c.item.id, p.item.id]);
+      expect(ids(undone.items)).toEqual([p.item.id, c.item.id]);
       expect(undone.items.map((i) => i.deletedAt !== undefined)).toEqual([true, true]);
       const redone = await redo(items);
       expect(redone.skipped).toEqual([]);
-      expect(ids(redone.items)).toEqual([p.item.id, c.item.id]);
+      expect(ids(redone.items)).toEqual([c.item.id, p.item.id]);
       expect(redone.items.map((i) => i.deletedAt)).toEqual([undefined, undefined]);
 
       // A batch that leaves one under a deleted parent applies nothing, and
@@ -432,6 +432,104 @@ export function undoRelationsConformance(open: () => Promise<UndoTarget>): void 
       expect(await revision()).toBe(rev);
       expect((await get(p.item.id)).deletedAt).toBeUndefined();
       expect((await get(c.item.id)).deletedAt).toBeUndefined();
+    });
+
+    it("undoes a batch that passes through a live subtask under a deleted parent, as the batch leaves it", async () => {
+      const { items, capture, get, state } = await setup();
+      const p = await capture("p");
+      const c = await capture("c", p.item.id);
+      const q = await capture("q");
+      const del = await deleteItem(items, p.item.id);
+      const deletedAt = (await get(c.item.id)).deletedAt;
+      const undelete = (id: string) => ({ kind: { case: "undeleteItem" as const, value: { id } } });
+      const remove = (id: string) => ({ kind: { case: "deleteItem" as const, value: { id } } });
+      const move = (id: string, parentId: string) => ({
+        kind: { case: "updateItem" as const, value: { item: { id, parentId }, updateMask: { paths: ["parent_id"] } } },
+      });
+      // Back for a moment under its deleted parent and gone again, also
+      // after a move: accepted, as c ends deleted, and undone exactly.
+      for (const batch of [
+        [undelete(c.item.id), remove(c.item.id)],
+        [undelete(c.item.id), move(c.item.id, q.item.id), remove(c.item.id)],
+      ]) {
+        const done = await batchMutate(items, batch);
+        const undone = await undo(items, { expectedOpId: done.result!.opId });
+        expect(undone.skipped).toEqual([]);
+        expect(await get(c.item.id)).toMatchObject({ deletedAt, parentId: p.item.id });
+        expect((await redo(items)).skipped).toEqual([]);
+        expect((await undo(items)).skipped).toEqual([]);
+      }
+      // So undoing the delete still brings c back with p.
+      expect((await state()).undo?.opId).toBe(del.result?.opId);
+      const undone = await undo(items);
+      expect(undone.skipped).toEqual([]);
+      expect((await get(c.item.id)).deletedAt).toBeUndefined();
+
+      // Undeleted and moved to a live parent: undo puts it back, deleted.
+      await deleteItem(items, p.item.id);
+      await batchMutate(items, [undelete(c.item.id), move(c.item.id, q.item.id)]);
+      expect((await undo(items)).skipped).toEqual([]);
+      expect(await get(c.item.id)).toMatchObject({ parentId: p.item.id, deletedAt: (await get(p.item.id)).deletedAt });
+
+      // Nothing is reported when every step lands, in whatever order.
+      const r = await capture("r");
+      const s = await capture("s", r.item.id);
+      await batchMutate(items, [remove(r.item.id), undelete(s.item.id), remove(s.item.id)]);
+      const back = await undo(items);
+      expect(back.skipped).toEqual([]);
+      expect([(await get(r.item.id)).deletedAt, (await get(s.item.id)).deletedAt]).toEqual([undefined, undefined]);
+    });
+
+    it("checks UpdateItem's mask and values: trimmed titles, labels as a set, one path per field", async () => {
+      const { items, capture, get, state, revision } = await setup();
+      const a = await capture("a");
+      const waiting = { on: { ref: { case: "freeText" as const, value: "the vendor" } }, reason: "quote" };
+      await updateItem(items, { id: a.item.id, labels: ["x"], waiting }, ["labels", "waiting"]);
+      const top = (await state()).undo?.opId;
+      const rejected = async (call: Promise<unknown>) => {
+        const err = await failure(call);
+        expect(err?.code).toBe(Code.InvalidArgument);
+        const [bad] = err?.findDetails(BadRequestSchema) ?? [];
+        return [bad?.fieldViolations[0]?.field, bad?.fieldViolations[0]?.description];
+      };
+      const update = (item: { title?: string; labels?: string[] }, paths: string[]) =>
+        updateItem(items, { ...item, id: a.item.id }, paths);
+      const rev = await revision();
+
+      // Only the paths of Item fields, and of the fields of its waiting,
+      // archived, remote_link, recurrence and staleness messages.
+      for (const path of ["title.x", "priority.y", "parent_id.z", "relations.from_id", "due_date.year", "waiting.on.free_text", "*"]) {
+        const description = path === "*" ? '"*" is not supported' : `unknown field path ${JSON.stringify(path)}`;
+        expect(await rejected(update({ title: "b" }, [path]))).toEqual(["update_mask", description]);
+      }
+      expect(await rejected(update({}, ["archived.at"]))).toEqual(["item.archived.at", "changes only through ArchiveItem and UnarchiveItem"]);
+      expect(await rejected(update({}, ["status_category"]))).toEqual(["item.status_category", "changes only through SetStatus"]);
+      // A field once, and not with its parent or a child of it.
+      for (const [paths, repeated] of [
+        [["title", "title"], "title"],
+        [["waiting", "waiting.reason"], "waiting.reason"],
+        [["waiting.reason", "waiting"], "waiting"],
+      ] as const) {
+        const description = `${JSON.stringify(repeated)} repeats or overlaps an earlier path`;
+        expect(await rejected(update({ title: "b" }, [...paths]))).toEqual(["update_mask", description]);
+      }
+      // A title is trimmed, and must then be non-empty.
+      expect(await rejected(update({ title: " \t " }, ["title"]))).toEqual(["item.title", "must not be empty"]);
+      expect(await revision()).toBe(rev);
+      expect((await update({ title: "  b  " }, ["title"])).item?.title).toBe("b");
+      expect((await state()).undo?.description).toBe('edit "b"');
+
+      // Labels are a set: repeating one changes nothing, and is no entry.
+      const entry = (await state()).undo?.opId;
+      expect(entry).not.toBe(top);
+      const same = await revision();
+      const res = await update({ labels: ["x", "x"] }, ["labels"]);
+      expect(res.item?.labels).toEqual(["x"]);
+      expect(res.result?.revision).toBe(same);
+      expect((await state()).undo?.opId).toBe(entry);
+      expect((await get(a.item.id)).labels).toEqual(["x"]);
+      const deduped = await update({ labels: ["y", "x", "y"] }, ["labels"]);
+      expect(deduped.item?.labels).toEqual(["y", "x"]);
     });
 
     it("checks parent_id: it must name a live Item and not make a cycle", async () => {
@@ -564,6 +662,12 @@ export function undoRelationsConformance(open: () => Promise<UndoTarget>): void 
         ]) {
           expect((await info(addRelation(items, rel(from!.id, to!.id, kind)), Code.FailedPrecondition))?.metadata).toEqual({ item_id: from!.id });
         }
+        // An Item related to itself: when it is missing, or deleted for an
+        // add, both ends are wrong.
+        expect((await info(addRelation(items, rel(lo!, lo!.toLowerCase(), kind)), Code.NotFound))?.metadata).toEqual({ item_id: lo });
+        expect((await info(removeRelation(items, rel(lo!, lo!, kind)), Code.NotFound))?.metadata).toEqual({ item_id: lo });
+        expect((await info(addRelation(items, rel(c!.id, c!.id, kind)), Code.FailedPrecondition))?.metadata).toEqual({ item_id: c!.id });
+        expect(await badField(removeRelation(items, rel(c!.id, c!.id, kind)))).toBe("relation.to_id");
       }
     });
   });

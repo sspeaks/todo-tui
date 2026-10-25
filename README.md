@@ -5,10 +5,11 @@ state in SQLite and serves a gRPC API (`todo.v1`) over a Unix socket; an Ink TUI
 `todo` CLI and an MCP server are clients. See [docs/design.md](docs/design.md).
 
 Status: P1 in progress. Milestone M1 (capture) is done: `todo add` with inline
-tokens, batch capture from stdin, and an offline spool. Milestone M2 (undo) is in
-progress: `todo undo` and `todo redo` work. The TUI is still the minimal P0 inbox
-list; the full TUI is milestone M4. There are no CLI commands yet to list, edit,
-complete or delete items.
+tokens, batch capture from stdin, and an offline spool. Milestone M2 (undo) is done:
+`todo undo` and `todo redo`, relations between items in the API, and deleting an
+item together with its subtasks. The TUI is still the minimal P0 inbox list; the
+full TUI is milestone M4. There are no CLI commands yet to list, edit, complete or
+delete items.
 
 ## Quick start
 
@@ -193,9 +194,10 @@ spooled  pay rent ^tom #later
 todo: daemon unavailable (…); spooled to …/data/spool.jsonl; it will be imported once the daemon is running again
 ```
 
-The daemon imports the spool when it starts and every 30 s while it runs. Relative
-dates resolve against the time you captured, not the time of import. Lines it cannot
-import are moved to `spool.rejected.jsonl` next to it.
+The daemon imports the spool when it starts, before it answers any request, and
+every 30 s while it runs. Relative dates resolve against the time you captured, not
+the time of import. Lines it cannot import are moved to `spool.rejected.jsonl` next
+to it.
 
 ### Undo and redo
 
@@ -214,7 +216,8 @@ spooled capture once the daemon imports it. Undoing a capture deletes the item: 
 disappears from the TUI, and `todo redo` brings it back. You can keep undoing, one
 step at a time, back to the first change; a new change clears what there was to
 redo. When there is nothing left, `todo` prints `Nothing to undo` (or
-`Nothing to redo`).
+`Nothing to redo`). Changes made before you upgraded to a `todo` with undo are not
+in the history, so undo stops at the first change made after the upgrade.
 
 There is one history per data directory, shared by the CLI and the TUI: `todo undo`
 also undoes a change made in the TUI, and the TUI's undo (M4) also undoes a
@@ -227,17 +230,27 @@ a line for each field it left, with the item's short id:
 
 ```console
 $ todo undo
-Undid: mark done "call dentist"
+Undid: edit "call dentist"
+  not restored: due_date of 7GQ4ZK2M (the field has changed since)
+```
+
+If it could restore nothing at all, it says so, and that change also leaves the
+history, so there is nothing to redo:
+
+```console
+$ todo undo
+Could not undo: mark done "call dentist" (everything it changed has changed since)
   not restored: status of 7GQ4ZK2M (the field has changed since)
 ```
 
-If it could restore nothing at all, that change also leaves the history, so there
-is nothing to redo.
-
 `todo undo` and `todo redo` start the daemon if needed, as `todo add` does, and
-exit 0 when they succeed, with or without such lines. They have no spool: if the
-daemon cannot be reached or started, they print `todo: daemon unavailable (…)` and
-exit 1. They also exit 1, with `todo: <why>`, if the daemon refuses.
+exit 0 when the daemon answers, with or without such lines. They have no spool: if
+the daemon cannot be reached or started, they print `todo: daemon unavailable (…)`
+and exit 1. If the daemon does not answer in time, they ask again, up to three times
+in all; the daemon never applies the same request twice. If it still does not
+answer, they print `todo: no answer from the daemon (…); the undo may have been
+applied, so check before undoing again` and exit 1. They also exit 1, with
+`todo: <why>`, if the daemon refuses.
 
 ### Seeing your todos: the TUI
 

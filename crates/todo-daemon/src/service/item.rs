@@ -435,8 +435,25 @@ impl Items {
         add: bool,
     ) -> Result<RelationOutput, Status> {
         let request_id = check_request_id(request_id)?;
-        let canonical = request::relation_from_proto(relation).map_err(error::convert)?;
         let now = Zoned::now();
+        let canonical = match request::relation_from_proto(relation) {
+            Ok(canonical) => canonical,
+            // An Item related to itself has a wrong to_id; when its from_id
+            // is wrong too, that is the end named, as when both ends are.
+            Err(e) => {
+                if let Some(asked) = relation
+                    && let Some(from) = request::self_relation(asked)
+                    && let Some(problem) = self.end_problem(from, add, now.date()).await?
+                {
+                    let end = StoreError::RelationEnd {
+                        item_id: from,
+                        problem,
+                    };
+                    return Err(error::mutation(end, &Shape::Relation(asked), &[]));
+                }
+                return Err(error::convert(e));
+            }
+        };
         let input = RelationInput {
             request_id,
             relation: canonical,

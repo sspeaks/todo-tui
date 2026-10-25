@@ -116,8 +116,8 @@ interface Planned {
   idPath: string;
   /** Whether it is part of a BatchMutate, whose precondition failures name `idPath`. */
   batched: boolean;
-  /** UpdateItem: the masked top-level fields, in mask order. */
-  patch?: Fields;
+  /** UpdateItem: the mask's paths, in order, and the values of their top-level fields. */
+  mask?: { paths: readonly string[]; values: Fields };
   /** SetStatus: the target. */
   status?: Status;
 }
@@ -195,9 +195,9 @@ const RELATION_WORDS: Record<number, string> = {
  *   expected_op_id guard) restore field values only where the field still
  *   holds the value the reverted op wrote, the status triple as one unit
  *   and labels as a set, and report the rest as UndoSkips (CHANGED_SINCE,
- *   ITEM_DELETED, INVALID); a delete or undelete step the parent rule
- *   blocks waits for the later steps; one that restores nothing drops its
- *   entry; an undone capture is soft-deleted; replays return the original
+ *   ITEM_DELETED, INVALID); the parent rule holds where the whole undo
+ *   leaves the Items, and a step that breaks it there is skipped; one that
+ *   restores nothing drops its entry; an undone capture is soft-deleted; replays return the original
  *   entry and skips. GetUndoState, and OpSummary texts and error messages
  *   as the daemon words them.
  * - Parent rules (design 3.7): DeleteItem soft-deletes the live
@@ -215,12 +215,14 @@ const RELATION_WORDS: Record<number, string> = {
  *
  * What it does not model: capture parsing (the title is the text), spool_id
  * and reference_time; field values and read-only fields are not checked,
- * except the 64 KiB limit on capture text and titles, parent_id and
+ * except the 64 KiB limit on capture text, titles (stored trimmed, then
+ * non-empty and at most 64 KiB), labels (deduplicated), parent_id and
  * SetStatus's status.
- * SetStatus decomposes the status into the triple as the daemon does, and
- * UpdateItem copies the top-level fields its mask names (status, archived
- * and relations paths are refused), so for it a nested path such as
- * "waiting.reason" changes, records and restores the whole `waiting`.
+ * SetStatus decomposes the status into the triple as the daemon does.
+ * UpdateItem checks its mask's paths as the daemon does (Item field paths
+ * only, each field once; status, archived and relations paths are refused)
+ * and copies the top-level fields they name, so for it a nested path such
+ * as "waiting.reason" changes, records and restores the whole `waiting`.
  * Staleness signals are not maintained or restored (`updated_at` is set on
  * every op that touches an Item); request ids never expire; ListItems sorts
  * by id. ParseCapture is not implemented.
@@ -573,43 +575,21 @@ export class FakeDaemon {
     }
     const summary = `${verb}: ${entry.summary}`;
     const now = timestampNow();
-    const batch = this.batch();
-    const skipped: UndoSkip[] = [];
-    // Deletes and undeletes the parent rule holds back for now.
-    let held: [string, FieldRestore[], UndoSkip][] = [];
-    let changed = false;
-    const restore = (itemId: string, unit: FieldRestore[]) => {
-      const outcome = this.restoreUnit(batch, itemId, unit);
-      if (outcome === "restored") changed = true;
-      else if (outcome.held) held.push([itemId, unit, outcome.skip]);
-      else skipped.push(outcome.skip);
-    };
-    for (const step of inverse(this.sourceOf(entry, redo).events, now)) {
-      if (step.kind === "restore") {
-        restore(step.itemId, step.unit);
-        continue;
-      }
-      const outcome = this.changeRelation(batch, step.relation, step.kind === "addRelation");
-      if (outcome === "changed") {
-        changed = true;
-        continue;
-      }
-      const [reason, message] =
-        outcome === "unchanged"
-          ? [UndoSkipReason.CHANGED_SINCE, "the relation has changed since"]
-          : [UndoSkipReason.INVALID, `item ${outcome.missing} does not exist`];
-      skipped.push(create(UndoSkipSchema, { itemId: step.relation.fromId, reason, message, relation: step.relation }));
+    const steps = inverse(this.sourceOf(entry, redo).events, now);
+    // The parent rule holds where the undo leaves the Items, as for a batch,
+    // not after each step: a batch may pass through a live Item under a
+    // deleted parent, and its undo then passes through it too, in reverse.
+    // A pass that leaves the rule broken is rolled back and run again
+    // without the steps that broke it, which are reported.
+    const ruledOut = new Map<number, string>();
+    let pass = this.undoPass(steps, ruledOut);
+    for (let broken = pass.broken(); broken.size > 0; broken = pass.broken()) {
+      for (const [at, reason] of broken) ruledOut.set(at, reason);
+      this.relations.clear();
+      for (const [key, relation] of pass.relations) this.relations.set(key, relation);
+      pass = this.undoPass(steps, ruledOut);
     }
-    // A step can wait for a later one: a batch may undelete a subtask before
-    // its parent, so its undo comes to the parent's delete while the subtask
-    // is still live. Retried until a pass restores none of them.
-    for (let before = -1; held.length !== before; ) {
-      before = held.length;
-      const retry = held;
-      held = [];
-      for (const [itemId, unit] of retry) restore(itemId, unit);
-    }
-    skipped.push(...held.map(([, , skip]) => skip));
+    const { batch, skipped, changed } = pass;
     const summarized = this.summaryOf(entry);
     if (!changed) {
       // Nothing to revert: the entry leaves both stacks, no Item is written.
@@ -624,20 +604,84 @@ export class FakeDaemon {
   }
 
   /**
+   * Runs an undo's `steps` on fresh working copies, except the ones
+   * `ruledOut`, which are skipped with their reason. `relations` is the
+   * relation set from before the pass, for a rerun; `broken` the steps
+   * that leave a live Item under a deleted parent, with why each is ruled
+   * out: of a step that undeleted or moved the Item and one that deleted
+   * its parent, the later one is.
+   */
+  private undoPass(steps: readonly InverseStep[], ruledOut: ReadonlyMap<number, string>) {
+    const relations = new Map(this.relations);
+    const batch = this.batch();
+    const skipped: UndoSkip[] = [];
+    // Per Item, the last step that undeleted it or changed its parent, and
+    // the last one that deleted it.
+    const placed = new Map<string, number>();
+    const deleted = new Map<string, number>();
+    let changed = false;
+    for (const [at, step] of steps.entries()) {
+      if (step.kind === "restore") {
+        const { itemId, unit } = step;
+        const reason = ruledOut.get(at);
+        const outcome =
+          reason === undefined
+            ? this.restoreUnit(batch, itemId, unit)
+            : create(UndoSkipSchema, { itemId, field: skipField(unit.map((r) => r.field)), reason: UndoSkipReason.INVALID, message: reason });
+        if (outcome !== "restored") {
+          skipped.push(outcome);
+          continue;
+        }
+        changed = true;
+        for (const r of unit) {
+          if (r.field === "deletedAt" && r.value !== undefined) deleted.set(itemId, at);
+          else if (r.field === "deletedAt" || r.field === "parentId") placed.set(itemId, at);
+        }
+        continue;
+      }
+      const outcome = this.changeRelation(batch, step.relation, step.kind === "addRelation");
+      if (outcome === "changed") {
+        changed = true;
+        continue;
+      }
+      const [reason, message] =
+        outcome === "unchanged"
+          ? [UndoSkipReason.CHANGED_SINCE, "the relation has changed since"]
+          : [UndoSkipReason.INVALID, `item ${outcome.missing} does not exist`];
+      skipped.push(create(UndoSkipSchema, { itemId: step.relation.fromId, reason, message, relation: step.relation }));
+    }
+    const broken = () => {
+      const out = new Map<number, string>();
+      const blame = (child: string, parent: string) => {
+        const [p, d] = [placed.get(child), deleted.get(parent)];
+        if (p !== undefined && !(d !== undefined && d > p)) out.set(p, "the parent is deleted");
+        else if (d !== undefined) out.set(d, "the Item has live subtasks");
+      };
+      for (const child of placed.keys()) {
+        const item = batch.items[batch.slots.get(child)!]!;
+        if (item.parentId !== undefined && item.deletedAt === undefined && batch.isDeleted(item.parentId)) blame(child, item.parentId);
+      }
+      for (const parent of deleted.keys()) {
+        if (!batch.isDeleted(parent)) continue;
+        for (const [child, gone] of batch.children(parent)) if (!gone) blame(child, parent);
+      }
+      return out;
+    };
+    return { batch, skipped, changed, relations, broken };
+  }
+
+  /**
    * Applies one unit of restores to `itemId`'s working copy, or says why
    * not: the Item is gone, deleted (only a deleted_at unit runs on a
    * tombstone), a field no longer holds the expected value, or the result
-   * is not valid (an inconsistent status triple, a parent that is missing,
-   * deleted or a descendant). A unit that would leave a live Item under a
-   * deleted parent, or a deleted Item with live subtasks, is held: a later
-   * step may change that.
+   * is not valid (an inconsistent status triple, a parent that is missing
+   * or a descendant). Whether it keeps every live Item's parent live is
+   * checked once the whole undo has run.
    */
-  private restoreUnit(batch: Working, itemId: string, unit: readonly FieldRestore[]): "restored" | { skip: UndoSkip; held: boolean } {
+  private restoreUnit(batch: Working, itemId: string, unit: readonly FieldRestore[]): "restored" | UndoSkip {
     const fields = unit.map((r) => r.field);
-    const skip = (reason: UndoSkipReason, message = SKIP_MESSAGES[reason] ?? "", held = false) => ({
-      skip: create(UndoSkipSchema, { itemId, field: skipField(fields), reason, message }),
-      held,
-    });
+    const skip = (reason: UndoSkipReason, message = SKIP_MESSAGES[reason] ?? "") =>
+      create(UndoSkipSchema, { itemId, field: skipField(fields), reason, message });
     const slot = batch.find(itemId);
     if (slot === undefined) return skip(UndoSkipReason.INVALID, "no such Item");
     const item = batch.items[slot]!;
@@ -655,16 +699,8 @@ export class FakeDaemon {
       return skip(UndoSkipReason.INVALID, "a resolution kind is only valid in the done category");
     }
     for (const c of changes) {
-      const problem = c.field === "parentId" && typeof c.new === "string" ? batch.parentProblem(itemId, c.new) : undefined;
+      const problem = c.field === "parentId" && typeof c.new === "string" ? batch.parentProblem(itemId, c.new, true) : undefined;
       if (problem) return skip(UndoSkipReason.INVALID, problem);
-    }
-    for (const c of changes) {
-      if (c.field !== "deletedAt") continue;
-      if (c.new === undefined) {
-        if (after.parentId !== undefined && batch.isDeleted(after.parentId)) return skip(UndoSkipReason.INVALID, "the parent is deleted", true);
-      } else if (batch.children(itemId).some(([, deleted]) => !deleted)) {
-        return skip(UndoSkipReason.INVALID, "the Item has live subtasks", true);
-      }
     }
     after.status = deriveStatus(after);
     batch.record(slot, after, changes);
@@ -676,6 +712,14 @@ export class FakeDaemon {
     this.check();
     const requestId = requestIdOf(req.requestId);
     const asked = relationOf(req.relation);
+    if (asked.fromId === asked.toId) {
+      // An Item related to itself has a wrong to_id; when its from_id is
+      // wrong too, that is the end named, as when both ends are.
+      const at = this.batch().parentOf(asked.fromId);
+      if (at === undefined) throw relationEnd(asked, asked.fromId, "missing");
+      if (add && at.deleted) throw relationEnd(asked, asked.fromId, "deleted");
+      throw badRequest("relation.to_id", "must differ from from_id");
+    }
     const relation = canonical(asked);
     // The same request names the same relation, whole.
     const recorded = this.recorded(rpc, requestId, relationKey(relation));
@@ -975,10 +1019,10 @@ class Working {
     return at.deleted ? "the parent is deleted" : undefined;
   }
 
-  /** Why `parent` cannot become `id`'s parent, if it cannot. */
-  parentProblem(id: string, parent: string): string | undefined {
+  /** Why `parent` cannot become `id`'s parent, if it cannot; a deleted `parent` can when `deletedOk`. */
+  parentProblem(id: string, parent: string, deletedOk = false): string | undefined {
     const unusable = this.unusableParent(parent);
-    if (unusable) return unusable;
+    if (unusable && !(deletedOk && unusable === "the parent is deleted")) return unusable;
     const seen = new Set<string>();
     for (let ancestor: string | undefined = parent; ancestor !== undefined; ancestor = this.parentOf(ancestor)?.parentId) {
       if (ancestor === id) return "would create a cycle";
@@ -990,18 +1034,35 @@ class Working {
 }
 
 /**
- * The fields a mutation sets on `item` (empty when it changes nothing),
- * checking UpdateItem's values in mask order: the title's length, and a
- * parent_id that names the Item itself.
+ * The fields a mutation sets on `item` (empty when it changes nothing). For
+ * UpdateItem it checks the mask's paths in order, as the store applies them:
+ * a path that repeats or overlaps an earlier one, a status or archived
+ * path, a title that is empty once trimmed or too long, and a parent_id
+ * that names the Item itself; labels are deduplicated, keeping the first.
  */
 function patchOf(p: Planned, item: Item, now: Timestamp): Fields {
   switch (p.kind) {
     case "update": {
-      for (const [field, value] of Object.entries(p.patch ?? {})) {
-        if (field === "title" && typeof value === "string" && overCaptureLimit(value.trim())) throw badRequest(`${p.prefix}item.title`, TOO_LONG);
+      const { paths, values } = p.mask!;
+      const patch: Fields = {};
+      for (const [at, path] of paths.entries()) {
+        const top = path.split(".")[0]!;
+        const overlaps = (earlier: string) => earlier === path || earlier === top || earlier.split(".")[0] === path;
+        if (paths.slice(0, at).some(overlaps)) throw badRequest(`${p.prefix}update_mask`, `${JSON.stringify(path)} repeats or overlaps an earlier path`);
+        if (STATUS_PATHS.has(path)) throw badRequest(`${p.prefix}item.${path}`, "changes only through SetStatus");
+        if (top === "archived") throw badRequest(`${p.prefix}item.${path}`, "changes only through ArchiveItem and UnarchiveItem");
+        const field = FIELDS_BY_NAME.get(top)!.localName;
+        let value = values[field];
+        if (field === "title" && typeof value === "string") {
+          value = value.trim();
+          if (value === "") throw badRequest(`${p.prefix}item.title`, "must not be empty");
+          if (overCaptureLimit(value as string)) throw badRequest(`${p.prefix}item.title`, TOO_LONG);
+        }
         if (field === "parentId" && value === item.id) throw badRequest(`${p.prefix}item.parent_id`, "an Item cannot be its own parent");
+        if (field === "labels" && Array.isArray(value)) value = [...new Set(value)];
+        patch[field] = value;
       }
-      return p.patch ?? {};
+      return patch;
     }
     case "setStatus":
       return p.status === undefined || deriveStatus(item) === p.status ? {} : withStatus(item, p.status);
@@ -1277,14 +1338,16 @@ function idOf(path: string, id: string): string {
   return canonical;
 }
 
-/** The request's relation, checked, with canonical-case ids, its ends as the request names them. */
+/**
+ * The request's relation, with its ids and kind checked, in canonical case,
+ * its ends as the request names them; the caller checks that they differ.
+ */
 function relationOf(relation: Relation | undefined): Relation {
   if (!relation) throw badRequest("relation", "required field is missing");
   const fromId = idOf("relation.from_id", relation.fromId);
   const toId = idOf("relation.to_id", relation.toId);
   if (relation.kind === RelationKind.UNSPECIFIED) throw badRequest("relation.kind", "value must not be UNSPECIFIED");
   if (!(relation.kind in RELATION_WORDS)) throw badRequest("relation.kind", `unknown enum value ${relation.kind}`);
-  if (fromId === toId) throw badRequest("relation.to_id", "must differ from from_id");
   return create(RelationSchema, { fromId, toId, kind: relation.kind });
 }
 
@@ -1343,7 +1406,7 @@ function planMutation(m: Mutation, prefix: string): Planned {
 function planUpdate(req: UpdateItemRequest, prefix: string): Planned {
   const idPath = `${prefix}item.id`;
   const id = idOf(idPath, req.item?.id ?? "");
-  return { kind: "update", id, expectedRevision: req.expectedRevision, prefix, idPath, batched: prefix !== "", patch: maskedFields(req, prefix) };
+  return { kind: "update", id, expectedRevision: req.expectedRevision, prefix, idPath, batched: prefix !== "", mask: maskOf(req, prefix) };
 }
 
 function planSetStatus(req: { id: string; status: Status; expectedRevision?: bigint | undefined }, prefix: string): Planned {
@@ -1362,28 +1425,45 @@ function planItemOp(kind: MutationKind, req: { id: string; expectedRevision?: bi
 /** Item fields that change only through SetStatus. */
 const STATUS_PATHS = new Set(["status", "status_category", "resolution_kind", "todo_refinement"]);
 
+const FIELDS_BY_NAME = new Map(ItemSchema.fields.map((f) => [f.name, f]));
+
+/** The Item fields whose own fields are mask paths too ("waiting.reason"), as ItemField names them. */
+const NESTED_PATHS = new Set(["waiting", "archived", "remote_link", "recurrence", "staleness"]);
+
+/** Whether `path` names an Item field, or a field of one of the NESTED_PATHS messages. */
+function knownPath(path: string): boolean {
+  const [top, sub, ...deeper] = path.split(".");
+  const field = FIELDS_BY_NAME.get(top!);
+  if (field === undefined || deeper.length > 0) return false;
+  if (sub === undefined) return true;
+  return NESTED_PATHS.has(top!) && field.fieldKind === "message" && field.message.fields.some((f) => f.name === sub);
+}
+
 /**
- * The top-level Item fields named by the update mask, taken from the
- * request's item, in mask order. Rejects the mask as the daemon does when it
- * is missing, empty or names an unknown field, a status field, archived or
- * relations, and a parent_id that is not a ULID.
+ * The update mask's paths and the request's values of their top-level
+ * fields, converted as the daemon converts the request, before it looks at
+ * the Item: it rejects a missing or empty mask, "*", relations, an unknown
+ * path, and a parent_id that is not a ULID (read, like every value, only
+ * up to the first repeated path).
  */
-function maskedFields(req: UpdateItemRequest, prefix: string): Fields {
+function maskOf(req: UpdateItemRequest, prefix: string): { paths: readonly string[]; values: Fields } {
   if (req.updateMask === undefined) throw badRequest(`${prefix}update_mask`, "required field is missing");
-  if (req.updateMask.paths.length === 0) throw badRequest(`${prefix}update_mask`, "must not be empty");
+  const paths = req.updateMask.paths;
+  if (paths.length === 0) throw badRequest(`${prefix}update_mask`, "must not be empty");
   const source = (req.item ?? create(ItemSchema)) as unknown as Fields;
-  const patch: Fields = {};
-  for (const path of req.updateMask.paths) {
-    const top = path.split(".")[0]!;
-    const field = ItemSchema.fields.find((f) => f.name === top);
-    if (!field) throw badRequest(`${prefix}update_mask`, `unknown field path ${JSON.stringify(path)}`);
-    if (STATUS_PATHS.has(top)) throw badRequest(`${prefix}item.${top}`, "changes only through SetStatus");
-    if (top === "archived") throw badRequest(`${prefix}item.archived`, "changes only through ArchiveItem and UnarchiveItem");
-    if (top === "relations") throw badRequest(`${prefix}item.relations`, "changes only through AddRelation and RemoveRelation");
-    const value = source[field.localName];
-    patch[field.localName] = top === "parent_id" && typeof value === "string" ? idOf(`${prefix}item.parent_id`, value) : value;
+  const values: Fields = {};
+  let repeated = false;
+  for (const [at, path] of paths.entries()) {
+    if (path === "*") throw badRequest(`${prefix}update_mask`, '"*" is not supported');
+    if (path === "relations") throw badRequest(`${prefix}item.relations`, "changes only through AddRelation and RemoveRelation");
+    if (!knownPath(path)) throw badRequest(`${prefix}update_mask`, `unknown field path ${JSON.stringify(path)}`);
+    repeated ||= paths.indexOf(path) < at;
+    if (repeated) continue;
+    const field = FIELDS_BY_NAME.get(path.split(".")[0]!)!.localName;
+    const value = source[field];
+    values[field] = field === "parentId" && typeof value === "string" ? idOf(`${prefix}item.parent_id`, value) : value;
   }
-  return patch;
+  return { paths, values };
 }
 
 /** A date as a sortable `YYYYMMDD` number. */

@@ -863,8 +863,8 @@ fn undo_reports_the_changes_it_leaves_alone() {
     assert_eq!(
         text(&out.stdout),
         format!(
-            "Undid: mark done \"call dentist\"\n  \
-             not restored: status of {short} (the field has changed since)\n"
+            "Could not undo: mark done \"call dentist\" (everything it changed has changed \
+             since)\n  not restored: status of {short} (the field has changed since)\n"
         )
     );
     assert_eq!(text(&out.stderr), "");

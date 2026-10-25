@@ -427,6 +427,8 @@ const REQUEST_SQL: &str = "SELECT r.op_id, r.revision, r.item_id, ops.kind
      FROM request_ids r JOIN ops ON ops.id = r.op_id WHERE r.request_id = ?1";
 const SPOOL_SQL: &str = "SELECT s.op_id, s.revision, s.item_id, ops.kind
      FROM spool_imports s JOIN ops ON ops.id = s.op_id WHERE s.spool_id = ?1";
+/// Why an Item cannot be moved, or undeleted, under its parent.
+const PARENT_IS_DELETED: &str = "the parent is deleted";
 
 /// State the writer thread shares with handles.
 struct Shared {
@@ -747,9 +749,13 @@ struct OpRow<'a> {
     summary: String,
     /// `ops.entry_op`: the entry an undo or redo acted on.
     entry_op: Option<Ulid>,
-    /// `ops.report`: the JSON of the changes an undo or redo skipped, or of
-    /// the relation a relation op that changed nothing was asked for (one
-    /// that changed it records it in its event), so a replay can check it.
+    /// `ops.report`, kept for replays of the op's request id. For an undo or
+    /// redo, the JSON of the changes it skipped, so a replay returns the
+    /// original report. For a relation op that changed nothing, the JSON of
+    /// the relation it was asked for, so a replay can check that it names
+    /// the same relation (one that changed it records the relation in its
+    /// event instead). The 0002 migration's comment names only the first
+    /// use; it stays as databases applied it.
     report: Option<String>,
 }
 
@@ -1294,20 +1300,24 @@ impl Batch {
     fn unusable_parent(&self, conn: &Connection, parent: ItemId) -> Result<Option<&'static str>> {
         Ok(match self.parent_of(conn, parent)? {
             None => Some("no such Item"),
-            Some((_, true)) => Some("the parent is deleted"),
+            Some((_, true)) => Some(PARENT_IS_DELETED),
             Some(_) => None,
         })
     }
 
-    /// Why `parent` cannot become `id`'s parent, if it cannot.
+    /// Why `parent` cannot become `id`'s parent, if it cannot. A deleted
+    /// `parent` can when `deleted_ok`.
     fn parent_problem(
         &self,
         conn: &Connection,
         id: ItemId,
         parent: ItemId,
+        deleted_ok: bool,
     ) -> Result<Option<&'static str>> {
-        if let Some(reason) = self.unusable_parent(conn, parent)? {
-            return Ok(Some(reason));
+        match self.unusable_parent(conn, parent)? {
+            Some(PARENT_IS_DELETED) if deleted_ok => {}
+            Some(reason) => return Ok(Some(reason)),
+            None => {}
         }
         let mut seen = HashSet::new();
         let mut next = Some(parent);
@@ -1326,18 +1336,20 @@ impl Batch {
     }
 
     /// The first change to `id` the database cannot take: a parent that is
-    /// missing, deleted or a descendant, a person, or a duration too long for
-    /// its nanosecond column.
+    /// missing, deleted (unless `deleted_parent_ok`: undo and redo check the
+    /// parent rule once they are done) or a descendant, a person, or a
+    /// duration too long for its nanosecond column.
     fn change_error(
         &self,
         conn: &Connection,
         id: ItemId,
         changes: &[FieldChange],
+        deleted_parent_ok: bool,
     ) -> Result<Option<MutationError>> {
         for change in changes {
             let error = match &change.new {
                 FieldValue::ItemId(parent) if change.field == ItemField::ParentId => self
-                    .parent_problem(conn, id, *parent)?
+                    .parent_problem(conn, id, *parent, deleted_parent_ok)?
                     .map(|reason| MutationError::Invalid {
                         field: change.field,
                         reason: reason.to_owned(),
@@ -1537,7 +1549,7 @@ fn mutate_tx(tx: &mut WriteTx<'_>, input: MutateInput) -> Result<MutateOutput> {
             _ => None,
         };
         let applied = apply(&batch.items[slot], &m.op, &ctx).map_err(invalid)?;
-        if let Some(error) = batch.change_error(conn, m.id, &applied.changes)? {
+        if let Some(error) = batch.change_error(conn, m.id, &applied.changes, false)? {
             return Err(invalid(error));
         }
         let changed = !applied.changes.is_empty();

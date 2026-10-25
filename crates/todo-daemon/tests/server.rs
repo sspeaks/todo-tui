@@ -1921,6 +1921,26 @@ async fn a_spool_entry_is_imported_once_across_restarts() {
     d.stop().await;
 }
 
+/// Spooled captures are undo stack entries, there before any call is
+/// served: the first Undo after the daemon starts undoes the last of them,
+/// and they are all imported.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_undo_finds_the_spooled_captures_on_the_stack() {
+    let home = TempDir::new().unwrap();
+    let paths = paths_for(&home);
+    for n in 1..=30 {
+        let entry = SpoolEntry::now(new_ulid(), format!("spooled {n}"));
+        spool::append(&paths, &entry).unwrap();
+    }
+    let d = start_in(home).await;
+    let mut items = d.items().await;
+    let last = "capture \"spooled 30\"";
+    assert_eq!(undo(&mut items).await.entry.unwrap().description, last);
+    assert_eq!(redo(&mut items).await.entry.unwrap().description, last);
+    assert_eq!(titles(&mut items).await.len(), 30);
+    d.stop().await;
+}
+
 // ---- M2: undo and redo, relations, parent rules ----------------------------
 
 fn undo_req(expected_op_id: Option<&str>) -> UndoRequest {
@@ -2684,6 +2704,58 @@ async fn relation_errors_name_the_ends_as_the_request_does() {
                 "{kind:?}"
             );
         }
+
+        // An Item related to itself has a wrong to_id; when its from_id is
+        // wrong too, the from_id is named.
+        let itself = |id: &str| Relation {
+            from_id: id.to_owned(),
+            to_id: id.to_lowercase(),
+            kind: kind as i32,
+        };
+        let status = items
+            .add_relation(add_req(itself(&gone[0])))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error_info(&status, Code::NotFound, "ITEM_NOT_FOUND")["item_id"],
+            gone[0],
+            "{kind:?}"
+        );
+        let status = items
+            .remove_relation(remove_req(itself(&gone[0])))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error_info(&status, Code::NotFound, "ITEM_NOT_FOUND")["item_id"],
+            gone[0],
+            "{kind:?}"
+        );
+        let status = items
+            .add_relation(add_req(itself(&dead[0].id)))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error_info(&status, Code::FailedPrecondition, "ITEM_DELETED")["item_id"],
+            dead[0].id,
+            "{kind:?}"
+        );
+        // A remove takes a deleted from_id, so only to_id is wrong.
+        let same = (
+            "relation.to_id".to_owned(),
+            "must differ from from_id".to_owned(),
+        );
+        for id in [&dead[0].id, &a.id] {
+            let status = items
+                .remove_relation(remove_req(itself(id)))
+                .await
+                .unwrap_err();
+            assert_eq!(violation(&status), same, "{kind:?}");
+        }
+        let status = items
+            .add_relation(add_req(itself(&a.id)))
+            .await
+            .unwrap_err();
+        assert_eq!(violation(&status), same, "{kind:?}");
     }
     d.stop().await;
 }

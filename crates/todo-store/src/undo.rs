@@ -5,7 +5,9 @@
 //! leave both as `dropped` (an undo or redo restored nothing) or `discarded`
 //! (a new entry cleared the redo stack). Undo inverts the entry's events, or
 //! those of its latest redo; redo inverts the events of its latest undo. Both
-//! are ops of their own, linked to the entry by `entry_op`.
+//! are ops of their own, linked to the entry by `entry_op`. Like a batch,
+//! they keep the parent rule (design 3.7) for where they leave the Items,
+//! not for each step.
 
 use std::collections::HashMap;
 
@@ -20,8 +22,9 @@ use ulid::Ulid;
 use crate::codec::{self, SqlEnum, ts_from_sql};
 use crate::relation::RelationChange;
 use crate::{
-    Batch, OpKind, OpRow, OpSummaryRow, REQUEST_SQL, Result, StoreError, UndoInput, UndoOutput,
-    UndoSkipRow, UndoState, WriteTx, load_items, prune_request_ids, recorded_op, summary, write_op,
+    Batch, OpKind, OpRow, OpSummaryRow, PARENT_IS_DELETED, REQUEST_SQL, Result, StoreError,
+    UndoInput, UndoOutput, UndoSkipRow, UndoState, WriteTx, load_items, prune_request_ids,
+    recorded_op, summary, write_op,
 };
 
 pub(crate) fn undo_state_tx(conn: &Connection) -> Result<UndoState> {
@@ -72,70 +75,36 @@ pub(crate) fn undo_tx(tx: &mut WriteTx<'_>, input: UndoInput, redo: bool) -> Res
     op.entry_op = Some(entry.op_id);
 
     let events = load_events(conn, &source_op(conn, entry.op_id, redo)?)?;
+    let steps = inverse(&events, input.now);
     let ctx = ApplyCtx {
         now: input.now,
         actor: Actor::User,
     };
-    let mut batch = Batch::default();
-    let mut skipped = Vec::new();
-    // The Items a content unit was restored on, and what it restored.
-    let mut restored: HashMap<ItemId, Restored> = HashMap::new();
-    let mut relations_changed = false;
-    let mut signals = Vec::new();
-    // Deletes and undeletes the parent rule holds back for now.
-    let mut held = Vec::new();
-    for step in inverse(&events, input.now) {
-        match step {
-            InverseStep::Restore { item_id, unit } if is_staleness(&unit) => {
-                signals.push((item_id, unit));
-            }
-            InverseStep::Restore { item_id, unit } => {
-                match restore(&mut batch, conn, item_id, &unit, &ctx, today)? {
-                    Outcome::Restored => {
-                        *restored.entry(item_id).or_default() |= Restored::of(&unit)
-                    }
-                    Outcome::Skipped(skip) => skipped.push(skip),
-                    Outcome::Held(skip) => held.push((item_id, unit, skip)),
-                }
-            }
-            InverseStep::AddRelation(relation) | InverseStep::RemoveRelation(relation) => {
-                let add = matches!(step, InverseStep::AddRelation(_));
-                let reason = match batch.change_relation(conn, relation, add, input.now, today)? {
-                    RelationChange::Changed => {
-                        relations_changed = true;
-                        continue;
-                    }
-                    RelationChange::Unchanged => SkipReason::ChangedSince,
-                    RelationChange::Missing(end) => {
-                        SkipReason::Invalid(format!("item {end} does not exist"))
-                    }
-                };
-                skipped.push(UndoSkipRow {
-                    item_id: relation.from(),
-                    fields: Vec::new(),
-                    reason,
-                    relation: Some(relation),
-                });
-            }
+    // The parent rule (design 3.7) holds where the undo leaves the Items, as
+    // for a batch, not after each step: a batch may pass through a live Item
+    // under a deleted parent, and its undo then passes through it too, in
+    // reverse. A pass that leaves the rule broken is rolled back and run
+    // again without the steps that broke it, which are reported.
+    let mut ruled_out = HashMap::new();
+    let pass = loop {
+        conn.execute_batch("SAVEPOINT undo_pass")?;
+        let pass = Pass::run(conn, &steps, &ruled_out, &ctx, today)?;
+        let broken = pass.broken(conn)?;
+        if broken.is_empty() {
+            conn.execute_batch("RELEASE undo_pass")?;
+            break pass;
         }
-    }
-    // A step can wait for a later one: a batch may undelete a subtask before
-    // its parent, so its undo comes to the parent's delete while the
-    // subtask is still live. Retried until a pass restores none of them.
-    loop {
-        let before = held.len();
-        for (item_id, unit, _) in std::mem::take(&mut held) {
-            match restore(&mut batch, conn, item_id, &unit, &ctx, today)? {
-                Outcome::Restored => *restored.entry(item_id).or_default() |= Restored::of(&unit),
-                Outcome::Skipped(skip) => skipped.push(skip),
-                Outcome::Held(skip) => held.push((item_id, unit, skip)),
-            }
-        }
-        if held.len() == before {
-            break;
-        }
-    }
-    skipped.extend(held.into_iter().map(|(_, _, skip)| skip));
+        conn.execute_batch("ROLLBACK TO undo_pass; RELEASE undo_pass")?;
+        ruled_out.extend(broken);
+    };
+    let Pass {
+        mut batch,
+        skipped,
+        restored,
+        relations_changed,
+        signals,
+        ..
+    } = pass;
     op.report = Some(report_to_sql(&skipped)?);
 
     if restored.is_empty() && !relations_changed {
@@ -196,18 +165,147 @@ pub(crate) fn undo_tx(tx: &mut WriteTx<'_>, input: UndoInput, redo: bool) -> Res
     })
 }
 
-/// What [`restore`] did with a unit.
-enum Outcome {
-    Restored,
-    Skipped(UndoSkipRow),
-    /// Not restored for now: a delete of an Item with live subtasks, or an
-    /// undelete under a deleted parent. A later step may change that.
-    Held(UndoSkipRow),
+/// Why a step that deleted an Item is ruled out (one that undeleted or
+/// moved an Item under a deleted parent is ruled out with
+/// [`PARENT_IS_DELETED`]).
+const WITH_LIVE_SUBTASKS: &str = "the Item has live subtasks";
+
+/// One run of an undo's steps on fresh working copies.
+#[derive(Default)]
+struct Pass {
+    batch: Batch,
+    skipped: Vec<UndoSkipRow>,
+    /// The Items a content unit was restored on, and what it restored.
+    restored: HashMap<ItemId, Restored>,
+    relations_changed: bool,
+    /// The staleness units, applied once the content is restored.
+    signals: Vec<(ItemId, RestoreUnit)>,
+    /// Per Item, the last step that undeleted it or changed its parent.
+    placed: HashMap<ItemId, usize>,
+    /// Per Item, the last step that deleted it.
+    deleted: HashMap<ItemId, usize>,
+}
+
+impl Pass {
+    /// Runs `steps` in order, except the ones `ruled_out`, which are
+    /// skipped with their reason.
+    fn run(
+        conn: &Connection,
+        steps: &[InverseStep],
+        ruled_out: &HashMap<usize, &'static str>,
+        ctx: &ApplyCtx,
+        today: Date,
+    ) -> Result<Pass> {
+        let mut pass = Pass::default();
+        for (at, step) in steps.iter().enumerate() {
+            match step {
+                InverseStep::Restore { item_id, unit } if is_staleness(unit) => {
+                    pass.signals.push((*item_id, unit.clone()));
+                }
+                InverseStep::Restore { item_id, unit } => {
+                    let skip = match ruled_out.get(&at) {
+                        Some(&reason) => Some(SkipReason::Invalid(reason.to_owned())),
+                        None => restore(&mut pass.batch, conn, *item_id, unit, ctx, today)?,
+                    };
+                    let Some(reason) = skip else {
+                        pass.note_restore(at, *item_id, unit);
+                        continue;
+                    };
+                    pass.skipped.push(UndoSkipRow {
+                        item_id: *item_id,
+                        fields: unit.restores.iter().map(|r| r.field).collect(),
+                        reason,
+                        relation: None,
+                    });
+                }
+                &InverseStep::AddRelation(relation) | &InverseStep::RemoveRelation(relation) => {
+                    let add = matches!(step, InverseStep::AddRelation(_));
+                    let reason = match pass
+                        .batch
+                        .change_relation(conn, relation, add, ctx.now, today)?
+                    {
+                        RelationChange::Changed => {
+                            pass.relations_changed = true;
+                            continue;
+                        }
+                        RelationChange::Unchanged => SkipReason::ChangedSince,
+                        RelationChange::Missing(end) => {
+                            SkipReason::Invalid(format!("item {end} does not exist"))
+                        }
+                    };
+                    pass.skipped.push(UndoSkipRow {
+                        item_id: relation.from(),
+                        fields: Vec::new(),
+                        reason,
+                        relation: Some(relation),
+                    });
+                }
+            }
+        }
+        Ok(pass)
+    }
+
+    /// Notes that step `at` restored `unit` on `item_id`.
+    fn note_restore(&mut self, at: usize, item_id: ItemId, unit: &RestoreUnit) {
+        *self.restored.entry(item_id).or_default() |= Restored::of(unit);
+        for r in &unit.restores {
+            match r.field {
+                ItemField::DeletedAt if r.value != FieldValue::Cleared => {
+                    self.deleted.insert(item_id, at);
+                }
+                ItemField::DeletedAt | ItemField::ParentId => {
+                    self.placed.insert(item_id, at);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The steps that leave a live Item under a deleted parent, each with
+    /// why it is ruled out. Of a step that undeleted or moved the Item and
+    /// one that deleted its parent, the later one is. A live Item that was
+    /// under a deleted parent before the undo (in a database from before
+    /// deletes cascaded) is not the undo's doing, and is left alone.
+    fn broken(&self, conn: &Connection) -> Result<HashMap<usize, &'static str>> {
+        let mut broken = HashMap::new();
+        let mut blame = |child: ItemId, parent: ItemId| {
+            let (at, reason) = match (self.placed.get(&child), self.deleted.get(&parent)) {
+                (Some(&placed), Some(&deleted)) if deleted > placed => {
+                    (deleted, WITH_LIVE_SUBTASKS)
+                }
+                (Some(&placed), _) => (placed, PARENT_IS_DELETED),
+                (None, Some(&deleted)) => (deleted, WITH_LIVE_SUBTASKS),
+                (None, None) => return,
+            };
+            broken.insert(at, reason);
+        };
+        for &child in self.placed.keys() {
+            let item = &self.batch.items[self.batch.slots[&child]];
+            if let Some(parent) = item.core.parent_id
+                && !item.is_deleted()
+                && self.batch.is_deleted(conn, parent)?
+            {
+                blame(child, parent);
+            }
+        }
+        for &parent in self.deleted.keys() {
+            if !self.batch.is_deleted(conn, parent)? {
+                continue;
+            }
+            for (child, deleted) in self.batch.children(conn, parent)? {
+                if !deleted {
+                    blame(child, parent);
+                }
+            }
+        }
+        Ok(broken)
+    }
 }
 
 /// Applies one content unit to `item_id`'s working copy, or says why not.
 /// Besides the core checks, a restore must leave references the database
-/// can take, and keep every live Item's parent live (design 3.7).
+/// can take; whether it keeps every live Item's parent live (design 3.7) is
+/// checked once the whole undo has run ([`Pass::broken`]).
 fn restore(
     batch: &mut Batch,
     conn: &Connection,
@@ -215,17 +313,11 @@ fn restore(
     unit: &RestoreUnit,
     ctx: &ApplyCtx,
     today: Date,
-) -> Result<Outcome> {
-    let skip = |reason| UndoSkipRow {
-        item_id,
-        fields: unit.restores.iter().map(|r| r.field).collect(),
-        reason,
-        relation: None,
-    };
-    let invalid = |reason: &str| skip(SkipReason::Invalid(reason.to_owned()));
+) -> Result<Option<SkipReason>> {
+    let invalid = |reason: &str| Some(SkipReason::Invalid(reason.to_owned()));
     let slot = match batch.load(conn, item_id, today) {
         Ok(slot) => slot,
-        Err(StoreError::NotFound(_)) => return Ok(Outcome::Skipped(invalid("no such Item"))),
+        Err(StoreError::NotFound(_)) => return Ok(invalid("no such Item")),
         Err(e) => return Err(e),
     };
     let mut applied = apply(
@@ -235,36 +327,18 @@ fn restore(
     )
     .map_err(|e| StoreError::Corrupt(format!("restoring {item_id}: {e}")))?;
     if let Some(core_skip) = applied.skipped.pop() {
-        return Ok(Outcome::Skipped(skip(core_skip.reason)));
+        return Ok(Some(core_skip.reason));
     }
-    if let Some(error) = batch.change_error(conn, item_id, &applied.changes)? {
-        return Ok(Outcome::Skipped(invalid(&match error {
+    if let Some(error) = batch.change_error(conn, item_id, &applied.changes, true)? {
+        return Ok(invalid(&match error {
             MutationError::Invalid { reason, .. } | MutationError::Unsupported { reason, .. } => {
                 reason
             }
             other => other.to_string(),
-        })));
-    }
-    for change in &applied.changes {
-        if change.field != ItemField::DeletedAt {
-            continue;
-        }
-        if change.new == FieldValue::Cleared {
-            if let Some(parent) = applied.item.core.parent_id
-                && batch.is_deleted(conn, parent)?
-            {
-                return Ok(Outcome::Held(invalid("the parent is deleted")));
-            }
-        } else if batch
-            .children(conn, item_id)?
-            .iter()
-            .any(|&(_, deleted)| !deleted)
-        {
-            return Ok(Outcome::Held(invalid("the Item has live subtasks")));
-        }
+        }));
     }
     batch.record(slot, applied);
-    Ok(Outcome::Restored)
+    Ok(None)
 }
 
 /// Which content an undo restored on one Item, for its staleness signals.

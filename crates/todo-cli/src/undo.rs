@@ -10,8 +10,9 @@ use todo_proto::convert::item_field_path;
 use todo_proto::v1::item_service_client::ItemServiceClient;
 use todo_proto::v1::{OpSummary, RedoRequest, RelationKind, UndoRequest, UndoSkip};
 use tonic::Status;
+use tonic::transport::Channel;
 
-use crate::rpc::{Why, call, describe, is_transport, ready};
+use crate::rpc::{call, describe, is_transport, ready};
 use crate::{print_out, short_id};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,65 +21,153 @@ pub(crate) enum Direction {
     Redo,
 }
 
+/// How many times `todo undo` sends its request while no answer comes
+/// back.
+const ATTEMPTS: usize = 3;
+
 /// Undoes, or redoes, one entry through the daemon, which is started or
 /// restarted as for `todo add`. Prints `Undid: <entry>` (`Redid: …`) and a
-/// line per change left alone, or `Nothing to undo` (`… redo`). There is no
-/// spool: without a daemon it fails.
+/// line per change left alone, `Could not undo: …` when the entry was
+/// dropped, or `Nothing to undo` (`… redo`). There is no spool: without a
+/// daemon it fails.
+///
+/// The request is sent again, with the same request id, when its answer is
+/// lost (the daemon may have acted on it): the daemon answers a repeat with
+/// what the first one did, so it never undoes a second entry.
 pub(crate) async fn undo(paths: &Paths, direction: Direction) -> anyhow::Result<ExitCode> {
-    let channel = ready(paths).await.map_err(|why| anyhow::anyhow!("{why}"))?;
-    // As for a capture: the reply to an undo the daemon applied must always
-    // decode, however many Items it carries.
-    let mut items = ItemServiceClient::new(channel).max_decoding_message_size(usize::MAX);
     let request_id = new_ulid().to_string();
-    let reply = match direction {
-        Direction::Undo => {
-            let request = UndoRequest {
-                request_id,
-                expected_op_id: None,
-            };
-            call(items.undo(request))
-                .await
-                .map(|r| (r.entry, r.skipped))
-        }
-        Direction::Redo => {
-            let request = RedoRequest {
-                request_id,
-                expected_op_id: None,
-            };
-            call(items.redo(request))
-                .await
-                .map(|r| (r.entry, r.skipped))
+    let connect = async || ready(paths).await.map_err(|why| why.to_string());
+    let send = async |channel: Channel| {
+        // As for a capture: the reply to an undo the daemon applied must
+        // always decode, however many Items it carries.
+        let mut items = ItemServiceClient::new(channel).max_decoding_message_size(usize::MAX);
+        let request_id = request_id.clone();
+        match direction {
+            Direction::Undo => {
+                let request = UndoRequest {
+                    request_id,
+                    expected_op_id: None,
+                };
+                call(items.undo(request))
+                    .await
+                    .map(|r| Reply::new(r.entry, r.items.is_empty(), r.skipped))
+            }
+            Direction::Redo => {
+                let request = RedoRequest {
+                    request_id,
+                    expected_op_id: None,
+                };
+                call(items.redo(request))
+                    .await
+                    .map(|r| Reply::new(r.entry, r.items.is_empty(), r.skipped))
+            }
         }
     };
-    let (entry, skipped) = reply.map_err(|status| anyhow::anyhow!("{}", failure(&status)))?;
-    for line in report(direction, entry.as_ref(), &skipped) {
+    let reply = until_answered(connect, send)
+        .await
+        .map_err(|failure| anyhow::anyhow!("{}", failure.message(direction)))?;
+    for line in report(direction, &reply) {
         print_out(line);
     }
     Ok(ExitCode::SUCCESS)
 }
 
-/// What `todo: …` says when the call fails: that the daemon is unavailable
-/// if the call did not reach it or its answer was lost, otherwise why the
-/// daemon refused.
-fn failure(status: &Status) -> String {
-    if is_transport(status) {
-        Why::Unavailable(describe(status)).to_string()
-    } else {
-        status.message().to_owned()
+/// What an Undo or Redo answered.
+#[derive(Debug, Clone, PartialEq)]
+struct Reply {
+    /// The entry it acted on; `None` when the stack was empty.
+    entry: Option<OpSummary>,
+    /// Whether it restored nothing and so dropped the entry. The proto says
+    /// so with an entry and no Items: `items` lists the Items it changed,
+    /// and one that restores nothing drops its entry from both stacks.
+    dropped: bool,
+    skipped: Vec<UndoSkip>,
+}
+
+impl Reply {
+    fn new(entry: Option<OpSummary>, no_items: bool, skipped: Vec<UndoSkip>) -> Reply {
+        Reply {
+            dropped: entry.is_some() && no_items,
+            entry,
+            skipped,
+        }
+    }
+}
+
+/// Why `todo undo` (`todo redo`) failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Failure {
+    /// The daemon could not be reached, started or spoken to, so nothing
+    /// was sent: why, as [`crate::rpc::Why`] puts it.
+    Unavailable(String),
+    /// The daemon refused the request.
+    Refused(String),
+    /// It was sent, but no answer came back however often it was: the
+    /// daemon may have acted on it.
+    Unanswered(String),
+}
+
+impl Failure {
+    /// What `todo: …` says.
+    fn message(&self, direction: Direction) -> String {
+        let (verb, again) = match direction {
+            Direction::Undo => ("undo", "undoing"),
+            Direction::Redo => ("redo", "redoing"),
+        };
+        match self {
+            Failure::Unavailable(why) | Failure::Refused(why) => why.clone(),
+            Failure::Unanswered(why) => format!(
+                "no answer from the daemon ({why}); the {verb} may have been applied, \
+                 so check before {again} again"
+            ),
+        }
+    }
+}
+
+/// Connects with `connect` and sends the request with `send` until it is
+/// answered or refused: after a failure on the way to or from the daemon
+/// it reconnects and sends it again, [`ATTEMPTS`] times in all.
+async fn until_answered<C, T>(
+    mut connect: impl AsyncFnMut() -> Result<C, String>,
+    mut send: impl AsyncFnMut(C) -> Result<T, Status>,
+) -> Result<T, Failure> {
+    let mut sent = 0;
+    loop {
+        let channel = match connect().await {
+            Ok(channel) => channel,
+            Err(why) if sent == 0 => return Err(Failure::Unavailable(why)),
+            Err(why) => return Err(Failure::Unanswered(why)),
+        };
+        sent += 1;
+        match send(channel).await {
+            Ok(reply) => return Ok(reply),
+            Err(status) if !is_transport(&status) => {
+                return Err(Failure::Refused(status.message().to_owned()));
+            }
+            Err(status) if sent == ATTEMPTS => return Err(Failure::Unanswered(describe(&status))),
+            Err(_) => {}
+        }
     }
 }
 
 /// The lines `todo undo` (`todo redo`) prints for the daemon's reply.
-fn report(direction: Direction, entry: Option<&OpSummary>, skipped: &[UndoSkip]) -> Vec<String> {
-    let (done, nothing) = match direction {
-        Direction::Undo => ("Undid", "Nothing to undo"),
-        Direction::Redo => ("Redid", "Nothing to redo"),
+fn report(direction: Direction, reply: &Reply) -> Vec<String> {
+    let (done, failed, nothing) = match direction {
+        Direction::Undo => ("Undid", "Could not undo", "Nothing to undo"),
+        Direction::Redo => ("Redid", "Could not redo", "Nothing to redo"),
     };
-    let Some(entry) = entry else {
+    let Some(entry) = &reply.entry else {
         return vec![nothing.to_owned()];
     };
-    let mut lines = vec![format!("{done}: {}", entry.description)];
-    lines.extend(skipped.iter().map(skip_line));
+    let mut lines = vec![if reply.dropped {
+        format!(
+            "{failed}: {} (everything it changed has changed since)",
+            entry.description
+        )
+    } else {
+        format!("{done}: {}", entry.description)
+    }];
+    lines.extend(reply.skipped.iter().map(skip_line));
     lines
 }
 
@@ -143,34 +232,141 @@ mod tests {
         }
     }
 
-    #[test]
-    fn failures_say_whether_the_daemon_was_reached() {
-        let lost = Status::unavailable("connection refused");
-        assert_eq!(failure(&lost), "daemon unavailable (connection refused)");
-        let changed = Status::aborted("the undo stack changed: expected entry A, but it is empty");
+    /// A reply that changed Items, or none when `entry` is `None`.
+    fn reply(entry: Option<OpSummary>, skipped: &[UndoSkip]) -> Reply {
+        Reply::new(entry, false, skipped.to_vec())
+    }
+
+    /// Runs [`until_answered`] with `connects` and `answers` in turn, and
+    /// returns its outcome, how many times it connected and what it sent.
+    async fn attempts(
+        connects: &[Result<(), &str>],
+        answers: &[Result<&str, Status>],
+    ) -> (Result<String, Failure>, usize, usize) {
+        let (mut connected, mut sent) = (0, 0);
+        let connect = async || {
+            connected += 1;
+            connects[connected - 1].map_err(str::to_owned)
+        };
+        let send = async |()| {
+            sent += 1;
+            answers[sent - 1].clone().map(str::to_owned)
+        };
+        let outcome = until_answered(connect, send).await;
+        (outcome, connected, sent)
+    }
+
+    #[tokio::test]
+    async fn a_lost_answer_is_asked_for_again() {
+        let lost = || Err(Status::deadline_exceeded("no answer within 5s"));
+        let dropped = || Err(Status::unavailable("connection reset"));
+        // Answered the second or the third time, after reconnecting.
         assert_eq!(
-            failure(&changed),
-            "the undo stack changed: expected entry A, but it is empty"
+            attempts(&[Ok(()); 2], &[lost(), Ok("undone")]).await,
+            (Ok("undone".into()), 2, 2)
+        );
+        assert_eq!(
+            attempts(&[Ok(()); 3], &[dropped(), lost(), Ok("undone")]).await,
+            (Ok("undone".into()), 3, 3)
+        );
+        // Never answered: it may have been applied.
+        assert_eq!(
+            attempts(&[Ok(()); 3], &[lost(), lost(), lost()]).await,
+            (Err(Failure::Unanswered("no answer within 5s".into())), 3, 3)
+        );
+        assert_eq!(
+            attempts(&[Ok(()), Err("daemon unavailable (gone)")], &[dropped()]).await,
+            (
+                Err(Failure::Unanswered("daemon unavailable (gone)".into())),
+                2,
+                1
+            )
+        );
+        // Never sent, or refused: no second try.
+        assert_eq!(
+            attempts(&[Err("daemon unavailable (no socket)")], &[]).await,
+            (
+                Err(Failure::Unavailable(
+                    "daemon unavailable (no socket)".into()
+                )),
+                1,
+                0
+            )
+        );
+        let refused = Status::aborted("the undo stack changed");
+        assert_eq!(
+            attempts(&[Ok(())], &[Err(refused)]).await,
+            (Err(Failure::Refused("the undo stack changed".into())), 1, 1)
+        );
+    }
+
+    #[test]
+    fn failures_say_whether_the_undo_may_have_been_applied() {
+        let unavailable = Failure::Unavailable("daemon unavailable (no socket)".into());
+        assert_eq!(
+            unavailable.message(Direction::Undo),
+            "daemon unavailable (no socket)"
+        );
+        let refused = Failure::Refused("the undo stack changed".into());
+        assert_eq!(refused.message(Direction::Redo), "the undo stack changed");
+        let lost = Failure::Unanswered("no answer within 5s".into());
+        assert_eq!(
+            lost.message(Direction::Undo),
+            "no answer from the daemon (no answer within 5s); the undo may have been \
+             applied, so check before undoing again"
+        );
+        assert_eq!(
+            lost.message(Direction::Redo),
+            "no answer from the daemon (no answer within 5s); the redo may have been \
+             applied, so check before redoing again"
         );
     }
 
     #[test]
     fn an_empty_stack_has_nothing_to_do() {
-        assert_eq!(report(Direction::Undo, None, &[]), ["Nothing to undo"]);
-        assert_eq!(report(Direction::Redo, None, &[]), ["Nothing to redo"]);
+        assert_eq!(
+            report(Direction::Undo, &Reply::new(None, true, Vec::new())),
+            ["Nothing to undo"]
+        );
+        assert_eq!(
+            report(Direction::Redo, &reply(None, &[])),
+            ["Nothing to redo"]
+        );
     }
 
     #[test]
     fn the_entry_is_named_by_its_description() {
         let capture = entry("capture \"call dentist\"");
         assert_eq!(
-            report(Direction::Undo, Some(&capture), &[]),
+            report(Direction::Undo, &reply(Some(capture), &[])),
             ["Undid: capture \"call dentist\""]
         );
         let done = entry("mark done (3 items)");
         assert_eq!(
-            report(Direction::Redo, Some(&done), &[]),
+            report(Direction::Redo, &reply(Some(done), &[])),
             ["Redid: mark done (3 items)"]
+        );
+    }
+
+    #[test]
+    fn an_entry_that_restored_nothing_could_not_be_undone() {
+        let skipped = [skip(ItemField::Status, "the field has changed since")];
+        let dropped = Reply::new(Some(entry("mark done \"x\"")), true, skipped.to_vec());
+        assert!(dropped.dropped);
+        let line = "  not restored: status of 00ABCDEF (the field has changed since)";
+        assert_eq!(
+            report(Direction::Undo, &dropped),
+            [
+                "Could not undo: mark done \"x\" (everything it changed has changed since)",
+                line
+            ]
+        );
+        assert_eq!(
+            report(Direction::Redo, &dropped),
+            [
+                "Could not redo: mark done \"x\" (everything it changed has changed since)",
+                line
+            ]
         );
     }
 
@@ -203,7 +399,10 @@ mod tests {
             // Neither a known field nor a relation, nor a message.
             skip(ItemField::Unspecified, ""),
         ];
-        let lines = report(Direction::Undo, Some(&entry("edit 2 items")), &skipped);
+        let lines = report(
+            Direction::Undo,
+            &reply(Some(entry("edit 2 items")), &skipped),
+        );
         assert_eq!(
             lines,
             [

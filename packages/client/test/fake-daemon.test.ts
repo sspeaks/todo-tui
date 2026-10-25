@@ -174,7 +174,8 @@ describe("FakeDaemon mutations", () => {
     expect(await badField(capture(over))).toBe("text");
     expect(await badField(updateItem(client, { id: a.id, title: over }, ["title"]))).toBe("item.title");
     expect(daemon.items.get(a.id)?.title).toBe("a");
-    expect((await updateItem(client, { id: a.id, title: ` ${longest} ` }, ["title"])).item?.title).toBe(` ${longest} `);
+    // Counted, and stored, trimmed.
+    expect((await updateItem(client, { id: a.id, title: ` ${longest} ` }, ["title"])).item?.title).toBe(longest);
   });
 
   it("sets status, archives and unarchives", async () => {

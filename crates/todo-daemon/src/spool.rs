@@ -269,32 +269,37 @@ fn captured_at(s: &str) -> Option<(Timestamp, Date)> {
     storable(at).then(|| (at, at.to_zoned(TimeZone::fixed(offset)).date()))
 }
 
-/// Imports the spool now, then every `interval` while it is non-empty,
-/// until `stop`. A failed import is logged and retried at the next interval.
+/// [`import`], logging what it did. A failed import is logged; the spool is
+/// kept for the next one.
+pub(crate) async fn import_logged(paths: &Paths, store: &Store) {
+    match import(paths, store).await {
+        Ok(Imported {
+            captured: 0,
+            rejected: 0,
+        }) => {}
+        Ok(done) => tracing::info!(
+            captured = done.captured,
+            rejected = done.rejected,
+            "imported the spool"
+        ),
+        Err(e) => tracing::error!(error = %format_args!("{e:#}"), "spool import failed"),
+    }
+}
+
+/// Imports the spool every `interval` while it is non-empty, until `stop`.
+/// The import at start is the daemon's own, before it serves (see
+/// [`crate::server::Daemon::serve`]).
 pub(crate) async fn run(paths: Paths, store: Store, mut stop: ShutdownSignal, interval: Duration) {
     let spool = paths.spool();
-    let mut due = true;
     loop {
-        if due {
-            match import(&paths, &store).await {
-                Ok(Imported {
-                    captured: 0,
-                    rejected: 0,
-                }) => {}
-                Ok(done) => tracing::info!(
-                    captured = done.captured,
-                    rejected = done.rejected,
-                    "imported the spool"
-                ),
-                Err(e) => tracing::error!(error = %format_args!("{e:#}"), "spool import failed"),
-            }
-        }
         tokio::select! {
             () = tokio::time::sleep(interval) => {}
             () = stop.wait() => return,
         }
         // Only the metadata, so an idle daemon never takes the lock.
-        due = tokio::fs::metadata(&spool).await.is_ok_and(|m| m.len() > 0);
+        if tokio::fs::metadata(&spool).await.is_ok_and(|m| m.len() > 0) {
+            import_logged(&paths, &store).await;
+        }
     }
 }
 
@@ -524,9 +529,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_imports_at_start_then_whenever_the_spool_fills() {
+    async fn run_imports_whenever_the_spool_fills() {
         let (_home, paths, store) = setup();
-        append(&paths, &SpoolEntry::now(new_ulid(), "at start")).unwrap();
+        append(&paths, &SpoolEntry::now(new_ulid(), "already spooled")).unwrap();
         let shutdown = ShutdownHandle::new();
         let task = tokio::spawn(run(
             paths.clone(),
@@ -544,7 +549,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         };
-        wait_for("at start").await;
+        wait_for("already spooled").await;
         // Off the runtime: the import may still hold the lock, and it needs
         // this test's only runtime thread to get to its truncate.
         let spool = paths.clone();

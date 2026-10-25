@@ -223,6 +223,16 @@ pub fn relation_from_proto(relation: Option<&v1::Relation>) -> Result<core::Rela
     core::Relation::try_from(require("relation", relation)?).map_err(|e| e.within("relation"))
 }
 
+/// The Item `relation` relates to itself, when that is all
+/// [`relation_from_proto`] finds wrong with it: its `to_id` is wrong, but
+/// so may its `from_id` be, which is then the end to name.
+pub fn self_relation(relation: &v1::Relation) -> Option<core::ItemId> {
+    let from = parse_id("from_id", &relation.from_id).ok()?;
+    let to = parse_id("to_id", &relation.to_id).ok()?;
+    let _: core::RelationKind = EnumField::from_i32("kind", relation.kind).ok()?;
+    (from == to).then_some(from)
+}
+
 /// One mutation of a `BatchMutate`. Errors are prefixed with the oneof case
 /// (`update_item.item.title`); an unset oneof is `Missing` at `kind`.
 pub fn mutation_from_proto(m: &v1::Mutation, today: Date) -> Result<core::Mutation> {
@@ -1217,12 +1227,29 @@ mod tests {
             ConvertError::UnknownEnum("relation.kind".into(), 9)
         );
         // An Item related to itself, in any spelling of its id.
+        let itself = v1::Relation {
+            to_id: id(1).to_string(),
+            ..good.clone()
+        };
         assert_eq!(
-            fails(v1::Relation {
-                to_id: id(1).to_string(),
-                ..good
-            }),
+            fails(itself.clone()),
             ConvertError::Invalid("relation.to_id".into(), "must differ from from_id".into())
         );
+        assert_eq!(self_relation(&itself), Some(id(1)));
+        // Only when nothing else is wrong.
+        assert_eq!(self_relation(&good), None);
+        for wrong in [
+            v1::Relation {
+                kind: 0,
+                ..itself.clone()
+            },
+            v1::Relation {
+                from_id: "nope".into(),
+                to_id: "nope".into(),
+                ..itself
+            },
+        ] {
+            assert_eq!(self_relation(&wrong), None);
+        }
     }
 }
