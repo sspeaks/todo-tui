@@ -37,9 +37,12 @@ import "todo/v1/relation.proto";
 // compare as sets), otherwise it keeps its current value and is reported in
 // `skipped` (changed since, Item deleted, or no longer valid). A restored
 // value is the recorded one, e.g. the original archived.at or deleted_at,
-// not the current time. An Undo or Redo that restores nothing drops the
-// entry from both stacks. Undo, Redo and the relation RPCs are not
-// BatchMutate mutations.
+// not the current time. The staleness signals are restored only together
+// with the content they belong to, also on an Item the Undo or Redo itself
+// deletes, and are never reported in `skipped`. Relation steps are undone
+// and redone also when an end is deleted. An Undo or Redo that restores
+// nothing drops the entry from both stacks. Undo, Redo and the relation
+// RPCs are not BatchMutate mutations.
 service ItemService {
   rpc CaptureItem(CaptureItemRequest) returns (CaptureItemResponse);
   // Parses capture text without creating anything (the TUI's live preview).
@@ -56,12 +59,16 @@ service ItemService {
   // changes arrive on the change stream).
   rpc DeleteItem(DeleteItemRequest) returns (DeleteItemResponse);
   // Also restores the descendants that were deleted by the same op as the
-  // Item. Fails with FAILED_PRECONDITION (ErrorInfo PARENT_DELETED, with
-  // item_id and parent_id) while the Item's parent is deleted: undelete the
-  // parent first.
+  // Item (their changes arrive on the change stream). Fails with
+  // FAILED_PRECONDITION (ErrorInfo PARENT_DELETED, with item_id and
+  // parent_id) while the Item's parent is deleted: undelete the parent
+  // first. In a BatchMutate the parent is checked as the whole batch leaves
+  // it, so the order of the batch's undeletes does not matter.
   rpc UndeleteItem(UndeleteItemRequest) returns (UndeleteItemResponse);
   // Applies the mutations atomically as one op (one undo step): either all
-  // succeed or none is applied.
+  // succeed or none is applied. A precondition failure (ITEM_DELETED,
+  // PARENT_DELETED) names the mutation's id path in its message, e.g.
+  // "mutations[2].undelete_item.id: ...".
   rpc BatchMutate(BatchMutateRequest) returns (BatchMutateResponse);
   // Reverts the top entry of the undo stack and moves it to the redo stack;
   // an undone capture is soft-deleted. There is no out-of-order undo. With
@@ -75,10 +82,12 @@ service ItemService {
   rpc Redo(RedoRequest) returns (RedoResponse);
   // The entries Undo and Redo would act on next.
   rpc GetUndoState(GetUndoStateRequest) returns (GetUndoStateResponse);
-  // Relations (design 3.6). Both ends must exist, be live and differ. A
-  // relation change is one op that gives both ends a new revision. Adding a
-  // relation that exists, or removing one that does not, changes nothing.
-  // Relations change only through these two RPCs.
+  // Relations (design 3.6). Both ends must exist and differ, and to add a
+  // relation both must be live; a relation is kept when an end is deleted,
+  // and can still be removed then. A relation change is one op that gives
+  // both ends a new revision. Adding a relation that exists, or removing one
+  // that does not, changes nothing. Relations change only through these two
+  // RPCs.
   rpc AddRelation(AddRelationRequest) returns (AddRelationResponse);
   rpc RemoveRelation(RemoveRelationRequest) returns (RemoveRelationResponse);
 }
@@ -280,7 +289,8 @@ message DeleteItemRequest {
 }
 
 message DeleteItemResponse {
-  // The tombstone, with deleted_at set.
+  // The tombstone, with deleted_at set. The descendants deleted with it are
+  // not included: their changes arrive on the change stream.
   Item item = 1;
   MutationResult result = 2;
 }
@@ -292,6 +302,8 @@ message UndeleteItemRequest {
 }
 
 message UndeleteItemResponse {
+  // The Item. The descendants restored with it are not included: their
+  // changes arrive on the change stream.
   Item item = 1;
   MutationResult result = 2;
 }
@@ -319,14 +331,18 @@ message Mutation {
 
 message BatchMutateResponse {
   // One per mutation, in request order, each in its state after the whole
-  // batch (an Item mutated twice appears twice, identically).
+  // batch (an Item mutated twice appears twice, identically). Descendants a
+  // delete or undelete took along are not included: their changes arrive on
+  // the change stream.
   repeated Item items = 1;
   MutationResult result = 2;
 }
 
 message UndoRequest {
   string request_id = 1;
-  // The op_id of the entry the client means to undo (GetUndoState.undo).
+  // The op_id of the entry the client means to undo (GetUndoState.undo); a
+  // value that is not a ULID fails with INVALID_ARGUMENT on
+  // "expected_op_id".
   // When the top entry is another one, or the stack is empty, Undo fails
   // with ABORTED (ErrorInfo UNDO_STACK_CHANGED, with expected_op_id and
   // top_op_id, empty for an empty stack), so an op made meanwhile by another
@@ -378,8 +394,10 @@ message GetUndoStateResponse {
 // ITEM_NOT_FOUND), a deleted one with FAILED_PRECONDITION (ErrorInfo
 // ITEM_DELETED). A to_id that names no Item, a deleted one, or from_id
 // itself fails with INVALID_ARGUMENT on "relation.to_id", and an
-// unspecified kind on "relation.kind". Errors name each end as the request
-// does, also for a RELATES_TO that is stored the other way round.
+// unspecified kind on "relation.kind" (an id that is not a ULID on its own
+// path). Errors name each end as the request does, also for a RELATES_TO
+// that is stored the other way round; when both ends are wrong, from_id is
+// the one named.
 message AddRelationRequest {
   string request_id = 1;
   Relation relation = 2;
@@ -393,7 +411,8 @@ message AddRelationResponse {
   MutationResult result = 3;
 }
 
-// Validated as in AddRelationRequest.
+// Validated as in AddRelationRequest, except that either end may be
+// deleted.
 message RemoveRelationRequest {
   string request_id = 1;
   Relation relation = 2;

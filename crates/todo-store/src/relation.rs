@@ -5,8 +5,9 @@ use std::collections::HashMap;
 
 use jiff::Timestamp;
 use jiff::civil::Date;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use todo_core::{Actor, Item, ItemId, MutationResult, Relation};
+use ulid::Ulid;
 
 use crate::codec::{self, SqlEnum, ts_to_sql};
 use crate::{
@@ -134,8 +135,13 @@ pub(crate) fn relation_tx(
     if let Some(request_id) = op.request_id
         && let Some((op_id, revision, item_id)) = recorded_op(conn, REQUEST_SQL, request_id, kind)?
     {
-        // Like a single-item mutation: the request id names the from end.
-        if item_id != Some(from.to_string()) {
+        // The same request names the same relation, whole.
+        let same = match recorded_relation(conn, op_id)? {
+            Some(recorded) => recorded == relation,
+            // No relation op lacks one; this only keeps the from end check.
+            None => item_id == Some(from.to_string()),
+        };
+        if !same {
             return Err(StoreError::RequestIdReused);
         }
         let [from_item, to_item] = load_items(conn, &[from, to], today)?
@@ -163,7 +169,9 @@ pub(crate) fn relation_tx(
     let from_slot = batch.load(conn, from, today)?;
     let to_slot = batch.load(conn, to, today)?;
     match batch.change_relation(conn, relation, add, input.now, today)? {
-        RelationChange::Changed | RelationChange::Unchanged => {}
+        RelationChange::Changed => {}
+        // No event records the relation, so the op does, for replays.
+        RelationChange::Unchanged => op.report = Some(codec::relation_to_sql(&relation)?),
         RelationChange::Missing(end) => {
             return Err(StoreError::Corrupt(format!("relation end {end} vanished")));
         }
@@ -184,4 +192,25 @@ pub(crate) fn relation_tx(
             revision,
         },
     })
+}
+
+/// The relation that relation op `op_id` was asked for: the one its event
+/// records or, when it changed nothing, the one in its `report`.
+fn recorded_relation(conn: &Connection, op_id: Ulid) -> Result<Option<Relation>> {
+    let id = op_id.to_string();
+    let event: Option<String> = conn
+        .prepare_cached(
+            "SELECT COALESCE(new, old) FROM events
+             WHERE op_id = ?1 AND kind IN ('relation_add', 'relation_remove')
+             ORDER BY ord LIMIT 1",
+        )?
+        .query_row([&id], |r| r.get(0))
+        .optional()?;
+    let json = match event {
+        Some(json) => Some(json),
+        None => conn
+            .prepare_cached("SELECT report FROM ops WHERE id = ?1")?
+            .query_row([&id], |r| r.get(0))?,
+    };
+    json.as_deref().map(codec::relation_from_sql).transpose()
 }

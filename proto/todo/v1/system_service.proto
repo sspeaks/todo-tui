@@ -26,7 +26,8 @@ message GetServerInfoRequest {
 
 message GetServerInfoResponse {
   string daemon_version = 1;
-  // Bumped with every additive change to todo.v1.
+  // Bumped with every additive change to todo.v1, and again when an RPC
+  // that answered UNIMPLEMENTED starts working.
   uint32 api_minor = 2;
   // e.g. "jira", "assistant".
   repeated string capabilities = 3;

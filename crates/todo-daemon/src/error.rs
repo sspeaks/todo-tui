@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use todo_core::{ItemField, ItemId, MutationError};
 use todo_proto::convert::{ConvertError, item_field_path};
 use todo_proto::v1;
-use todo_store::StoreError;
+use todo_store::{EndProblem, StoreError};
 use tonic::{Code, Status};
 use tonic_types::{ErrorDetails, StatusExt};
 
@@ -93,11 +93,20 @@ pub(crate) fn store(e: StoreError) -> Status {
             bad_request("request_id", "was already used for a different request")
         }
         StoreError::InvalidPageToken => bad_request("page_token", e.to_string()),
-        // M2 phase 3 maps these per RPC; these arms are the defaults.
+        // Undo and Redo: another client changed the stack meanwhile.
         StoreError::UndoStackChanged { expected, top } => error_info(
             Code::Aborted,
             "UNDO_STACK_CHANGED",
-            e.to_string(),
+            match top {
+                Some(top) => {
+                    format!(
+                        "the undo stack changed: expected entry {expected}, but the next is {top}"
+                    )
+                }
+                None => {
+                    format!("the undo stack changed: expected entry {expected}, but it is empty")
+                }
+            },
             [
                 ("expected_op_id", expected.to_string()),
                 (
@@ -106,16 +115,16 @@ pub(crate) fn store(e: StoreError) -> Status {
                 ),
             ],
         ),
-        StoreError::ParentDeleted { item_id, parent_id } => error_info(
-            Code::FailedPrecondition,
-            "PARENT_DELETED",
-            e.to_string(),
-            [
-                ("item_id", item_id.to_string()),
-                ("parent_id", parent_id.to_string()),
-            ],
-        ),
-        StoreError::RelationEnd { .. } => bad_request("relation", e.to_string()),
+        // As for Mutation, `mutation` names the request's fields; without
+        // it the Item is named as the target of a single-item request.
+        StoreError::ParentDeleted {
+            index,
+            item_id,
+            parent_id,
+        } => Shape::ItemOp.parent_deleted(index, item_id, parent_id),
+        StoreError::RelationEnd { item_id, problem } => {
+            Shape::ItemOp.relation_end(item_id, problem)
+        }
         StoreError::SchemaTooNew { .. } => error_info(
             Code::FailedPrecondition,
             "SCHEMA_TOO_NEW",
@@ -142,6 +151,10 @@ pub(crate) enum Shape<'a> {
     ItemOp,
     /// `BatchMutate`: mutation `i` under `mutations[i].<oneof case>`.
     Batch(&'a [v1::Mutation]),
+    /// `AddRelation` and `RemoveRelation`, with the relation as the request
+    /// names it: the store reports an end of the canonical relation, whose
+    /// ends a `RELATES_TO` may have swapped.
+    Relation(&'a v1::Relation),
 }
 
 impl Shape<'_> {
@@ -157,20 +170,29 @@ impl Shape<'_> {
             },
             Shape::SetStatus => "status".to_owned(),
             Shape::ItemOp => "id".to_owned(),
-            Shape::Batch(mutations) => {
-                use v1::mutation::Kind;
-                let prefix = format!("mutations[{index}]");
-                let (case, inner) = match mutations.get(index).and_then(|m| m.kind.as_ref()) {
-                    Some(Kind::UpdateItem(_)) => ("update_item", Shape::Update),
-                    Some(Kind::SetStatus(_)) => ("set_status", Shape::SetStatus),
-                    Some(Kind::ArchiveItem(_)) => ("archive_item", Shape::ItemOp),
-                    Some(Kind::UnarchiveItem(_)) => ("unarchive_item", Shape::ItemOp),
-                    Some(Kind::DeleteItem(_)) => ("delete_item", Shape::ItemOp),
-                    Some(Kind::UndeleteItem(_)) => ("undelete_item", Shape::ItemOp),
-                    None => return prefix,
-                };
-                format!("{prefix}.{case}.{}", inner.path(0, error))
-            }
+            Shape::Batch(mutations) => batched(mutations, index, |inner| inner.path(0, error)),
+            // The store makes no MutationError from a relation.
+            Shape::Relation(_) => "relation".to_owned(),
+        }
+    }
+
+    /// The request path of the id of the Item mutation `index` targets.
+    fn id_path(&self, index: usize) -> String {
+        match self {
+            Shape::Capture => "parent_id".to_owned(),
+            Shape::Update => "item.id".to_owned(),
+            Shape::SetStatus | Shape::ItemOp => "id".to_owned(),
+            Shape::Batch(mutations) => batched(mutations, index, |inner| inner.id_path(0)),
+            Shape::Relation(_) => "relation.from_id".to_owned(),
+        }
+    }
+
+    /// `message`, prefixed in a batch with the id path of mutation `index`,
+    /// so a precondition failure names the mutation it is about.
+    fn in_batch(&self, index: usize, message: String) -> String {
+        match self {
+            Shape::Batch(_) => format!("{}: {message}", self.id_path(index)),
+            _ => message,
         }
     }
 
@@ -180,24 +202,99 @@ impl Shape<'_> {
             MutationError::Deleted => error_info(
                 Code::FailedPrecondition,
                 "ITEM_DELETED",
-                match id {
-                    Some(id) => format!("item {id} is deleted"),
-                    None => "the item is deleted".to_owned(),
-                },
+                self.in_batch(
+                    index,
+                    match id {
+                        Some(id) => format!("item {id} is deleted"),
+                        None => "the item is deleted".to_owned(),
+                    },
+                ),
                 id.map(|id| ("item_id", id.to_string())),
             ),
             _ => bad_request(&self.path(index, error), describe(error)),
         }
     }
+
+    /// Mutation `index` undeleted `item_id` under its deleted parent.
+    fn parent_deleted(&self, index: usize, item_id: ItemId, parent_id: ItemId) -> Status {
+        error_info(
+            Code::FailedPrecondition,
+            "PARENT_DELETED",
+            self.in_batch(
+                index,
+                format!(
+                    "item {item_id} cannot be undeleted while its parent {parent_id} is deleted: \
+                     undelete the parent first"
+                ),
+            ),
+            [
+                ("item_id", item_id.to_string()),
+                ("parent_id", parent_id.to_string()),
+            ],
+        )
+    }
+
+    /// The relation end `item_id` names no Item or is deleted. The request's
+    /// `from_id` is the Item the request acts on (NOT_FOUND or ITEM_DELETED,
+    /// as for an Item mutation); its `to_id` is an argument.
+    fn relation_end(&self, item_id: ItemId, problem: EndProblem) -> Status {
+        let from_end = match self {
+            Shape::Relation(r) => r.from_id.parse::<ItemId>().ok() == Some(item_id),
+            _ => true,
+        };
+        match (from_end, problem) {
+            (true, EndProblem::Missing) => error_info(
+                Code::NotFound,
+                "ITEM_NOT_FOUND",
+                format!("item {item_id} not found"),
+                [("item_id", item_id.to_string())],
+            ),
+            (true, EndProblem::Deleted) => error_info(
+                Code::FailedPrecondition,
+                "ITEM_DELETED",
+                format!("item {item_id} is deleted"),
+                [("item_id", item_id.to_string())],
+            ),
+            (false, EndProblem::Missing) => bad_request("relation.to_id", "no such Item"),
+            (false, EndProblem::Deleted) => bad_request("relation.to_id", "the Item is deleted"),
+        }
+    }
+}
+
+/// `mutations[index].<oneof case>.<path>`, `path` given the shape of the
+/// batched request; just `mutations[index]` when the oneof is unset.
+fn batched(
+    mutations: &[v1::Mutation],
+    index: usize,
+    path: impl FnOnce(&Shape<'_>) -> String,
+) -> String {
+    use v1::mutation::Kind;
+    let prefix = format!("mutations[{index}]");
+    let (case, inner) = match mutations.get(index).and_then(|m| m.kind.as_ref()) {
+        Some(Kind::UpdateItem(_)) => ("update_item", Shape::Update),
+        Some(Kind::SetStatus(_)) => ("set_status", Shape::SetStatus),
+        Some(Kind::ArchiveItem(_)) => ("archive_item", Shape::ItemOp),
+        Some(Kind::UnarchiveItem(_)) => ("unarchive_item", Shape::ItemOp),
+        Some(Kind::DeleteItem(_)) => ("delete_item", Shape::ItemOp),
+        Some(Kind::UndeleteItem(_)) => ("undelete_item", Shape::ItemOp),
+        None => return prefix,
+    };
+    format!("{prefix}.{case}.{}", path(&inner))
 }
 
 /// Maps a [`StoreError`] from a mutating request of `shape`, whose mutation
-/// `i` targets `ids[i]` (empty for a capture).
+/// `i` targets `ids[i]` (empty for a capture or a relation).
 pub(crate) fn mutation(e: StoreError, shape: &Shape<'_>, ids: &[ItemId]) -> Status {
     match e {
         StoreError::Mutation { index, error } => {
             shape.status(index, &error, ids.get(index).copied())
         }
+        StoreError::ParentDeleted {
+            index,
+            item_id,
+            parent_id,
+        } => shape.parent_deleted(index, item_id, parent_id),
+        StoreError::RelationEnd { item_id, problem } => shape.relation_end(item_id, problem),
         other => store(other),
     }
 }
@@ -283,6 +380,10 @@ mod tests {
             "mutations[1].update_item.update_mask"
         );
         assert_eq!(batch.path(2, &invalid), "mutations[2].delete_item.id");
+        assert_eq!(batch.id_path(0), "mutations[0].set_status.id");
+        assert_eq!(batch.id_path(1), "mutations[1].update_item.item.id");
+        assert_eq!(batch.id_path(2), "mutations[2].delete_item.id");
+        assert_eq!(batch.id_path(3), "mutations[3]");
         assert_eq!(Shape::Capture.path(0, &invalid), "text");
         let parent = MutationError::Invalid {
             field: ItemField::ParentId,

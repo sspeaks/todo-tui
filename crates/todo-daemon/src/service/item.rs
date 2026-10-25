@@ -3,7 +3,9 @@ use jiff::{Timestamp, Zoned};
 use todo_core::{
     Actor, CreatedVia, ItemId, MAX_CAPTURE_BYTES, Mutation, Status as ItemStatus, parse_capture,
 };
-use todo_proto::convert::{ConvertError, EnumField, timestamp_from_proto};
+use todo_proto::convert::{
+    ConvertError, EnumField, timestamp_from_proto, timestamp_to_proto, undo_skip_to_proto,
+};
 use todo_proto::request;
 use todo_proto::v1::item_service_server::ItemService;
 use todo_proto::v1::{
@@ -16,7 +18,10 @@ use todo_proto::v1::{
     UnarchiveItemRequest, UnarchiveItemResponse, UndeleteItemRequest, UndeleteItemResponse,
     UndoRequest, UndoResponse, UpdateItemRequest, UpdateItemResponse, clause, field_value, operand,
 };
-use todo_store::{CaptureInput, ListQuery, MutateInput, MutateOutput, OpKind};
+use todo_store::{
+    CaptureInput, EndProblem, ListQuery, MutateInput, MutateOutput, OpKind, OpSummaryRow,
+    RelationInput, RelationOutput, StoreError, UndoInput, UndoSkipRow,
+};
 use tonic::{Code, Request, Response, Status};
 use ulid::Ulid;
 
@@ -290,34 +295,80 @@ impl ItemService for Items {
         }))
     }
 
-    async fn undo(&self, _request: Request<UndoRequest>) -> Result<Response<UndoResponse>, Status> {
-        Err(not_implemented("Undo"))
+    async fn undo(&self, request: Request<UndoRequest>) -> Result<Response<UndoResponse>, Status> {
+        let req = request.into_inner();
+        let out = self
+            .undo_or_redo(&req.request_id, req.expected_op_id.as_deref(), false)
+            .await?;
+        Ok(Response::new(UndoResponse {
+            result: out.result,
+            entry: out.entry,
+            items: out.items,
+            skipped: out.skipped,
+        }))
     }
 
-    async fn redo(&self, _request: Request<RedoRequest>) -> Result<Response<RedoResponse>, Status> {
-        Err(not_implemented("Redo"))
+    async fn redo(&self, request: Request<RedoRequest>) -> Result<Response<RedoResponse>, Status> {
+        let req = request.into_inner();
+        let out = self
+            .undo_or_redo(&req.request_id, req.expected_op_id.as_deref(), true)
+            .await?;
+        Ok(Response::new(RedoResponse {
+            result: out.result,
+            entry: out.entry,
+            items: out.items,
+            skipped: out.skipped,
+        }))
     }
 
     async fn get_undo_state(
         &self,
         _request: Request<GetUndoStateRequest>,
     ) -> Result<Response<GetUndoStateResponse>, Status> {
-        Err(not_implemented("GetUndoState"))
+        let state = self.0.store.undo_state().await.map_err(error::store)?;
+        Ok(Response::new(GetUndoStateResponse {
+            undo: state.undo.map(op_summary),
+            redo: state.redo.map(op_summary),
+        }))
     }
 
     async fn add_relation(
         &self,
-        _request: Request<AddRelationRequest>,
+        request: Request<AddRelationRequest>,
     ) -> Result<Response<AddRelationResponse>, Status> {
-        Err(not_implemented("AddRelation"))
+        let req = request.into_inner();
+        let out = self
+            .relation(&req.request_id, req.relation.as_ref(), true)
+            .await?;
+        Ok(Response::new(AddRelationResponse {
+            from_item: Some(out.from_item.into()),
+            to_item: Some(out.to_item.into()),
+            result: Some(out.result.into()),
+        }))
     }
 
     async fn remove_relation(
         &self,
-        _request: Request<RemoveRelationRequest>,
+        request: Request<RemoveRelationRequest>,
     ) -> Result<Response<RemoveRelationResponse>, Status> {
-        Err(not_implemented("RemoveRelation"))
+        let req = request.into_inner();
+        let out = self
+            .relation(&req.request_id, req.relation.as_ref(), false)
+            .await?;
+        Ok(Response::new(RemoveRelationResponse {
+            from_item: Some(out.from_item.into()),
+            to_item: Some(out.to_item.into()),
+            result: Some(out.result.into()),
+        }))
     }
+}
+
+/// The fields `UndoResponse` and `RedoResponse` share.
+struct Undone {
+    result: Option<v1::MutationResult>,
+    entry: Option<v1::OpSummary>,
+    items: Vec<v1::Item>,
+    skipped: Vec<v1::UndoSkip>,
 }
 
 impl Items {
@@ -338,6 +389,104 @@ impl Items {
             .await?;
         let item = out.items.into_iter().next().map(v1::Item::from);
         Ok((item, Some(out.result.into())))
+    }
+
+    /// `Undo`, or `Redo` when `redo`, by the user now.
+    async fn undo_or_redo(
+        &self,
+        request_id: &str,
+        expected_op_id: Option<&str>,
+        redo: bool,
+    ) -> Result<Undone, Status> {
+        let request_id = check_request_id(request_id)?;
+        let expected_op_id = expected_op_id
+            .map(|id| {
+                id.parse::<Ulid>()
+                    .map_err(|_| error::bad_request("expected_op_id", "must be a ULID"))
+            })
+            .transpose()?;
+        let now = Zoned::now();
+        let input = UndoInput {
+            request_id,
+            expected_op_id,
+            now: now.timestamp(),
+            today: now.date(),
+        };
+        let store = &self.0.store;
+        let out = if redo {
+            store.redo(input).await
+        } else {
+            store.undo(input).await
+        }
+        .map_err(error::store)?;
+        Ok(Undone {
+            result: Some(out.result.into()),
+            entry: out.entry.map(op_summary),
+            items: out.items.into_iter().map(v1::Item::from).collect(),
+            skipped: out.skipped.iter().map(undo_skip).collect(),
+        })
+    }
+
+    /// `AddRelation`, or `RemoveRelation` unless `add`, by the user now.
+    async fn relation(
+        &self,
+        request_id: &str,
+        relation: Option<&v1::Relation>,
+        add: bool,
+    ) -> Result<RelationOutput, Status> {
+        let request_id = check_request_id(request_id)?;
+        let canonical = request::relation_from_proto(relation).map_err(error::convert)?;
+        let now = Zoned::now();
+        let input = RelationInput {
+            request_id,
+            relation: canonical,
+            now: now.timestamp(),
+            today: now.date(),
+        };
+        let store = &self.0.store;
+        let out = if add {
+            store.add_relation(input).await
+        } else {
+            store.remove_relation(input).await
+        };
+        // Converted above, so `relation` is set.
+        let unset = v1::Relation::default();
+        let asked = relation.unwrap_or(&unset);
+        // The store checks the ends as stored, so for a RELATES_TO the
+        // request names the other way round it blames the request's to_id
+        // first. The request's from_id comes first, as for every kind.
+        let out = match out {
+            Err(e @ StoreError::RelationEnd { item_id, .. })
+                if item_id == canonical.from()
+                    && asked.from_id.parse::<ItemId>().ok() != Some(item_id) =>
+            {
+                match self.end_problem(canonical.to(), add, now.date()).await? {
+                    Some(problem) => Err(StoreError::RelationEnd {
+                        item_id: canonical.to(),
+                        problem,
+                    }),
+                    None => Err(e),
+                }
+            }
+            other => other,
+        };
+        out.map_err(|e| error::mutation(e, &Shape::Relation(asked), &[]))
+    }
+
+    /// What makes `id` unfit as a relation end, for an add (`add`) or a
+    /// remove: it names no Item or, for an add, a deleted one.
+    async fn end_problem(
+        &self,
+        id: ItemId,
+        add: bool,
+        today: Date,
+    ) -> Result<Option<EndProblem>, Status> {
+        match self.0.store.get_item(id, today).await {
+            Ok(out) if add && out.item.is_deleted() => Ok(Some(EndProblem::Deleted)),
+            Ok(_) => Ok(None),
+            Err(StoreError::NotFound(_)) => Ok(Some(EndProblem::Missing)),
+            Err(e) => Err(error::store(e)),
+        }
     }
 
     /// Runs `mutations` as one op by the user at `now`; store errors name
@@ -367,13 +516,41 @@ impl Items {
     }
 }
 
-/// UNIMPLEMENTED for an RPC this daemon does not serve yet.
-fn not_implemented(rpc: &str) -> Status {
-    error::error_info(
-        Code::Unimplemented,
-        "NOT_IMPLEMENTED",
-        format!("{rpc} is not implemented yet"),
-        [],
+/// An undo stack entry.
+fn op_summary(row: OpSummaryRow) -> v1::OpSummary {
+    v1::OpSummary {
+        op_id: row.op_id.to_string(),
+        kind: op_kind(row.kind) as i32,
+        item_ids: row.item_ids.iter().map(ItemId::to_string).collect(),
+        at: Some(timestamp_to_proto(row.at)),
+        description: row.description,
+    }
+}
+
+fn op_kind(kind: OpKind) -> v1::OpKind {
+    match kind {
+        OpKind::Capture => v1::OpKind::Capture,
+        OpKind::Update => v1::OpKind::Update,
+        OpKind::SetStatus => v1::OpKind::SetStatus,
+        OpKind::Archive => v1::OpKind::Archive,
+        OpKind::Unarchive => v1::OpKind::Unarchive,
+        OpKind::Delete => v1::OpKind::Delete,
+        OpKind::Undelete => v1::OpKind::Undelete,
+        OpKind::Batch => v1::OpKind::Batch,
+        OpKind::Undo => v1::OpKind::Undo,
+        OpKind::Redo => v1::OpKind::Redo,
+        OpKind::AddRelation => v1::OpKind::AddRelation,
+        OpKind::RemoveRelation => v1::OpKind::RemoveRelation,
+    }
+}
+
+/// A change an undo or redo left alone.
+fn undo_skip(skip: &UndoSkipRow) -> v1::UndoSkip {
+    undo_skip_to_proto(
+        skip.item_id,
+        &skip.fields,
+        &skip.reason,
+        skip.relation.as_ref(),
     )
 }
 
@@ -475,4 +652,44 @@ fn p0_statuses(filter: &Filter) -> Result<Vec<ItemStatus>, Status> {
             )),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+
+    #[test]
+    fn every_op_kind_has_its_own_proto_kind() {
+        let kinds = [
+            OpKind::Capture,
+            OpKind::Update,
+            OpKind::SetStatus,
+            OpKind::Archive,
+            OpKind::Unarchive,
+            OpKind::Delete,
+            OpKind::Undelete,
+            OpKind::Batch,
+            OpKind::Undo,
+            OpKind::Redo,
+            OpKind::AddRelation,
+            OpKind::RemoveRelation,
+        ];
+        let proto: HashSet<i32> = kinds.iter().map(|&k| op_kind(k) as i32).collect();
+        assert_eq!(proto.len(), kinds.len());
+        assert!(!proto.contains(&(v1::OpKind::Unspecified as i32)));
+        // Every proto kind but UNSPECIFIED is one of them.
+        assert!((1..=kinds.len() as i32).all(|n| proto.contains(&n)));
+        assert!(v1::OpKind::try_from(kinds.len() as i32 + 1).is_err());
+        // The names match: OP_KIND_<the store's snake_case kind>.
+        assert_eq!(
+            op_kind(OpKind::AddRelation).as_str_name(),
+            "OP_KIND_ADD_RELATION"
+        );
+        assert_eq!(
+            op_kind(OpKind::SetStatus).as_str_name(),
+            "OP_KIND_SET_STATUS"
+        );
+    }
 }

@@ -16,6 +16,7 @@ import type { LiveStore } from "../src/live-store.js";
 import { updateItem } from "../src/mutations.js";
 import { resolvePaths, envFromProcess } from "../src/paths.js";
 import { ulid } from "../src/ulid.js";
+import { undoRelationsConformance } from "./conformance/undo-relations.js";
 
 const TODO_BIN = process.env.TODO_BIN;
 const run = promisify(execFile);
@@ -232,5 +233,17 @@ describe.skipIf(!TODO_BIN)("UDS integration against $TODO_BIN", { timeout: 60_00
     for (const t of ["a", "b", "c"]) await conn.items.captureItem({ createdVia: CreatedVia.TUI, requestId: ulid(), text: t });
     const results = await Promise.all(streams);
     for (const r of results) expect(r).toEqual(["a", "b", "c"]);
+  });
+});
+
+describe.skipIf(!TODO_BIN)("undo, parent rules and relations against $TODO_BIN", { timeout: 60_000 }, () => {
+  // The suite FakeDaemon runs too, each test on a fresh daemon. Every RPC is
+  // the user's, so nothing can change an Item off the undo stack, and the
+  // cases that need that (a partial undo, a dropped entry) are skipped here:
+  // the store's tests cover them.
+  undoRelationsConformance(async () => {
+    const h = await home();
+    const conn = await h.open();
+    return { items: conn.items, transport: conn.transport };
   });
 });

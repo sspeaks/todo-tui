@@ -1,4 +1,5 @@
-//! Mutating `ItemService` requests -> core [`Mutation`](core::Mutation)s.
+//! Mutating `ItemService` requests -> core [`Mutation`](core::Mutation)s and
+//! [`Relation`](core::Relation)s.
 //!
 //! Errors name the offending field relative to the request (`item.title`,
 //! `update_mask`, `id`); the daemon prefixes a batched mutation's errors with
@@ -213,6 +214,13 @@ fn item_op(
         expected_revision,
         op,
     })
+}
+
+/// The relation of an `AddRelation` or `RemoveRelation`, canonical (a
+/// `RELATES_TO` has `from_id < to_id`). Errors are at `relation.*`; an Item
+/// related to itself is invalid at `relation.to_id`.
+pub fn relation_from_proto(relation: Option<&v1::Relation>) -> Result<core::Relation> {
+    core::Relation::try_from(require("relation", relation)?).map_err(|e| e.within("relation"))
 }
 
 /// One mutation of a `BatchMutate`. Errors are prefixed with the oneof case
@@ -1152,6 +1160,69 @@ mod tests {
                 since: TODAY,
                 ..waiting()
             })
+        );
+    }
+
+    #[test]
+    fn relation_requests() {
+        use todo_core::RelationKind as RK;
+        let wire = |from: Ulid, to: Ulid, kind: v1::RelationKind| v1::Relation {
+            from_id: from.to_string().to_lowercase(),
+            to_id: to.to_string(),
+            kind: kind as i32,
+        };
+        assert_eq!(
+            relation_from_proto(Some(&wire(id(2), id(1), v1::RelationKind::Blocks))),
+            Ok(core::Relation::new(id(2), id(1), RK::Blocks).unwrap())
+        );
+        // RELATES_TO named either way round is the same relation.
+        let relates = core::Relation::new(id(1), id(2), RK::RelatesTo).unwrap();
+        for (from, to) in [(id(1), id(2)), (id(2), id(1))] {
+            let got = relation_from_proto(Some(&wire(from, to, v1::RelationKind::RelatesTo)));
+            assert_eq!(got, Ok(relates));
+        }
+
+        let good = wire(id(1), id(2), v1::RelationKind::Duplicates);
+        let fails = |r: v1::Relation| relation_from_proto(Some(&r)).unwrap_err();
+        assert_eq!(
+            relation_from_proto(None),
+            Err(ConvertError::Missing("relation".into()))
+        );
+        assert_eq!(
+            fails(v1::Relation {
+                from_id: "nope".into(),
+                ..good.clone()
+            }),
+            ConvertError::InvalidId("relation.from_id".into(), "nope".into())
+        );
+        assert_eq!(
+            fails(v1::Relation {
+                to_id: String::new(),
+                ..good.clone()
+            }),
+            ConvertError::InvalidId("relation.to_id".into(), String::new())
+        );
+        assert_eq!(
+            fails(v1::Relation {
+                kind: 0,
+                ..good.clone()
+            }),
+            ConvertError::Unspecified("relation.kind".into())
+        );
+        assert_eq!(
+            fails(v1::Relation {
+                kind: 9,
+                ..good.clone()
+            }),
+            ConvertError::UnknownEnum("relation.kind".into(), 9)
+        );
+        // An Item related to itself, in any spelling of its id.
+        assert_eq!(
+            fails(v1::Relation {
+                to_id: id(1).to_string(),
+                ..good
+            }),
+            ConvertError::Invalid("relation.to_id".into(), "must differ from from_id".into())
         );
     }
 }

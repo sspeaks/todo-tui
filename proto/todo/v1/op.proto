@@ -43,7 +43,8 @@ message UndoSkip {
   string item_id = 1;
   // The field that was not restored. The status triple (status_category,
   // resolution_kind, todo_refinement) is restored as one unit and reported
-  // once, as ITEM_FIELD_STATUS. UNSPECIFIED for a relation step.
+  // once, as ITEM_FIELD_STATUS. UNSPECIFIED for a relation step. The
+  // staleness signals are never reported: they follow their content.
   ItemField field = 2;
   UndoSkipReason reason = 3;
   // Why, for a user.
@@ -58,11 +59,13 @@ enum UndoSkipReason {
   // The field no longer holds the value the op wrote; for a relation step,
   // the relation has since been removed or added back.
   UNDO_SKIP_REASON_CHANGED_SINCE = 1;
-  // The Item (for a relation step, either end) is soft-deleted; on a deleted
-  // Item only deleted_at is restored.
+  // The Item is soft-deleted; on a deleted Item only deleted_at is
+  // restored. Never for a relation step: relations of deleted Items are
+  // added and removed too.
   UNDO_SKIP_REASON_ITEM_DELETED = 2;
   // The value to restore is no longer valid, e.g. a parent that is now
-  // deleted or would create a cycle.
+  // deleted or would create a cycle; for a relation step, an end that no
+  // longer exists.
   UNDO_SKIP_REASON_INVALID = 3;
   // Reserved for P2: the op has a remote side effect that cannot be undone.
   UNDO_SKIP_REASON_NOT_UNDOABLE = 4;

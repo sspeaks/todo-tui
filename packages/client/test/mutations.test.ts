@@ -1,23 +1,35 @@
-import { createClient, createRouterTransport } from "@connectrpc/connect";
+import { Code, ConnectError, createClient, createRouterTransport } from "@connectrpc/connect";
 import { describe, expect, it } from "vitest";
+import { ErrorInfoSchema } from "../src/gen/google/rpc/error_details_pb.js";
 import { Status } from "../src/gen/todo/v1/item_pb.js";
 import {
+  type AddRelationRequest,
   type ArchiveItemRequest,
   type BatchMutateRequest,
   type DeleteItemRequest,
   ItemService,
+  type RedoRequest,
+  type RemoveRelationRequest,
   type SetStatusRequest,
   type UnarchiveItemRequest,
   type UndeleteItemRequest,
+  type UndoRequest,
   type UpdateItemRequest,
 } from "../src/gen/todo/v1/item_service_pb.js";
+import { RelationKind } from "../src/gen/todo/v1/relation_pb.js";
 import {
+  addRelation,
   archiveItem,
   batchMutate,
   deleteItem,
+  errorReason,
+  getUndoState,
+  redo,
+  removeRelation,
   setStatus,
   unarchiveItem,
   undeleteItem,
+  undo,
   updateItem,
 } from "../src/mutations.js";
 
@@ -33,6 +45,11 @@ function recorder() {
     deleteItem: [] as DeleteItemRequest[],
     undeleteItem: [] as UndeleteItemRequest[],
     batchMutate: [] as BatchMutateRequest[],
+    undo: [] as UndoRequest[],
+    redo: [] as RedoRequest[],
+    getUndoState: 0,
+    addRelation: [] as AddRelationRequest[],
+    removeRelation: [] as RemoveRelationRequest[],
   };
   const transport = createRouterTransport(({ service }) => {
     service(ItemService, {
@@ -43,6 +60,11 @@ function recorder() {
       deleteItem: (req) => (got.deleteItem.push(req), {}),
       undeleteItem: (req) => (got.undeleteItem.push(req), {}),
       batchMutate: (req) => (got.batchMutate.push(req), {}),
+      undo: (req) => (got.undo.push(req), {}),
+      redo: (req) => (got.redo.push(req), {}),
+      getUndoState: () => (got.getUndoState++, {}),
+      addRelation: (req) => (got.addRelation.push(req), {}),
+      removeRelation: (req) => (got.removeRelation.push(req), {}),
     });
   });
   return { client: createClient(ItemService, transport), got };
@@ -106,5 +128,45 @@ describe("mutation helpers", () => {
     const [status, update] = kinds;
     expect(status?.case === "setStatus" && status.value.expectedRevision).toBe(4n);
     expect(update?.case === "updateItem" && update.value.updateMask?.paths).toEqual(["title"]);
+  });
+
+  it("Undo and Redo send a fresh request id and expected_op_id only when given", async () => {
+    const { client, got } = recorder();
+    const opId = "01JENTRY00000000000000000A";
+    await undo(client, { expectedOpId: opId });
+    await undo(client);
+    await redo(client, { expectedOpId: opId, requestId: "01JRETRY000000000000000000" });
+    await redo(client);
+    await getUndoState(client);
+    expect(got.undo.map((r) => r.expectedOpId)).toEqual([opId, undefined]);
+    expect(got.redo.map((r) => [r.requestId, r.expectedOpId])).toEqual([
+      ["01JRETRY000000000000000000", opId],
+      [got.redo[1]?.requestId, undefined],
+    ]);
+    for (const r of [...got.undo, got.redo[1]!]) expect(r.requestId).toMatch(ULID);
+    expect(got.getUndoState).toBe(1);
+  });
+
+  it("relation helpers send the relation with a fresh request id", async () => {
+    const { client, got } = recorder();
+    const relation = { fromId: "A", toId: "B", kind: RelationKind.BLOCKS };
+    await addRelation(client, relation);
+    await removeRelation(client, relation, { requestId: "01JRETRY000000000000000000" });
+    expect(got.addRelation[0]?.relation).toMatchObject(relation);
+    expect(got.addRelation[0]?.requestId).toMatch(ULID);
+    expect(got.removeRelation[0]?.relation).toMatchObject(relation);
+    expect(got.removeRelation[0]?.requestId).toBe("01JRETRY000000000000000000");
+  });
+});
+
+describe("errorReason", () => {
+  it("is the ErrorInfo reason of a ConnectError", () => {
+    const info = new ConnectError("stale", Code.Aborted, undefined, [
+      { desc: ErrorInfoSchema, value: { reason: "UNDO_STACK_CHANGED", domain: "todo-tui" } },
+    ]);
+    expect(errorReason(info)).toBe("UNDO_STACK_CHANGED");
+    expect(errorReason(new ConnectError("plain", Code.Internal))).toBeUndefined();
+    expect(errorReason(new Error("not a ConnectError"))).toBeUndefined();
+    expect(errorReason(undefined)).toBeUndefined();
   });
 });

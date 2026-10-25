@@ -1353,6 +1353,7 @@ dependencies = [
  "todo-core",
  "todo-daemon",
  "todo-proto",
+ "todo-store",
  "tokio",
  "tonic",
  "tonic-types",

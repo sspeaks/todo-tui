@@ -1,9 +1,13 @@
 //! The `todo` binary.
 
 mod add;
+mod rpc;
 mod spawn;
 mod tui;
+mod undo;
 
+use std::fmt::Display;
+use std::io::Write as _;
 use std::process::ExitCode;
 
 use anyhow::Context as _;
@@ -30,6 +34,10 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         text: Vec<String>,
     },
+    /// Undo the most recent change, made from the CLI or the TUI.
+    Undo,
+    /// Redo the most recently undone change.
+    Redo,
     /// Run the daemon (in the foreground unless --detach).
     Daemon {
         /// Start the daemon in the background and return once it is listening.
@@ -71,6 +79,8 @@ async fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
     let paths = Paths::resolve(&Env::from_process())?;
     match command {
         Command::Add { text } => return add::add(&paths, text).await,
+        Command::Undo => return undo::undo(&paths, undo::Direction::Undo).await,
+        Command::Redo => return undo::undo(&paths, undo::Direction::Redo).await,
         Command::Daemon {
             action: Some(DaemonAction::Stop),
             ..
@@ -101,7 +111,7 @@ async fn stop(paths: &Paths) -> anyhow::Result<()> {
         .with_context(|| format!("no daemon pid in {}", paths.lock.display()))?;
     let channel = todo_daemon::client::connect(&paths.socket).await?;
     let mut system = SystemServiceClient::new(channel);
-    add::call(system.shutdown(ShutdownRequest { restart: false }))
+    rpc::call(system.shutdown(ShutdownRequest { restart: false }))
         .await
         .map_err(|s| anyhow::anyhow!("shutdown failed: {}", s.message()))?;
     spawn::wait_for_exit(pid).await?;
@@ -109,9 +119,32 @@ async fn stop(paths: &Paths) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Writes `line` to stdout. Unlike `println!` it does not panic when stdout
+/// is closed (`todo add < notes | head -1`), which would drop the captures
+/// still to come.
+fn print_out(line: impl Display) {
+    let _ = writeln!(std::io::stdout(), "{line}");
+}
+
+/// [`print_out`] for stderr.
+fn print_err(line: impl Display) {
+    let _ = writeln!(std::io::stderr(), "{line}");
+}
+
+/// The ULID's random tail, which tells captures from the same second apart.
+fn short_id(id: &str) -> &str {
+    id.get(id.len().saturating_sub(8)..).unwrap_or(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_id_is_the_tail() {
+        assert_eq!(short_id("01JB0000000000000000ABCDEF"), "00ABCDEF");
+        assert_eq!(short_id("xy"), "xy");
+    }
 
     #[test]
     fn cli_parses() {
@@ -132,6 +165,11 @@ mod tests {
         // Without text, `add` reads stdin.
         let cli = Cli::try_parse_from(["todo", "add"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Add { text }) if text.is_empty()));
+        let cli = Cli::try_parse_from(["todo", "undo"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Undo)));
+        let cli = Cli::try_parse_from(["todo", "redo"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Redo)));
+        assert!(Cli::try_parse_from(["todo", "undo", "extra"]).is_err());
         // Without a command, `todo` opens the TUI; --help still helps.
         assert!(Cli::try_parse_from(["todo"]).unwrap().command.is_none());
         let help = Cli::try_parse_from(["todo", "--help"]).err().unwrap();

@@ -5,7 +5,8 @@ import { ItemSchema } from "../src/gen/todo/v1/item_pb.js";
 import { ItemService } from "../src/gen/todo/v1/item_service_pb.js";
 import { FakeDaemon } from "../src/fake-daemon.js";
 import { LiveStore, type LiveStoreOptions } from "../src/live-store.js";
-import { deleteItem, undeleteItem } from "../src/mutations.js";
+import { RelationKind } from "../src/gen/todo/v1/relation_pb.js";
+import { addRelation, deleteItem, removeRelation, undeleteItem, undo } from "../src/mutations.js";
 
 async function waitFor(cond: () => boolean, timeoutMs = 2000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -93,6 +94,40 @@ describe("LiveStore", () => {
     await undeleteItem(items, a!.id);
     await waitFor(() => view.getSnapshot().items.length === 2);
     expect(view.getSnapshot().items.map((i) => i.id)).toEqual([a!.id, b!.id]);
+  });
+
+  it("keeps Items' relations from changes and re-queries", async () => {
+    const { daemon, store } = setup(2);
+    const items = createClient(ItemService, daemon.transport);
+    const view = store.view();
+    store.start();
+    await waitFor(() => store.getConnection().state === "live");
+    const [a, b] = view.getSnapshot().items;
+    const relation = { fromId: a!.id, toId: b!.id, kind: RelationKind.BLOCKS };
+    const keys = (id: string) => store.getItem(id)?.relations.map((r) => [r.fromId, r.toId, r.kind]);
+
+    const calls = daemon.calls.listItems;
+    await addRelation(items, relation);
+    // Both ends change, each with its relations.
+    await waitFor(() => keys(a!.id)?.length === 1 && keys(b!.id)?.length === 1);
+    expect(keys(b!.id)).toEqual([[a!.id, b!.id, RelationKind.BLOCKS]]);
+    expect(view.getSnapshot().items.map((i) => i.relations.length)).toEqual([1, 1]);
+    // The re-query the changes trigger returns them too.
+    await waitFor(() => daemon.calls.listItems > calls);
+    await sleep(40);
+    expect(view.getSnapshot().items.map((i) => i.relations.length)).toEqual([1, 1]);
+
+    // A deleted end keeps its relation, on both Items.
+    await deleteItem(items, b!.id);
+    await waitFor(() => store.getItem(b!.id)?.deletedAt !== undefined);
+    expect([keys(a!.id), keys(b!.id)]).toEqual([[[a!.id, b!.id, RelationKind.BLOCKS]], [[a!.id, b!.id, RelationKind.BLOCKS]]]);
+    await undo(items);
+    await waitFor(() => view.getSnapshot().items.length === 2);
+
+    await removeRelation(items, relation);
+    await waitFor(() => keys(a!.id)?.length === 0 && keys(b!.id)?.length === 0);
+    await undo(items);
+    await waitFor(() => keys(a!.id)?.length === 1 && keys(b!.id)?.length === 1);
   });
 
   it("re-shows an undeleted item after the re-query dropped it", async () => {

@@ -5,9 +5,10 @@ state in SQLite and serves a gRPC API (`todo.v1`) over a Unix socket; an Ink TUI
 `todo` CLI and an MCP server are clients. See [docs/design.md](docs/design.md).
 
 Status: P1 in progress. Milestone M1 (capture) is done: `todo add` with inline
-tokens, batch capture from stdin, and an offline spool. The TUI is still the minimal
-P0 inbox list; the full TUI is milestone M4. There are no CLI commands yet to list,
-edit, complete or delete items.
+tokens, batch capture from stdin, and an offline spool. Milestone M2 (undo) is in
+progress: `todo undo` and `todo redo` work. The TUI is still the minimal P0 inbox
+list; the full TUI is milestone M4. There are no CLI commands yet to list, edit,
+complete or delete items.
 
 ## Quick start
 
@@ -196,6 +197,48 @@ The daemon imports the spool when it starts and every 30 s while it runs. Relati
 dates resolve against the time you captured, not the time of import. Lines it cannot
 import are moved to `spool.rejected.jsonl` next to it.
 
+### Undo and redo
+
+```console
+$ todo add "call dentist +2"
+7GQ4ZK2M  call dentist  +2
+$ todo undo
+Undid: capture "call dentist"
+$ todo redo
+Redid: capture "call dentist"
+```
+
+`todo undo` reverts your most recent change, and `todo redo` re-applies the change
+you undid last. Every capture and every change to an item is one step, including a
+spooled capture once the daemon imports it. Undoing a capture deletes the item: it
+disappears from the TUI, and `todo redo` brings it back. You can keep undoing, one
+step at a time, back to the first change; a new change clears what there was to
+redo. When there is nothing left, `todo` prints `Nothing to undo` (or
+`Nothing to redo`).
+
+There is one history per data directory, shared by the CLI and the TUI: `todo undo`
+also undoes a change made in the TUI, and the TUI's undo (M4) also undoes a
+`todo add`. Deleting an item also deletes its subtasks, as one change, so one undo
+restores them all.
+
+Changes the daemon makes on its own are not in the history. If one of them has
+changed a field since, undo leaves that field alone, restores the rest, and prints
+a line for each field it left, with the item's short id:
+
+```console
+$ todo undo
+Undid: mark done "call dentist"
+  not restored: status of 7GQ4ZK2M (the field has changed since)
+```
+
+If it could restore nothing at all, that change also leaves the history, so there
+is nothing to redo.
+
+`todo undo` and `todo redo` start the daemon if needed, as `todo add` does, and
+exit 0 when they succeed, with or without such lines. They have no spool: if the
+daemon cannot be reached or started, they print `todo: daemon unavailable (…)` and
+exit 1. They also exit 1, with `todo: <why>`, if the daemon refuses.
+
 ### Seeing your todos: the TUI
 
 There is no `todo list` yet; the TUI is how you see items. `todo` with no
@@ -240,8 +283,8 @@ itself unless it is already set, so the TUI starts that `todo`'s daemon. Under
 
 ### The daemon
 
-You rarely need to manage it: `todo add` and the TUI start it when needed, and only
-one daemon runs per data directory.
+You rarely need to manage it: `todo add`, `todo undo`, `todo redo` and the TUI
+start it when needed, and only one daemon runs per data directory.
 
 | Command | What it does |
 |---|---|
@@ -318,8 +361,9 @@ pnpm smoke            # builds todo, then exercises daemon, CLI and TS client to
 Run `pnpm gen` again after changing `proto/`; the Rust side compiles the protos
 during `cargo build` (that is what needs `protoc`).
 
-`pnpm test` skips the 9 client tests that run against a real daemon unless
-`TODO_BIN` is an absolute path to a built `todo`:
+`pnpm test` skips the client tests that run against a real daemon
+(`packages/client/test/uds.integration.test.ts`) unless `TODO_BIN` is an absolute
+path to a built `todo`:
 `cargo build -p todo-cli && TODO_BIN=$PWD/target/debug/todo pnpm test`. The snippet
 below and `pnpm smoke` assume the default `target/`. If you set
 `CARGO_TARGET_DIR`, smoke fails with `…/target/debug/todo: No such file or directory`,

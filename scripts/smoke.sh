@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Smoke test: auto-spawn, a TS watcher over Subscribe, the single-daemon lock
 # under parallel --detach, the long-path socket fallback (P0), parsed capture
-# and the capture spool round trip (P1 M1).
+# and the capture spool round trip (P1 M1), and undo/redo of a capture (P1 M2).
 # Usage: scripts/smoke.sh   (TODO_BIN overrides the binary; default: cargo build)
 set -euo pipefail
 
@@ -167,4 +167,26 @@ for _ in $(seq 1 50); do [[ -s $home/data/spool.jsonl ]] || break; sleep 0.1; do
 list_items >"$root/spool.items" || fail "listing items failed"
 [[ $(grep -c '"title":"spooled item"' "$root/spool.items") == 1 ]] || { cat "$root/spool.items" >&2; fail "spooled item not imported exactly once"; }
 grep -qF '"labels":["later"]' "$root/spool.items" || { cat "$root/spool.items" >&2; fail "spooled item lost its label"; }
+"$TODO_BIN" daemon stop >/dev/null
+
+# 6. `todo undo` soft-deletes the capture, and the TS watcher sees deletedAt;
+#    `todo redo` brings it back, and the watcher sees it live again.
+step "undo and redo"
+home=$root/undo
+new_home "$home"
+export TODO_TUI_HOME=$home
+"$TODO_BIN" add "undo me +2" >/dev/null
+start_watcher "$root/watch4.out"
+out=$("$TODO_BIN" undo)
+[[ $out == 'Undid: capture "undo me"' ]] || fail "unexpected undo output: $out"
+wait_watcher_sees "$root/watch4.out" "undo me"
+grep -q '"deletedAt":"' "$root/watch4.out" || { cat "$root/watch4.out" >&2; fail "watcher did not see the undone capture deleted"; }
+start_watcher "$root/watch5.out"
+out=$("$TODO_BIN" redo)
+[[ $out == 'Redid: capture "undo me"' ]] || fail "unexpected redo output: $out"
+wait_watcher_sees "$root/watch5.out" "undo me"
+grep -q '"deletedAt"' "$root/watch5.out" && { cat "$root/watch5.out" >&2; fail "watcher saw the redone capture still deleted"; }
+grep -qF '"priority":"PRIORITY_HIGH"' "$root/watch5.out" || { cat "$root/watch5.out" >&2; fail "the redone capture lost its priority"; }
+out=$("$TODO_BIN" redo)
+[[ $out == "Nothing to redo" ]] || fail "unexpected second redo output: $out"
 "$TODO_BIN" daemon stop >/dev/null

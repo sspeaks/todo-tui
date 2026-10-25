@@ -71,18 +71,25 @@ pub enum StoreError {
     /// `None`).
     #[error("the undo stack changed: expected entry {expected}, found {top:?}")]
     UndoStackChanged { expected: Ulid, top: Option<Ulid> },
-    /// Undeleting `item_id` while its parent `parent_id` is deleted (design
-    /// 3.7): the parent must be undeleted first. The daemon maps it to
-    /// FAILED_PRECONDITION with ErrorInfo `PARENT_DELETED` (`item_id`,
-    /// `parent_id`).
-    #[error("item {item_id}: its parent {parent_id} is deleted")]
-    ParentDeleted { item_id: ItemId, parent_id: ItemId },
+    /// Mutation `index` of a batch undeleted `item_id`, but its parent
+    /// `parent_id` is still deleted when the batch ends (design 3.7): the
+    /// parent must be undeleted first, in this batch or before it. The
+    /// daemon maps it to FAILED_PRECONDITION with ErrorInfo `PARENT_DELETED`
+    /// (`item_id`, `parent_id`).
+    #[error("mutation {index}: item {item_id}: its parent {parent_id} is deleted")]
+    ParentDeleted {
+        index: usize,
+        item_id: ItemId,
+        parent_id: ItemId,
+    },
     /// A relation end names no Item, or (for an add) a deleted one. The store
     /// sees the canonical [`Relation`], whose ends a `relates_to` may have
     /// swapped, so the daemon maps by the end of the *request* that `item_id`
     /// is: the request's `from_id` gives NOT_FOUND (ErrorInfo
     /// `ITEM_NOT_FOUND`) or FAILED_PRECONDITION (ErrorInfo `ITEM_DELETED`),
-    /// its `to_id` INVALID_ARGUMENT on `relation.to_id`.
+    /// its `to_id` INVALID_ARGUMENT on `relation.to_id`. When both ends are
+    /// wrong this names the canonical `from` end, which the daemon checks
+    /// against the request's `from_id`.
     #[error("relation end {item_id} {problem}")]
     RelationEnd {
         item_id: ItemId,
@@ -588,8 +595,9 @@ impl Store {
     /// Parent rules (design 3.7): a delete also soft-deletes every live
     /// descendant, with the same `deleted_at`; an undelete also restores the
     /// descendants the Item's delete took with it, and fails with
-    /// [`StoreError::ParentDeleted`] while the Item's parent is deleted. No
-    /// live Item ever has a deleted parent.
+    /// [`StoreError::ParentDeleted`] when the Item is live under a deleted
+    /// parent at the end of the batch, so the order of a batch's undeletes
+    /// does not matter. No live Item ever has a deleted parent.
     ///
     /// An op by the user or a suggestion that writes an event becomes the
     /// top undo stack entry and discards the redo stack (design 3.10).
@@ -626,8 +634,10 @@ impl Store {
     /// Adds a relation (design 3.6) as one op that gives both ends a new
     /// revision. Both ends must exist and be live
     /// ([`StoreError::RelationEnd`]). Adding a relation that exists changes
-    /// nothing. Idempotent on `request_id` like a single-item mutation of the
-    /// relation's `from` end.
+    /// nothing. Idempotent on `request_id`: a replay returns the original
+    /// result with both ends' current state, and the id reused for another
+    /// relation (any of its ends or its kind) or another kind of op fails
+    /// with [`StoreError::RequestIdReused`].
     pub async fn add_relation(&self, input: RelationInput) -> Result<RelationOutput> {
         self.write(move |tx| relation::relation_tx(tx, input, true))
             .await
@@ -737,7 +747,9 @@ struct OpRow<'a> {
     summary: String,
     /// `ops.entry_op`: the entry an undo or redo acted on.
     entry_op: Option<Ulid>,
-    /// `ops.report`: the JSON of the changes an undo or redo skipped.
+    /// `ops.report`: the JSON of the changes an undo or redo skipped, or of
+    /// the relation a relation op that changed nothing was asked for (one
+    /// that changed it records it in its event), so a replay can check it.
     report: Option<String>,
 }
 
@@ -1242,6 +1254,41 @@ impl Batch {
         Ok(restored)
     }
 
+    /// The parent rule for the Items an op undeleted, `(mutation, Item)` in
+    /// op order, as the op leaves them: one still live under a deleted parent
+    /// is a [`StoreError::ParentDeleted`] of the last mutation that undeleted
+    /// it. Only these Items are checked, so a live Item that was already
+    /// under a deleted parent (an M1 database, from before deletes cascaded)
+    /// does not fail an op that only touches it.
+    fn orphan(
+        &self,
+        conn: &Connection,
+        undeleted: &[(usize, ItemId)],
+    ) -> Result<Option<StoreError>> {
+        let last: HashMap<ItemId, usize> = undeleted
+            .iter()
+            .enumerate()
+            .map(|(at, &(_, id))| (id, at))
+            .collect();
+        for (at, &(index, item_id)) in undeleted.iter().enumerate() {
+            if last[&item_id] != at {
+                continue;
+            }
+            let item = &self.items[self.slots[&item_id]];
+            if let Some(parent_id) = item.core.parent_id
+                && !item.is_deleted()
+                && self.is_deleted(conn, parent_id)?
+            {
+                return Ok(Some(StoreError::ParentDeleted {
+                    index,
+                    item_id,
+                    parent_id,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
     /// Why `parent` cannot be any Item's parent (it is missing or deleted),
     /// if it cannot.
     fn unusable_parent(&self, conn: &Connection, parent: ItemId) -> Result<Option<&'static str>> {
@@ -1467,6 +1514,9 @@ fn mutate_tx(tx: &mut WriteTx<'_>, input: MutateInput) -> Result<MutateOutput> {
     // either order.
     let named: HashSet<ItemId> = input.mutations.iter().map(|m| m.id).collect();
     let mut subtasks = HashSet::new();
+    // Each undelete with the mutation that made it, for the parent rule,
+    // which holds for the batch as a whole.
+    let mut undeleted: Vec<(usize, ItemId)> = Vec::new();
     for (index, m) in input.mutations.iter().enumerate() {
         let slot = batch.load(conn, m.id, today)?;
         // `apply` never changes `revision`, so this is the stored one.
@@ -1506,23 +1556,20 @@ fn mutate_tx(tx: &mut WriteTx<'_>, input: MutateInput) -> Result<MutateOutput> {
                 batch.record(slot, applied);
             }
             MutationOp::Undelete if changed => {
-                if let Some(parent_id) = applied.item.core.parent_id
-                    && batch.is_deleted(conn, parent_id)?
-                {
-                    return Err(StoreError::ParentDeleted {
-                        item_id: m.id,
-                        parent_id,
-                    });
-                }
                 batch.record(slot, applied);
+                undeleted.push((index, m.id));
                 if let Some(by) = deleted_by {
                     let restored = batch.undelete_descendants(conn, m.id, &by, &ctx, today)?;
+                    undeleted.extend(restored.iter().map(|&id| (index, id)));
                     subtasks.extend(restored.into_iter().filter(|id| !named.contains(id)));
                 }
             }
             _ => batch.record(slot, applied),
         }
         slots.push(slot);
+    }
+    if let Some(error) = batch.orphan(conn, &undeleted)? {
+        return Err(error);
     }
 
     let actions: Vec<(Action, ItemId, &str)> = input

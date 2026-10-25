@@ -1,16 +1,16 @@
 import { dirname } from "node:path";
 import { Code, ConnectError, type Client, type Transport, createClient } from "@connectrpc/connect";
-import { ErrorInfoSchema } from "./gen/google/rpc/error_details_pb.js";
 import { ItemService } from "./gen/todo/v1/item_service_pb.js";
 import { ClientKind, type GetServerInfoResponse, SystemService } from "./gen/todo/v1/system_service_pb.js";
 import { WatchService } from "./gen/todo/v1/watch_service_pb.js";
 import { LiveStore, type LiveStoreOptions } from "./live-store.js";
+import { errorReason } from "./mutations.js";
 import { defaultSocketPath, envFromProcess, resolvePaths } from "./paths.js";
 import { isConnectionFailure, readDaemonPid, spawnDaemon, waitForDaemonExit, withAutoSpawn } from "./spawn.js";
 import { type TodoTransport, type TodoTransportOptions, UnsafeRuntimeDirError, checkRuntimeDir, createTodoTransport } from "./transport.js";
 
 /** The api_minor this client was built against. */
-export const CLIENT_API_MINOR = 2;
+export const CLIENT_API_MINOR = 3;
 export const CLIENT_VERSION = "0.1.0";
 
 export interface TodoClients {
@@ -81,11 +81,7 @@ export interface UpgradeRestartSteps {
 }
 
 function isRestartRefused(err: unknown): boolean {
-  return (
-    err instanceof ConnectError &&
-    err.code === Code.FailedPrecondition &&
-    err.findDetails(ErrorInfoSchema).some((d) => d.reason === "INTERACTIVE_CLIENTS_CONNECTED")
-  );
+  return err instanceof ConnectError && err.code === Code.FailedPrecondition && errorReason(err) === "INTERACTIVE_CLIENTS_CONNECTED";
 }
 
 /**

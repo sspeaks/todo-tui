@@ -16,7 +16,11 @@ use todo_daemon::paths::{Env, Paths};
 use todo_daemon::spool::SpoolEntry;
 use todo_proto::google::r#type::Date;
 use todo_proto::v1::item_service_client::ItemServiceClient;
-use todo_proto::v1::{CreatedVia, Item, ListItemsRequest, PersonRef, Priority, Status, person_ref};
+use todo_proto::v1::{
+    CreatedVia, GetItemRequest, Item, ListItemsRequest, PersonRef, Priority, SetStatusRequest,
+    Status, person_ref,
+};
+use tonic::transport::Channel;
 
 /// A temp home whose daemon is stopped on drop, even if the test fails.
 struct Home {
@@ -84,27 +88,43 @@ impl Home {
         Paths::resolve(&env).unwrap()
     }
 
-    /// Every Item, oldest first, read from the running daemon over gRPC.
-    fn items(&self) -> Vec<Item> {
+    /// Runs `rpc` with a client of the running daemon.
+    fn rpc<T>(&self, rpc: impl AsyncFnOnce(ItemServiceClient<Channel>) -> T) -> T {
         let socket = self.paths().socket;
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
+        block_on(async {
             let channel = todo_daemon::client::connect(&socket).await.unwrap();
+            rpc(ItemServiceClient::new(channel)).await
+        })
+    }
+
+    /// Every Item the default filter shows (no deleted ones), oldest first,
+    /// read from the running daemon over gRPC.
+    fn items(&self) -> Vec<Item> {
+        self.rpc(async |mut items| {
             let request = ListItemsRequest {
                 page_size: 1000,
                 ..Default::default()
             };
-            ItemServiceClient::new(channel)
-                .list_items(request)
-                .await
-                .unwrap()
-                .into_inner()
-                .items
+            items.list_items(request).await.unwrap().into_inner().items
         })
     }
+
+    /// The Item `id`, deleted or not, from the running daemon.
+    fn item(&self, id: &str) -> Item {
+        self.rpc(async |mut items| {
+            let request = GetItemRequest { id: id.to_owned() };
+            let item = items.get_item(request).await.unwrap().into_inner().item;
+            item.unwrap()
+        })
+    }
+}
+
+fn block_on<T>(future: impl Future<Output = T>) -> T {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(future)
 }
 
 impl Drop for Home {
@@ -750,4 +770,122 @@ fn a_capture_that_cannot_be_spooled_fails_loudly() {
         stderr.contains(r#"NOT CAPTURED: "nowhere to go""#),
         "{stderr}"
     );
+}
+
+#[test]
+fn undo_hides_a_capture_and_redo_brings_it_back() {
+    let h = Home::new();
+    h.ok(&["add", "call", "dentist", "+2"]);
+    let id = h.items()[0].id.clone();
+
+    let out = h.todo(&["undo"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "Undid: capture \"call dentist\"\n");
+    assert_eq!(text(&out.stderr), "");
+    // Soft-deleted: hidden from ListItems, a tombstone to GetItem.
+    assert_eq!(h.items(), []);
+    assert!(h.item(&id).deleted_at.is_some());
+
+    assert_eq!(h.ok(&["redo"]), "Redid: capture \"call dentist\"\n");
+    assert_eq!(titles(&h.items()), ["call dentist"]);
+    let item = h.item(&id);
+    assert_eq!(item.deleted_at, None);
+    assert_eq!(item.priority(), Priority::High);
+    assert_eq!(h.ok(&["redo"]), "Nothing to redo\n");
+
+    // One history for every client: a change made over gRPC, as the TUI
+    // makes it, is the next one `todo undo` undoes.
+    h.rpc(async |mut items| {
+        let request = SetStatusRequest {
+            request_id: todo_core::new_ulid().to_string(),
+            id: id.clone(),
+            status: Status::Done.into(),
+            expected_revision: None,
+        };
+        items.set_status(request).await.unwrap();
+    });
+    assert_eq!(h.ok(&["undo"]), "Undid: mark done \"call dentist\"\n");
+    assert_eq!(h.item(&id).status(), Status::Inbox);
+    assert_eq!(h.ok(&["undo"]), "Undid: capture \"call dentist\"\n");
+    assert_eq!(h.ok(&["undo"]), "Nothing to undo\n");
+    assert_eq!(h.ok(&["redo"]), "Redid: capture \"call dentist\"\n");
+}
+
+#[test]
+fn undo_and_redo_on_a_fresh_home_have_nothing_to_do() {
+    let h = Home::new();
+    let out = h.todo(&["undo"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "Nothing to undo\n");
+    assert_eq!(text(&out.stderr), "");
+    // Started the daemon, as `todo add` does.
+    assert!(socket_in(&h.home.join("run")));
+    assert_eq!(h.ok(&["redo"]), "Nothing to redo\n");
+}
+
+#[test]
+fn undo_reports_the_changes_it_leaves_alone() {
+    use todo_core::{Actor, Mutation, MutationOp};
+    use todo_store::{MutateInput, OpKind, Store};
+
+    let h = Home::new();
+    h.ok(&["add", "call", "dentist"]);
+    let id = h.items()[0].id.clone();
+    h.ok(&["daemon", "stop"]);
+    // Marked done by the user, then moved on by the system, which no RPC
+    // can do: a system op is not an undo stack entry.
+    block_on(async {
+        let store = Store::open(&h.paths().database()).unwrap();
+        let now = jiff::Timestamp::now();
+        let today = now.to_zoned(jiff::tz::TimeZone::system()).date();
+        let set_status = |actor, status| MutateInput {
+            request_id: todo_core::new_ulid().to_string(),
+            actor,
+            kind: OpKind::SetStatus,
+            mutations: vec![Mutation {
+                id: id.parse().unwrap(),
+                expected_revision: None,
+                op: MutationOp::SetStatus(status),
+            }],
+            now,
+            today,
+        };
+        let done = set_status(Actor::User, todo_core::Status::Done);
+        store.mutate(done).await.unwrap();
+        let next = set_status(Actor::System, todo_core::Status::Next);
+        store.mutate(next).await.unwrap();
+    });
+
+    let short = &id[id.len() - 8..];
+    let out = h.todo(&["undo"]);
+    // Succeeds, though it restored nothing.
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "Undid: mark done \"call dentist\"\n  \
+             not restored: status of {short} (the field has changed since)\n"
+        )
+    );
+    assert_eq!(text(&out.stderr), "");
+    assert_eq!(h.item(&id).status(), Status::Next);
+    // Restoring nothing dropped the entry from both stacks.
+    assert_eq!(h.ok(&["redo"]), "Nothing to redo\n");
+    assert_eq!(h.ok(&["undo"]), "Undid: capture \"call dentist\"\n");
+}
+
+#[test]
+fn undo_without_a_daemon_fails_and_spools_nothing() {
+    let h = Home::new();
+    // A file where the runtime directory belongs: no daemon can listen.
+    std::fs::write(h.home.join("run"), "").unwrap();
+    for command in ["undo", "redo"] {
+        let out = h.todo(&[command]);
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+        assert_eq!(text(&out.stdout), "");
+        let stderr = text(&out.stderr);
+        assert_eq!(stderr.lines().count(), 1, "{stderr}");
+        assert!(stderr.starts_with("todo: daemon unavailable ("), "{stderr}");
+    }
+    assert!(!h.paths().spool().exists());
 }

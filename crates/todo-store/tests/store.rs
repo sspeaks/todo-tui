@@ -2920,8 +2920,12 @@ async fn delete_cascades_to_live_descendants_and_undelete_brings_them_back() {
             vec![mutation(child, MutationOp::Undelete)],
         );
         match db.store.mutate(req).await {
-            Err(StoreError::ParentDeleted { item_id, parent_id }) => {
-                assert_eq!((item_id, parent_id), (child, parent));
+            Err(StoreError::ParentDeleted {
+                index,
+                item_id,
+                parent_id,
+            }) => {
+                assert_eq!((index, item_id, parent_id), (0, child, parent));
             }
             other => panic!("expected ParentDeleted, got {other:?}"),
         }
@@ -2985,12 +2989,186 @@ async fn the_cascade_follows_the_batch_working_copies() {
         ],
     );
     match db.store.mutate(req).await {
-        Err(StoreError::ParentDeleted { item_id, parent_id }) => {
-            assert_eq!((item_id, parent_id), (x.id, a.id));
+        Err(StoreError::ParentDeleted {
+            index,
+            item_id,
+            parent_id,
+        }) => {
+            assert_eq!((index, item_id, parent_id), (1, x.id, a.id));
         }
         other => panic!("expected ParentDeleted, got {other:?}"),
     }
     assert_eq!(snapshot(&db).await, before);
+    assert_no_live_orphans(&db).await;
+}
+
+#[tokio::test]
+async fn a_batch_checks_the_parent_rule_once_it_is_done() {
+    let db = open();
+    let p = capture(&db, "p").await;
+    let c = capture_under(&db, "c", p.id).await;
+    let g = capture_under(&db, "g", c.id).await;
+    let q = capture_under(&db, "q", p.id).await;
+    let all = [p.id, c.id, g.id, q.id];
+    let delete_p = |at| {
+        run(
+            &db,
+            Actor::User,
+            at,
+            OpKind::Delete,
+            vec![mutation(p.id, MutationOp::Delete)],
+        )
+    };
+    let undelete = |id| mutation(id, MutationOp::Undelete);
+    let parent_deleted = |result: Result<MutateOutput, StoreError>| match result {
+        Err(StoreError::ParentDeleted {
+            index,
+            item_id,
+            parent_id,
+        }) => (index, item_id, parent_id),
+        other => panic!("expected ParentDeleted, got {other:?}"),
+    };
+
+    // The child first or the parent first: either way all four come back.
+    for (n, order) in [[c.id, p.id], [p.id, c.id], [g.id, p.id]]
+        .into_iter()
+        .enumerate()
+    {
+        delete_p(1_000 + n as i64).await;
+        for &id in &all {
+            assert!(get(&db, id).await.is_deleted());
+        }
+        let out = run(
+            &db,
+            Actor::User,
+            2_000,
+            OpKind::Batch,
+            order.iter().map(|&id| undelete(id)).collect(),
+        )
+        .await;
+        for &id in &all {
+            assert!(!get(&db, id).await.is_deleted(), "{order:?}");
+        }
+        assert_eq!(
+            op_stack(&db, out.result.op_id).await.1.as_deref(),
+            Some("undelete 2 items and 2 subtasks"),
+            "{order:?}"
+        );
+        assert_no_live_orphans(&db).await;
+    }
+
+    // What counts is where the batch leaves an undeleted Item.
+    delete_p(5_000).await;
+    run(
+        &db,
+        Actor::User,
+        6_000,
+        OpKind::Batch,
+        vec![
+            undelete(c.id),
+            set(c.id, ItemField::ParentId, FieldValue::Cleared),
+        ],
+    )
+    .await;
+    assert!(!get(&db, c.id).await.is_deleted());
+    assert!(!get(&db, g.id).await.is_deleted());
+    assert!(get(&db, p.id).await.is_deleted());
+    assert_no_live_orphans(&db).await;
+
+    // Still under a deleted parent when the batch ends: the last mutation
+    // that undeleted it is named, and nothing is written.
+    let p2 = capture(&db, "p2").await;
+    let c2 = capture_under(&db, "c2", p2.id).await;
+    let g2 = capture_under(&db, "g2", c2.id).await;
+    run(
+        &db,
+        Actor::User,
+        7_000,
+        OpKind::Delete,
+        vec![mutation(p2.id, MutationOp::Delete)],
+    )
+    .await;
+    let before = snapshot(&db).await;
+    let rows = [
+        (vec![undelete(c2.id)], (0, c2.id, p2.id)),
+        // Deleting a deleted Item changes nothing, so cascades nothing.
+        (
+            vec![undelete(c2.id), mutation(p2.id, MutationOp::Delete)],
+            (0, c2.id, p2.id),
+        ),
+        (vec![undelete(g2.id), undelete(c2.id)], (1, c2.id, p2.id)),
+        (
+            vec![
+                undelete(c2.id),
+                mutation(c2.id, MutationOp::Delete),
+                undelete(c2.id),
+            ],
+            (2, c2.id, p2.id),
+        ),
+    ];
+    for (mutations, want) in rows {
+        let req = mutate(OpKind::Batch, mutations);
+        assert_eq!(parent_deleted(db.store.mutate(req).await), want);
+        assert_eq!(snapshot(&db).await, before);
+    }
+    assert_no_live_orphans(&db).await;
+}
+
+#[tokio::test]
+async fn a_batch_that_undeletes_a_child_first_undoes_and_redoes_whole() {
+    let db = open();
+    let p = capture(&db, "p").await;
+    let c = capture_under(&db, "c", p.id).await;
+    let g = capture_under(&db, "g", c.id).await;
+    let q = capture_under(&db, "q", p.id).await;
+    let all = [p.id, c.id, g.id, q.id];
+    run(
+        &db,
+        Actor::User,
+        1_000,
+        OpKind::Delete,
+        vec![mutation(p.id, MutationOp::Delete)],
+    )
+    .await;
+    let mut deleted = Vec::new();
+    for id in all {
+        deleted.push(content(&get(&db, id).await));
+    }
+    let batch = run(
+        &db,
+        Actor::User,
+        2_000,
+        OpKind::Batch,
+        vec![
+            mutation(c.id, MutationOp::Undelete),
+            title(c.id, "c2"),
+            mutation(p.id, MutationOp::Undelete),
+        ],
+    )
+    .await;
+    let mut live = Vec::new();
+    for id in all {
+        live.push(content(&get(&db, id).await));
+    }
+
+    // Undo deletes the subtasks before their parents, whatever the order
+    // the batch undeleted them in.
+    let out = undo(&db).await;
+    assert_eq!(out.entry.unwrap().op_id, batch.result.op_id);
+    assert_eq!(out.skipped, []);
+    for (id, want) in all.iter().zip(&deleted) {
+        assert_eq!(&content(&get(&db, *id).await), want);
+    }
+    assert_no_live_orphans(&db).await;
+    let out = redo(&db).await;
+    assert_eq!(out.skipped, []);
+    for (id, want) in all.iter().zip(&live) {
+        assert_eq!(&content(&get(&db, *id).await), want);
+    }
+    assert_no_live_orphans(&db).await;
+    let out = undo(&db).await;
+    assert_eq!(out.skipped, []);
+    assert!(get(&db, p.id).await.is_deleted());
     assert_no_live_orphans(&db).await;
 }
 
@@ -3315,6 +3493,63 @@ async fn relations_change_as_ops_on_both_ends() {
     let again = remove(&db, blocks).await;
     assert_eq!(again.result.revision, revision + 2);
     assert_eq!(undo_state_of(&db, again.result.op_id).await, None);
+}
+
+#[tokio::test]
+async fn a_relation_request_id_replays_only_the_same_relation() {
+    let db = open();
+    let a = capture(&db, "a").await;
+    let b = capture(&db, "b").await;
+    let c = capture(&db, "c").await;
+    let blocks = relation(&a, &b, RelationKind::Blocks);
+    // Each from a, the end a request id used to be matched by.
+    let others = [
+        relation(&a, &c, RelationKind::Blocks),
+        relation(&a, &b, RelationKind::Duplicates),
+        relation(&a, &b, RelationKind::RelatesTo),
+        relation(&b, &a, RelationKind::Blocks),
+    ];
+    let reused = |result: Result<RelationOutput, StoreError>| match result {
+        Err(StoreError::RequestIdReused) => {}
+        other => panic!("expected RequestIdReused, got {other:?}"),
+    };
+
+    // A change records the relation in its event, a no-op in its op.
+    let changed = relation_input(blocks);
+    let unchanged = relation_input(blocks);
+    let missing = relation_input(relation(&b, &c, RelationKind::Duplicates));
+    let first = db.store.add_relation(changed.clone()).await.unwrap();
+    let again = db.store.add_relation(unchanged.clone()).await.unwrap();
+    assert_eq!(again.result.revision, first.result.revision);
+    let gone = db.store.remove_relation(missing.clone()).await.unwrap();
+    assert_eq!(gone.result.revision, first.result.revision);
+    let before = snapshot(&db).await;
+    for (req, add, out) in [
+        (&changed, true, &first),
+        (&unchanged, true, &again),
+        (&missing, false, &gone),
+    ] {
+        let store = &db.store;
+        let replay = |req: RelationInput| async move {
+            if add {
+                store.add_relation(req).await
+            } else {
+                store.remove_relation(req).await
+            }
+        };
+        assert_eq!(replay(req.clone()).await.unwrap(), *out);
+        for relation in others.iter().chain([&blocks]) {
+            if *relation == req.relation {
+                continue;
+            }
+            let other = RelationInput {
+                relation: *relation,
+                ..req.clone()
+            };
+            reused(replay(other).await);
+        }
+    }
+    assert_eq!(snapshot(&db).await, before);
 }
 
 #[tokio::test]

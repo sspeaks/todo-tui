@@ -282,6 +282,9 @@ enum_map!(core::LinkState, v1::LinkState, "link_state", {
 enum_map!(core::CaptureTokenKind, v1::CaptureTokenKind, "capture_token_kind", {
     Priority => Priority, DueDate => DueDate, Label => Label, Waiting => Waiting, Status => Status,
 });
+enum_map!(core::RelationKind, v1::RelationKind, "kind", {
+    Blocks => Blocks, Duplicates => Duplicates, RelatesTo => RelatesTo,
+});
 
 impl From<core::ItemField> for v1::ItemField {
     fn from(f: core::ItemField) -> Self {
@@ -522,6 +525,38 @@ impl TryFrom<&v1::StalenessSignals> for core::StalenessSignals {
     }
 }
 
+impl From<&core::Relation> for v1::Relation {
+    fn from(r: &core::Relation) -> Self {
+        Self {
+            from_id: r.from().to_string(),
+            to_id: r.to().to_string(),
+            kind: r.kind().to_i32(),
+        }
+    }
+}
+
+impl From<core::Relation> for v1::Relation {
+    fn from(r: core::Relation) -> Self {
+        (&r).into()
+    }
+}
+
+/// The canonical relation: a `RELATES_TO` named either way round has
+/// `from_id < to_id`. An Item related to itself is invalid at `to_id`.
+impl TryFrom<&v1::Relation> for core::Relation {
+    type Error = ConvertError;
+    fn try_from(r: &v1::Relation) -> Result<Self> {
+        let from = parse_id("from_id", &r.from_id)?;
+        let to = parse_id("to_id", &r.to_id)?;
+        let kind = EnumField::from_i32("kind", r.kind)?;
+        core::Relation::new(from, to, kind).map_err(|e| match e {
+            core::RelationError::SameItem => {
+                ConvertError::Invalid("to_id".into(), "must differ from from_id".into())
+            }
+        })
+    }
+}
+
 impl From<&core::Item> for v1::Item {
     fn from(item: &core::Item) -> Self {
         let c = &item.core;
@@ -586,7 +621,7 @@ impl From<&core::Item> for v1::Item {
             merged_into: d.merged_into.map(|id| id.to_string()),
             is_overdue: d.is_overdue,
 
-            relations: Vec::new(),
+            relations: item.relations.iter().map(Into::into).collect(),
         }
     }
 }
@@ -697,7 +732,15 @@ impl TryFrom<&v1::Item> for core::Item {
                 merged_into: id("merged_into", &p.merged_into)?,
                 is_overdue: p.is_overdue,
             },
-            relations: Vec::new(),
+            relations: p
+                .relations
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    r.try_into()
+                        .map_err(|e: ConvertError| e.within(format!("relations[{i}]")))
+                })
+                .collect::<Result<_>>()?,
         })
     }
 }
@@ -886,6 +929,61 @@ pub fn item_field_from_path(path: &str) -> Option<core::ItemField> {
         .find(|&f| item_field_path(f) == path)
 }
 
+// ---- undo ---------------------------------------------------------------
+
+impl From<&core::SkipReason> for v1::UndoSkipReason {
+    fn from(r: &core::SkipReason) -> Self {
+        match r {
+            core::SkipReason::ChangedSince => v1::UndoSkipReason::ChangedSince,
+            core::SkipReason::ItemDeleted => v1::UndoSkipReason::ItemDeleted,
+            core::SkipReason::Invalid(_) => v1::UndoSkipReason::Invalid,
+        }
+    }
+}
+
+/// The `UndoSkip.field` of a unit of `fields` that was restored together:
+/// `STATUS` for one on the status triple, which is restored as one unit, the
+/// field itself for any other, and `UNSPECIFIED` for a relation step, which
+/// has no fields.
+pub fn undo_skip_field(fields: &[core::ItemField]) -> v1::ItemField {
+    use core::ItemField as F;
+    let status = |f: &F| matches!(f, F::StatusCategory | F::ResolutionKind | F::TodoRefinement);
+    match fields.first() {
+        None => v1::ItemField::Unspecified,
+        Some(_) if fields.iter().any(status) => v1::ItemField::Status,
+        Some(&field) => field.into(),
+    }
+}
+
+/// Why a change was left alone, for a user: the reason a value is no longer
+/// valid, or a short sentence for the other reasons.
+pub fn undo_skip_message(reason: &core::SkipReason, relation_step: bool) -> String {
+    match reason {
+        core::SkipReason::ChangedSince if relation_step => "the relation has changed since",
+        core::SkipReason::ChangedSince => "the field has changed since",
+        core::SkipReason::ItemDeleted => "the Item is deleted",
+        core::SkipReason::Invalid(reason) => return reason.clone(),
+    }
+    .to_owned()
+}
+
+/// A change undo or redo left alone: the unit of `fields` on `item_id`, or
+/// the relation step on `relation` (whose `from` end `item_id` is).
+pub fn undo_skip_to_proto(
+    item_id: core::ItemId,
+    fields: &[core::ItemField],
+    reason: &core::SkipReason,
+    relation: Option<&core::Relation>,
+) -> v1::UndoSkip {
+    v1::UndoSkip {
+        item_id: item_id.to_string(),
+        field: undo_skip_field(fields) as i32,
+        reason: v1::UndoSkipReason::from(reason) as i32,
+        message: undo_skip_message(reason, relation.is_some()),
+        relation: relation.map(Into::into),
+    }
+}
+
 // ---- capture ------------------------------------------------------------
 
 impl From<&core::CaptureToken> for v1::CaptureToken {
@@ -1008,6 +1106,11 @@ mod tests {
         d.deleted_at = Some(ts(1_700_000_400));
         d.merged_into = Some(new_ulid());
         d.is_overdue = true;
+        let other = new_ulid();
+        item.relations = vec![
+            core::Relation::new(item.id, other, core::RelationKind::Blocks).unwrap(),
+            core::Relation::new(other, item.id, core::RelationKind::RelatesTo).unwrap(),
+        ];
         item
     }
 
@@ -1231,6 +1334,145 @@ mod tests {
 
     /// D4: prost-reflect renders an Item as canonical proto3 JSON.
     #[test]
+    fn relations_convert_canonically() {
+        use todo_core::RelationKind as K;
+        let (a, b) = (Ulid::from(1u128), Ulid::from(2u128));
+        let rows = [
+            (K::Blocks, v1::RelationKind::Blocks),
+            (K::Duplicates, v1::RelationKind::Duplicates),
+            (K::RelatesTo, v1::RelationKind::RelatesTo),
+        ];
+        for (kind, proto_kind) in rows {
+            let r = core::Relation::new(b, a, kind).unwrap();
+            let p = v1::Relation::from(r);
+            assert_eq!(
+                (p.from_id.as_str(), p.to_id.as_str(), p.kind),
+                (
+                    r.from().to_string().as_str(),
+                    r.to().to_string().as_str(),
+                    proto_kind as i32
+                )
+            );
+            assert_eq!(core::Relation::try_from(&p), Ok(r));
+        }
+        // A RELATES_TO named the other way round is the stored one.
+        let swapped = v1::Relation {
+            from_id: b.to_string(),
+            to_id: a.to_string(),
+            kind: v1::RelationKind::RelatesTo as i32,
+        };
+        let r = core::Relation::try_from(&swapped).unwrap();
+        assert_eq!((r.from(), r.to()), (a, b));
+        assert_eq!(v1::Relation::from(r).from_id, a.to_string());
+
+        let bad = |kind: i32, to_id: String| v1::Relation {
+            from_id: a.to_string(),
+            to_id,
+            kind,
+        };
+        let blocks = v1::RelationKind::Blocks as i32;
+        assert_eq!(
+            core::Relation::try_from(&bad(0, b.to_string())),
+            Err(ConvertError::Unspecified("kind".into()))
+        );
+        assert_eq!(
+            core::Relation::try_from(&bad(4, b.to_string())),
+            Err(ConvertError::UnknownEnum("kind".into(), 4))
+        );
+        assert_eq!(
+            core::Relation::try_from(&bad(blocks, a.to_string())),
+            Err(ConvertError::Invalid(
+                "to_id".into(),
+                "must differ from from_id".into()
+            ))
+        );
+        assert_eq!(
+            core::Relation::try_from(&bad(blocks, "x".into())),
+            Err(ConvertError::InvalidId("to_id".into(), "x".into()))
+        );
+
+        // An Item's relations are read back too, errors naming the entry.
+        let mut item = v1::Item::from(&full_item());
+        item.relations[1].kind = 0;
+        assert_eq!(
+            core::Item::try_from(&item),
+            Err(ConvertError::Unspecified("relations[1].kind".into()))
+        );
+    }
+
+    #[test]
+    fn undo_skips_convert() {
+        use todo_core::ItemField as F;
+        use todo_core::SkipReason as R;
+        let fields = [
+            (vec![], v1::ItemField::Unspecified),
+            (vec![F::Title], v1::ItemField::Title),
+            (vec![F::WaitingFollowUpOn], v1::ItemField::WaitingFollowUpOn),
+            (vec![F::DeletedAt], v1::ItemField::DeletedAt),
+            (vec![F::TodoRefinement], v1::ItemField::Status),
+            (
+                vec![F::StatusCategory, F::ResolutionKind],
+                v1::ItemField::Status,
+            ),
+            (
+                vec![F::StatusCategory, F::ResolutionKind, F::TodoRefinement],
+                v1::ItemField::Status,
+            ),
+        ];
+        for (unit, want) in fields {
+            assert_eq!(undo_skip_field(&unit), want, "{unit:?}");
+        }
+
+        let item_id = new_ulid();
+        let relation =
+            core::Relation::new(item_id, new_ulid(), core::RelationKind::Duplicates).unwrap();
+        let rows = [
+            (
+                R::ChangedSince,
+                None,
+                v1::UndoSkipReason::ChangedSince,
+                "the field has changed since",
+            ),
+            (
+                R::ChangedSince,
+                Some(&relation),
+                v1::UndoSkipReason::ChangedSince,
+                "the relation has changed since",
+            ),
+            (
+                R::ItemDeleted,
+                None,
+                v1::UndoSkipReason::ItemDeleted,
+                "the Item is deleted",
+            ),
+            (
+                R::Invalid("the parent is deleted".into()),
+                None,
+                v1::UndoSkipReason::Invalid,
+                "the parent is deleted",
+            ),
+        ];
+        for (reason, relation, want, message) in rows {
+            let unit: &[F] = if relation.is_some() { &[] } else { &[F::Title] };
+            let skip = undo_skip_to_proto(item_id, unit, &reason, relation);
+            assert_eq!(
+                skip,
+                v1::UndoSkip {
+                    item_id: item_id.to_string(),
+                    field: if relation.is_some() {
+                        v1::ItemField::Unspecified
+                    } else {
+                        v1::ItemField::Title
+                    } as i32,
+                    reason: want as i32,
+                    message: message.into(),
+                    relation: relation.map(Into::into),
+                }
+            );
+        }
+    }
+
+    #[test]
     fn prost_reflect_renders_proto3_json() {
         let pool = DescriptorPool::decode(crate::FILE_DESCRIPTOR_SET).unwrap();
         let desc = pool.get_message_by_name("todo.v1.Item").unwrap();
@@ -1255,6 +1497,8 @@ mod tests {
         );
         assert_eq!(json["remoteExtras"]["customfield_10010"]["b"]["c"], 2.5);
         assert_eq!(json["waiting"]["on"]["freeText"], "Dana");
+        assert_eq!(json["relations"][0]["kind"], "RELATION_KIND_BLOCKS");
+        assert_eq!(json["relations"][0]["fromId"], proto.id);
 
         let back: DynamicMessage = DynamicMessage::deserialize(desc, json).unwrap();
         assert_eq!(

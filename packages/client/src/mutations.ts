@@ -1,21 +1,28 @@
 // Thin helpers over ItemService's mutating RPCs (design 4.3 rule 4): they fill
-// request_id with a fresh ULID and pass expected_revision through. The daemon
-// does all validation.
+// request_id with a fresh ULID and pass expected_revision (or, for Undo and
+// Redo, expected_op_id) through. The daemon does all validation.
 
 import type { MessageInitShape } from "@bufbuild/protobuf";
-import type { CallOptions, Client } from "@connectrpc/connect";
+import { type CallOptions, type Client, ConnectError } from "@connectrpc/connect";
+import { ErrorInfoSchema } from "./gen/google/rpc/error_details_pb.js";
 import type { ItemSchema, Status } from "./gen/todo/v1/item_pb.js";
 import type {
+  AddRelationResponse,
   ArchiveItemResponse,
   BatchMutateResponse,
   DeleteItemResponse,
+  GetUndoStateResponse,
   ItemService,
   MutationSchema,
+  RedoResponse,
+  RemoveRelationResponse,
   SetStatusResponse,
   UndeleteItemResponse,
   UnarchiveItemResponse,
+  UndoResponse,
   UpdateItemResponse,
 } from "./gen/todo/v1/item_service_pb.js";
+import type { RelationSchema } from "./gen/todo/v1/relation_pb.js";
 import { ulid } from "./ulid.js";
 
 export type ItemsClient = Client<typeof ItemService>;
@@ -91,4 +98,74 @@ export function batchMutate(
 ): Promise<BatchMutateResponse> {
   const [fields, call] = split(opts);
   return client.batchMutate({ ...fields, mutations: [...mutations] }, call);
+}
+
+export interface UndoOptions extends CallOptions {
+  /**
+   * The op_id of the entry meant (GetUndoState's `undo`, or `redo` for
+   * Redo); the daemon fails with ABORTED (ErrorInfo UNDO_STACK_CHANGED) if
+   * another entry, or none, is on top.
+   */
+  expectedOpId?: string;
+  /** Defaults to a new ULID. Reuse one to retry a call idempotently. */
+  requestId?: string;
+}
+
+function splitUndo({ expectedOpId, requestId, ...call }: UndoOptions) {
+  const fields = { requestId: requestId ?? ulid(), ...(expectedOpId !== undefined && { expectedOpId }) };
+  return [fields, call] as const;
+}
+
+/**
+ * Undo (design 3.10): reverts the top entry of the global undo stack. With an
+ * empty stack it succeeds with `entry` unset; fields that changed since the
+ * entry are left alone and listed in `skipped`.
+ */
+export function undo(client: ItemsClient, opts: UndoOptions = {}): Promise<UndoResponse> {
+  const [fields, call] = splitUndo(opts);
+  return client.undo(fields, call);
+}
+
+/** Redo: re-applies the most recently undone entry, as Undo reverts one. */
+export function redo(client: ItemsClient, opts: UndoOptions = {}): Promise<RedoResponse> {
+  const [fields, call] = splitUndo(opts);
+  return client.redo(fields, call);
+}
+
+/** The entries Undo and Redo would act on next, e.g. for "Undo: <description>". */
+export function getUndoState(client: ItemsClient, opts: CallOptions = {}): Promise<GetUndoStateResponse> {
+  return client.getUndoState({}, opts);
+}
+
+/**
+ * AddRelation (design 3.6). A RELATES_TO may name its ends in either order;
+ * the response's from_item / to_item are the ends as stored. Adding a
+ * relation that exists changes nothing.
+ */
+export function addRelation(
+  client: ItemsClient,
+  relation: MessageInitShape<typeof RelationSchema>,
+  opts: Omit<MutationOptions, "expectedRevision"> = {},
+): Promise<AddRelationResponse> {
+  const [fields, call] = split(opts);
+  return client.addRelation({ ...fields, relation }, call);
+}
+
+/** RemoveRelation; removing a relation that does not exist changes nothing. */
+export function removeRelation(
+  client: ItemsClient,
+  relation: MessageInitShape<typeof RelationSchema>,
+  opts: Omit<MutationOptions, "expectedRevision"> = {},
+): Promise<RemoveRelationResponse> {
+  const [fields, call] = split(opts);
+  return client.removeRelation({ ...fields, relation }, call);
+}
+
+/**
+ * The ErrorInfo reason of a ConnectError, e.g. "REVISION_MISMATCH" or
+ * "UNDO_STACK_CHANGED"; undefined for other errors and for errors without
+ * an ErrorInfo detail.
+ */
+export function errorReason(err: unknown): string | undefined {
+  return err instanceof ConnectError ? err.findDetails(ErrorInfoSchema)[0]?.reason : undefined;
 }

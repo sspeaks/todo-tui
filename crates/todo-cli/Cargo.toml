@@ -33,6 +33,7 @@ rusqlite.workspace = true
 rustix = { workspace = true, features = ["pty"] }
 serde_json.workspace = true
 tempfile.workspace = true
+todo-store.workspace = true
 
 [lints]
 workspace = true

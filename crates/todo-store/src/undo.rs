@@ -82,16 +82,20 @@ pub(crate) fn undo_tx(tx: &mut WriteTx<'_>, input: UndoInput, redo: bool) -> Res
     let mut restored: HashMap<ItemId, Restored> = HashMap::new();
     let mut relations_changed = false;
     let mut signals = Vec::new();
+    // Deletes and undeletes the parent rule holds back for now.
+    let mut held = Vec::new();
     for step in inverse(&events, input.now) {
         match step {
             InverseStep::Restore { item_id, unit } if is_staleness(&unit) => {
                 signals.push((item_id, unit));
             }
             InverseStep::Restore { item_id, unit } => {
-                let what = Restored::of(&unit);
-                match restore(&mut batch, conn, item_id, unit, &ctx, today)? {
-                    Ok(()) => *restored.entry(item_id).or_default() |= what,
-                    Err(skip) => skipped.push(skip),
+                match restore(&mut batch, conn, item_id, &unit, &ctx, today)? {
+                    Outcome::Restored => {
+                        *restored.entry(item_id).or_default() |= Restored::of(&unit)
+                    }
+                    Outcome::Skipped(skip) => skipped.push(skip),
+                    Outcome::Held(skip) => held.push((item_id, unit, skip)),
                 }
             }
             InverseStep::AddRelation(relation) | InverseStep::RemoveRelation(relation) => {
@@ -115,6 +119,23 @@ pub(crate) fn undo_tx(tx: &mut WriteTx<'_>, input: UndoInput, redo: bool) -> Res
             }
         }
     }
+    // A step can wait for a later one: a batch may undelete a subtask before
+    // its parent, so its undo comes to the parent's delete while the
+    // subtask is still live. Retried until a pass restores none of them.
+    loop {
+        let before = held.len();
+        for (item_id, unit, _) in std::mem::take(&mut held) {
+            match restore(&mut batch, conn, item_id, &unit, &ctx, today)? {
+                Outcome::Restored => *restored.entry(item_id).or_default() |= Restored::of(&unit),
+                Outcome::Skipped(skip) => skipped.push(skip),
+                Outcome::Held(skip) => held.push((item_id, unit, skip)),
+            }
+        }
+        if held.len() == before {
+            break;
+        }
+    }
+    skipped.extend(held.into_iter().map(|(_, _, skip)| skip));
     op.report = Some(report_to_sql(&skipped)?);
 
     if restored.is_empty() && !relations_changed {
@@ -175,6 +196,15 @@ pub(crate) fn undo_tx(tx: &mut WriteTx<'_>, input: UndoInput, redo: bool) -> Res
     })
 }
 
+/// What [`restore`] did with a unit.
+enum Outcome {
+    Restored,
+    Skipped(UndoSkipRow),
+    /// Not restored for now: a delete of an Item with live subtasks, or an
+    /// undelete under a deleted parent. A later step may change that.
+    Held(UndoSkipRow),
+}
+
 /// Applies one content unit to `item_id`'s working copy, or says why not.
 /// Besides the core checks, a restore must leave references the database
 /// can take, and keep every live Item's parent live (design 3.7).
@@ -182,39 +212,38 @@ fn restore(
     batch: &mut Batch,
     conn: &Connection,
     item_id: ItemId,
-    unit: RestoreUnit,
+    unit: &RestoreUnit,
     ctx: &ApplyCtx,
     today: Date,
-) -> Result<Result<(), UndoSkipRow>> {
-    let fields: Vec<ItemField> = unit.restores.iter().map(|r| r.field).collect();
-    let skip = |reason| {
-        Ok(Err(UndoSkipRow {
-            item_id,
-            fields: fields.clone(),
-            reason,
-            relation: None,
-        }))
+) -> Result<Outcome> {
+    let skip = |reason| UndoSkipRow {
+        item_id,
+        fields: unit.restores.iter().map(|r| r.field).collect(),
+        reason,
+        relation: None,
     };
+    let invalid = |reason: &str| skip(SkipReason::Invalid(reason.to_owned()));
     let slot = match batch.load(conn, item_id, today) {
         Ok(slot) => slot,
-        Err(StoreError::NotFound(_)) => {
-            return skip(SkipReason::Invalid("no such Item".to_owned()));
-        }
+        Err(StoreError::NotFound(_)) => return Ok(Outcome::Skipped(invalid("no such Item"))),
         Err(e) => return Err(e),
     };
-    let mut applied = apply(&batch.items[slot], &MutationOp::Restore(vec![unit]), ctx)
-        .map_err(|e| StoreError::Corrupt(format!("restoring {item_id}: {e}")))?;
+    let mut applied = apply(
+        &batch.items[slot],
+        &MutationOp::Restore(vec![unit.clone()]),
+        ctx,
+    )
+    .map_err(|e| StoreError::Corrupt(format!("restoring {item_id}: {e}")))?;
     if let Some(core_skip) = applied.skipped.pop() {
-        return skip(core_skip.reason);
+        return Ok(Outcome::Skipped(skip(core_skip.reason)));
     }
-    let invalid = |reason: &str| skip(SkipReason::Invalid(reason.to_owned()));
     if let Some(error) = batch.change_error(conn, item_id, &applied.changes)? {
-        return invalid(&match error {
+        return Ok(Outcome::Skipped(invalid(&match error {
             MutationError::Invalid { reason, .. } | MutationError::Unsupported { reason, .. } => {
                 reason
             }
             other => other.to_string(),
-        });
+        })));
     }
     for change in &applied.changes {
         if change.field != ItemField::DeletedAt {
@@ -224,18 +253,18 @@ fn restore(
             if let Some(parent) = applied.item.core.parent_id
                 && batch.is_deleted(conn, parent)?
             {
-                return invalid("the parent is deleted");
+                return Ok(Outcome::Held(invalid("the parent is deleted")));
             }
         } else if batch
             .children(conn, item_id)?
             .iter()
             .any(|&(_, deleted)| !deleted)
         {
-            return invalid("the Item has live subtasks");
+            return Ok(Outcome::Held(invalid("the Item has live subtasks")));
         }
     }
     batch.record(slot, applied);
-    Ok(Ok(()))
+    Ok(Outcome::Restored)
 }
 
 /// Which content an undo restored on one Item, for its staleness signals.

@@ -25,5 +25,6 @@ pub use todo::v1;
 pub const FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/todo_descriptor.bin"));
 
-/// The `api_minor` this build serves (design 4.2).
-pub const API_MINOR: u32 = 2;
+/// The `api_minor` this build serves (design 4.2). 2 added the M2 RPCs as
+/// stubs; 3 is the first that implements them.
+pub const API_MINOR: u32 = 3;
