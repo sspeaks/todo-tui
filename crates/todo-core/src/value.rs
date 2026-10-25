@@ -192,6 +192,18 @@ fn opt<T>(value: Option<T>, variant: fn(T) -> FieldValue) -> FieldValue {
     value.map_or(FieldValue::Cleared, variant)
 }
 
+/// Whether `t` fits the store's instants: i64 nanoseconds since the epoch,
+/// 1677-09-21T00:12:43.145224192Z to 2262-04-11T23:47:16.854775807Z.
+pub fn timestamp_in_range(t: Timestamp) -> bool {
+    i64::try_from(t.as_nanosecond()).is_ok()
+}
+
+/// Whether `d` fits the store's durations: i64 nanoseconds, about 292
+/// years either way.
+pub fn duration_in_range(d: SignedDuration) -> bool {
+    i64::try_from(d.as_nanos()).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;

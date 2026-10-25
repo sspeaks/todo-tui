@@ -10,7 +10,30 @@ import "todo/v1/field_value.proto";
 // An Item matches if every all_of clause matches and (any_of is empty or at
 // least one any_of clause matches), and it passes the implicit rules unless
 // the matching include_* flag is true: exclude archived, exclude done and
-// cancelled, exclude defer_until in the future, exclude deleted.
+// cancelled, exclude defer_until in the future, exclude deleted. Clauses
+// never lift an implicit rule, only the flags do: status IN (DONE) without
+// include_done matches nothing.
+//
+// Each request resolves one civil "today" in the daemon's zone (from its
+// reference_time, else the daemon's clock), for relative dates, is_overdue
+// and the defer rule.
+//
+// Limits: groups nest at most 4 deep (a group in the Filter is 1 deep), a
+// filter holds at most 128 predicates and 4000 operands, a predicate at most
+// 1000 operands, and MATCHES text at most 1024 bytes of UTF-8.
+//
+// A target × operator × operand combination that is not valid fails with
+// INVALID_ARGUMENT and a BadRequest naming the first offending path in
+// document order: all_of before any_of, each clause depth-first (a group
+// nested too deep is named by its own path), and in a predicate its target,
+// op, operand count ("operands"), then each operand in turn ("operands[1]"):
+// first its form (an unknown anchor is "operands[1].relative_date.anchor"),
+// then its fit to the target. For example
+// "filter.all_of[1].group.any_of[0].predicate.op". A filter over the totals
+// is named "filter", after every clause. Only when nothing is invalid, a
+// valid combination that is not built yet fails with UNIMPLEMENTED (ErrorInfo
+// NOT_IMPLEMENTED, metadata "field" the path): relative dates on instant
+// targets, remote_extras, and pending_fields with CONTAINS_ANY / ALL.
 message Filter {
   repeated Clause all_of = 1;
   repeated Clause any_of = 2;
@@ -20,6 +43,7 @@ message Filter {
   bool include_deleted = 6;
 }
 
+// Exactly one of predicate or group; a clause with neither is invalid.
 message Clause {
   oneof kind {
     Predicate predicate = 1;
@@ -27,18 +51,44 @@ message Clause {
   }
 }
 
-// A nested group with the same all_of / any_of semantics as Filter.
+// A nested group with the same all_of / any_of semantics as Filter. An empty
+// group matches every Item.
 message ClauseGroup {
   repeated Clause all_of = 1;
   repeated Clause any_of = 2;
 }
 
-// A typed predicate on one target: a stored, nested or derived ItemField.
+// A typed predicate on one target: a stored, nested or derived ItemField
+// (not ITEM_FIELD_UNSPECIFIED).
+//
+// Unset values: a target is unset when its optional value or message is
+// absent, or when any enclosing message is absent (waiting.reason on an Item
+// that is not waiting). IN, EQ, LT, LE, GT and GE never match an unset value;
+// NE is exactly NOT EQ, so it does match one. IS_SET and IS_UNSET are valid
+// only on targets that can be unset; on any other use EQ.
+//
+// Sets (labels, components, fix_versions, scopes) and pending_fields are
+// never unset: IS_SET means non-empty and IS_UNSET empty. CONTAINS_ANY and
+// CONTAINS_ALL use exact, case-sensitive membership and are false on an
+// empty set. Sets take no other operator, except MATCHES on labels.
+//
+// Priority (priority, effective_priority, local_priority_override) orders by
+// rank, LOWEST lowest and HIGHEST highest. PRIORITY_NONE is outside the
+// order: it never matches LT, LE, GT or GE and is invalid as their operand,
+// while EQ, IN and NE treat it as a value.
+//
+// Strings compare by exact code point. The ordering operators are invalid
+// on strings, except on focus_week, whose "YYYY-Www" form orders by week.
 message Predicate {
   ItemField target = 1;
   Operator op = 2;
-  // IN takes one or more operands; IS_SET / IS_UNSET take none; MATCHES takes
-  // one text operand; the comparison operators take exactly one.
+  // IN, CONTAINS_ANY and CONTAINS_ALL take one or more operands; IS_SET /
+  // IS_UNSET take none; MATCHES takes one text operand; EQ, NE and the
+  // comparison operators take exactly one. A value operand has the target's
+  // own FieldValue case (one string_value per member for a set), never
+  // cleared; instants and durations must fit in 64-bit nanoseconds
+  // (1677-09-21 to 2262-04-11, about 292 years), numbers must be finite and
+  // a uint_value at most 2^63 - 1.
   repeated Operand operands = 3;
 }
 
@@ -57,13 +107,20 @@ enum Operator {
   OPERATOR_CONTAINS_ANY = 10;
   // Set-valued targets: every operand is a member.
   OPERATOR_CONTAINS_ALL = 11;
-  // Full-text search (FTS5).
+  // Full-text search (FTS5) in the target's text: TITLE, DESCRIPTION, LABELS
+  // or REMOTE_LINK_KEY (any other target is invalid, on "target"). The text
+  // is plain words, never FTS syntax: it is split into terms on code points
+  // up to U+0020, and every term must match, its words in order within one
+  // field, the last as a prefix, ignoring case and accents. Blank text is
+  // invalid.
   OPERATOR_MATCHES = 12;
 }
 
 message Operand {
   oneof kind {
     FieldValue value = 1;
+    // On date targets (TODAY, START_OF_WEEK, END_OF_WEEK) and focus_week
+    // (CURRENT_WEEK).
     RelativeDate relative_date = 2;
     // Query text for OPERATOR_MATCHES.
     string text = 3;
@@ -73,8 +130,8 @@ message Operand {
 // A date resolved by the daemon in the user's local zone at query time.
 message RelativeDate {
   Anchor anchor = 1;
-  // Days added to the anchor date (e.g. +3 for "+3d"). Ignored for
-  // ANCHOR_CURRENT_WEEK.
+  // Days added to the anchor date (e.g. +3 for "+3d"). Must be 0 for
+  // ANCHOR_CURRENT_WEEK. A date outside 0001-01-01 to 9999-12-31 is invalid.
   int32 offset_days = 2;
 
   enum Anchor {
@@ -82,15 +139,25 @@ message RelativeDate {
     ANCHOR_TODAY = 1;
     // First day of the current ISO week (Monday).
     ANCHOR_START_OF_WEEK = 2;
-    // Last day of the current ISO week (Sunday); "this_week".
+    // Last day of the current ISO week (Sunday); "this_week". Capture's
+    // "eow" is Friday instead.
     ANCHOR_END_OF_WEEK = 3;
-    // The current ISO week as "YYYY-Www", for focus_week.
+    // The current ISO week as "YYYY-Www", for focus_week. The year is the
+    // ISO week-year: 2027-01-01 is in 2026-W53.
     ANCHOR_CURRENT_WEEK = 4;
   }
 }
 
-// Sort key; keys are any clause target. PRIORITY_NONE sorts after LOWEST and
-// unset values sort last in both directions.
+// Sort key; keys apply in order, each in its own direction, and unset values
+// sort last in both directions. Priority-typed keys sort by rank with
+// PRIORITY_NONE last in both directions, enums by enum number, false before
+// true, strings by code point. Markdown, set, person, message-presence,
+// pending_fields and remote_extras targets cannot be sort keys, nor can
+// references to other records (parent_id, merged_into,
+// recurrence.series_id). A sort holds at most 8 keys, none twice: errors
+// name "sort[2].key", and "sort" for too many keys, after every key. The
+// tie-break created_at, id (both ascending) follows, minus a key already
+// given; an empty sort is that tie-break.
 message SortKey {
   ItemField key = 1;
   bool descending = 2;

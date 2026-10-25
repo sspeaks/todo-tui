@@ -8,6 +8,7 @@ import { ArchiveReason, CreatedVia, Priority, ResolutionKind, Status, StatusCate
 import { ItemService } from "../src/gen/todo/v1/item_service_pb.js";
 import { OpKind, UndoSkipReason, UndoSkipSchema } from "../src/gen/todo/v1/op_pb.js";
 import { RelationKind } from "../src/gen/todo/v1/relation_pb.js";
+import { ViewService } from "../src/gen/todo/v1/view_service_pb.js";
 import { FakeDaemon } from "../src/fake-daemon.js";
 import { MAX_CAPTURE_BYTES } from "../src/limits.js";
 import {
@@ -232,6 +233,14 @@ describe("FakeDaemon mutations", () => {
     expect(again.result).toEqual(first.result);
     expect(again.item?.id).toBe(first.item?.id);
     expect([...daemon.items.values()].filter((i) => i.title === "once")).toHaveLength(1);
+  });
+
+  it("answers the RPCs it does not model with UNIMPLEMENTED", async () => {
+    const { daemon, client } = setup();
+    const views = createClient(ViewService, daemon.transport);
+    for (const call of [client.parseDate({ text: "fri" }), client.getStatusCounts({}), views.listViews({})]) {
+      expect((await failure(call))?.code).toBe(Code.Unimplemented);
+    }
   });
 
   it("fails an unknown id with NOT_FOUND", async () => {

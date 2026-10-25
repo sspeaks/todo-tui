@@ -49,8 +49,14 @@ service ItemService {
   rpc CaptureItem(CaptureItemRequest) returns (CaptureItemResponse);
   // Parses capture text without creating anything (the TUI's live preview).
   rpc ParseCapture(ParseCaptureRequest) returns (ParseCaptureResponse);
+  // Resolves a date expression with the capture date grammar (design 2.3),
+  // for the date and follow-up prompts.
+  rpc ParseDate(ParseDateRequest) returns (ParseDateResponse);
   rpc GetItem(GetItemRequest) returns (GetItemResponse);
   rpc ListItems(ListItemsRequest) returns (ListItemsResponse);
+  // Counts for `todo status` and the tab bar (design 2.1, 2.2), all read in
+  // one transaction.
+  rpc GetStatusCounts(GetStatusCountsRequest) returns (GetStatusCountsResponse);
   rpc UpdateItem(UpdateItemRequest) returns (UpdateItemResponse);
   rpc SetStatus(SetStatusRequest) returns (SetStatusResponse);
   rpc ArchiveItem(ArchiveItemRequest) returns (ArchiveItemResponse);
@@ -137,6 +143,20 @@ message ParseCaptureResponse {
   CaptureDraft draft = 1;
 }
 
+message ParseDateRequest {
+  // A date expression (design 2.3), e.g. "fri", "+3d", "eow", "nov2" or
+  // "2026-11-02", with an optional leading "^".
+  string text = 1;
+  // "Now" for relative dates; defaults to the daemon's clock.
+  google.protobuf.Timestamp reference_time = 2;
+}
+
+message ParseDateResponse {
+  // Unset when text does not parse; warning then says why.
+  google.type.Date date = 1;
+  string warning = 2;
+}
+
 // The result of parsing capture text (design 2.3). A token that fails to
 // parse stays in the title and adds a warning. When no title words remain,
 // the whole text is kept as the title and no token is applied.
@@ -198,12 +218,17 @@ message GetItemResponse {
 }
 
 message ListItemsRequest {
+  // Errors name their path from "filter" (filter.proto).
   Filter filter = 1;
+  // Errors name their path from "sort", e.g. "sort[2].key".
   repeated SortKey sort = 2;
   // 0 means the server default.
   int32 page_size = 3;
-  // From a previous response to the same filter and sort (INVALID_ARGUMENT
-  // otherwise). Each page reads live data: a write between pages may show up
+  // From a previous response to the same request: a token is bound to the
+  // effective filter and sort (after view_id is applied), not to page_size,
+  // and fails with INVALID_ARGUMENT on "page_token" for any other. It keeps
+  // the first page's today, so a paged list does not change its mind at
+  // midnight. Each page reads live data: a write between pages may show up
   // on a later page, and an item created behind the cursor is not returned.
   // Clients that need a consistent view subscribe from the first page's
   // revision and apply the changes.
@@ -211,8 +236,12 @@ message ListItemsRequest {
   // When set, the request narrows this saved view: the effective filter is the
   // view's filter AND the request's filter (its all_of / any_of as one extra
   // all_of group), with each include_* flag true if true in either. A
-  // non-empty request sort replaces the view's sort.
+  // non-empty request sort replaces the view's sort. A view_id that names no
+  // view fails with NOT_FOUND (ErrorInfo VIEW_NOT_FOUND, with view_id).
   optional string view_id = 5;
+  // "Now", for today (filter.proto); defaults to the daemon's clock. Ignored
+  // with a page_token, which keeps the first page's today.
+  google.protobuf.Timestamp reference_time = 6;
 }
 
 message ListItemsResponse {
@@ -220,6 +249,45 @@ message ListItemsResponse {
   string next_page_token = 2;
   // The revision this page was read at (later pages may report a higher one).
   uint64 revision = 3;
+}
+
+message GetStatusCountsRequest {
+  // Also count the views whose show_count is set (the tab bar). `todo
+  // status` leaves it false.
+  bool include_views = 1;
+  // "Now", for today (filter.proto); defaults to the daemon's clock.
+  google.protobuf.Timestamp reference_time = 2;
+}
+
+message GetStatusCountsResponse {
+  StatusCounts counts = 1;
+  // Only with include_views: the views whose show_count is set, in tab
+  // order.
+  repeated ViewCount views = 2;
+  // The revision this was read at.
+  uint64 revision = 3;
+  // The today every count used, in the daemon's zone. Clients refresh their
+  // views and counts once their own date passes it.
+  google.type.Date today = 4;
+}
+
+// Each count applies the implicit rules (filter.proto): deleted, archived,
+// done, cancelled and deferred Items are not counted.
+message StatusCounts {
+  // status = inbox.
+  uint32 inbox = 1;
+  // due_date <= today: due today or overdue.
+  uint32 due = 2;
+  // The part of due with due_date < today (is_overdue).
+  uint32 overdue = 3;
+  // Allocated (P2): uint32 pending_suggestions = 4;
+}
+
+message ViewCount {
+  string view_id = 1;
+  // The number of Items ListItems with this view_id, and nothing to narrow
+  // it, returns.
+  uint32 count = 2;
 }
 
 // Partial update (design 4.3 rule 2). Only the paths in update_mask are

@@ -225,7 +225,8 @@ const RELATION_WORDS: Record<number, string> = {
  * as "waiting.reason" changes, records and restores the whole `waiting`.
  * Staleness signals are not maintained or restored (`updated_at` is set on
  * every op that touches an Item); request ids never expire; ListItems sorts
- * by id. ParseCapture is not implemented.
+ * by id. ParseCapture, ParseDate, GetStatusCounts and ViewService are not
+ * implemented (UNIMPLEMENTED).
  */
 export class FakeDaemon {
   revision = 0n;
@@ -240,7 +241,7 @@ export class FakeDaemon {
   pageSize = 1000;
   /** Runs before every ListItems; throw from it to fail that call. */
   onListItems: ((req: ListItemsRequest) => void) | undefined;
-  apiMinor = 3;
+  apiMinor = 4;
   readonly calls = { listItems: 0, subscribe: [] as (bigint | undefined)[] };
   readonly transport: Transport;
   private readonly watchers = new Set<Waiter>();

@@ -71,6 +71,7 @@ enum ItemField {
   ITEM_FIELD_DELETED_AT = 80;
   ITEM_FIELD_MERGED_INTO = 81;
   ITEM_FIELD_IS_OVERDUE = 82;
+  // Allocated (P4): ITEM_FIELD_IS_BLOCKED = 83;
 
   // Nested: waiting.*
   ITEM_FIELD_WAITING_ON = 41001;

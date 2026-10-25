@@ -19,7 +19,7 @@ use crate::field::ItemField;
 use crate::ids::{ItemId, Revision};
 use crate::item::{ArchiveReason, Archived, Item, PersonRef, Priority, Waiting};
 use crate::status::Status;
-use crate::value::FieldValue;
+use crate::value::{FieldValue, duration_in_range, timestamp_in_range};
 
 /// The stored fields behind the derived status, in `SetStatus` event order.
 pub(crate) const STATUS_TRIPLE: [ItemField; 3] = [
@@ -365,7 +365,13 @@ fn restore_field(
         field,
         got: value.kind(),
     };
+    // The store keeps i64 nanoseconds.
+    let out_of_range = || MutationError::Invalid {
+        field,
+        reason: "must be between 1677-09-21T00:12:44Z and 2262-04-11T23:47:16Z".to_owned(),
+    };
     let timestamp = || match value {
+        V::Timestamp(at) if !timestamp_in_range(*at) => Err(out_of_range()),
         V::Timestamp(at) => Ok(Some(*at)),
         V::Cleared => Ok(None),
         _ => Err(wrong_type()),
@@ -377,6 +383,9 @@ fn restore_field(
         (F::ResolutionKind, V::Cleared) => item.core.resolution_kind = None,
         (F::TodoRefinement, V::TodoRefinement(refinement)) => {
             item.overlay.todo_refinement = *refinement;
+        }
+        (F::Archived, V::Archived(archived)) if !timestamp_in_range(archived.at) => {
+            return Err(out_of_range());
         }
         (F::Archived, V::Archived(archived)) => item.overlay.archived = Some(*archived),
         (F::Archived, V::Cleared) => item.overlay.archived = None,
@@ -502,10 +511,10 @@ fn set_field(item: &mut Item, field: ItemField, value: &FieldValue) -> Result<()
             };
             if labels
                 .iter()
-                .any(|l| l.is_empty() || l.contains(char::is_whitespace))
+                .any(|l| l.is_empty() || l.contains(|c: char| c.is_whitespace() || c.is_control()))
             {
                 return Err(invalid(
-                    "labels must be non-empty and contain no whitespace",
+                    "labels must be non-empty and contain no whitespace or control characters",
                 ));
             }
             item.core.labels = dedup(labels.iter().cloned());
@@ -561,6 +570,10 @@ fn set_field(item: &mut Item, field: ItemField, value: &FieldValue) -> Result<()
         F::OriginalEstimate | F::RemainingEstimate => {
             let estimate = match value {
                 V::Duration(d) if d.is_negative() => return Err(invalid("must not be negative")),
+                // The store keeps i64 nanoseconds.
+                V::Duration(d) if !duration_in_range(*d) => {
+                    return Err(invalid("must be shorter than about 292 years"));
+                }
                 V::Duration(d) => Some(*d),
                 V::Cleared => None,
                 _ => return Err(wrong_type()),
@@ -681,7 +694,7 @@ fn dedup(values: impl IntoIterator<Item = String>) -> Vec<String> {
 }
 
 /// `YYYY-Www` naming a week that exists in that ISO year.
-fn is_iso_week(s: &str) -> bool {
+pub(crate) fn is_iso_week(s: &str) -> bool {
     let Some((year, week)) = s.split_once("-W") else {
         return false;
     };
@@ -1080,9 +1093,19 @@ mod tests {
         assert_eq!(reordered.changes.len(), 1);
         let cleared = set(&applied.item, F::Labels, labels(&[])).unwrap();
         assert!(cleared.item.core.labels.is_empty());
-        for bad in [&[""][..], &["a b"], &["ok", " x"], &["tab\t"]] {
+        for bad in [
+            &[""][..],
+            &["a b"],
+            &["ok", " x"],
+            &["tab\t"],
+            &["bell\u{7}"],
+            &["ok", "\u{1b}[31m"],
+            &["del\u{7f}"],
+            &["c1\u{85}"],
+        ] {
             invalid(F::Labels, labels(bad));
         }
+        assert!(set(&item(), F::Labels, labels(&["tiếng", "c++", "#a"])).is_ok());
     }
 
     #[test]
@@ -1171,6 +1194,12 @@ mod tests {
             assert!(set(&item(), field, V::Duration(SignedDuration::ZERO)).is_ok());
             assert!(set(&applied.item, field, V::Cleared).is_ok());
             invalid(field, V::Duration(SignedDuration::from_secs(-1)));
+            // The store keeps i64 nanoseconds, about 292 years.
+            let longest = SignedDuration::from_nanos(i64::MAX);
+            assert!(set(&item(), field, V::Duration(longest)).is_ok());
+            let next = longest + SignedDuration::from_nanos(1);
+            invalid(field, V::Duration(next));
+            invalid(field, V::Duration(SignedDuration::from_hours(300 * 8766)));
         }
     }
 
@@ -1798,6 +1827,23 @@ mod tests {
                 item(),
                 restore(F::DeletedAt, V::Cleared, V::Date(date(2026, 1, 1))),
                 invalid("DeletedAt does not take a date value"),
+            ),
+            (
+                item(),
+                restore(F::DeletedAt, V::Cleared, V::Timestamp(Timestamp::MAX)),
+                invalid("DeletedAt: must be between 1677-09-21T00:12:44Z and 2262-04-11T23:47:16Z"),
+            ),
+            (
+                item(),
+                restore(
+                    F::Archived,
+                    V::Cleared,
+                    V::Archived(Archived {
+                        at: Timestamp::MIN,
+                        reason: ArchiveReason::User,
+                    }),
+                ),
+                invalid("Archived: must be between 1677-09-21T00:12:44Z and 2262-04-11T23:47:16Z"),
             ),
             (
                 item(),

@@ -265,7 +265,7 @@ fn classify(word: &str, quoted: bool, today: Date) -> Piece {
                 .map(Effect::DueDate)
                 .map_err(|e| e.reason),
         ),
-        '#' => Piece::Token(CaptureTokenKind::Label, Ok(Effect::Label(rest.to_owned()))),
+        '#' => Piece::Token(CaptureTokenKind::Label, label(rest)),
         '~' => Piece::Token(CaptureTokenKind::Waiting, waiting(rest, quoted)),
         _ => Piece::Token(CaptureTokenKind::Status, status(rest)),
     }
@@ -281,6 +281,14 @@ fn priority(digits: &str) -> Result<Effect, String> {
         _ => return Err("priority must be +1 to +5".to_owned()),
     };
     Ok(Effect::Priority(priority))
+}
+
+/// `rest` follows the `#`; it has no whitespace.
+fn label(rest: &str) -> Result<Effect, String> {
+    if rest.contains(char::is_control) {
+        return Err("labels must not contain control characters".to_owned());
+    }
+    Ok(Effect::Label(rest.to_owned()))
 }
 
 /// `rest` follows the `~`; a quoted word still has both quotes.
@@ -401,6 +409,14 @@ mod tests {
         assert_eq!(draft.labels, ["Auth"]);
         assert_eq!(draft.tokens, [token(2, 7, CaptureTokenKind::Label)]);
         assert_eq!(parse("x ##a#b").labels, ["#a#b"]);
+        // A label with a control character stays in the title.
+        let draft = parse("x #a\u{7}b #c");
+        assert_eq!(draft.labels, ["c"]);
+        assert_eq!(draft.title, "x #a\u{7}b");
+        assert_eq!(
+            draft.warnings,
+            ["#a\u{7}b: labels must not contain control characters"]
+        );
 
         let draft = parse("x ~dana");
         assert_eq!(draft.waiting, free_text("dana"));

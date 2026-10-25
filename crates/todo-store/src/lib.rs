@@ -1337,8 +1337,8 @@ impl Batch {
 
     /// The first change to `id` the database cannot take: a parent that is
     /// missing, deleted (unless `deleted_parent_ok`: undo and redo check the
-    /// parent rule once they are done) or a descendant, a person, or a
-    /// duration too long for its nanosecond column.
+    /// parent rule once they are done) or a descendant, or a person. Core
+    /// refuses values too large for their nanosecond columns.
     fn change_error(
         &self,
         conn: &Connection,
@@ -1357,12 +1357,6 @@ impl Batch {
                 FieldValue::Person(PersonRef::Person(_)) => Some(people_unsupported(change.field)),
                 FieldValue::Waiting(w) if matches!(w.on, PersonRef::Person(_)) => {
                     Some(people_unsupported(ItemField::WaitingOn))
-                }
-                FieldValue::Duration(d) if codec::dur_to_sql(Some(*d)).is_err() => {
-                    Some(MutationError::Invalid {
-                        field: change.field,
-                        reason: "too long to store".to_owned(),
-                    })
                 }
                 _ => None,
             };

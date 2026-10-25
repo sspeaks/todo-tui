@@ -26,5 +26,6 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/todo_descriptor.bin"));
 
 /// The `api_minor` this build serves (design 4.2). 2 added the M2 RPCs as
-/// stubs; 3 is the first that implements them.
-pub const API_MINOR: u32 = 3;
+/// stubs; 3 is the first that implements them. 4 added the M3 RPCs as
+/// stubs.
+pub const API_MINOR: u32 = 4;

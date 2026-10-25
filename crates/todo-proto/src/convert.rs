@@ -4,7 +4,9 @@
 //! be valid ULIDs, enums must be known and not `*_UNSPECIFIED`, and dates and
 //! instants must be in range. Derived values that core computes (`status`,
 //! `effective_priority`) are emitted on the way out and ignored on the way in;
-//! unknown values in the derived `pending_fields` are dropped.
+//! unknown values in the derived `pending_fields` are dropped. Filters and
+//! sorts are also checked as they are read, so that the first error in
+//! document order is reported (filter.proto).
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -13,6 +15,7 @@ use std::fmt;
 use jiff::civil::{Date, ISOWeekDate, Weekday};
 use jiff::{SignedDuration, Timestamp};
 use todo_core as core;
+use todo_core::filter::{Checker, check_sort_keys, child_path, validate_sort};
 use ulid::Ulid;
 
 use crate::google::r#type as gtype;
@@ -33,6 +36,9 @@ pub enum ConvertError {
     UnknownEnum(Cow<'static, str>, i32),
     #[error("{0}: {1}")]
     Invalid(Cow<'static, str>, String),
+    /// Valid, but not built yet: only a filter has these (filter.proto).
+    #[error("{0}: {1}")]
+    Unimplemented(Cow<'static, str>, String),
 }
 
 impl ConvertError {
@@ -43,23 +49,43 @@ impl ConvertError {
             | ConvertError::InvalidId(path, _)
             | ConvertError::Unspecified(path)
             | ConvertError::UnknownEnum(path, _)
-            | ConvertError::Invalid(path, _) => path,
+            | ConvertError::Invalid(path, _)
+            | ConvertError::Unimplemented(path, _) => path,
         }
     }
 
     /// Prefixes the path with the field holding the converted message:
     /// `title` within `item` is `item.title`, and that within `mutations[3]`
-    /// is `mutations[3].item.title`.
+    /// is `mutations[3].item.title`. An empty path, the converted message
+    /// itself, becomes the prefix.
     pub fn within(mut self, prefix: impl fmt::Display) -> Self {
         let path = match &mut self {
             ConvertError::Missing(path)
             | ConvertError::InvalidId(path, _)
             | ConvertError::Unspecified(path)
             | ConvertError::UnknownEnum(path, _)
-            | ConvertError::Invalid(path, _) => path,
+            | ConvertError::Invalid(path, _)
+            | ConvertError::Unimplemented(path, _) => path,
         };
-        *path = format!("{prefix}.{path}").into();
+        *path = if path.is_empty() {
+            prefix.to_string().into()
+        } else {
+            format!("{prefix}.{path}").into()
+        };
         self
+    }
+}
+
+/// An INVALID filter error is `Invalid`, an UNIMPLEMENTED one
+/// `Unimplemented`, at the same path.
+impl From<core::FilterError> for ConvertError {
+    fn from(e: core::FilterError) -> Self {
+        match e.kind {
+            core::FilterErrorKind::Invalid => ConvertError::Invalid(e.path.into(), e.reason),
+            core::FilterErrorKind::Unimplemented => {
+                ConvertError::Unimplemented(e.path.into(), e.reason)
+            }
+        }
     }
 }
 
@@ -840,6 +866,252 @@ fn field_value(v: &v1::FieldValue) -> Result<core::FieldValue> {
         K::RemoteLink(l) => V::RemoteLink(l.try_into()?),
         K::Staleness(s) => V::Staleness(s.try_into()?),
     })
+}
+
+// ---- filters, sorts and views -------------------------------------------
+
+enum_map!(core::filter::Operator, v1::Operator, "op", {
+    In => In, Eq => Eq, Ne => Ne, Lt => Lt, Le => Le, Gt => Gt, Ge => Ge, IsSet => IsSet,
+    IsUnset => IsUnset, ContainsAny => ContainsAny, ContainsAll => ContainsAll, Matches => Matches,
+});
+enum_map!(core::filter::Anchor, v1::relative_date::Anchor, "anchor", {
+    Today => Today, StartOfWeek => StartOfWeek, EndOfWeek => EndOfWeek, CurrentWeek => CurrentWeek,
+});
+
+impl From<&core::Filter> for v1::Filter {
+    fn from(f: &core::Filter) -> Self {
+        Self {
+            all_of: f.all_of.iter().map(Into::into).collect(),
+            any_of: f.any_of.iter().map(Into::into).collect(),
+            include_archived: f.include_archived,
+            include_done: f.include_done,
+            include_deferred: f.include_deferred,
+            include_deleted: f.include_deleted,
+        }
+    }
+}
+
+impl From<&core::filter::Clause> for v1::Clause {
+    fn from(c: &core::filter::Clause) -> Self {
+        use core::filter::Clause;
+        use v1::clause::Kind;
+        let kind = match c {
+            Clause::Predicate(p) => Kind::Predicate(v1::Predicate {
+                target: p.target.to_i32(),
+                op: p.op.to_i32(),
+                operands: p.operands.iter().map(Into::into).collect(),
+            }),
+            Clause::Group(g) => Kind::Group(v1::ClauseGroup {
+                all_of: g.all_of.iter().map(Into::into).collect(),
+                any_of: g.any_of.iter().map(Into::into).collect(),
+            }),
+        };
+        Self { kind: Some(kind) }
+    }
+}
+
+impl From<&core::filter::Operand> for v1::Operand {
+    fn from(o: &core::filter::Operand) -> Self {
+        use core::filter::Operand;
+        use v1::operand::Kind;
+        let kind = match o {
+            Operand::Value(v) => Kind::Value(v.into()),
+            Operand::RelativeDate(d) => Kind::RelativeDate(v1::RelativeDate {
+                anchor: d.anchor.to_i32(),
+                offset_days: d.offset_days,
+            }),
+            Operand::Text(t) => Kind::Text(t.clone()),
+        };
+        Self { kind: Some(kind) }
+    }
+}
+
+impl From<core::SortKey> for v1::SortKey {
+    fn from(k: core::SortKey) -> Self {
+        Self {
+            key: k.key.to_i32(),
+            descending: k.descending,
+        }
+    }
+}
+
+/// The filter at `filter` of a request or view, checked as it is read: the
+/// error is the first in document order (filter.proto), as
+/// [`core::Filter::validate`] reports them, with what cannot be read (an
+/// unset clause, an unknown target or op, an operand that is no valid
+/// value) in its place. Paths start with `filter` (`filter.all_of[1].
+/// predicate.op`, and `filter` for a limit on the whole filter). With
+/// `today`, relative dates are resolved too, so a date out of range is also
+/// reported in its place.
+pub fn filter_from_proto(f: &v1::Filter, today: Option<Date>) -> Result<core::Filter> {
+    let read = || {
+        let mut check = Checker::new(today);
+        let (all_of, any_of) = clauses_from_proto(&mut check, "", &f.all_of, &f.any_of, 0)?;
+        check.finish()?;
+        Ok(core::Filter {
+            all_of,
+            any_of,
+            include_archived: f.include_archived,
+            include_done: f.include_done,
+            include_deferred: f.include_deferred,
+            include_deleted: f.include_deleted,
+        })
+    };
+    read().map_err(|e: ConvertError| e.within("filter"))
+}
+
+type Clauses = (Vec<core::filter::Clause>, Vec<core::filter::Clause>);
+
+/// The clauses of the filter or group at `path`, `depth` groups deep.
+fn clauses_from_proto(
+    check: &mut Checker,
+    path: &str,
+    all_of: &[v1::Clause],
+    any_of: &[v1::Clause],
+    depth: usize,
+) -> Result<Clauses> {
+    let mut read = |list: &str, clauses: &[v1::Clause]| {
+        clauses
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let path = child_path(path, format_args!("{list}[{i}]"));
+                clause_from_proto(check, &path, c, depth)
+            })
+            .collect::<Result<Vec<_>>>()
+    };
+    let all_of = read("all_of", all_of)?;
+    let any_of = read("any_of", any_of)?;
+    Ok((all_of, any_of))
+}
+
+fn clause_from_proto(
+    check: &mut Checker,
+    path: &str,
+    c: &v1::Clause,
+    depth: usize,
+) -> Result<core::filter::Clause> {
+    use core::filter::{Clause, Group, Predicate};
+    use v1::clause::Kind;
+    match &c.kind {
+        None => Err(ConvertError::Invalid(
+            path.to_owned().into(),
+            "must be a predicate or a group".into(),
+        )),
+        Some(Kind::Predicate(p)) => {
+            let path = format!("{path}.predicate");
+            let at = |e: ConvertError| e.within(&path);
+            let target = core::ItemField::from_i32("target", p.target).map_err(at)?;
+            let op = core::filter::Operator::from_i32("op", p.op).map_err(at)?;
+            check.predicate(&path, target, op, p.operands.len())?;
+            let operands = p
+                .operands
+                .iter()
+                .enumerate()
+                .map(|(k, o)| {
+                    let path = format!("{path}.operands[{k}]");
+                    let operand = operand_from_proto(&path, o)?;
+                    check.operand(&path, target, op, &operand)?;
+                    Ok(operand)
+                })
+                .collect::<Result<_>>()?;
+            Ok(Clause::Predicate(Predicate::new(target, op, operands)))
+        }
+        Some(Kind::Group(g)) => {
+            let path = format!("{path}.group");
+            check.group(&path, depth + 1)?;
+            let (all_of, any_of) =
+                clauses_from_proto(check, &path, &g.all_of, &g.any_of, depth + 1)?;
+            Ok(Clause::Group(Group { all_of, any_of }))
+        }
+    }
+}
+
+/// The operand at `path` as it reads, before its fit to the target: a value
+/// that does not read is named as the whole operand, its case and reason in
+/// the description.
+fn operand_from_proto(path: &str, o: &v1::Operand) -> Result<core::filter::Operand> {
+    use core::filter::{Operand, RelativeDate};
+    use v1::operand::Kind;
+    let invalid = |reason: String| ConvertError::Invalid(path.to_owned().into(), reason);
+    match &o.kind {
+        None => Err(invalid("must be a value, a relative date or text".into())),
+        Some(Kind::Value(v)) => field_value_from_proto("value", v)
+            .map(Operand::Value)
+            .map_err(|e| invalid(e.to_string())),
+        Some(Kind::RelativeDate(d)) => Ok(Operand::RelativeDate(RelativeDate::new(
+            EnumField::from_i32("relative_date.anchor", d.anchor).map_err(|e| e.within(path))?,
+            d.offset_days,
+        ))),
+        Some(Kind::Text(t)) => Ok(Operand::Text(t.clone())),
+    }
+}
+
+/// The sort at `sort` of a request or view, checked as it is read (see
+/// [`core::filter::validate_sort`]): paths are `sort[i].key`, and `sort`
+/// for too many keys.
+pub fn sort_from_proto(keys: &[v1::SortKey]) -> Result<Vec<core::SortKey>> {
+    let mut sort = Vec::with_capacity(keys.len());
+    for (i, k) in keys.iter().enumerate() {
+        match core::ItemField::from_i32("key", k.key) {
+            Ok(key) => sort.push(core::SortKey {
+                key,
+                descending: k.descending,
+            }),
+            Err(e) => {
+                // The keys before it are checked first.
+                check_sort_keys(&sort)?;
+                return Err(e.within(format_args!("sort[{i}]")));
+            }
+        }
+    }
+    validate_sort(&sort)?;
+    Ok(sort)
+}
+
+impl From<&core::View> for v1::View {
+    fn from(v: &core::View) -> Self {
+        Self {
+            id: v.id.map(|id| id.to_string()).unwrap_or_default(),
+            name: v.name.clone(),
+            filter: Some((&v.filter).into()),
+            sort: v.sort.iter().map(|&k| k.into()).collect(),
+            show_count: v.show_count,
+            position: v.position,
+            seed: v.seed.clone(),
+            revision: v.revision,
+            created_at: v.created_at.map(timestamp_to_proto),
+            updated_at: v.updated_at.map(timestamp_to_proto),
+        }
+    }
+}
+
+/// An empty id is none; the filter and sort are checked as a request's.
+impl TryFrom<&v1::View> for core::View {
+    type Error = ConvertError;
+    fn try_from(v: &v1::View) -> Result<Self> {
+        let ts = |field, t: &Option<prost_types::Timestamp>| {
+            t.as_ref()
+                .map(|t| timestamp_from_proto(field, t))
+                .transpose()
+        };
+        let no_filter = v1::Filter::default();
+        Ok(core::View {
+            id: Some(v.id.as_str())
+                .filter(|id| !id.is_empty())
+                .map(|id| parse_id("id", id))
+                .transpose()?,
+            name: v.name.clone(),
+            filter: filter_from_proto(v.filter.as_ref().unwrap_or(&no_filter), None)?,
+            sort: sort_from_proto(&v.sort)?,
+            show_count: v.show_count,
+            position: v.position,
+            seed: v.seed.clone(),
+            revision: v.revision,
+            created_at: ts("created_at", &v.created_at)?,
+            updated_at: ts("updated_at", &v.updated_at)?,
+        })
+    }
 }
 
 // ---- field paths --------------------------------------------------------
@@ -1763,5 +2035,576 @@ mod tests {
         };
         let p = v1::CaptureToken::from(&huge);
         assert_eq!((p.start, p.end), (u32::MAX, u32::MAX));
+    }
+
+    // ---- filters, sorts and views ----
+
+    use todo_core::filter::{Anchor, Operand, Operator, RelativeDate};
+
+    fn raw(target: i32, op: i32, operands: Vec<v1::Operand>) -> v1::Clause {
+        v1::Clause {
+            kind: Some(v1::clause::Kind::Predicate(v1::Predicate {
+                target,
+                op,
+                operands,
+            })),
+        }
+    }
+
+    fn clause(target: i32, op: v1::Operator, operands: Vec<v1::Operand>) -> v1::Clause {
+        raw(target, op as i32, operands)
+    }
+
+    fn pred(target: ItemField, op: v1::Operator, operands: Vec<v1::Operand>) -> v1::Clause {
+        clause(target.to_i32(), op, operands)
+    }
+
+    fn value(v: core::FieldValue) -> v1::Operand {
+        v1::Operand::from(&Operand::Value(v))
+    }
+
+    fn relative(anchor: i32, offset_days: i32) -> v1::Operand {
+        v1::Operand {
+            kind: Some(v1::operand::Kind::RelativeDate(v1::RelativeDate {
+                anchor,
+                offset_days,
+            })),
+        }
+    }
+
+    fn group(all_of: Vec<v1::Clause>, any_of: Vec<v1::Clause>) -> v1::Clause {
+        v1::Clause {
+            kind: Some(v1::clause::Kind::Group(v1::ClauseGroup { all_of, any_of })),
+        }
+    }
+
+    fn all_of(clauses: Vec<v1::Clause>) -> v1::Filter {
+        v1::Filter {
+            all_of: clauses,
+            ..Default::default()
+        }
+    }
+
+    fn status(s: Status) -> v1::Operand {
+        value(core::FieldValue::Status(s))
+    }
+
+    /// Every operator, operand kind and anchor, in nested groups, with
+    /// every flag.
+    fn every_filter() -> core::Filter {
+        use ItemField as F;
+        use Operator as O;
+        use todo_core::FieldValue as V;
+        use todo_core::filter::{Clause, Group, Predicate};
+        let p =
+            |target, op, operands: Vec<Operand>| Clause::from(Predicate::new(target, op, operands));
+        let v = Operand::Value;
+        let rel = |anchor, offset| Operand::from(RelativeDate::new(anchor, offset));
+        core::Filter {
+            all_of: vec![
+                p(
+                    F::Status,
+                    O::In,
+                    vec![v(V::Status(Status::Next)), v(V::Status(Status::InProgress))],
+                ),
+                p(
+                    F::Priority,
+                    O::Ge,
+                    vec![v(V::Priority(core::Priority::Medium))],
+                ),
+                p(F::Title, O::Ne, vec![v(V::String("x".into()))]),
+                p(F::StoryPoints, O::Lt, vec![v(V::Number(2.5))]),
+                p(F::DueDate, O::Le, vec![rel(Anchor::EndOfWeek, 3)]),
+                p(F::DeferUntil, O::Gt, vec![rel(Anchor::StartOfWeek, -7)]),
+                Group {
+                    all_of: vec![p(F::Waiting, O::IsSet, vec![])],
+                    any_of: vec![
+                        p(F::Archived, O::IsUnset, vec![]),
+                        p(F::Labels, O::ContainsAny, vec![v(V::String("auth".into()))]),
+                        Group {
+                            all_of: vec![p(
+                                F::Scopes,
+                                O::ContainsAll,
+                                vec![v(V::String("a".into()))],
+                            )],
+                            any_of: vec![],
+                        }
+                        .into(),
+                    ],
+                }
+                .into(),
+            ],
+            any_of: vec![
+                p(F::FocusWeek, O::Eq, vec![rel(Anchor::CurrentWeek, 0)]),
+                p(F::WaitingFollowUpOn, O::Eq, vec![rel(Anchor::Today, -1)]),
+                p(
+                    F::Description,
+                    O::Matches,
+                    vec![Operand::Text("plat 530".into())],
+                ),
+                p(
+                    F::CreatedAt,
+                    O::Ge,
+                    vec![v(V::Timestamp(ts(1_700_000_000)))],
+                ),
+                p(
+                    F::WaitingOn,
+                    O::Eq,
+                    vec![v(V::Person(core::PersonRef::FreeText("Dana".into())))],
+                ),
+            ],
+            include_archived: true,
+            include_done: true,
+            include_deferred: true,
+            include_deleted: true,
+        }
+    }
+
+    #[test]
+    fn filters_and_sorts_round_trip_through_proto_and_wire() {
+        use prost::Message as _;
+        let filter = every_filter();
+        assert_eq!(filter.validate(), Ok(()));
+        let proto = v1::Filter::from(&filter);
+        let decoded = v1::Filter::decode(proto.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, proto);
+        assert_eq!(filter_from_proto(&decoded, None), Ok(filter.clone()));
+        assert_eq!(
+            filter_from_proto(&decoded, Some(date(2026, 10, 25))),
+            Ok(filter)
+        );
+        assert_eq!(
+            filter_from_proto(&v1::Filter::default(), None),
+            Ok(core::Filter::default())
+        );
+
+        let sort = vec![
+            core::SortKey::desc(ItemField::IsOverdue),
+            core::SortKey::asc(ItemField::DueDate),
+        ];
+        let proto: Vec<v1::SortKey> = sort.iter().map(|&k| k.into()).collect();
+        assert_eq!(proto[0].key, v1::ItemField::IsOverdue as i32);
+        assert!(proto[0].descending);
+        assert_eq!(sort_from_proto(&proto), Ok(sort));
+    }
+
+    #[test]
+    fn operators_and_anchors_map_both_ways() {
+        use Operator as O;
+        let ops = [
+            O::In,
+            O::Eq,
+            O::Ne,
+            O::Lt,
+            O::Le,
+            O::Gt,
+            O::Ge,
+            O::IsSet,
+            O::IsUnset,
+            O::ContainsAny,
+            O::ContainsAll,
+            O::Matches,
+        ];
+        for op in ops {
+            assert_eq!(Operator::from_i32("op", op.to_i32()), Ok(op));
+            assert_eq!(
+                v1::Operator::from(op).as_str_name(),
+                format!("OPERATOR_{}", op.name())
+            );
+        }
+        let numbers: HashSet<i32> = ops.iter().map(|op| op.to_i32()).collect();
+        assert_eq!(numbers, (1..=12).collect());
+        assert_eq!(
+            Operator::from_i32("op", 0),
+            Err(ConvertError::Unspecified("op".into()))
+        );
+        assert_eq!(
+            Operator::from_i32("op", 13),
+            Err(ConvertError::UnknownEnum("op".into(), 13))
+        );
+        let anchors = [
+            Anchor::Today,
+            Anchor::StartOfWeek,
+            Anchor::EndOfWeek,
+            Anchor::CurrentWeek,
+        ];
+        for (anchor, n) in anchors.into_iter().zip(1..) {
+            assert_eq!(anchor.to_i32(), n);
+            assert_eq!(Anchor::from_i32("anchor", n), Ok(anchor));
+        }
+        assert!(Anchor::from_i32("anchor", 5).is_err());
+    }
+
+    /// Enums sort by proto number and priorities by rank, which core
+    /// knows without the proto.
+    #[test]
+    fn enum_numbers_are_the_proto_numbers() {
+        use todo_core::FieldValue as V;
+        use todo_core::filter::{enum_number, priority_rank};
+        let check = |v: V, proto: i32| assert_eq!(enum_number(&v), Some(proto as u32), "{v:?}");
+        for s in [
+            Status::Inbox,
+            Status::Next,
+            Status::Someday,
+            Status::InProgress,
+            Status::Done,
+            Status::Cancelled,
+        ] {
+            check(V::Status(s), s.to_i32());
+        }
+        for c in [
+            core::StatusCategory::Todo,
+            core::StatusCategory::InProgress,
+            core::StatusCategory::Done,
+        ] {
+            check(V::StatusCategory(c), c.to_i32());
+        }
+        for r in [core::ResolutionKind::Done, core::ResolutionKind::Cancelled] {
+            check(V::ResolutionKind(r), r.to_i32());
+        }
+        for r in [
+            core::TodoRefinement::Inbox,
+            core::TodoRefinement::Next,
+            core::TodoRefinement::Someday,
+        ] {
+            check(V::TodoRefinement(r), r.to_i32());
+        }
+        use todo_core::CreatedVia as Via;
+        for c in [
+            Via::Tui,
+            Via::Cli,
+            Via::Mcp,
+            Via::RemoteImport,
+            Via::Restore,
+            Via::Split,
+            Via::Recurrence,
+        ] {
+            check(V::CreatedVia(c), c.to_i32());
+        }
+        use todo_core::ArchiveReason as Why;
+        for r in [
+            Why::User,
+            Why::LeftScope,
+            Why::RemoteUnavailable,
+            Why::AutoDone,
+        ] {
+            check(V::ArchiveReason(r), r.to_i32());
+        }
+        for l in [
+            core::LinkState::Pending,
+            core::LinkState::Ok,
+            core::LinkState::Broken,
+        ] {
+            check(V::LinkState(l), l.to_i32());
+        }
+        use todo_core::Priority as P;
+        assert_eq!(priority_rank(P::None), None);
+        for p in [P::Lowest, P::Low, P::Medium, P::High, P::Highest] {
+            // PRIORITY_NONE = 1 is outside the order.
+            assert_eq!(
+                priority_rank(p).map(i32::from),
+                Some(p.to_i32() - 1),
+                "{p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn filter_errors_name_the_first_path_in_document_order() {
+        use v1::Operator as O;
+        let ok = || pred(ItemField::Status, O::In, vec![status(Status::Inbox)]);
+        let bad_op = || {
+            pred(
+                ItemField::Title,
+                O::Lt,
+                vec![value(core::FieldValue::String("x".into()))],
+            )
+        };
+        let unset = v1::Operand::default;
+        let bad_date = v1::Operand {
+            kind: Some(v1::operand::Kind::Value(v1::FieldValue {
+                kind: Some(v1::field_value::Kind::DateValue(gtype::Date {
+                    year: 2026,
+                    month: 2,
+                    day: 30,
+                })),
+            })),
+        };
+        let unknown_target = || clause(999, O::Eq, vec![status(Status::Inbox)]);
+        let invalid = |path: &str| ConvertError::Invalid(path.to_owned().into(), String::new());
+        let unspecified = |path: &str| ConvertError::Unspecified(path.to_owned().into());
+        let unknown = |path: &str, n| ConvertError::UnknownEnum(path.to_owned().into(), n);
+        let p = "filter.all_of[0].predicate";
+        let deep = {
+            let mut c = v1::Clause::default();
+            for _ in 0..5 {
+                c = group(vec![c], vec![]);
+            }
+            c
+        };
+        let rows: Vec<(v1::Filter, ConvertError)> = vec![
+            // C51: all_of first, the semantic error before the unreadable target.
+            (
+                v1::Filter {
+                    all_of: vec![ok(), bad_op()],
+                    any_of: vec![unknown_target()],
+                    ..Default::default()
+                },
+                invalid("filter.all_of[1].predicate.op"),
+            ),
+            (
+                v1::Filter {
+                    any_of: vec![ok(), unknown_target()],
+                    ..Default::default()
+                },
+                unknown("filter.any_of[1].predicate.target", 999),
+            ),
+            (
+                all_of(vec![clause(0, O::Eq, vec![])]),
+                unspecified(&format!("{p}.target")),
+            ),
+            (
+                all_of(vec![pred(ItemField::Title, O::Unspecified, vec![])]),
+                unspecified(&format!("{p}.op")),
+            ),
+            (
+                all_of(vec![raw(ItemField::Title.to_i32(), 99, vec![])]),
+                unknown(&format!("{p}.op"), 99),
+            ),
+            (
+                all_of(vec![ok(), v1::Clause::default()]),
+                invalid("filter.all_of[1]"),
+            ),
+            (
+                v1::Filter {
+                    any_of: vec![ok(), group(vec![], vec![ok(), v1::Clause::default()])],
+                    ..Default::default()
+                },
+                invalid("filter.any_of[1].group.any_of[1]"),
+            ),
+            (
+                all_of(vec![pred(ItemField::Status, O::Eq, vec![unset()])]),
+                invalid(&format!("{p}.operands[0]")),
+            ),
+            (
+                all_of(vec![pred(
+                    ItemField::DueDate,
+                    O::Eq,
+                    vec![bad_date.clone()],
+                )]),
+                invalid(&format!("{p}.operands[0]")),
+            ),
+            (
+                all_of(vec![pred(ItemField::DueDate, O::Eq, vec![relative(0, 0)])]),
+                unspecified(&format!("{p}.operands[0].relative_date.anchor")),
+            ),
+            (
+                all_of(vec![pred(ItemField::DueDate, O::Eq, vec![relative(9, 0)])]),
+                unknown(&format!("{p}.operands[0].relative_date.anchor"), 9),
+            ),
+            // An operand's form comes before its fit to the target.
+            (
+                all_of(vec![pred(ItemField::Title, O::Eq, vec![relative(0, 0)])]),
+                unspecified(&format!("{p}.operands[0].relative_date.anchor")),
+            ),
+            // The count before any operand.
+            (
+                all_of(vec![pred(ItemField::Status, O::Eq, vec![unset(), unset()])]),
+                invalid(&format!("{p}.operands")),
+            ),
+            // Operands in order, each read then fitted.
+            (
+                all_of(vec![pred(
+                    ItemField::Status,
+                    O::In,
+                    vec![value(core::FieldValue::Bool(true)), unset()],
+                )]),
+                invalid(&format!("{p}.operands[0]")),
+            ),
+            (
+                all_of(vec![pred(
+                    ItemField::Status,
+                    O::In,
+                    vec![
+                        status(Status::Next),
+                        unset(),
+                        value(core::FieldValue::Bool(true)),
+                    ],
+                )]),
+                invalid(&format!("{p}.operands[1]")),
+            ),
+            // A group too deep is named before what it holds.
+            (
+                all_of(vec![deep]),
+                invalid(&format!("filter{}", ".all_of[0].group".repeat(5))),
+            ),
+            // The totals come after the clauses.
+            (all_of((0..129).map(|_| ok()).collect()), invalid("filter")),
+            (
+                all_of((0..129).map(|_| ok()).chain([unknown_target()]).collect()),
+                unknown("filter.all_of[129].predicate.target", 999),
+            ),
+        ];
+        for (filter, want) in rows {
+            let got = filter_from_proto(&filter, None).unwrap_err();
+            assert_eq!(
+                std::mem::discriminant(&got),
+                std::mem::discriminant(&want),
+                "{got}"
+            );
+            assert_eq!(got.path(), want.path(), "{got}");
+        }
+        let got = filter_from_proto(
+            &all_of(vec![pred(ItemField::DueDate, O::Eq, vec![bad_date])]),
+            None,
+        );
+        assert!(
+            got.unwrap_err()
+                .to_string()
+                .contains(": value.date_value: ")
+        );
+    }
+
+    #[test]
+    fn unbuilt_filters_and_offsets() {
+        use v1::Operator as O;
+        let unbuilt = || pred(ItemField::RemoteExtras, O::IsSet, vec![]);
+        let filter = all_of(vec![unbuilt()]);
+        assert_eq!(
+            filter_from_proto(&filter, None).unwrap_err(),
+            ConvertError::Unimplemented(
+                "filter.all_of[0].predicate.target".into(),
+                "filters on remote_extras are not supported yet".into()
+            )
+        );
+        // Anything invalid wins, even later.
+        let filter = all_of(vec![unbuilt(), clause(999, O::IsSet, vec![])]);
+        assert!(matches!(
+            filter_from_proto(&filter, None),
+            Err(ConvertError::UnknownEnum(path, 999)) if path == "filter.all_of[1].predicate.target"
+        ));
+        // With today, a date out of range is named in its place.
+        let far = || pred(ItemField::DueDate, O::Eq, vec![relative(1, i32::MAX)]);
+        let filter = all_of(vec![far(), clause(999, O::IsSet, vec![])]);
+        let got = filter_from_proto(&filter, Some(date(2026, 10, 25))).unwrap_err();
+        assert_eq!(
+            got.path(),
+            "filter.all_of[0].predicate.operands[0].relative_date.offset_days"
+        );
+        assert!(matches!(got, ConvertError::Invalid(..)));
+        let got = filter_from_proto(&filter, None).unwrap_err();
+        assert_eq!(got.path(), "filter.all_of[1].predicate.target");
+        assert!(filter_from_proto(&all_of(vec![far()]), None).is_ok());
+    }
+
+    #[test]
+    fn sort_errors() {
+        let keys = |keys: &[i32]| -> Vec<v1::SortKey> {
+            keys.iter()
+                .map(|&key| v1::SortKey {
+                    key,
+                    descending: false,
+                })
+                .collect()
+        };
+        let f = |f: ItemField| f.to_i32();
+        let path = |k: &[i32]| sort_from_proto(&keys(k)).map_err(|e| e.path().to_owned());
+        assert_eq!(
+            path(&[f(ItemField::Labels), 999]),
+            Err("sort[0].key".into())
+        );
+        assert_eq!(path(&[f(ItemField::Title), 999]), Err("sort[1].key".into()));
+        assert!(matches!(
+            sort_from_proto(&keys(&[f(ItemField::Title), 999])),
+            Err(ConvertError::UnknownEnum(_, 999))
+        ));
+        assert!(matches!(
+            sort_from_proto(&keys(&[0])),
+            Err(ConvertError::Unspecified(p)) if p == "sort[0].key"
+        ));
+        assert_eq!(
+            path(&[f(ItemField::DueDate), f(ItemField::DueDate)]),
+            Err("sort[1].key".into())
+        );
+        let nine: Vec<i32> = [
+            ItemField::Status,
+            ItemField::Priority,
+            ItemField::DueDate,
+            ItemField::DeferUntil,
+            ItemField::CreatedAt,
+            ItemField::UpdatedAt,
+            ItemField::Title,
+            ItemField::Id,
+            ItemField::Revision,
+        ]
+        .into_iter()
+        .map(f)
+        .collect();
+        assert_eq!(path(&nine[..8]).map(|_| ()), Ok(()));
+        assert_eq!(path(&nine), Err("sort".into()));
+    }
+
+    #[test]
+    fn views_round_trip() {
+        use prost::Message as _;
+        let mut views = core::view::defaults();
+        let mut stored = views[1].clone();
+        stored.id = Some(new_ulid());
+        stored.revision = 7;
+        stored.created_at = Some(ts(1_700_000_000));
+        stored.updated_at = Some(ts(1_700_000_100));
+        views.push(stored);
+        for view in views {
+            let proto = v1::View::from(&view);
+            let decoded = v1::View::decode(proto.encode_to_vec().as_slice()).unwrap();
+            assert_eq!(decoded, proto);
+            assert_eq!(core::View::try_from(&decoded), Ok(view));
+        }
+        let today = v1::View::from(&core::view::defaults()[1]);
+        assert_eq!(today.id, "");
+        assert_eq!(today.seed.as_deref(), Some("today"));
+        assert_eq!(today.sort.len(), 3);
+
+        let mut bad = today.clone();
+        bad.id = "nope".into();
+        assert!(
+            matches!(core::View::try_from(&bad), Err(ConvertError::InvalidId(p, _)) if p == "id")
+        );
+        let mut bad = today.clone();
+        bad.filter.as_mut().unwrap().any_of[0] = v1::Clause::default();
+        assert_eq!(
+            core::View::try_from(&bad).unwrap_err().path(),
+            "filter.any_of[0]"
+        );
+        let mut bad = today;
+        bad.sort[2].key = ItemField::Labels.to_i32();
+        assert_eq!(
+            core::View::try_from(&bad).unwrap_err().path(),
+            "sort[2].key"
+        );
+        // A view without a filter matches everything the implicit rules let by.
+        let bare = v1::View::default();
+        assert_eq!(
+            core::View::try_from(&bare).unwrap().filter,
+            core::Filter::default()
+        );
+    }
+
+    #[test]
+    fn filter_errors_convert() {
+        let invalid = core::FilterError::invalid("all_of[0].predicate.op", "x");
+        assert_eq!(
+            ConvertError::from(invalid).within("filter"),
+            ConvertError::Invalid("filter.all_of[0].predicate.op".into(), "x".into())
+        );
+        let totals = core::FilterError::invalid("", "holds 129 predicates; at most 128");
+        let e = ConvertError::from(totals).within("filter");
+        assert_eq!(e.path(), "filter");
+        assert_eq!(e.to_string(), "filter: holds 129 predicates; at most 128");
+        let unbuilt = core::FilterError::unimplemented("sort", "y");
+        assert_eq!(
+            ConvertError::from(unbuilt).within("view"),
+            ConvertError::Unimplemented("view.sort".into(), "y".into())
+        );
     }
 }

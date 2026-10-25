@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package todo.v1;
+
+import "google/protobuf/timestamp.proto";
+import "todo/v1/filter.proto";
+
+// A saved view (design 2.4): a stored filter and sort, shown as a tab. Views
+// live in the database, one set per data directory, and stream on
+// TOPIC_VIEW. A deleted view leaves no tombstone: its Change has deleted
+// set. A separate file from view_service.proto, so that the change stream
+// can carry a View without importing the service.
+message View {
+  // ULID.
+  string id = 1;
+  // The tab label, e.g. "Inbox".
+  string name = 2;
+  // Matched as in ListItems, including the implicit rules (filter.proto).
+  Filter filter = 3;
+  // Applied in order, then the tie-break created_at, id (SortKey).
+  repeated SortKey sort = 4;
+  // Whether the tab bar shows a count (GetStatusCountsResponse.views).
+  bool show_count = 5;
+  // 0-based place in the tab order; positions are dense.
+  uint32 position = 6;
+  // The default this view was seeded from: "inbox", "today", "next",
+  // "waiting", "someday" or "archive". Unset for a view a user created. A
+  // deleted seeded view is never seeded again.
+  optional string seed = 7;
+  // Global revision of the view's last change.
+  uint64 revision = 8;
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp updated_at = 10;
+}

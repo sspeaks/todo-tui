@@ -14,17 +14,18 @@ use todo_daemon::{Daemon, ShutdownHandle, Started};
 use todo_proto::convert::{date_to_proto, timestamp_to_proto};
 use todo_proto::v1::item_service_client::ItemServiceClient;
 use todo_proto::v1::system_service_client::SystemServiceClient;
+use todo_proto::v1::view_service_client::ViewServiceClient;
 use todo_proto::v1::watch_service_client::WatchServiceClient;
 use todo_proto::v1::{
     AddRelationRequest, ArchiveItemRequest, ArchiveReason, BatchMutateRequest, CaptureItemRequest,
     CaptureTokenKind, Clause, ClientKind, CreatedVia, DeleteItemRequest, FieldValue, Filter,
-    GetItemRequest, GetServerInfoRequest, GetUndoStateRequest, Item, ItemField, ListItemsRequest,
-    Mutation, MutationResult, OpKind, Operand, Operator, ParseCaptureRequest, PersonRef, Predicate,
-    Priority, RedoRequest, RedoResponse, Relation, RelationKind, RemoveRelationRequest,
-    SetStatusRequest, ShutdownRequest, SortKey, Status, SubscribeRequest, SubscribeResponse, Topic,
-    UnarchiveItemRequest, UndeleteItemRequest, UndoRequest, UndoResponse, UndoSkip, UndoSkipReason,
-    UpdateItemRequest, clause, field_value, mutation, operand, person_ref,
-    subscribe_response::Message,
+    GetItemRequest, GetServerInfoRequest, GetStatusCountsRequest, GetUndoStateRequest, Item,
+    ItemField, ListItemsRequest, ListViewsRequest, Mutation, MutationResult, OpKind, Operand,
+    Operator, ParseCaptureRequest, ParseDateRequest, PersonRef, Predicate, Priority, RedoRequest,
+    RedoResponse, Relation, RelationKind, RemoveRelationRequest, SetStatusRequest, ShutdownRequest,
+    SortKey, Status, SubscribeRequest, SubscribeResponse, Topic, UnarchiveItemRequest,
+    UndeleteItemRequest, UndoRequest, UndoResponse, UndoSkip, UndoSkipReason, UpdateItemRequest,
+    clause, field_value, mutation, operand, person_ref, subscribe_response::Message,
 };
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -288,7 +289,35 @@ async fn handshake_reports_version_and_api_minor() {
         .into_inner();
     assert_eq!(info.daemon_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(info.api_minor, todo_proto::API_MINOR);
-    assert_eq!(info.api_minor, 3);
+    assert_eq!(info.api_minor, 4);
+    d.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn m3_rpcs_are_not_implemented_yet() {
+    let d = start().await;
+    let mut items = d.items().await;
+    let mut views = ViewServiceClient::new(d.channel().await);
+    let statuses = [
+        items
+            .get_status_counts(GetStatusCountsRequest::default())
+            .await
+            .unwrap_err(),
+        items
+            .parse_date(ParseDateRequest {
+                text: "fri".into(),
+                reference_time: None,
+            })
+            .await
+            .unwrap_err(),
+        views
+            .list_views(ListViewsRequest::default())
+            .await
+            .unwrap_err(),
+    ];
+    for status in statuses {
+        assert!(error_info(&status, Code::Unimplemented, "NOT_IMPLEMENTED").is_empty());
+    }
     d.stop().await;
 }
 
@@ -443,6 +472,50 @@ async fn invalid_requests_carry_bad_request_details() {
         .unwrap_err();
     assert_eq!(status.code(), Code::Unimplemented);
     assert!(status.get_details_error_info().is_some());
+    let status = items
+        .list_items(ListItemsRequest {
+            reference_time: Some(prost_types::Timestamp {
+                seconds: 9_223_372_037,
+                nanos: 0,
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(violation(&status).0, "reference_time");
+    d.stop().await;
+}
+
+/// ListItems takes today from reference_time, in the daemon's zone, for the
+/// defer rule.
+#[tokio::test(flavor = "multi_thread")]
+async fn list_items_today_is_the_reference_time() {
+    let d = start().await;
+    let mut items = d.items().await;
+    let a = capture(&mut items, "deferred").await;
+    let day = jiff::civil::date(2030, 6, 1);
+    let defer = Item {
+        defer_until: Some(date_to_proto(day)),
+        ..Default::default()
+    };
+    items
+        .update_item(update_req(&a.id, defer, &["defer_until"]))
+        .await
+        .unwrap();
+    let listed = async |items: &mut ItemServiceClient<Channel>, now: jiff::Timestamp| {
+        let req = ListItemsRequest {
+            reference_time: Some(timestamp_to_proto(now)),
+            ..Default::default()
+        };
+        let page = items.list_items(req).await.unwrap().into_inner();
+        page.items.len()
+    };
+    // The daemon runs in this process, in its zone: the Item shows from
+    // that zone's midnight.
+    let midnight = day.to_zoned(TimeZone::system()).unwrap().timestamp();
+    let before = midnight - jiff::SignedDuration::from_nanos(1);
+    assert_eq!(listed(&mut items, before).await, 0);
+    assert_eq!(listed(&mut items, midnight).await, 1);
     d.stop().await;
 }
 
@@ -992,6 +1065,55 @@ async fn update_item_errors_name_the_request_field() {
     d.stop().await;
 }
 
+/// The store keeps durations as i64 nanoseconds (about 292 years); a longer
+/// one is the client's error, as are control characters in a label.
+#[tokio::test(flavor = "multi_thread")]
+async fn values_the_store_cannot_keep_are_invalid_arguments() {
+    let d = start().await;
+    let mut items = d.items().await;
+    let a = capture(&mut items, "a").await;
+    let estimate = |seconds| Item {
+        original_estimate: Some(prost_types::Duration { seconds, nanos: 0 }),
+        remaining_estimate: Some(prost_types::Duration { seconds, nanos: 0 }),
+        ..Default::default()
+    };
+    let three_centuries = 300 * 31_557_600;
+    let req = update_req(&a.id, estimate(three_centuries), &["original_estimate"]);
+    let status = items.update_item(req).await.unwrap_err();
+    let (field, description) = violation(&status);
+    assert_eq!(field, "item.original_estimate");
+    assert_eq!(description, "must be shorter than about 292 years");
+    let update = update_req(&a.id, estimate(three_centuries), &["remaining_estimate"]);
+    let req = batch_req(vec![batched(mutation::Kind::UpdateItem(update))]);
+    let status = items.batch_mutate(req).await.unwrap_err();
+    assert_eq!(
+        violation(&status).0,
+        "mutations[0].update_item.item.remaining_estimate"
+    );
+    let labels = Item {
+        labels: vec!["ok".into(), "bell\u{7}".into()],
+        ..Default::default()
+    };
+    let status = items
+        .update_item(update_req(&a.id, labels, &["labels"]))
+        .await
+        .unwrap_err();
+    assert_eq!(violation(&status).0, "item.labels");
+    assert_eq!(get(&mut items, &a.id).await, a);
+
+    // The longest that fits is kept.
+    let req = update_req(&a.id, estimate(9_223_372_036), &["original_estimate"]);
+    let item = items
+        .update_item(req)
+        .await
+        .unwrap()
+        .into_inner()
+        .item
+        .unwrap();
+    assert_eq!(item.original_estimate.unwrap().seconds, 9_223_372_036);
+    d.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn set_status_archive_and_delete() {
     let d = start().await;
@@ -1410,7 +1532,9 @@ async fn subscribe_sees_updates_and_soft_deletes() {
         // A soft delete is an ordinary change: the tombstone is sent.
         assert!(!c.deleted);
         assert_eq!(c.id, a.id);
-        let todo_proto::v1::change::Resource::Item(item) = c.resource.unwrap();
+        let Some(todo_proto::v1::change::Resource::Item(item)) = c.resource else {
+            panic!("expected an Item");
+        };
         seen.push((c.revision, item.title, item.deleted_at.is_some()));
     }
     let r = a.revision;
@@ -1444,7 +1568,9 @@ async fn collect_changes(
             Message::Change(c) => {
                 assert_eq!(c.topic, Topic::Item as i32);
                 assert!(!c.deleted);
-                let todo_proto::v1::change::Resource::Item(item) = c.resource.unwrap();
+                let Some(todo_proto::v1::change::Resource::Item(item)) = c.resource else {
+                    panic!("expected an Item");
+                };
                 assert_eq!(item.id, c.id);
                 out.push((c.revision, c.id));
             }
@@ -2023,7 +2149,9 @@ async fn changed_items(stream: &mut Streaming<SubscribeResponse>, n: usize) -> V
             panic!("expected a change");
         };
         assert!(!c.deleted);
-        let todo_proto::v1::change::Resource::Item(item) = c.resource.unwrap();
+        let Some(todo_proto::v1::change::Resource::Item(item)) = c.resource else {
+            panic!("expected an Item");
+        };
         assert_eq!(item.id, c.id);
         out.push(*item);
     }

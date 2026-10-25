@@ -4,6 +4,7 @@ package todo.v1;
 
 import "todo/v1/common.proto";
 import "todo/v1/item.proto";
+import "todo/v1/view.proto";
 
 service WatchService {
   // Subscribes first, then replays changes after since_revision, sends
@@ -44,7 +45,7 @@ message Change {
   oneof resource {
     Item item = 10;
     // Allocated: Suggestion suggestion = 11;
-    // Allocated: View view = 12;
+    View view = 12;
     // Allocated: Person person = 13;
     // Allocated: RecurrenceSeries series = 14;
     // Allocated: ReviewSession review = 15;

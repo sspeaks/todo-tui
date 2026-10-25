@@ -98,9 +98,11 @@ message Item {
   google.protobuf.Timestamp deleted_at = 80;
   // Set when deleted by a merge.
   optional string merged_into = 81;
-  // due_date is before today in the user's zone and the Item is not done.
+  // due_date is before today in the user's zone and the Item is not done or
+  // cancelled. Archive, defer and delete do not affect it.
   bool is_overdue = 82;
-  // 83-99 reserved for future derived fields.
+  // Allocated (P4): bool is_blocked = 83; see design 4.8.
+  // 84-99 reserved for future derived fields.
 
   // Aggregate members.
   // Every relation with this Item at either end, including those whose
@@ -154,7 +156,7 @@ message StalenessSignals {
 }
 
 // "No priority" is always PRIORITY_NONE, never FieldValue.cleared.
-// Sort order: NONE sorts after LOWEST.
+// Sorting puts NONE last in both directions (filter.proto, SortKey).
 enum Priority {
   PRIORITY_UNSPECIFIED = 0;
   PRIORITY_NONE = 1;

@@ -275,6 +275,12 @@ impl Item {
     pub fn is_deleted(&self) -> bool {
         self.derived.deleted_at.is_some()
     }
+
+    /// `due_date` is before `today` and the Item is not done or cancelled;
+    /// archive, defer and delete do not matter (item.proto `is_overdue`).
+    pub fn is_overdue(&self, today: Date) -> bool {
+        self.core.due_date.is_some_and(|due| due < today) && !self.status().is_closed()
+    }
 }
 
 #[cfg(test)]

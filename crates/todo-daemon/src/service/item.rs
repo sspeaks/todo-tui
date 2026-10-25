@@ -12,8 +12,9 @@ use todo_proto::v1::{
     self, AddRelationRequest, AddRelationResponse, ArchiveItemRequest, ArchiveItemResponse,
     BatchMutateRequest, BatchMutateResponse, CaptureItemRequest, CaptureItemResponse,
     DeleteItemRequest, DeleteItemResponse, Filter, GetItemRequest, GetItemResponse,
-    GetUndoStateRequest, GetUndoStateResponse, ItemField, ListItemsRequest, ListItemsResponse,
-    Operator, ParseCaptureRequest, ParseCaptureResponse, RedoRequest, RedoResponse,
+    GetStatusCountsRequest, GetStatusCountsResponse, GetUndoStateRequest, GetUndoStateResponse,
+    ItemField, ListItemsRequest, ListItemsResponse, Operator, ParseCaptureRequest,
+    ParseCaptureResponse, ParseDateRequest, ParseDateResponse, RedoRequest, RedoResponse,
     RemoveRelationRequest, RemoveRelationResponse, SetStatusRequest, SetStatusResponse, SortKey,
     UnarchiveItemRequest, UnarchiveItemResponse, UndeleteItemRequest, UndeleteItemResponse,
     UndoRequest, UndoResponse, UpdateItemRequest, UpdateItemResponse, clause, field_value, operand,
@@ -25,7 +26,7 @@ use todo_store::{
 use tonic::{Code, Request, Response, Status};
 use ulid::Ulid;
 
-use super::Ctx;
+use super::{Ctx, not_implemented};
 use crate::error::{self, Shape};
 
 /// The most mutations one `BatchMutate` may carry.
@@ -117,6 +118,13 @@ impl ItemService for Items {
         Ok(Response::new(ParseCaptureResponse {
             draft: Some((&draft).into()),
         }))
+    }
+
+    async fn parse_date(
+        &self,
+        _request: Request<ParseDateRequest>,
+    ) -> Result<Response<ParseDateResponse>, Status> {
+        Err(not_implemented("ParseDate"))
     }
 
     async fn get_item(
@@ -276,6 +284,7 @@ impl ItemService for Items {
         }
         let page_size = u32::try_from(req.page_size)
             .map_err(|_| error::bad_request("page_size", "must not be negative"))?;
+        let today = reference_time(req.reference_time.as_ref(), &Zoned::now())?.date();
 
         let query = ListQuery {
             statuses,
@@ -285,7 +294,7 @@ impl ItemService for Items {
             include_deleted: filter.include_deleted,
             page_size,
             page_token: Some(req.page_token).filter(|t| !t.is_empty()),
-            today: Some(Zoned::now().date()),
+            today: Some(today),
         };
         let page = self.0.store.list_items(query).await.map_err(error::store)?;
         Ok(Response::new(ListItemsResponse {
@@ -293,6 +302,13 @@ impl ItemService for Items {
             next_page_token: page.next_page_token.unwrap_or_default(),
             revision: page.revision,
         }))
+    }
+
+    async fn get_status_counts(
+        &self,
+        _request: Request<GetStatusCountsRequest>,
+    ) -> Result<Response<GetStatusCountsResponse>, Status> {
+        Err(not_implemented("GetStatusCounts"))
     }
 
     async fn undo(&self, request: Request<UndoRequest>) -> Result<Response<UndoResponse>, Status> {
@@ -595,8 +611,8 @@ fn check_capture_length(text: &str) -> Result<(), Status> {
     Ok(())
 }
 
-/// The capture reference time in `now`'s zone: `reference_time` if set
-/// and storable, else `now`.
+/// A request's reference time in `now`'s zone: `reference_time` if set and
+/// storable, else `now`.
 fn reference_time(t: Option<&prost_types::Timestamp>, now: &Zoned) -> Result<Zoned, Status> {
     let Some(t) = t else {
         return Ok(now.clone());
@@ -613,7 +629,7 @@ fn reference_time(t: Option<&prost_types::Timestamp>, now: &Zoned) -> Result<Zon
 
 /// Whether the store can record `t`: its timestamps are i64 nanoseconds.
 pub(crate) fn storable(t: Timestamp) -> bool {
-    i64::try_from(t.as_nanosecond()).is_ok()
+    todo_core::value::timestamp_in_range(t)
 }
 
 /// The store's only P0 order is `created_at, id` ascending; a sort that asks

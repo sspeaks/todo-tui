@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package todo.v1;
+
+import "todo/v1/view.proto";
+
+// Saved views (design 2.4, 4.3). The defaults are seeded into every
+// database; until views can be edited, they are read-only here.
+service ViewService {
+  // Every view, in tab order (position).
+  rpc ListViews(ListViewsRequest) returns (ListViewsResponse);
+}
+
+message ListViewsRequest {}
+
+message ListViewsResponse {
+  repeated View views = 1;
+  // The revision this was read at.
+  uint64 revision = 2;
+}

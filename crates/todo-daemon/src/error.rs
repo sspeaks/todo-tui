@@ -51,7 +51,18 @@ pub(crate) fn error_info(
     )
 }
 
+/// INVALID_ARGUMENT naming the path; UNIMPLEMENTED (`NOT_IMPLEMENTED`, with
+/// the path as `field`) for a valid filter that is not built yet.
 pub(crate) fn convert(e: ConvertError) -> Status {
+    if let ConvertError::Unimplemented(path, _) = &e {
+        let field = path.to_string();
+        return error_info(
+            Code::Unimplemented,
+            "NOT_IMPLEMENTED",
+            e.to_string(),
+            [("field", field)],
+        );
+    }
     // The Display form starts with the path, which bad_request adds back.
     let message = e.to_string();
     let description = message
@@ -348,6 +359,24 @@ mod tests {
             bad.field_violations[0].description,
             "required field is missing"
         );
+    }
+
+    #[test]
+    fn unbuilt_filters_are_unimplemented() {
+        let e = ConvertError::Unimplemented(
+            "all_of[0].predicate.target".into(),
+            "filters on remote_extras are not supported yet".into(),
+        );
+        let status = convert(e.within("filter"));
+        assert_eq!(status.code(), Code::Unimplemented);
+        assert_eq!(
+            status.message(),
+            "filter.all_of[0].predicate.target: filters on remote_extras are not supported yet"
+        );
+        let info = status.get_details_error_info().unwrap();
+        assert_eq!(info.reason, "NOT_IMPLEMENTED");
+        assert_eq!(info.domain, DOMAIN);
+        assert_eq!(info.metadata["field"], "filter.all_of[0].predicate.target");
     }
 
     #[test]

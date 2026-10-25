@@ -9,6 +9,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use todo_proto::v1::item_service_server::ItemServiceServer;
 use todo_proto::v1::system_service_server::SystemServiceServer;
+use todo_proto::v1::view_service_server::ViewServiceServer;
 use todo_proto::v1::watch_service_server::WatchServiceServer;
 use todo_store::Store;
 use tokio::net::UnixListener;
@@ -19,7 +20,7 @@ use crate::ShutdownHandle;
 use crate::client;
 use crate::conn::Clients;
 use crate::paths::Paths;
-use crate::service::{Ctx, item::Items, system::System, watch::Watch};
+use crate::service::{Ctx, item::Items, system::System, view::Views, watch::Watch};
 use crate::spool;
 
 /// How long in-flight work may take once shutdown starts (design 4.2).
@@ -148,6 +149,7 @@ impl Daemon {
             .http2_keepalive_timeout(Some(Duration::from_secs(10)))
             .add_service(SystemServiceServer::new(System(ctx.clone())))
             .add_service(ItemServiceServer::new(Items(ctx.clone())))
+            .add_service(ViewServiceServer::new(Views))
             .add_service(WatchServiceServer::new(Watch(ctx)))
             .serve_with_incoming_shutdown(incoming, async move { stop.wait().await });
 

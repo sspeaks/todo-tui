@@ -10,6 +10,8 @@ const PROTOS: &[&str] = &[
     "todo/v1/op.proto",
     "todo/v1/relation.proto",
     "todo/v1/system_service.proto",
+    "todo/v1/view.proto",
+    "todo/v1/view_service.proto",
     "todo/v1/watch_service.proto",
 ];
 
@@ -22,6 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let protos: Vec<PathBuf> = PROTOS.iter().map(|p| root.join(p)).collect();
     tonic_prost_build::configure()
         .boxed(".todo.v1.Change.resource.item")
+        .boxed(".todo.v1.Change.resource.view")
         .file_descriptor_set_path(out.join("todo_descriptor.bin"))
         .compile_protos(&protos, &[root])?;
     Ok(())
