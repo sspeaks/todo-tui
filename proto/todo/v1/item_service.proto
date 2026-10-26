@@ -253,7 +253,7 @@ message ListItemsResponse {
 
 message GetStatusCountsRequest {
   // Also count the views whose show_count is set (the tab bar). `todo
-  // status` leaves it false.
+  // status --short` leaves it false.
   bool include_views = 1;
   // "Now", for today (filter.proto); defaults to the daemon's clock.
   google.protobuf.Timestamp reference_time = 2;

@@ -1,5 +1,6 @@
 import { type MessageInitShape, create, toBinary } from "@bufbuild/protobuf";
-import { type Client, type Transport, createClient } from "@connectrpc/connect";
+import { Code, type Client, ConnectError, type Transport, createClient } from "@connectrpc/connect";
+import { ErrorInfoSchema } from "./gen/google/rpc/error_details_pb.js";
 import type { Date as ProtoDate } from "./gen/google/type/date_pb.js";
 import { Topic } from "./gen/todo/v1/common_pb.js";
 import type { FilterSchema, SortKeySchema } from "./gen/todo/v1/filter_pb.js";
@@ -52,7 +53,7 @@ export interface CountsSnapshot {
   readonly counts?: StatusCounts;
   /** Tab counts by view id, for the views whose show_count is set. */
   readonly views: ReadonlyMap<string, number>;
-  /** The daemon's today the counts were taken on: they go stale once the local date passes it. */
+  /** The daemon's today the counts were taken on: they go stale once the local date passes it (LiveStore.refresh). */
   readonly today?: ProtoDate;
   /** Revision the counts were read at. */
   readonly revision: bigint;
@@ -176,6 +177,18 @@ export class LiveStore {
   subscribeCounts = (listener: Listener): (() => void) => this.liveCounts.subscribe(listener);
 
   getCounts = (): CountsSnapshot => this.liveCounts.getSnapshot();
+
+  /**
+   * Re-runs every view's ListItems and the counts (or, while nothing
+   * observes them, has their next observer do so). Nothing on the stream
+   * marks a new day, so a client calls this once its date passes
+   * CountsSnapshot.today: Today, is_overdue and deferrals move then.
+   */
+  refresh(): void {
+    if (!this.loaded) return;
+    for (const v of this.views.values()) void v.load();
+    this.liveCounts.reload();
+  }
 
   onNotice(listener: (n: Notice) => void): () => void {
     this.noticeListeners.add(listener);
@@ -423,7 +436,7 @@ export class LiveStore {
       }
     }
     this.conn = { ...this.conn, revision: this.revision };
-    for (const v of this.views.values()) v.scheduleRequery();
+    for (const v of this.views.values()) if (!v.viewGone) v.scheduleRequery();
     this.liveCounts.scheduleRequery();
     this.bump();
   }
@@ -442,11 +455,16 @@ export class LiveStore {
     this.bump();
   }
 
-  /** The loads of a baseline or a resync: every view, the saved views, and the counts when observed. */
+  /**
+   * The loads of a baseline or a resync: every view, the saved views, and
+   * the counts when observed; unobserved counts are left for their next
+   * observer to reload.
+   */
   private loads(): Promise<bigint>[] {
     const loads = [...this.views.values()].map((v) => v.load(true));
     loads.push(this.loadSavedViews(true));
     if (this.liveCounts.wanted) loads.push(this.liveCounts.load(true));
+    else this.liveCounts.reload();
     return loads;
   }
 
@@ -485,6 +503,12 @@ export class LiveView {
   private loaded = false;
   /** A reload failed after the view had loaded; its ids may be out of date. */
   private stale = false;
+  /**
+   * @internal The saved view it narrows no longer exists (VIEW_NOT_FOUND):
+   * the view is an error with no rows, re-queried only when that view
+   * changes, on a resync or on a reconnect.
+   */
+  viewGone = false;
   private seq = 0;
   private debounce: ReturnType<typeof setTimeout> | undefined;
   private grace: ReturnType<typeof setTimeout> | undefined;
@@ -527,12 +551,21 @@ export class LiveView {
         this.error = undefined;
         this.loaded = true;
         this.stale = false;
+        this.viewGone = false;
         this.store.bump();
       }
       return revision;
     } catch (err) {
       if (seq === this.seq) {
-        if (this.loaded) {
+        if (isViewNotFound(err)) {
+          // Its last rows are no longer anything's: show none.
+          this.ids = [];
+          this.status = "error";
+          this.error = err;
+          this.stale = false;
+          this.viewGone = true;
+          this.store.bump();
+        } else if (this.loaded) {
           this.stale = true;
         } else {
           this.status = "error";
@@ -659,6 +692,16 @@ class LiveCounts {
     }
   }
 
+  /** Re-runs now while observed; otherwise the next observer reloads. */
+  reload(): void {
+    if (!this.wanted) {
+      this.stale = true;
+      return;
+    }
+    this.cancelTimers();
+    void this.load();
+  }
+
   /** After a change: re-runs, debounced, while observed; otherwise the next observer reloads. */
   scheduleRequery(): void {
     if (!this.wanted) {
@@ -691,4 +734,10 @@ class LiveCounts {
   };
 
   getSnapshot = (): CountsSnapshot => this.snap;
+}
+
+/** Whether ListItems failed because its view_id names no saved view. */
+function isViewNotFound(err: unknown): boolean {
+  const e = ConnectError.from(err);
+  return e.code === Code.NotFound && e.findDetails(ErrorInfoSchema).some((info) => info.reason === "VIEW_NOT_FOUND");
 }

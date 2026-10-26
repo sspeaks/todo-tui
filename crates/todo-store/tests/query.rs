@@ -8,8 +8,8 @@ use jiff::{SignedDuration, Timestamp};
 use rusqlite::Connection;
 use rusqlite::types::Value;
 use todo_core::filter::{
-    Anchor, Clause, FilterErrorKind, Group, Operand, Operator, Predicate, RelativeDate, SortKey,
-    ValueClass, compare, matches, target,
+    Anchor, Clause, FilterErrorKind, Group, MAX_PREDICATE_OPERANDS, Operand, Operator, Predicate,
+    RelativeDate, SortKey, ValueClass, compare, matches, target,
 };
 use todo_core::view::{View, defaults};
 use todo_core::{
@@ -869,6 +869,81 @@ async fn errors_come_in_order() {
         matches!(listed, Err(StoreError::InvalidPageToken)),
         "{listed:?}"
     );
+}
+
+/// A filter within the limits lists, however wide: groups cost nothing
+/// against them, and an IN takes up to 1000 people. SQLite stops at an
+/// expression 1000 deep, which the SQL must never reach.
+#[tokio::test]
+async fn wide_filters_within_the_limits_list() {
+    let db = open();
+    let fx = fixture(&db).await;
+    let empty = || group(vec![], vec![]);
+    let empties = |n| (0..n).map(|_| empty()).collect::<Vec<_>>();
+    let inbox = || p(F::Status, O::In, vec![st(Status::Inbox)]);
+    let inbox_ids = fx.ids(&db, all_of(vec![inbox()]), SUN).await;
+    // Empty groups match everything, alone or among others, at any depth.
+    for filter in [
+        all_of(empties(2000)),
+        any_of(empties(2000)),
+        all_of(vec![group(empties(2000), empties(2000))]),
+        Filter {
+            any_of: [empties(1000), vec![inbox()], empties(1000)].concat(),
+            ..all_of(empties(1000))
+        },
+    ] {
+        filter.validate().unwrap();
+        assert_eq!(fx.ids(&db, filter, SUN).await, C01);
+    }
+    let filter = || Filter {
+        all_of: [empties(1000), vec![inbox()], empties(1000)].concat(),
+        any_of: [empties(10), vec![group(vec![], empties(1000))]].concat(),
+        ..Filter::default()
+    };
+    filter().validate().unwrap();
+    assert_eq!(fx.ids(&db, filter(), SUN).await, inbox_ids);
+    // As one more group of a view, on a later page.
+    let today = view(&db, "today").await;
+    let narrowed = ListInput {
+        view_id: today.id,
+        ..input(filter(), vec![], SUN)
+    };
+    let unnarrowed = ListInput {
+        view_id: today.id,
+        ..input(all_of(vec![inbox()]), vec![], SUN)
+    };
+    assert_eq!(
+        fx.nums(&paged(&db, &narrowed, 1).await),
+        fx.nums(&paged(&db, &unnarrowed, 1).await)
+    );
+    // A group that only holds empty groups is empty too; one any_of that
+    // holds only a false clause is not.
+    let never = || p(F::Status, O::In, vec![st(Status::Done)]);
+    let filter = all_of(vec![
+        group(vec![group(empties(1000), vec![])], empties(1000)),
+        group(vec![], vec![never(), group(empties(1000), vec![never()])]),
+    ]);
+    filter.validate().unwrap();
+    assert_eq!(fx.ids(&db, filter, SUN).await, [] as [u32; 0]);
+    // A person IN with the most operands, in every predicate the filter
+    // may hold operands for.
+    let vendors = |n: usize| {
+        let mut who: Vec<Operand> = (1..n)
+            .map(|i| val(FieldValue::Person(PersonRef::FreeText(format!("v{i}")))))
+            .collect();
+        who.push(val(FieldValue::Person(PersonRef::FreeText(
+            "the vendor".into(),
+        ))));
+        who
+    };
+    let on = || p(F::WaitingOn, O::In, vendors(MAX_PREDICATE_OPERANDS));
+    for filter in [
+        all_of(vec![on(), on(), on(), on()]),
+        any_of(vec![on(), on(), on(), on()]),
+    ] {
+        filter.validate().unwrap();
+        assert_eq!(fx.ids(&db, filter, SUN).await, [10]);
+    }
 }
 
 #[tokio::test]

@@ -52,6 +52,17 @@ impl Sql {
         self.args.push(value);
         self
     }
+
+    /// Binds each text, separated by commas, as in an IN list.
+    fn bind_list(&mut self, texts: &[String]) -> &mut Self {
+        for (i, t) in texts.iter().enumerate() {
+            if i > 0 {
+                self.text.push_str(", ");
+            }
+            self.bind(Value::Text(t.clone()));
+        }
+        self
+    }
 }
 
 /// Whether the Item is linked: the schema ties the instance id to the
@@ -387,14 +398,34 @@ fn where_sql(sql: &mut Sql, filter: &Resolved) {
     sql.push(")");
 }
 
+/// Whether `c` holds for every Item: a group whose `all_of` clauses all do
+/// and whose `any_of` is empty or has one that does, as an empty group.
+fn always(c: &Clause<ResolvedOperand>) -> bool {
+    match c {
+        Clause::Predicate(_) => false,
+        Clause::Group(g) => {
+            g.all_of.iter().all(always) && (g.any_of.is_empty() || g.any_of.iter().any(always))
+        }
+    }
+}
+
 /// Every `all_of` clause and, unless `any_of` is empty, one of its clauses;
-/// `1` when both are empty.
+/// `1` when both are empty. A clause that [`always`] holds is left out, and
+/// so is an `any_of` that has one, so that each clause written holds a
+/// predicate: the predicate limit then bounds how deep the SQL nests,
+/// which SQLite caps at 1000, however many groups the filter has.
 fn clauses(
     sql: &mut Sql,
     all_of: &[Clause<ResolvedOperand>],
     any_of: &[Clause<ResolvedOperand>],
     today: Date,
 ) {
+    let all_of: Vec<_> = all_of.iter().filter(|c| !always(c)).collect();
+    let any_of: Vec<_> = if any_of.iter().any(always) {
+        Vec::new()
+    } else {
+        any_of.iter().collect()
+    };
     sql.push("(");
     for (i, c) in all_of.iter().enumerate() {
         if i > 0 {
@@ -498,29 +529,35 @@ fn presence(sql: &mut Sql, field: ItemField, today: Date) {
 fn equals(sql: &mut Sql, field: ItemField, values: &[&FieldValue], today: Date) {
     match col(field) {
         Col::Person { id, text, guard } => {
+            // IN lists, not an OR per operand, which would nest as deep as
+            // the operands are many.
+            let (mut ids, mut texts) = (Vec::new(), Vec::new());
+            for v in values {
+                match v {
+                    FieldValue::Person(PersonRef::Person(p)) => ids.push(p.to_string()),
+                    FieldValue::Person(PersonRef::FreeText(t)) => texts.push(t.clone()),
+                    _ => {}
+                }
+            }
             sql.push("COALESCE(").push(guard).push(" AND (");
-            for (i, v) in values.iter().enumerate() {
-                if i > 0 {
+            if !ids.is_empty() {
+                sql.push(id).push(" IN (").bind_list(&ids).push(")");
+            }
+            // A person id wins over free text, as the codec reads them.
+            if !texts.is_empty() {
+                if !ids.is_empty() {
                     sql.push(" OR ");
                 }
-                // A person id wins over free text, as the codec reads them.
-                match v {
-                    FieldValue::Person(PersonRef::Person(p)) => {
-                        sql.push(id).push(" = ").bind(Value::Text(p.to_string()));
-                    }
-                    FieldValue::Person(PersonRef::FreeText(t)) => {
-                        sql.push("(")
-                            .push(id)
-                            .push(" IS NULL AND ")
-                            .push(text)
-                            .push(" = ")
-                            .bind(Value::Text(t.clone()))
-                            .push(")");
-                    }
-                    _ => {
-                        sql.push("0");
-                    }
-                }
+                sql.push("(")
+                    .push(id)
+                    .push(" IS NULL AND ")
+                    .push(text)
+                    .push(" IN (")
+                    .bind_list(&texts)
+                    .push("))");
+            }
+            if ids.is_empty() && texts.is_empty() {
+                sql.push("0");
             }
             sql.push("), 0)");
         }

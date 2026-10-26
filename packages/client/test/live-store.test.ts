@@ -466,6 +466,77 @@ describe("LiveStore saved views, counts and paging", () => {
     again();
   });
 
+  it("re-reads the views and the counts on refresh(), as a new day needs", async () => {
+    let now = new Date(Date.UTC(2026, 9, 25, 23, 59));
+    const daemon = new FakeDaemon([], { timeZone: "UTC", now: () => now });
+    daemon.put({ title: "due tomorrow", status: Status.NEXT, dueDate: { year: 2026, month: 10, day: 26 } });
+    const store = new LiveStore({ transport: daemon.transport, debounceMs: 20 });
+    stores.push(store);
+    const today = saved(daemon, "today").id;
+    const view = store.view({ viewId: today });
+    const unsubscribe = store.subscribeCounts(() => {});
+    store.start();
+    await waitFor(() => store.getCounts().status === "ready" && view.getSnapshot().status === "ready");
+    expect(store.getCounts().today).toMatchObject({ year: 2026, month: 10, day: 25 });
+    expect(store.getCounts().counts).toMatchObject({ due: 0 });
+    expect(view.getSnapshot().items).toEqual([]);
+
+    // Midnight passes, and nothing is written.
+    now = new Date(Date.UTC(2026, 9, 26, 0, 1));
+    store.refresh();
+    await waitFor(() => store.getCounts().today?.day === 26 && view.getSnapshot().items.length === 1);
+    expect(store.getCounts().counts).toMatchObject({ due: 1, overdue: 0 });
+    expect(store.getCounts().views.get(today)).toBe(1);
+    unsubscribe();
+
+    // Unobserved counts are re-read by their next observer.
+    const calls = daemon.calls.getStatusCounts;
+    now = new Date(Date.UTC(2026, 9, 27, 0, 1));
+    store.refresh();
+    await sleep(40);
+    expect(daemon.calls.getStatusCounts).toBe(calls);
+    const again = store.subscribeCounts(() => {});
+    await waitFor(() => store.getCounts().counts?.overdue === 1);
+    again();
+  });
+
+  it("re-reads counts a resync found unobserved once they are observed again", async () => {
+    const { daemon, store } = setup(2);
+    store.start();
+    const unsubscribe = store.subscribeCounts(() => {});
+    await waitFor(() => store.getCounts().counts?.inbox === 2);
+    unsubscribe();
+    // The database is replaced by an older one with one Item.
+    const [kept] = [...daemon.items.values()];
+    daemon.restore(3n, [kept!]);
+    daemon.dropStreams();
+    await waitFor(() => daemon.calls.listViews === 2);
+    await sleep(40);
+    const again = store.subscribeCounts(() => {});
+    await waitFor(() => store.getCounts().counts?.inbox === 1);
+    again();
+  });
+
+  it("shows a view whose saved view is gone as an error with no rows, and stops re-querying it", async () => {
+    const { daemon, store } = setup(1);
+    const inbox = saved(daemon, "inbox").id;
+    const view = store.view({ viewId: inbox });
+    const unsubscribe = view.subscribe(() => {});
+    store.start();
+    await waitFor(() => view.getSnapshot().status === "ready");
+    expect(view.getSnapshot().items.map((i) => i.title)).toEqual(["item 0"]);
+
+    daemon.removeView(inbox);
+    await waitFor(() => view.getSnapshot().status === "error");
+    expect(view.getSnapshot().items).toEqual([]);
+    expect(ConnectError.from(view.getSnapshot().error).code).toBe(Code.NotFound);
+    const calls = daemon.calls.listItems;
+    for (let i = 0; i < 3; i++) daemon.put({ title: `later ${i}` });
+    await sleep(60);
+    expect(daemon.calls.listItems).toBe(calls);
+    unsubscribe();
+  });
+
   it("asks for MAX_PAGE_SIZE pages", async () => {
     const { daemon, store } = setup(3);
     const sizes: number[] = [];

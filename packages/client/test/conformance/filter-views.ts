@@ -27,6 +27,7 @@ import { type View, ViewSchema } from "../../src/gen/todo/v1/view_pb.js";
 import { ViewService } from "../../src/gen/todo/v1/view_service_pb.js";
 import { WatchService } from "../../src/gen/todo/v1/watch_service_pb.js";
 import { defaultViews } from "../../src/default-views.js";
+import { MAX_PREDICATE_OPERANDS } from "../../src/limits.js";
 import { type ItemsClient, archiveItem, deleteItem, setStatus, updateItem } from "../../src/mutations.js";
 import { getStatusCounts, listViews, parseDate } from "../../src/queries.js";
 import { ulid } from "../../src/ulid.js";
@@ -379,6 +380,19 @@ export function filterViewsConformance(open: () => Promise<FilterTarget>): void 
       expect(await fx.where(nested)).toEqual([18, 1, 2, 4, 19, 20, 21, 29, 30]);
       expect(await fx.where(group([]))).toEqual(VISIBLE);
       expect(await fx.filtered({ anyOf: [p(F.STATUS, O.IN, status(Status.IN_PROGRESS)), p(F.LABELS, O.CONTAINS_ANY, str("auth"))] })).toEqual([1, 3, 11]);
+    });
+
+    it("lists any filter within the limits: groups cost nothing, and an IN takes the most operands", async () => {
+      const empties = (n: number) => Array.from({ length: n }, () => group([]));
+      const inbox = p(F.STATUS, O.IN, status(Status.INBOX));
+      const inboxIds = await fx.where(inbox);
+      expect(await fx.where(...empties(2000))).toEqual(VISIBLE);
+      expect(await fx.filtered({ anyOf: empties(2000) })).toEqual(VISIBLE);
+      expect(await fx.filtered({ allOf: [...empties(1000), inbox], anyOf: [...empties(1000), p(F.STATUS, O.IN, status(Status.DONE))] })).toEqual(inboxIds);
+      expect(await fx.list({ filter: { allOf: [group(empties(1000), empties(1000))] }, viewId: fx.view("today") }, 2)).toEqual(await fx.list({ viewId: fx.view("today") }));
+      const vendors = [...Array.from({ length: MAX_PREDICATE_OPERANDS - 1 }, (_, i) => free(`v${i}`)), free("the vendor")];
+      const on = p(F.WAITING_ON, O.IN, ...vendors);
+      expect(await fx.where(on, on, on, on)).toEqual([10]);
     });
 
     it("searches text with MATCHES: words in order, the last a prefix, ignoring case and accents", async () => {

@@ -7,9 +7,10 @@ state in SQLite and serves a gRPC API (`todo.v1`) over a Unix socket; an Ink TUI
 Status: P1 in progress. Milestone M1 (capture) is done: `todo add` with inline
 tokens, batch capture from stdin, and an offline spool. Milestone M2 (undo) is done:
 `todo undo` and `todo redo`, relations between items in the API, and deleting an
-item together with its subtasks. The TUI is still the minimal P0 inbox list; the
-full TUI is milestone M4. There are no CLI commands yet to list, edit, complete or
-delete items.
+item together with its subtasks. Milestone M3 (views) is done: filters, sorting and
+paging, the six default views and their counts in the API, and `todo status`. The
+TUI is still the minimal P0 inbox list; the full TUI, with the views as tabs, is
+milestone M4. There are no CLI commands yet to list, edit, complete or delete items.
 
 ## Quick start
 
@@ -252,6 +253,32 @@ answer, they print `todo: no answer from the daemon (…); the undo may have bee
 applied, so check before undoing again` and exit 1. They also exit 1, with
 `todo: <why>`, if the daemon refuses.
 
+### Counts: `todo status`
+
+```console
+$ todo status
+📥 Inbox: 3
+⏰ Due: 2 (1 overdue)
+Views:
+  Inbox: 3
+  Today: 2
+  Next: 0
+  Waiting: 0
+```
+
+📥 counts items in the inbox and ⏰ items due today or overdue. Neither counts done,
+cancelled, archived or deferred items. The views are the TUI's tabs that show a
+count. `todo status` starts the daemon if needed, as `todo add` does.
+
+`todo status --short` prints one line for a shell prompt or tmux status line, such
+as `📥3 ⏰2`, leaving out zero counts. It never starts the daemon and gives up after
+40 ms: with no daemon, a slow one or any error it prints nothing, and it always
+exits 0. In bash (in zsh, `setopt prompt_subst` first):
+
+```sh
+PS1='$(todo status --short) '"$PS1"
+```
+
 ### Seeing your todos: the TUI
 
 There is no `todo list` yet; the TUI is how you see items. `todo` with no
@@ -296,8 +323,8 @@ itself unless it is already set, so the TUI starts that `todo`'s daemon. Under
 
 ### The daemon
 
-You rarely need to manage it: `todo add`, `todo undo`, `todo redo` and the TUI
-start it when needed, and only one daemon runs per data directory.
+You rarely need to manage it: `todo add`, `todo undo`, `todo redo`, `todo status`
+and the TUI start it when needed, and only one daemon runs per data directory.
 
 | Command | What it does |
 |---|---|

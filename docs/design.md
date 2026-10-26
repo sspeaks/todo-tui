@@ -68,7 +68,7 @@ The TUI is designed for two speeds: **capture in under three seconds**, and **tr
 
 **Capture never fails for want of a daemon.** If the daemon cannot be reached or started within the auto-spawn budget, the CLI appends a line `{ "spool_id": <ULID>, "captured_at": <local timestamp with offset>, "text": "…" }` to `spool.jsonl` in the data directory (7.1), using an exclusive append lock, and exits successfully. The daemon imports the spool when it starts and every 30 s while it runs: each line with `ParseCapture(text, reference_time = captured_at)` so relative dates resolve against the capture time, `created_via = cli`, skipping any `spool_id` it has already imported (crash-safe). The file is truncated after a successful import; lines it cannot import (malformed, blank, or over the capture limit, 2.3) move to `spool.rejected.jsonl`. Text over the limit is neither sent nor spooled: the CLI reports it `NOT CAPTURED` and exits 1. Captures are always local first (`inbox`); nothing touches Jira until you promote.
 
-**Shell prompt integration**: `todo status --short` prints compact counts (e.g. `📥3 ⏰1 ✦2` = inbox items, overdue-or-due-today items, pending suggestions; zero counts omitted) for prompt or tmux status lines. It must answer from the daemon in well under 50ms, or print nothing.
+**Shell prompt integration**: `todo status --short` prints compact counts for prompt or tmux status lines, e.g. `📥3 ⏰1`: 📥 = `inbox` Items, ⏰ = Items due today or overdue (`due_date <= today`). Both pass the implicit rules (2.4), so done, cancelled, archived and deferred Items never count. Zero counts are omitted, and nothing is printed when all are zero. ✦ (pending suggestions) joins in P2. It must never block or start anything: no spawn, no handshake (the one exception to 4.2), just one `GetStatusCounts` call under a **40 ms total deadline**; on any failure (no daemon, no answer in time, an older daemon answering `UNIMPLEMENTED`) it prints nothing and exits 0. `todo status` without `--short` behaves like other commands (auto-spawn, handshake, 5 s timeout) and prints the inbox, due and overdue counts and one line per counted view (2.2).
 
 Future capture surfaces (Raycast, macOS Shortcuts, mobile) are just more gRPC clients. No design change is needed.
 
@@ -89,7 +89,7 @@ Future capture surfaces (Raycast, macOS Shortcuts, mobile) are just more gRPC cl
 └────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **Tab bar**: the views (2.4) with counts. `1`–`9` jump to a view; `[` / `]` go to the previous / next view.
+- **Tab bar**: the views (2.4). A view with `show_count` set (every default but Someday and Archive) shows its count, a COUNT over the same query its list runs, so the badge always equals the rows (`GetStatusCounts(include_views)`). `1`–`9` jump to a view; `[` / `]` go to the previous / next view.
 - **List**: one dense row per Item: status glyph (`○` todo, `◐` in progress, `●` done, `⊘` cancelled), *effective* priority (`*` suffix = local override, 3.2), title, Jira key, due, waiting (person + age), and markers: `✦` pending suggestions, `↑` pending push, `!` sync conflict / push failure, `🔁` recurring.
 - **Detail pane** shows the Jira status *name* when linked (e.g. "In Review") with the category glyph; the local status otherwise.
 - **Right pane**: shows either the **detail** of the selected Item, or the **Suggestions** drawer (`S` toggles). It follows the list selection.
@@ -107,10 +107,10 @@ On a shell command line, single quotes are the safe form. Unquoted, bash treats 
 | `+1` … `+5` | Priority: 1 = highest … 5 = lowest | `+2` |
 | `^<date>` | Due date (grammar below) | `^fri`, `^tomorrow`, `^+3d`, `^2026-10-24`, `^nov2`, `^eow` |
 | `#<label>` | Label (tag) | `#auth #oncall` |
-| `~<person>` | Waiting on. Fuzzy-matched against known People; unknown names are free text | `~dana`, `~"the vendor"` |
+| `~<person>` | Waiting on. Free text in P1; from P2 fuzzy-matched against known People (3.5), unknown names staying free text | `~dana`, `~"the vendor"` |
 | `>someday` / `>next` | Initial status refinement (default `inbox`) | `>someday` |
 
-**Date grammar** (shared by `^`, the `^` / `D` prompts, and follow-up dates), case-insensitive, resolved in local time against the reference time:
+**Date grammar** (shared by `^`, the `^` / `D` prompts, and follow-up dates), case-insensitive, resolved in local time against the reference time. The prompts use `ParseDate(text, reference_time?)` (a leading `^` is allowed), since `ParseCapture` applies no token to text with no title words:
 
 | Form | Meaning |
 |---|---|
@@ -123,27 +123,31 @@ On a shell command line, single quotes are the safe form. Unquoted, bash treats 
 
 ### 2.4 Views (tabs)
 
-Views are **saved queries**: a server-side filter + sort (4.3 rule 6). The defaults below are just preconfigured saved views, and you can add, remove and reorder views in config.
+Views are **saved queries**: a server-side filter + sort (4.3 rule 6). The defaults below are just preconfigured saved views; you add, remove and reorder views with `:view` commands (M6). Until then views are read-only through the API (`ListViews` only).
 
-| # | View | Shows | Default sort |
-|---|---|---|---|
-| 1 | **Inbox** | `inbox` | Oldest first (process in order) |
-| 2 | **Today** | Overdue or due today, `in_progress`, waiting follow-ups due, `focus_week` | Overdue → priority → due |
-| 3 | **Next** | `next` + `in_progress` | Priority → due |
-| 4 | **Waiting** | `waiting` flag set | Longest waiting first |
-| 5 | **Someday** | `someday` | Last touched |
-| 6 | **<instance id>** (e.g. `work-jira`), one tab per instance | Open (not done/cancelled) Items linked to that instance | Remote key |
-| 7 | **Archive** | Archived (any reason), dimmed | Archived date desc |
+| # | View | Shows | Default sort | Count |
+|---|---|---|---|---|
+| 1 | **Inbox** | `inbox` | Oldest first (process in order) | yes |
+| 2 | **Today** | Overdue or due today, `in_progress`, waiting follow-ups due, `focus_week` = this week | Overdue → effective priority → due | yes |
+| 3 | **Next** | `next` + `in_progress` | Effective priority → due | yes |
+| 4 | **Waiting** | `waiting` set | Longest waiting first (`waiting.since` asc) | yes |
+| 5 | **Someday** | `someday` | Last touched (`updated_at` desc) | no |
+| 6 | **<instance id>** (e.g. `work-jira`), one tab per instance (P2) | Open (not done/cancelled) Items linked to that instance | Remote key | yes |
+| 7 | **Archive** | Archived (any reason, deferred included), and done/cancelled Items not yet archived; archived Items are dimmed | Last updated first (`updated_at` desc: a done Item has no archived date) | no |
 
-**Implicit rules** applied to every view unless its filter explicitly opts in: exclude deleted; exclude archived; exclude `done`/`cancelled`; exclude `defer_until` in the future. Archive opts in to archived (and done/cancelled). `/` search filters within the current view; `:search …` searches everything including archived.
+Exact filters are in 4.8. Archive must show done Items: otherwise `x` makes an Item vanish from every tab until the M5 auto-archive (3.7).
 
-Views are stored **in the database** (not the TOML), created and edited with `:view new|edit|delete`, ordered by `:view move`; the defaults above are seeded on first run, and when an instance first appears in config its tab is appended once (a deleted instance tab is not re-created). The filter language is defined in 4.8.
+**Implicit rules** apply to every view, `ListItems` and count: exclude deleted; exclude archived; exclude `done`/`cancelled`; exclude `defer_until` in the future (a deferred Item is hidden from Today even when due). Only the filter's `include_*` flags lift them, never its clauses (4.8). `/` and `:search` are in 2.5.
+
+Views are stored **in the database** (not the TOML), one set per data directory, and created and edited with `:view new|edit|delete`, ordered by `:view move` (M6). View edits are not undo entries: they write no events (`:view delete` confirms instead). **Seeding**: the defaults are `todo_core::view::defaults()` (FakeDaemon mirrors them), each with a seed key (`inbox`, `today`, `next`, `waiting`, `someday`, `archive`). At `Store::open`, after migrations and in one transaction, each default whose key is not yet in `view_seeds` is appended after the existing views (a taken name gets a number), its key recorded, and a `view` Change written; no op or event. So the defaults appear on first run, a default added in a later version is seeded once into existing databases, and a deleted seeded view is never re-created. P2 seeds an instance's tab the same way, with key `instance:<id>`, when the instance first appears in config; P2 also decides where it goes (M3 seeds positions 0–5).
 
 ### 2.5 Keymap (normal mode)
 
 All bindings live in one declarative keymap table (4.6), are listed in the `F1` help overlay, and are user-overridable.
 
-**Navigation**: `j`/`k` move · `gg`/`G` top/bottom · `ctrl-d`/`ctrl-u` half-page · `tab` cycle focus list ↔ right pane · `1`–`9`, `[`, `]` views · `/` incremental filter (`n`/`N` next/prev match) · `esc` clear / close.
+**Navigation**: `j`/`k` move · `gg`/`G` top/bottom · `ctrl-d`/`ctrl-u` half-page · `tab` cycle focus list ↔ right pane · `1`–`9`, `[`, `]` views · `/` incremental filter (below) · `esc` clear / close.
+
+**`/` and `:search`**: `/` narrows the current view **on the server** as you type (debounced, ~100 ms): `ListItems(view_id = current, filter = {any_of: [title, labels, remote_link.key MATCHES q]})`. `enter` keeps the narrowed list, `esc` clears it, and the tab count stays un-narrowed. A narrowed list holds only matches, so `n`/`N` are not match jumps (M4 may make them row moves). `:search q` searches everything: no view, `any_of` the same targets plus description, with `include_archived`, `include_done` and `include_deferred` (deleted Items stay hidden). MATCHES takes plain words, each a prefix, ignoring case and accents (4.8).
 
 **Item actions** (on the selected Item, or on all marked Items):
 
@@ -277,7 +281,7 @@ A JSON map of remote field id → raw value, refreshed on every pull. Stored so 
 
 #### Derived and sync-state fields (read-only, computed by the daemon)
 
-`status` (the 6-value convenience status, 3.4) · `effective_priority` (override if set, else `priority`) · `is_mine` (5.9) · `pending_fields` (Core fields with an un-pushed local value, 5.6) · `has_conflict` / `has_push_failure` · `description_lossy` and `description_dirty` (5.6) · staleness signals (3.10) · `scopes` (5.3) · `deleted_at` (3.7).
+`status` (the 6-value convenience status, 3.4) · `effective_priority` (override if set, else `priority`) · `is_overdue` (4.8) · `is_mine` (5.9) · `pending_fields` (Core fields with an un-pushed local value, 5.6) · `has_conflict` / `has_push_failure` · `description_lossy` and `description_dirty` (5.6) · staleness signals (3.10) · `scopes` (5.3) · `deleted_at` (3.7).
 
 Read-only Core fields (`reporter`, `sprint`, `remote_status_name`, `remote_*_at`, `resolution_kind` when linked) and remote extras **cannot be targeted by any patch or update**; the daemon rejects such writes.
 
@@ -329,6 +333,8 @@ Person { id, display_name, emails[], remote_identities: [{ instance_id, account_
 ```
 
 Assignee, reporter, and `waiting.on` reference People. People are created on demand from Jira data. `waiting.on` may instead be free text ("the vendor") so capture is never blocked on choosing a person.
+
+**People are P2.** Local-only P1 has no Jira data, so no Person can exist: assignee cannot be set and `waiting.on` is always free text. `Person`, `PeopleService`, the `person` topic and `~` fuzzy matching arrive with P2; creating "local People" from `~name` now would force a merge with Jira identities later. In P1 the `w` prompt completes from the free-text `waiting.on` values already on Items.
 
 ### 3.6 Relations
 
@@ -452,7 +458,7 @@ Three independent version axes: the **API** is versioned by protobuf package (`t
 - **One binary, `todo`** (Rust), with subcommands: `todo daemon` (run the server), `todo add …` (one-shot capture), `todo` with no arguments (launch the TUI), plus admin commands (`todo config`, `todo export`, `todo auth`).
 - **Auto-spawn**: every client tries the socket first. If no daemon answers, it spawns `todo daemon --detach` and retries with a short backoff (budget ~2s). A lock file (exclusive `flock`) guarantees a single daemon per user.
 - **Stays running** after clients disconnect, so background sync and scheduled jobs continue. An optional `todo daemon install` registers a launchd agent (macOS) / systemd user unit (Linux) so it starts at login. Not required.
-- **Version handshake**: the first call from any client is `GetServerInfo(client_kind: interactive | oneshot | mcp, client_version, required_api_minor)` → daemon version, `api_minor` (an integer bumped with every additive change to `todo.v1`, and when an RPC that answered `UNIMPLEMENTED` starts working; 3 as of M2), and capability strings (e.g. `jira`, `assistant`). Interactive clients connected drive the faster pull cadence (5.4).
+- **Version handshake**: the first call from any client is `GetServerInfo(client_kind: interactive | oneshot | mcp, client_version, required_api_minor)` → daemon version, `api_minor` (an integer bumped with every additive change to `todo.v1`, and when an RPC that answered `UNIMPLEMENTED` starts working; 5 as of M3), and capability strings (e.g. `jira`, `assistant`). Interactive clients connected drive the faster pull cadence (5.4). **One exception**: `todo status --short` (2.1) makes no handshake and never spawns or restarts the daemon; an older daemon's `UNIMPLEMENTED` just prints nothing.
 - **Upgrade restart**: if the daemon's `api_minor` is lower than the client requires, the daemon binary on disk is presumably newer (an upgrade happened). The client calls `Shutdown(restart = true)`; the daemon refuses if other interactive clients are connected (the client then shows "restart required; close other sessions"), otherwise it waits up to 10s for in-flight work (outbox ops `in_flight`, open Claude calls) and exits; the client re-spawns `todo daemon` from **its own install path**.
 - **Socket**: `daemon.sock` in the runtime directory (7.1), mode `0600`; the gRPC `:authority` is `localhost`. No TCP listener in v1. A network transport (TLS + token) is a later, opt-in addition and must not change the API.
 
@@ -467,9 +473,9 @@ Three independent version axes: the **API** is versioned by protobuf package (`t
 | Service | Responsibility |
 |---|---|
 | `SystemService` | Server info, health, shutdown/restart, config read + reload (the daemon **never writes** the TOML), export/import, backup |
-| `ItemService` | Capture, `ParseCapture`, get, list/query, update (`FieldMask`), `SetStatus`, archive/unarchive, delete/undelete, relations, comments (local drafts), undo/redo, status counts (for `todo status`) |
-| `ViewService` | Saved views: list, create, update, delete, reorder (4.8) |
-| `PeopleService` | List/search (for `~` fuzzy match), get, update display name, merge duplicates |
+| `ItemService` | Capture, `ParseCapture`, `ParseDate`, get, list/query, update (`FieldMask`), `SetStatus`, archive/unarchive, delete/undelete, relations, comments (local drafts), undo/redo, status and tab counts (`GetStatusCounts`, for `todo status` and the tab bar) |
+| `ViewService` | Saved views: list (M3); create, update, delete, reorder (M6; 2.4, 4.8) |
+| `PeopleService` | (P2, 3.5) List/search (for `~` fuzzy match), get, update display name, merge duplicates |
 | `RecurrenceService` | Series CRUD; completing an instance and generating the next one happen in **one op** |
 | `ReviewService` | Weekly review sessions (start, resume, advance step), standup generation (works without Claude; Claude condenses when configured) |
 | `SuggestionService` | List, apply (selected patches), reject, request generation |
@@ -491,12 +497,12 @@ Three independent version axes: the **API** is versioned by protobuf package (`t
 
 ### 4.4 Change stream and revisions
 
-- The store keeps a single monotonically increasing **revision**, incremented on every committed write (user, sync, suggestion, scheduler). Every read response (`GetItem`, `ListItems`, …) includes the revision it was read at; a paged `ListItems` pins all pages to the first page's revision.
+- The store keeps a single monotonically increasing **revision**, incremented on every committed write (user, sync, suggestion, scheduler). Every read response (`GetItem`, `ListItems`, …) includes the revision it was read at. **`ListItems` pages read live data**, each at its own revision; nothing pins a revision. Paging is keyset (4.8), so a write between pages never makes unchanged rows skip or repeat, but a row whose sort key moved past the cursor can come twice (clients keep the first). The page token pins the first page's `today`, so a list does not change its mind at midnight. LiveStore reads views in pages of 1000.
 - `WatchService.Subscribe(since_revision, topics[])` returns a server stream of `WatchMessage`, a oneof of:
-  - **`Change { revision, topic, id, deleted: bool, resource: oneof { Item, Suggestion, View, Person, RecurrenceSeries, ReviewSession, ConfigSnapshot } }`** — durable, replayable. `topic` ∈ `item` (covers the Item aggregate incl. its comments, relations and pending-push state), `suggestion`, `view`, `person`, `series`, `review`, `config`. The full resource is included unless `deleted`.
+  - **`Change { revision, topic, id, deleted: bool, resource: oneof { Item, Suggestion, View, Person, RecurrenceSeries, ReviewSession, ConfigSnapshot } }`** — durable, replayable. `topic` ∈ `item` (covers the Item aggregate incl. its comments, relations and pending-push state), `suggestion`, `view`, `person`, `series`, `review`, `config`. The full resource is included unless `deleted`. Views are hard-deleted, so a replayed `view` row whose view is gone is sent as `deleted`.
   - **`Notice { kind, … }`** — ephemeral, **no revision**, not replayed: `sync_status` (5.11), `import_progress` (5.4), `assistant_job` (queued/running/done), `toast`.
   - **`ResyncRequired {}`** — sent once when `since_revision` is older than the replay window (7.2); the stream then continues from the current revision and the client must reload.
-- Clients load data, remember its revision, subscribe from it, and resume from the last seen revision on reconnect. Because filtering is server-side, a client re-runs the current view's `ListItems` (debounced) when `item` changes arrive, or applies the change locally if it can evaluate membership cheaply.
+- Clients load data, remember its revision, subscribe from it, and resume from the last seen revision on reconnect. Because filtering is server-side, a client re-runs the current view's `ListItems` and the counts (debounced) when `item` changes arrive, or applies the change locally if it can evaluate membership cheaply; a `view` change re-runs the views that name it. **No change marks a new day**: Today, `is_overdue`, deferrals and ⏰ move at midnight without a revision, so a client re-reads its views and counts once its date passes `GetStatusCountsResponse.today` (LiveStore `refresh()`, on an M4 timer).
 - This one mechanism keeps the TUI live while sync and Claude work in the background, and it gives future clients the same live behavior for free.
 
 ### 4.5 Daemon internals (Rust)
@@ -562,11 +568,22 @@ Binding conventions for the API design phase, so implementers don't diverge:
 - **People**: `PersonRef { oneof { string person_id; string free_text } }` (free text only valid for `waiting.on`). Full `Person` records are fetched separately and streamed on the `person` topic.
 - **Typed patch values**: `set_field.expected_old` / `new` use a `FieldValue` oneof covering every field type (string, markdown, enum values, date, person ref, string set, number, duration, …) plus `cleared`. No JSON strings. `field` is an enum `ItemField`, not a free-form path.
 - **Update vs patch**: `UpdateItem` uses `FieldMask` over the same `ItemField` set. Applying a `set_field` patch is equivalent to an `UpdateItem` with precondition `expected_old`.
-- **Filter language** (views, `ListItems`): `Filter { all_of: [Clause], any_of: [Clause], include_archived, include_done, include_deferred, include_deleted }`. Semantics: an Item matches if **every** `all_of` clause matches **and** (`any_of` is empty **or** at least one `any_of` clause matches), and it passes the implicit rules unless the matching `include_*` flag is true (all default false, 2.4).
-  - A `Clause` is a typed predicate on one target: any stored field, any nested field (`waiting.on`, `waiting.follow_up_on`, `archived.reason`, `remote_link.instance_id`), or a derived field (`status`, `effective_priority`, `is_mine`, `is_overdue`, `has_conflict`, `scopes`, staleness signals). Operators by type: `in`, `=`, `!=`, `<`, `<=`, `>`, `>=`, `is_set`, `is_unset`, `contains_any`, `contains_all`, and `matches` (FTS text search). Date operands may be absolute or relative (`today`, `+Nd`, `this_week`; `current_week` for `focus_week`).
-  - A Clause may instead be a nested group `{ all_of, any_of }` with the same semantics.
-  - **Sort** is a list of `(key, direction)`; keys are any clause target. `none` priority sorts after `lowest`; unset dates sort last.
-  - Default view filters: **Today** `any_of: [due_date <= today, status in [in_progress], {all_of: [waiting is_set, waiting.follow_up_on <= today]}, focus_week = current_week]`, sort `is_overdue desc, effective_priority desc, due_date asc`. **Archive** `include_archived, include_done, all_of: [archived is_set]`. The others are single `status`/`waiting`/`instance_id` clauses per 2.4.
+- **Filter language** (views, `ListItems`): `Filter { all_of: [Clause], any_of: [Clause], include_archived, include_done, include_deferred, include_deleted }`. Semantics: an Item matches if **every** `all_of` clause matches **and** (`any_of` is empty **or** at least one `any_of` clause matches), and it passes the implicit rules unless the matching `include_*` flag is true (all default false, 2.4). Clauses never lift a rule: `status in [done]` without `include_done` matches nothing.
+  - A `Clause` is a typed predicate on one target: any stored field, any nested field (`waiting.on`, `waiting.follow_up_on`, `archived.reason`, `remote_link.instance_id`), or a derived field (`status`, `effective_priority`, `is_mine`, `is_overdue`, `has_conflict`, `scopes`, staleness signals). Operators by type: `in`, `=`, `!=`, `<`, `<=`, `>`, `>=`, `is_set`, `is_unset`, `contains_any`, `contains_all`, and `matches` (FTS text search). Date operands may be absolute or relative: `today`, `start_of_week` (Monday) or `end_of_week` (Sunday; capture's `eow` is Friday) plus `offset_days`, and `current_week`, the ISO week-year `YYYY-Www`, for `focus_week` (its offset must be 0).
+  - A Clause may instead be a nested group `{ all_of, any_of }` with the same semantics; an empty group matches every Item.
+  - **Today**: each request resolves exactly one civil `today` in the daemon's zone, from its `reference_time` (`ListItems`, `GetStatusCounts`) or else the daemon's clock. It drives relative dates, the defer rule and **`is_overdue`** = `due_date < today` and status not `done`/`cancelled` (archive, defer and delete do not affect it).
+  - **Unset**: a target is unset when its optional value or message is absent, or any enclosing message is (`waiting.reason` on an Item that is not waiting). `in`, `=`, `<`, `<=`, `>`, `>=` never match unset; `!=` is exactly NOT `=`, so it does. `is_set` / `is_unset` apply only to targets that can be unset (otherwise use `=`). `FieldValue.cleared` is never an operand.
+  - **Sets** (`labels`, `components`, `fix_versions`, `scopes`) are never unset: `is_set` = non-empty, `is_unset` = empty. `contains_any` / `contains_all` are exact, case-sensitive membership, false on an empty set.
+  - **Priority** ranks `lowest` = 1 … `highest` = 5. `none` behaves as unset for ordering: it never matches `<`, `<=`, `>`, `>=`, is invalid as their operand, and sorts last in both directions; `=`, `in` and `!=` treat it as a value.
+  - **Strings** compare by exact code point. Ordering operators on strings are invalid, except on `focus_week`.
+  - **`matches`** (full-text search) targets one of `title`, `description`, `labels`, `remote_link.key`, which picks the FTS column. The text is plain words, never FTS syntax: split on code points ≤ U+0020, each term quoted (doubling `"`) with `*` for a prefix match, and the terms ANDed, so a term's words match in order within one field. Blank text is invalid. `items_fts` uses `unicode61 remove_diacritics 2`: case- and accent-insensitive, so `tieng` finds "Tiếng" in NFC or NFD. FakeDaemon approximates the tokenizer; exact `unicode61` parity is not a goal.
+  - **Sort** is a list of `(key, direction)`, applied in order. Unset values sort last in both directions; priorities by rank (`none` last), enums by proto number, `false` < `true`, strings by code point. Markdown, set, person and message-presence targets are invalid keys. At most 8 keys, none repeated. The tie-break `created_at asc, id asc` is appended, minus any key already present; an empty sort is that tie-break.
+  - **Paging is keyset**, not offset: completing rows is the commonest write, and offset paging would skip rows. The token (`p3.` + base64url) holds a fingerprint of the **effective** filter and sort (after `view_id` merging; not page size or today), the first page's today and the last row's keys and id. A token from another query is invalid on `page_token`. Pages read live data (4.4).
+  - **`view_id`** (`ListItems`) narrows a saved view: the effective filter is the view's filter AND the request's clauses as one extra group, each `include_*` flag is the OR of the two, and a non-empty request sort replaces the view's. An unknown view is `NOT_FOUND` / `VIEW_NOT_FOUND` (metadata `view_id`). A tab count is a COUNT over the same compiled query, all counts read in one transaction.
+  - **Errors**: an invalid target × operator × operand combination is `INVALID_ARGUMENT` with a `BadRequest` naming the first offending path in document order, e.g. `filter.all_of[1].group.any_of[0].predicate.op` or `sort[2].key` (a total over a limit: `filter` or `sort`). A valid combination that is not built yet is `UNIMPLEMENTED` / `NOT_IMPLEMENTED` (metadata `field`), reported only when nothing is invalid: relative dates on instant targets, `remote_extras`, `pending_fields` with `contains_*`. The full type × operator table is in `filter.proto`.
+  - **Limits** (`todo_core::filter`, mirrored in `packages/client/src/limits.ts`): groups nest at most 4 deep; a filter holds at most 128 predicates and 4000 operands, a predicate at most 1000; `matches` text at most 1024 bytes; a sort at most 8 keys. Groups themselves cost nothing: one that always matches (an empty group, or one of only such groups) compiles to nothing, so the SQL never nests deeper than the predicates do. Every value is a bound SQL parameter; SQL text comes only from a fixed vocabulary.
+  - **Default views** (seeded, 2.4), with the implicit rules on top and every sort ending in the tie-break: **Inbox** `status in [inbox]`, `created_at asc`. **Today** `any_of: [due_date <= today, status in [in_progress], {all_of: [waiting is_set, waiting.follow_up_on <= today]}, focus_week = current_week]`, `is_overdue desc, effective_priority desc, due_date asc`. **Next** `status in [next, in_progress]`, `effective_priority desc, due_date asc`. **Waiting** `waiting is_set`, `waiting.since asc`. **Someday** `status in [someday]`, `updated_at desc`. **Archive** `include_archived, include_done, include_deferred, any_of: [archived is_set, status in [done, cancelled]]`, `updated_at desc`. **Instance tab** (P2) `remote_link.instance_id = <id>`, `remote_link.key asc`.
+  - **`is_blocked`** (P4, standup and Ask; no tab, marker or key needs it before): true iff some relation `X blocks this` exists where X is not deleted and not `done`/`cancelled` (archive does not matter). When X crosses open/closed, or is deleted or undeleted, the op must also record a change for every Item X blocks, or cached Items go stale. Field number 83 is allocated by comment only (`item.proto`, `field.proto`).
 
 ## 5. Sync Engine
 
@@ -858,7 +875,7 @@ What is sent: Item Core and Overlay fields of the Items in context, minus `priva
 
 Conceptual tables. Exact columns belong to the implementation phase, but each maps to a concept in Section 3 or 5:
 
-`items` (incl. soft-delete / tombstone columns, 3.7) · `remote_links` · `remote_snapshots` · `remote_extras` · `relations` · `people` (+ `person_identities`) · `comments` · `recurrence_series` · `events` · `ops` (op_id, actor, undo/redo state) · `suggestions` · `suggestion_patches` · `suggestion_decisions` (6.8) · `outbox` · `sync_instances` (cursors, state, account id, time zone) · `scope_membership` · `tracker_metadata` (cached discovery, 5.8) · `views` (4.8) · `review_sessions` (2.7) · `assistant_jobs` · `assistant_usage` · `request_ids` (idempotency, 24h) · `spool_imports` (imported spool ids) · `kv` (e.g. last standup time) · `changes` (watch replay, 4.4) · `meta` (schema version, current revision) · `items_fts` (FTS5 over title, description, key, labels).
+`items` (incl. soft-delete / tombstone columns, 3.7) · `remote_links` · `remote_snapshots` · `remote_extras` · `relations` · `people` (+ `person_identities`) · `comments` · `recurrence_series` · `events` · `ops` (op_id, actor, undo/redo state) · `suggestions` · `suggestion_patches` · `suggestion_decisions` (6.8) · `outbox` · `sync_instances` (cursors, state, account id, time zone) · `scope_membership` · `tracker_metadata` (cached discovery, 5.8) · `views` + `view_seeds` (2.4, 4.8) · `review_sessions` (2.7) · `assistant_jobs` · `assistant_usage` · `request_ids` (idempotency, 24h) · `spool_imports` (imported spool ids) · `kv` (e.g. last standup time) · `changes` (watch replay, 4.4) · `meta` (schema version, current revision) · `items_fts` (FTS5 over title, description, key, labels).
 
 - **Migrations** are embedded in the binary, forward-only, and run at daemon start inside a transaction, after an automatic pre-migration backup. A daemon refuses to open a database whose schema version is newer than it understands. Real databases exist since M1, so from `0002` on every schema change is a **new** migration, and the statements of a migration that databases have applied are never edited (this replaces "edit `0001` until the first release").
 - **`changes` retention**: last 30 days or 50k rows, whichever is larger. Clients older than that get `RESYNC_REQUIRED` (4.4).
@@ -991,10 +1008,10 @@ Each phase ends usable. Later phases must not require reworking earlier contract
 | Phase | Scope | Exit criteria |
 |---|---|---|
 | **P0 — Spike** | Repo skeleton (4.7 layout), Buf setup, a minimal `todo.v1` (`GetServerInfo`, `CaptureItem`, `ListItems`, `Subscribe`) using the **real** `Item` message shape from 3.2/4.8 (it can't be renumbered later), tonic daemon on a Unix socket with SQLite + revisions + `changes`, Connect-ES client in Node, Ink list that updates live | TS client calls tonic over UDS incl. a server stream; auto-spawn + lock works. Fallback decision (4.3) made |
-| **P1 — Local core** | Full domain model (Section 3, minus remote parts, Suggestions and comment drafts, which move to P2 where they can be pushed), store + migrations, capture parser + `ParseCapture`, `todo add` + spool, TUI layout/views/keymap/detail/undo/bulk, recurrence, archive/delete/undelete, export/import, backups, `todo status`, MCP server (incl. `--read-only`). **Services**: `SystemService`, `ItemService` (incl. `BatchMutate`), `ViewService`, `PeopleService`, `RecurrenceService`, `WatchService` complete for local data | Daily-drivable as a local-only todo app |
-| **P2 — Jira sync** | Adapter trait + fake adapter + conformance suite, Jira adapter, discovery, pull loop + tracked set, reconciliation, outbox, promote/attach, conflicts, comment drafts and their push, **Suggestion model + pane** (for `sync_conflict` / `link_conflict` / `push_failed`), credentials, sync status. **Services**: `SyncService`, `SuggestionService` | Your assigned Jira issues stay in sync both ways on a work instance; offline edits recover correctly |
+| **P1 — Local core** | Full domain model (Section 3, minus remote parts, Suggestions and comment drafts, which move to P2 where they can be pushed), store + migrations, capture parser + `ParseCapture`, `todo add` + spool, TUI layout/views/keymap/detail/undo/bulk, recurrence, archive/delete/undelete, export/import, backups, `todo status`, MCP server (incl. `--read-only`). **Services**: `SystemService`, `ItemService` (incl. `BatchMutate`), `ViewService`, `RecurrenceService`, `WatchService` complete for local data. People (`PeopleService`, `~` fuzzy matching) move to P2, since P1 cannot create a Person (3.5) | Daily-drivable as a local-only todo app |
+| **P2 — Jira sync** | Adapter trait + fake adapter + conformance suite, Jira adapter, discovery, pull loop + tracked set, reconciliation, outbox, promote/attach, conflicts, comment drafts and their push, **Suggestion model + pane** (for `sync_conflict` / `link_conflict` / `push_failed`), credentials, sync status, People and `~` fuzzy matching (3.5). **Services**: `SyncService`, `SuggestionService`, `PeopleService` | Your assigned Jira issues stay in sync both ways on a work instance; offline edits recover correctly |
 | **P3 — Claude core** | Providers (`api`, `claude_code`), job queue, context builder, `refine` (incl. merge), `relate`, `prioritize`, `fill_required`, learning from decisions, NL inference, usage tracking. **Services**: `AssistantService` (request jobs, usage) | Captures arrive refined; duplicates are caught |
-| **P4 — Review & Claude workflows** | Stale rules + `stale_review` (rules and Claude), weekly review mode, standup, Ask bar, `split`, `comment_draft`. **Services**: `ReviewService` | Monday review is the routine |
+| **P4 — Review & Claude workflows** | Stale rules + `stale_review` (rules and Claude), weekly review mode, standup, Ask bar, `split`, `comment_draft`, derived `is_blocked` (4.8). **Services**: `ReviewService` | Monday review is the routine |
 | **P5 — Open source** | Packaging (Homebrew), docs, fixture scrubbing, a **second adapter** (GitHub Issues) to prove the adapter abstraction | Public release |
 
 ### 9.2 Open questions
