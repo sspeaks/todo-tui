@@ -148,6 +148,8 @@ fn change_message(row: ChangeRow) -> SubscribeResponse {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use futures_util::StreamExt as _;
     use todo_core::CreatedVia;
     use todo_store::CaptureInput;
@@ -207,5 +209,62 @@ mod tests {
             }
         }
         assert_eq!(revisions, (seeded + 1..=seeded + N).collect::<Vec<_>>());
+    }
+
+    /// A view change reaches a live subscriber, and a later replay, with
+    /// the whole View.
+    #[tokio::test]
+    async fn view_changes_stream_and_replay_with_the_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("todo.db")).unwrap();
+        let watch = Watch(Ctx {
+            store: store.clone(),
+            clients: Clients::default(),
+            shutdown: ShutdownHandle::new(),
+        });
+        let subscribe = async |since_revision| {
+            let req = SubscribeRequest {
+                since_revision,
+                topics: vec![Topic::View.to_i32()],
+            };
+            watch
+                .subscribe(Request::new(req))
+                .await
+                .unwrap()
+                .into_inner()
+        };
+        let mut live = subscribe(None).await;
+        let seeded = store.current_revision();
+        assert!(matches!(next(&mut live).await, Message::CaughtUp(c) if c.revision == seeded));
+
+        // Renames the Today view, as editing a view will (M6).
+        let (views, _) = store.list_views().await.unwrap();
+        let mut view = views[1].clone();
+        let renamed = store
+            .write(move |tx| {
+                let id = view.id.unwrap().to_string();
+                view.name = "Now".into();
+                view.revision = tx.next_revision();
+                tx.conn().execute(
+                    &format!(
+                        "UPDATE views SET name = 'Now', revision = {} WHERE id = '{id}'",
+                        view.revision
+                    ),
+                    [],
+                )?;
+                let resource = Resource::View(Arc::new(view.clone()));
+                tx.record_change(Topic::View, &id, false, Some(resource))?;
+                Ok(view)
+            })
+            .await
+            .unwrap();
+        let Message::Change(streamed) = next(&mut live).await else {
+            panic!("expected a change");
+        };
+        let resource = change::Resource::View(Box::new(v1::View::from(&renamed)));
+        assert_eq!(streamed.revision, seeded + 1);
+        assert_eq!(streamed.resource, Some(resource));
+        let mut replay = subscribe(Some(seeded)).await;
+        assert_eq!(next(&mut replay).await, Message::Change(streamed));
     }
 }

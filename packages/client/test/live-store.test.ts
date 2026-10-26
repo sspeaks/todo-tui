@@ -1,9 +1,13 @@
 import { create } from "@bufbuild/protobuf";
-import { Code, ConnectError, createClient } from "@connectrpc/connect";
-import { afterEach, describe, expect, it } from "vitest";
-import { ItemSchema } from "../src/gen/todo/v1/item_pb.js";
+import { Code, ConnectError, type Transport, createClient } from "@connectrpc/connect";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { ItemField } from "../src/gen/todo/v1/field_pb.js";
+import { Operator } from "../src/gen/todo/v1/filter_pb.js";
+import { ItemSchema, Priority, Status } from "../src/gen/todo/v1/item_pb.js";
 import { ItemService } from "../src/gen/todo/v1/item_service_pb.js";
+import type { SubscribeResponse } from "../src/gen/todo/v1/watch_service_pb.js";
 import { FakeDaemon } from "../src/fake-daemon.js";
+import { MAX_PAGE_SIZE } from "../src/limits.js";
 import { LiveStore, type LiveStoreOptions } from "../src/live-store.js";
 import { RelationKind } from "../src/gen/todo/v1/relation_pb.js";
 import { addRelation, deleteItem, removeRelation, undeleteItem, undo } from "../src/mutations.js";
@@ -45,8 +49,8 @@ describe("LiveStore", () => {
     await waitFor(() => store.getConnection().state === "live");
     expect(view.getSnapshot().status).toBe("ready");
     expect(titles(store)).toEqual(["item 0", "item 1", "item 2"]);
-    expect(daemon.calls.subscribe).toEqual([3n]);
-    expect(store.getConnection().revision).toBe(3n);
+    expect(daemon.calls.subscribe).toEqual([daemon.revision]);
+    expect(store.getConnection().revision).toBe(daemon.revision);
   });
 
   it("applies item changes immediately and re-queries membership after the debounce", async () => {
@@ -173,7 +177,8 @@ describe("LiveStore", () => {
     store.start();
     await waitFor(() => store.getConnection().state === "live");
     daemon.put({ title: "a" });
-    await waitFor(() => store.getConnection().revision === 3n);
+    const seen = daemon.revision;
+    await waitFor(() => store.getConnection().revision === seen);
 
     daemon.down = true;
     daemon.dropStreams();
@@ -183,8 +188,8 @@ describe("LiveStore", () => {
     daemon.down = false;
 
     await waitFor(() => store.getConnection().state === "live" && titles(store).includes("while down"));
-    expect(daemon.calls.subscribe.at(-1)).toBe(3n);
-    expect(store.getConnection().revision).toBe(4n);
+    expect(daemon.calls.subscribe.at(-1)).toBe(seen);
+    expect(store.getConnection().revision).toBe(seen + 1n);
   });
 
   it("retries with backoff and asks for the daemon once per outage", async () => {
@@ -233,7 +238,7 @@ describe("LiveStore", () => {
     const [x, y] = view.getSnapshot().items;
     for (let i = 0; i < 8; i++) daemon.update(x!.id, { title: `edit ${i}` });
     await waitFor(() => store.getItem(x!.id)?.title === "edit 7");
-    expect(store.getConnection().revision).toBe(10n);
+    expect(store.getConnection().revision).toBe(daemon.revision);
 
     daemon.down = true;
     daemon.dropStreams();
@@ -289,16 +294,17 @@ describe("LiveStore", () => {
     await waitFor(() => store.getConnection().state === "live");
     expect(good.getSnapshot().items).toHaveLength(2);
     expect(bad.getSnapshot().status).toBe("error");
-    expect(daemon.calls.subscribe).toEqual([2n]);
+    expect(daemon.calls.subscribe).toEqual([daemon.revision]);
     daemon.put({ title: "live" });
     await waitFor(() => titles(store).includes("live"));
   });
 
-  it("subscribes with the ListItems revision when no view exists", async () => {
+  it("subscribes with the ListViews revision when no view exists", async () => {
     const { daemon, store } = setup(4);
     store.start();
     await waitFor(() => store.getConnection().state === "live");
-    expect(daemon.calls.subscribe).toEqual([4n]);
+    expect(daemon.calls.subscribe).toEqual([daemon.revision]);
+    expect(daemon.calls.listItems).toBe(0);
     const view = store.view();
     await waitFor(() => view.getSnapshot().status === "ready");
     expect(view.getSnapshot().items).toHaveLength(4);
@@ -306,11 +312,12 @@ describe("LiveStore", () => {
 
   it("pages through ListItems", async () => {
     const { daemon, store } = setup(25);
-    daemon.pageSize = 10;
+    daemon.maxPageSize = 10;
     const view = store.view();
     store.start();
     await waitFor(() => view.getSnapshot().status === "ready");
     expect(view.getSnapshot().items).toHaveLength(25);
+    expect(daemon.calls.listItems).toBe(3);
   });
 
   it("keeps snapshots referentially stable and shares equal views", async () => {
@@ -347,5 +354,182 @@ describe("LiveStore", () => {
     store.start();
     await waitFor(() => store.getConnection().state === "live");
     expect(seen).toEqual([]);
+  });
+});
+
+describe("LiveStore saved views, counts and paging", () => {
+  const saved = (daemon: FakeDaemon, seed: string) => [...daemon.views.values()].find((v) => v.seed === seed)!;
+  const statusIn = (status: Status) => ({
+    allOf: [
+      {
+        kind: {
+          case: "predicate" as const,
+          value: { target: ItemField.STATUS, op: Operator.IN, operands: [{ kind: { case: "value" as const, value: { kind: { case: "status" as const, value: status } } } }] },
+        },
+      },
+    ],
+  });
+
+  it("keeps the saved views in tab order from ListViews and view changes", async () => {
+    const { daemon, store } = setup(0);
+    expect(store.getViews()).toMatchObject({ status: "loading", views: [] });
+    store.start();
+    await waitFor(() => store.getViews().status === "ready");
+    const snap = store.getViews();
+    expect(snap.views.map((v) => v.seed)).toEqual(["inbox", "today", "next", "waiting", "someday", "archive"]);
+    expect(store.getViews()).toBe(snap);
+    expect(daemon.calls.listViews).toBe(1);
+
+    const inbox = saved(daemon, "inbox");
+    daemon.updateView(inbox.id, { name: "In", position: 9 });
+    await waitFor(() => store.getViews().views.at(-1)?.name === "In");
+    expect(store.getSavedView(inbox.id.toLowerCase())?.name).toBe("In");
+    daemon.removeView(saved(daemon, "someday").id);
+    await waitFor(() => store.getViews().views.length === 5);
+    expect(store.getViews().views.map((v) => v.seed)).toEqual(["today", "next", "waiting", "archive", "inbox"]);
+    expect(store.getConnection().revision).toBe(daemon.revision);
+  });
+
+  it("re-queries the views that narrow a saved view when it changes, and only those", async () => {
+    const { daemon, store } = setup(0);
+    daemon.put({ title: "inboxed" });
+    daemon.put({ title: "next", status: Status.NEXT });
+    const next = saved(daemon, "next");
+    const narrowed = store.view({ viewId: next.id });
+    const all = store.view();
+    store.start();
+    await waitFor(() => narrowed.getSnapshot().status === "ready" && all.getSnapshot().status === "ready");
+    expect(narrowed.getSnapshot().items.map((i) => i.title)).toEqual(["next"]);
+
+    const calls = daemon.calls.listItems;
+    daemon.updateView(next.id, { filter: statusIn(Status.INBOX) });
+    await waitFor(() => narrowed.getSnapshot().items[0]?.title === "inboxed");
+    await sleep(40);
+    expect(daemon.calls.listItems).toBe(calls + 1);
+    expect(all.getSnapshot().items).toHaveLength(2);
+  });
+
+  it("shows soft-deleted Items in a view whose saved filter includes them", async () => {
+    // No re-query within the test: what the views show comes from the store.
+    const { daemon, store } = setup(2, { debounceMs: 60_000 });
+    const inbox = saved(daemon, "inbox");
+    daemon.updateView(inbox.id, { filter: { ...statusIn(Status.INBOX), includeDeleted: true } });
+    const items = createClient(ItemService, daemon.transport);
+    const withDeleted = store.view({ viewId: inbox.id });
+    const plain = store.view({ filter: statusIn(Status.INBOX) });
+    store.start();
+    await waitFor(() => withDeleted.getSnapshot().items.length === 2 && plain.getSnapshot().items.length === 2);
+    const [a] = plain.getSnapshot().items;
+
+    await deleteItem(items, a!.id);
+    await waitFor(() => store.getItem(a!.id)?.deletedAt !== undefined);
+    expect(plain.getSnapshot().items.map((i) => i.id)).not.toContain(a!.id);
+    expect(withDeleted.getSnapshot().items.map((i) => i.id)).toContain(a!.id);
+  });
+
+  it("keeps the status and tab counts live while they are observed", async () => {
+    const { daemon, store } = setup(2);
+    store.start();
+    await waitFor(() => store.getConnection().state === "live");
+    daemon.put({ title: "unobserved" });
+    await sleep(60);
+    expect(daemon.calls.getStatusCounts).toBe(0);
+    expect(store.getCounts().status).toBe("loading");
+
+    const unsubscribe = store.subscribeCounts(() => {});
+    await waitFor(() => store.getCounts().status === "ready");
+    const inbox = saved(daemon, "inbox").id;
+    const counts = store.getCounts();
+    expect(counts.counts).toMatchObject({ inbox: 3, due: 0, overdue: 0 });
+    expect([...counts.views]).toEqual(["inbox", "today", "next", "waiting"].map((seed) => [saved(daemon, seed).id, seed === "inbox" ? 3 : 0]));
+    expect(counts.today).toBeDefined();
+    expect(store.getCounts()).toBe(counts);
+
+    // Item changes re-count, debounced.
+    const calls = daemon.calls.getStatusCounts;
+    for (let i = 0; i < 5; i++) daemon.put({ title: `burst ${i}` });
+    await waitFor(() => store.getCounts().counts?.inbox === 8);
+    await sleep(40);
+    expect(daemon.calls.getStatusCounts).toBe(calls + 1);
+    // So do view changes.
+    daemon.updateView(inbox, { showCount: false });
+    await waitFor(() => !store.getCounts().views.has(inbox));
+
+    unsubscribe();
+    const after = daemon.calls.getStatusCounts;
+    daemon.put({ title: "unobserved again" });
+    await sleep(60);
+    expect(daemon.calls.getStatusCounts).toBe(after);
+    // The next observer reloads them.
+    const again = store.subscribeCounts(() => {});
+    await waitFor(() => store.getCounts().counts?.inbox === 9);
+    again();
+  });
+
+  it("asks for MAX_PAGE_SIZE pages", async () => {
+    const { daemon, store } = setup(3);
+    const sizes: number[] = [];
+    daemon.onListItems = (req) => void sizes.push(req.pageSize);
+    store.view();
+    store.start();
+    await waitFor(() => store.getConnection().state === "live");
+    expect(sizes).toEqual([MAX_PAGE_SIZE]);
+  });
+
+  it("keeps the first of an Item a later page returns again", async () => {
+    // No re-query within the test: the ids are the first load's.
+    const { daemon, store } = setup(0, { pageSize: 2, debounceMs: 60_000 });
+    const [a, b, c, d] = [Priority.HIGH, Priority.MEDIUM, Priority.LOW, Priority.NONE].map((priority, i) =>
+      daemon.put({ title: `p${i}`, status: Status.NEXT, priority }),
+    );
+    let pages = 0;
+    daemon.onListItems = (req) => {
+      // Between the first and second page, b moves past the cursor.
+      if (req.pageToken !== "" && pages++ === 0) daemon.update(b!.id, { priority: Priority.NONE });
+    };
+    const view = store.view({ filter: statusIn(Status.NEXT), sort: [{ key: ItemField.EFFECTIVE_PRIORITY, descending: true }] });
+    store.start();
+    await waitFor(() => view.getSnapshot().status === "ready");
+    expect(daemon.calls.listItems).toBe(3);
+    expect(view.ids).toEqual([a!.id, b!.id, c!.id, d!.id]);
+    expect(view.getSnapshot().items.map((i) => i.id)).toEqual([a!.id, b!.id, c!.id, d!.id]);
+  });
+
+  it("applies no message once stopped, so no re-query timer outlives stop", async () => {
+    const daemon = new FakeDaemon([{ title: "a" }]);
+    // Stops the store as a change arrives, before the store handles it.
+    let onChange: (() => void) | undefined;
+    const transport: Transport = {
+      unary: (...args) => daemon.transport.unary(...args),
+      async stream(...args) {
+        const res = await daemon.transport.stream(...args);
+        const message = (async function* () {
+          for await (const m of res.message) {
+            if ((m as SubscribeResponse).message.case === "change") onChange?.();
+            yield m;
+          }
+        })();
+        return { ...res, message } as typeof res;
+      },
+    };
+    const store = new LiveStore({ transport, debounceMs: 777 });
+    stores.push(store);
+    store.view();
+    const unsubscribe = store.subscribeCounts(() => {});
+    store.start();
+    await waitFor(() => store.getConnection().state === "live" && store.getCounts().status === "ready");
+    const timers = vi.spyOn(globalThis, "setTimeout");
+    let stopped: Promise<void> | undefined;
+    onChange = () => {
+      stopped ??= store.stop();
+    };
+    const late = daemon.put({ title: "late" });
+    await waitFor(() => stopped !== undefined);
+    await stopped;
+    const debounces = timers.mock.calls.filter(([, ms]) => ms === 777).length;
+    timers.mockRestore();
+    unsubscribe();
+    expect(debounces).toBe(0);
+    expect(store.getItem(late.id)).toBeUndefined();
   });
 });

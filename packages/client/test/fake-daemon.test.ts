@@ -1,14 +1,14 @@
 import { create } from "@bufbuild/protobuf";
-import { timestampNow } from "@bufbuild/protobuf/wkt";
+import { type Timestamp, timestampFromDate, timestampNow } from "@bufbuild/protobuf/wkt";
 import { Code, ConnectError, createClient } from "@connectrpc/connect";
 import { describe, expect, it } from "vitest";
 import { BadRequestSchema, ErrorInfoSchema } from "../src/gen/google/rpc/error_details_pb.js";
+import { Topic } from "../src/gen/todo/v1/common_pb.js";
 import { ItemField } from "../src/gen/todo/v1/field_pb.js";
 import { ArchiveReason, CreatedVia, Priority, ResolutionKind, Status, StatusCategory } from "../src/gen/todo/v1/item_pb.js";
 import { ItemService } from "../src/gen/todo/v1/item_service_pb.js";
 import { OpKind, UndoSkipReason, UndoSkipSchema } from "../src/gen/todo/v1/op_pb.js";
 import { RelationKind } from "../src/gen/todo/v1/relation_pb.js";
-import { ViewService } from "../src/gen/todo/v1/view_service_pb.js";
 import { FakeDaemon } from "../src/fake-daemon.js";
 import { MAX_CAPTURE_BYTES } from "../src/limits.js";
 import {
@@ -235,12 +235,9 @@ describe("FakeDaemon mutations", () => {
     expect([...daemon.items.values()].filter((i) => i.title === "once")).toHaveLength(1);
   });
 
-  it("answers the RPCs it does not model with UNIMPLEMENTED", async () => {
-    const { daemon, client } = setup();
-    const views = createClient(ViewService, daemon.transport);
-    for (const call of [client.parseDate({ text: "fri" }), client.getStatusCounts({}), views.listViews({})]) {
-      expect((await failure(call))?.code).toBe(Code.Unimplemented);
-    }
+  it("answers the RPC it does not model, ParseCapture, with UNIMPLEMENTED", async () => {
+    const { client } = setup();
+    expect((await failure(client.parseCapture({ text: "x" })))?.code).toBe(Code.Unimplemented);
   });
 
   it("fails an unknown id with NOT_FOUND", async () => {
@@ -460,5 +457,69 @@ describe("FakeDaemon BatchMutate", () => {
     expect(await summary([update(a.id, long)])).toBe(`edit "${"é".repeat(39)}…"`);
     const archive = (id: string) => ({ kind: { case: "archiveItem" as const, value: { id } } });
     expect(await summary([archive(a.id), archive(b.id)])).toBe("archive 2 items");
+  });
+});
+
+describe("FakeDaemon clock, zone and derived fields", () => {
+  const ns = (t: Timestamp | undefined) => t!.seconds * 1_000_000_000n + BigInt(t!.nanos);
+
+  it("seeds the default views first, each with a revision and a TOPIC_VIEW Change but no op", () => {
+    const daemon = new FakeDaemon([{ title: "a" }]);
+    expect(daemon.changes.slice(0, 6).map((c) => [c.revision, c.topic, c.resource.case])).toEqual(
+      [1n, 2n, 3n, 4n, 5n, 6n].map((r) => [r, Topic.VIEW, "view"]),
+    );
+    expect(daemon.changes[6]).toMatchObject({ revision: 7n, topic: Topic.ITEM });
+    expect(daemon.ops).toHaveLength(1);
+    expect([...daemon.views.values()].map((v) => v.revision)).toEqual([1n, 2n, 3n, 4n, 5n, 6n]);
+  });
+
+  it("takes today in its zone, at its clock or at a request's reference_time", async () => {
+    // 23:30 on Sunday in New York is 04:30 on Monday in UTC.
+    const at = new Date(Date.UTC(2026, 10, 2, 4, 30));
+    const today = async (timeZone: string, referenceTime?: Timestamp) => {
+      const daemon = new FakeDaemon([], { now: () => at, timeZone });
+      const res = await createClient(ItemService, daemon.transport).getStatusCounts(referenceTime ? { referenceTime } : {});
+      return [res.today?.year, res.today?.month, res.today?.day];
+    };
+    expect(await today("America/New_York")).toEqual([2026, 11, 1]);
+    expect(await today("UTC")).toEqual([2026, 11, 2]);
+    expect(await today("America/New_York", timestampFromDate(new Date(Date.UTC(2026, 10, 2, 5))))).toEqual([2026, 11, 2]);
+    const daemon = new FakeDaemon([], { now: () => at });
+    expect(await failure(createClient(ItemService, daemon.transport).listItems({ referenceTime: { seconds: 10n ** 11n } }))).toMatchObject({
+      code: Code.InvalidArgument,
+    });
+  });
+
+  it("derives effective_priority and is_overdue when an Item is read", async () => {
+    let now = new Date(Date.UTC(2026, 9, 25, 16));
+    const daemon = new FakeDaemon([], { now: () => now, timeZone: "UTC" });
+    const client = createClient(ItemService, daemon.transport);
+    const item = daemon.put({ title: "due", priority: Priority.HIGH, localPriorityOverride: Priority.LOW, dueDate: { year: 2026, month: 10, day: 25 } });
+    expect(item).toMatchObject({ effectivePriority: Priority.LOW, isOverdue: false });
+    now = new Date(Date.UTC(2026, 9, 26, 16));
+    expect((await client.getItem({ id: item.id })).item?.isOverdue).toBe(true);
+    expect((await client.listItems({})).items[0]?.isOverdue).toBe(true);
+    // As of the request's today.
+    const sunday = timestampFromDate(new Date(Date.UTC(2026, 9, 25, 12)));
+    expect((await client.listItems({ referenceTime: sunday })).items[0]?.isOverdue).toBe(false);
+    expect((await updateItem(client, { id: item.id, localPriorityOverride: undefined }, ["local_priority_override"])).item?.effectivePriority).toBe(Priority.HIGH);
+    // A done Item is never overdue.
+    expect((await setStatus(client, item.id, Status.DONE)).item?.isOverdue).toBe(false);
+  });
+
+  it("gives writes strictly increasing times on a clock that stands still, and captures their reference_time", async () => {
+    const at = new Date(Date.UTC(2026, 9, 25, 16));
+    const daemon = new FakeDaemon([], { now: () => at });
+    const client = createClient(ItemService, daemon.transport);
+    const capture = async (text: string, referenceTime?: Timestamp) =>
+      (await client.captureItem({ requestId: ulid(), text, createdVia: CreatedVia.TUI, ...(referenceTime && { referenceTime }) })).item!;
+    const [a, b] = [await capture("a"), await capture("b")];
+    expect(ns(b.createdAt)).toBeGreaterThan(ns(a.createdAt));
+    expect(ns(a.createdAt) / 1_000_000n).toBe(BigInt(at.getTime()));
+    const edited = (await updateItem(client, { id: a.id, title: "a2" }, ["title"])).item!;
+    expect(ns(edited.updatedAt)).toBeGreaterThan(ns(b.updatedAt));
+    const spooled = timestampFromDate(new Date(Date.UTC(2026, 8, 30)));
+    const c = await capture("c", spooled);
+    expect([ns(c.createdAt), ns(c.updatedAt)]).toEqual([ns(spooled), ns(spooled)]);
   });
 });

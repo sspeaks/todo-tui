@@ -889,3 +889,132 @@ fn undo_without_a_daemon_fails_and_spools_nothing() {
     }
     assert!(!h.paths().spool().exists());
 }
+
+/// `todo status --short`, asked up to five times while it prints nothing:
+/// on a loaded machine the daemon can miss the 40 ms deadline.
+fn status_short(h: &Home) -> String {
+    let mut out = String::new();
+    for _ in 0..5 {
+        out = h.ok(&["status", "--short"]);
+        if !out.is_empty() {
+            break;
+        }
+    }
+    out
+}
+
+#[test]
+fn status_counts_the_inbox_due_and_each_view() {
+    let h = Home::new();
+    // Starts the daemon, as `todo add` does.
+    let zero = "📥 Inbox: 0\n⏰ Due: 0 (0 overdue)\nViews:\n  Inbox: 0\n  Today: 0\n  Next: 0\n  \
+                Waiting: 0\n";
+    assert_eq!(h.ok(&["status"]), zero);
+    assert!(socket_in(&h.home.join("run")));
+    // Nothing to count: an empty prompt line.
+    let out = h.todo(&["status", "--short"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!((text(&out.stdout), text(&out.stderr)), ("", ""));
+
+    // Fixed dates, so that the counts do not depend on the day.
+    for capture in [
+        "plain",
+        "overdue ^2020-01-01",
+        "next overdue >next ^2020-01-02",
+        "far off ^2999-12-31",
+    ] {
+        h.ok(&["add", capture]);
+    }
+    assert_eq!(status_short(&h), "📥3 ⏰2\n");
+    assert_eq!(
+        h.ok(&["status"]),
+        "📥 Inbox: 3\n⏰ Due: 2 (2 overdue)\nViews:\n  Inbox: 3\n  Today: 2\n  Next: 1\n  \
+         Waiting: 0\n"
+    );
+
+    // A done Item is no longer counted.
+    let overdue = h
+        .items()
+        .into_iter()
+        .find(|i| i.title == "overdue")
+        .unwrap();
+    h.rpc(async |mut items| {
+        let request = SetStatusRequest {
+            request_id: todo_core::new_ulid().to_string(),
+            id: overdue.id.clone(),
+            status: Status::Done.into(),
+            expected_revision: None,
+        };
+        items.set_status(request).await.unwrap();
+    });
+    assert_eq!(status_short(&h), "📥2 ⏰1\n");
+    assert_eq!(
+        h.ok(&["status"]),
+        "📥 Inbox: 2\n⏰ Due: 1 (1 overdue)\nViews:\n  Inbox: 2\n  Today: 1\n  Next: 1\n  \
+         Waiting: 0\n"
+    );
+}
+
+#[test]
+fn status_short_without_a_daemon_prints_nothing_and_starts_none() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Home::new();
+    let quiet = |out: &Output, took: Duration| {
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        assert_eq!((text(&out.stdout), text(&out.stderr)), ("", ""));
+        assert!(took < Duration::from_secs(1), "took {took:?}");
+    };
+    let timed = |cmd: &mut Command| {
+        let started = Instant::now();
+        let out = cmd.output().unwrap();
+        (out, started.elapsed())
+    };
+    // Quick enough for a prompt: within 100 ms on the quickest of a few
+    // runs, which a loaded machine slows one at a time.
+    let mut quickest = Duration::MAX;
+    for _ in 0..5 {
+        let (out, took) = timed(&mut h.command(&["status", "--short"]));
+        quiet(&out, took);
+        quickest = quickest.min(took);
+    }
+    assert!(quickest < Duration::from_millis(100), "took {quickest:?}");
+    // Started nothing: no socket or lock, not even their directories.
+    let paths = h.paths();
+    assert!(!paths.runtime.exists() && !paths.data.exists());
+
+    // Nor does it fail where `todo status` would: with no home to find
+    // the daemon in.
+    let homeless = |args: &[&str]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_todo"));
+        cmd.args(args).env_clear();
+        cmd
+    };
+    let (out, took) = timed(&mut homeless(&["status", "--short"]));
+    quiet(&out, took);
+    let out = homeless(&["status"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+
+    // A wedged daemon: it accepts connections and never answers. Its
+    // directories are private, as a daemon makes them, so that the call
+    // gets as far as the socket (under a long TMPDIR it is in the /tmp
+    // fallback).
+    std::fs::create_dir_all(&paths.runtime).unwrap();
+    for dir in todo_daemon::client::guarded_dirs(&paths.runtime) {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let listener = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            held.push(stream);
+        }
+    });
+    let (out, took) = timed(&mut h.command(&["status", "--short"]));
+    // So that dropping the home finds no daemon to stop.
+    std::fs::remove_file(&paths.socket).unwrap();
+    let _ = std::fs::remove_dir(&paths.runtime);
+    quiet(&out, took);
+    // It waited out its deadline, then gave up.
+    assert!(took >= Duration::from_millis(40), "took {took:?}");
+    assert!(!paths.data.exists());
+}

@@ -33,12 +33,12 @@ const press = async (ui: ReturnType<typeof render>, key: string) => {
 
 describe("Inbox", () => {
   it("renders rows with glyph, priority and title, plus the status bar", async () => {
-    const { frame } = setup();
+    const { daemon, frame } = setup();
     await vi.waitFor(() => expect(frame()).toContain("● live"));
     expect(frame()).toMatch(/› ○ \+3\s+Call dentist/);
     expect(frame()).toContain("Buy milk");
     expect(frame()).toContain("Renew passport");
-    expect(frame()).toContain("rev 3");
+    expect(frame()).toContain(`rev ${daemon.revision}`);
   });
 
   it("only shows inbox items", async () => {
@@ -80,7 +80,7 @@ describe("Inbox", () => {
     const early = item("Early bird", { createdAt: new Date(Date.UTC(2025, 0, 1)) });
     daemon.put(early);
     await vi.waitFor(() => expect(frame()).toContain("Early bird"));
-    expect(frame()).toContain("rev 4");
+    expect(frame()).toContain(`rev ${daemon.revision}`);
     expect(selectedLine()).toContain("Buy milk");
     expect(frame().indexOf("Early bird")).toBeLessThan(frame().indexOf("Call dentist"));
   });
@@ -128,7 +128,7 @@ describe("Inbox", () => {
     daemon.put(item("Missed while down"));
     await vi.waitFor(() => expect(frame()).toContain("Missed while down"));
     await vi.waitFor(() => expect(frame()).toContain("● live"));
-    expect(frame()).toContain("rev 2");
+    expect(frame()).toContain(`rev ${daemon.revision}`);
   });
 
   it("quits on q", async () => {

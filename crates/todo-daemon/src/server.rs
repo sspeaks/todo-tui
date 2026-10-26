@@ -149,7 +149,7 @@ impl Daemon {
             .http2_keepalive_timeout(Some(Duration::from_secs(10)))
             .add_service(SystemServiceServer::new(System(ctx.clone())))
             .add_service(ItemServiceServer::new(Items(ctx.clone())))
-            .add_service(ViewServiceServer::new(Views))
+            .add_service(ViewServiceServer::new(Views(ctx.clone())))
             .add_service(WatchServiceServer::new(Watch(ctx)))
             .serve_with_incoming_shutdown(incoming, async move { stop.wait().await });
 

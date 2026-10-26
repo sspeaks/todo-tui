@@ -1,10 +1,12 @@
 use jiff::civil::Date;
 use jiff::{Timestamp, Zoned};
 use todo_core::view::ViewId;
-use todo_core::{Actor, CreatedVia, ItemId, MAX_CAPTURE_BYTES, Mutation, parse_capture};
+use todo_core::{
+    Actor, CreatedVia, ItemId, MAX_CAPTURE_BYTES, Mutation, parse_capture, parse_date,
+};
 use todo_proto::convert::{
-    ConvertError, EnumField, filter_from_proto, sort_from_proto, timestamp_from_proto,
-    timestamp_to_proto, undo_skip_to_proto,
+    ConvertError, EnumField, date_to_proto, filter_from_proto, sort_from_proto,
+    timestamp_from_proto, timestamp_to_proto, undo_skip_to_proto,
 };
 use todo_proto::request;
 use todo_proto::v1::item_service_server::ItemService;
@@ -26,7 +28,7 @@ use todo_store::{
 use tonic::{Request, Response, Status};
 use ulid::Ulid;
 
-use super::{Ctx, not_implemented};
+use super::Ctx;
 use crate::error::{self, Shape};
 
 /// The most mutations one `BatchMutate` may carry.
@@ -122,9 +124,29 @@ impl ItemService for Items {
 
     async fn parse_date(
         &self,
-        _request: Request<ParseDateRequest>,
+        request: Request<ParseDateRequest>,
     ) -> Result<Response<ParseDateResponse>, Status> {
-        Err(not_implemented("ParseDate"))
+        let req = request.into_inner();
+        check_capture_length(&req.text)?;
+        let today = reference_time(req.reference_time.as_ref(), &Zoned::now())?.date();
+        let typed = req.text.trim();
+        let expr = typed.strip_prefix('^').unwrap_or(typed);
+        let response = match parse_date(expr, today) {
+            Ok(date) => ParseDateResponse {
+                date: Some(date_to_proto(date)),
+                warning: String::new(),
+            },
+            // As ParseCapture words a ^ token that is not a date.
+            Err(e) if typed.is_empty() => ParseDateResponse {
+                date: None,
+                warning: e.reason,
+            },
+            Err(e) => ParseDateResponse {
+                date: None,
+                warning: format!("{typed}: {}", e.reason),
+            },
+        };
+        Ok(Response::new(response))
     }
 
     async fn get_item(
@@ -308,9 +330,33 @@ impl ItemService for Items {
 
     async fn get_status_counts(
         &self,
-        _request: Request<GetStatusCountsRequest>,
+        request: Request<GetStatusCountsRequest>,
     ) -> Result<Response<GetStatusCountsResponse>, Status> {
-        Err(not_implemented("GetStatusCounts"))
+        let req = request.into_inner();
+        let today = reference_time(req.reference_time.as_ref(), &Zoned::now())?.date();
+        let counts = self
+            .0
+            .store
+            .status_counts(today, req.include_views)
+            .await
+            .map_err(error::store)?;
+        Ok(Response::new(GetStatusCountsResponse {
+            counts: Some(v1::StatusCounts {
+                inbox: counts.inbox,
+                due: counts.due,
+                overdue: counts.overdue,
+            }),
+            views: counts
+                .views
+                .into_iter()
+                .map(|(id, count)| v1::ViewCount {
+                    view_id: id.to_string(),
+                    count,
+                })
+                .collect(),
+            revision: counts.revision,
+            today: Some(date_to_proto(today)),
+        }))
     }
 
     async fn undo(&self, request: Request<UndoRequest>) -> Result<Response<UndoResponse>, Status> {

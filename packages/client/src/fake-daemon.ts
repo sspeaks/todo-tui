@@ -1,10 +1,10 @@
 import { type MessageInitShape, clone, create, equals } from "@bufbuild/protobuf";
-import { type Timestamp, timestampNow } from "@bufbuild/protobuf/wkt";
+import { type Timestamp, TimestampSchema } from "@bufbuild/protobuf/wkt";
 import { Code, ConnectError, type Transport, createRouterTransport } from "@connectrpc/connect";
 import { BadRequestSchema, ErrorInfoSchema } from "./gen/google/rpc/error_details_pb.js";
-import type { DateSchema } from "./gen/google/type/date_pb.js";
 import { type MutationResultSchema, Topic } from "./gen/todo/v1/common_pb.js";
 import { ItemField } from "./gen/todo/v1/field_pb.js";
+import { type Filter, FilterSchema, type OperandSchema, Operator, RelativeDate_Anchor } from "./gen/todo/v1/filter_pb.js";
 import {
   ArchiveReason,
   ArchivedSchema,
@@ -19,9 +19,14 @@ import {
 import {
   type AddRelationRequest,
   type CaptureItemRequest,
+  type GetStatusCountsRequest,
+  type GetStatusCountsResponseSchema,
   ItemService,
   type ListItemsRequest,
+  type ListItemsResponseSchema,
   type Mutation,
+  type ParseDateRequest,
+  type ParseDateResponseSchema,
   type RedoRequest,
   type RemoveRelationRequest,
   type UndoRequest,
@@ -30,8 +35,28 @@ import {
 import { OpKind, type OpSummary, OpSummarySchema, type UndoSkip, UndoSkipReason, UndoSkipSchema } from "./gen/todo/v1/op_pb.js";
 import { type Relation, RelationKind, RelationSchema } from "./gen/todo/v1/relation_pb.js";
 import { SystemService } from "./gen/todo/v1/system_service_pb.js";
+import { type View, ViewSchema } from "./gen/todo/v1/view_pb.js";
+import { ViewService } from "./gen/todo/v1/view_service_pb.js";
 import { type Change, ChangeSchema, type SubscribeResponse, SubscribeResponseSchema, WatchService } from "./gen/todo/v1/watch_service_pb.js";
-import { MAX_CAPTURE_BYTES } from "./limits.js";
+import { dayIn, epochMs, parseDateExpr, protoDate, rustTrim } from "./dates.js";
+import { defaultViews } from "./default-views.js";
+import {
+  type FilterProblem,
+  checkFilter,
+  checkSort,
+  compareTuples,
+  decodeCursor,
+  effectivePriority,
+  encodeCursor,
+  fingerprint,
+  isOverdue,
+  matches as passes,
+  narrow,
+  resolveFilter,
+  sortKeys,
+  sortTuple,
+} from "./filter-eval.js";
+import { DEFAULT_PAGE_SIZE, MAX_CAPTURE_BYTES, MAX_PAGE_SIZE } from "./limits.js";
 import { ulid } from "./ulid.js";
 
 type Waiter = (msg: SubscribeResponse | Error) => void;
@@ -141,6 +166,8 @@ type InverseStep =
   | { kind: "restore"; itemId: string; unit: FieldRestore[] }
   | { kind: "addRelation" | "removeRelation"; relation: Relation };
 
+const NANOS = 1_000_000_000n;
+
 /** The most mutations one BatchMutate may carry. */
 const MAX_BATCH = 1000;
 
@@ -174,18 +201,41 @@ const RELATION_WORDS: Record<number, string> = {
   [RelationKind.RELATES_TO]: "relates to",
 };
 
+/** FakeDaemon's clock and zone. */
+export interface FakeDaemonOptions {
+  /**
+   * "Now": today when a request gives no reference_time, and the time of
+   * every write (default: the system clock). Writes get strictly increasing
+   * times, as a real clock gives them, so updated_at orders them.
+   */
+  now?: () => Date;
+  /** The IANA zone today is taken in, as the daemon takes its system zone (default: this process's). */
+  timeZone?: string;
+}
+
 /**
  * An in-memory daemon over createRouterTransport for tests: ItemService,
- * WatchService with replay / CaughtUp / ResyncRequired, and
- * SystemService.GetServerInfo. It follows the daemon's ItemService
+ * ViewService, WatchService with replay / CaughtUp / ResyncRequired and
+ * topics, and SystemService.GetServerInfo. It follows the daemon's ItemService
  * conventions and the store's rules (crates/todo-store), checked by the
  * shared conformance suite in test/conformance:
  *
  * - ULID request ids and Item ids; request_id replay (the original result
  *   with the current state) and reuse checks; expected_revision; soft-deleted
  *   Items take only DeleteItem (a no-op) and UndeleteItem; a mutation that
- *   changes nothing allocates no revision; ListItems hides deleted, archived,
- *   done and deferred Items unless asked for them.
+ *   changes nothing allocates no revision.
+ * - Items carry status, effective_priority and is_overdue as derived when
+ *   read, for the request's today (in {@link FakeDaemonOptions.timeZone}).
+ * - ListItems with the whole filter language (filter-eval.ts, ported from
+ *   todo_core::filter): the implicit rules, the checks with the daemon's
+ *   error paths and its INVALID / UNIMPLEMENTED split, relative dates,
+ *   sorts with the created_at, id tie-break, keyset page tokens bound to the
+ *   effective filter and sort that keep the first page's today, and view_id
+ *   (VIEW_NOT_FOUND). GetStatusCounts, and ParseDate with the capture date
+ *   grammar.
+ * - The six default views (todo_core::view::defaults()), seeded first as
+ *   the store seeds them, each with a revision and a TOPIC_VIEW Change;
+ *   ListViews. Views are read-only, as the daemon's are.
  * - An op log ({@link ops}): each touched Item gets one revision and one
  *   Change, and each changed field one event. BatchMutate applies its
  *   mutations in order as one op, all or nothing, under the single-item
@@ -213,24 +263,27 @@ const RELATION_WORDS: Record<number, string> = {
  * never an undo stack entry and leaving the redo stack alone, so a later
  * Undo skips what they changed. remove is a hard removal.
  *
- * What it does not model: capture parsing (the title is the text), spool_id
- * and reference_time; field values and read-only fields are not checked,
- * except the 64 KiB limit on capture text, titles (stored trimmed, then
- * non-empty and at most 64 KiB), labels (deduplicated), parent_id and
- * SetStatus's status.
+ * What it does not model: capture parsing (the title is the text, and
+ * reference_time only sets created_at) and spool_id; field values and
+ * read-only fields are not checked, except the 64 KiB limit on capture
+ * text, titles (stored trimmed, then non-empty and at most 64 KiB), labels
+ * (deduplicated), parent_id and SetStatus's status.
  * SetStatus decomposes the status into the triple as the daemon does.
  * UpdateItem checks its mask's paths as the daemon does (Item field paths
  * only, each field once; status, archived and relations paths are refused)
  * and copies the top-level fields they name, so for it a nested path such
  * as "waiting.reason" changes, records and restores the whole `waiting`.
  * Staleness signals are not maintained or restored (`updated_at` is set on
- * every op that touches an Item); request ids never expire; ListItems sorts
- * by id. ParseCapture, ParseDate, GetStatusCounts and ViewService are not
- * implemented (UNIMPLEMENTED).
+ * every op that touches an Item); request ids never expire. MATCHES
+ * approximates the full-text index (lower case, accents stripped, runs of
+ * letters and digits), so it agrees on ASCII and Latin text but not on
+ * every script or symbol. ParseCapture is not implemented (UNIMPLEMENTED).
  */
 export class FakeDaemon {
   revision = 0n;
   readonly items = new Map<string, Item>();
+  /** The saved views, by id: the six defaults, seeded by the constructor. */
+  readonly views = new Map<string, View>();
   readonly changes: Change[] = [];
   /** Every op, oldest first: each RPC call that got past validation (no-ops too), each put and update. */
   readonly ops: FakeOp[] = [];
@@ -238,20 +291,28 @@ export class FakeDaemon {
   replayFloor = 0n;
   /** When true every RPC fails with UNAVAILABLE. */
   down = false;
-  pageSize = 1000;
+  /** The largest page ListItems returns (the daemon's is MAX_PAGE_SIZE); page_size 0 asks for DEFAULT_PAGE_SIZE. */
+  maxPageSize = MAX_PAGE_SIZE;
   /** Runs before every ListItems; throw from it to fail that call. */
   onListItems: ((req: ListItemsRequest) => void) | undefined;
-  apiMinor = 4;
-  readonly calls = { listItems: 0, subscribe: [] as (bigint | undefined)[] };
+  apiMinor = 5;
+  readonly calls = { listItems: 0, listViews: 0, getStatusCounts: 0, subscribe: [] as (bigint | undefined)[] };
   readonly transport: Transport;
+  readonly now: () => Date;
+  readonly timeZone: string;
   private readonly watchers = new Set<Waiter>();
   /** Requests by request_id (upper case), for replays. */
   private readonly requests = new Map<string, Recorded>();
   /** Every relation, by relationKey. */
   private readonly relations = new Map<string, Relation>();
   private nextId = 0;
+  /** The last write time handed out, in nanoseconds. */
+  private lastWrite = -(2n ** 63n);
 
-  constructor(initial: MessageInitShape<typeof ItemSchema>[] = []) {
+  constructor(initial: MessageInitShape<typeof ItemSchema>[] = [], options: FakeDaemonOptions = {}) {
+    this.now = options.now ?? (() => new Date());
+    this.timeZone = options.timeZone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+    this.seedViews();
     for (const init of initial) this.put(init);
     this.transport = createRouterTransport(({ service }) => {
       service(SystemService, {
@@ -263,30 +324,24 @@ export class FakeDaemon {
       });
       service(ItemService, {
         captureItem: (req) => this.capture(req),
+        parseDate: (req) => {
+          this.check();
+          return this.parseDate(req);
+        },
         listItems: (req) => {
           this.check();
           this.calls.listItems++;
           this.onListItems?.(req);
-          const f = req.filter;
-          const today = localToday();
-          const all = [...this.items.values()]
-            .filter((i) => f?.includeDeleted || i.deletedAt === undefined)
-            .filter((i) => f?.includeArchived || i.archived === undefined)
-            .filter((i) => f?.includeDone || (i.status !== Status.DONE && i.status !== Status.CANCELLED))
-            .filter((i) => f?.includeDeferred || i.deferUntil === undefined || dateKey(i.deferUntil) <= today)
-            .sort((a, b) => (a.id < b.id ? -1 : 1));
-          const size = req.pageSize > 0 ? req.pageSize : this.pageSize;
-          const offset = req.pageToken ? Number(req.pageToken) : 0;
-          const end = offset + size;
-          return {
-            items: all.slice(offset, end),
-            nextPageToken: end < all.length ? String(end) : "",
-            revision: this.revision,
-          };
+          return this.list(req);
+        },
+        getStatusCounts: (req) => {
+          this.check();
+          this.calls.getStatusCounts++;
+          return this.statusCounts(req);
         },
         getItem: (req) => {
           this.check();
-          return { item: this.get(idOf("id", req.id)), revision: this.revision };
+          return { item: this.present(this.get(idOf("id", req.id)), this.today()), revision: this.revision };
         },
         updateItem: (req) => this.single("UpdateItem", OpKind.UPDATE, req.requestId, () => planUpdate(req, "")),
         setStatus: (req) => this.single("SetStatus", OpKind.SET_STATUS, req.requestId, () => planSetStatus(req, "")),
@@ -312,14 +367,23 @@ export class FakeDaemon {
         addRelation: (req) => this.relationTx("AddRelation", req, true),
         removeRelation: (req) => this.relationTx("RemoveRelation", req, false),
       });
+      service(ViewService, {
+        listViews: () => {
+          this.check();
+          this.calls.listViews++;
+          return { views: this.tabOrder(), revision: this.revision };
+        },
+      });
       const self = this;
       service(WatchService, {
         async *subscribe(req, ctx) {
           self.check();
           self.calls.subscribe.push(req.sinceRevision);
+          const wants = topicFilter(req.topics);
           const queue: (SubscribeResponse | Error)[] = [];
           let wake = () => {};
           const waiter: Waiter = (m) => {
+            if (!(m instanceof Error) && m.message.case === "change" && !wants(m.message.value)) return;
             queue.push(m);
             wake();
           };
@@ -332,7 +396,7 @@ export class FakeDaemon {
               if (since < self.replayFloor || since > self.revision) {
                 yield msg({ case: "resyncRequired", value: { currentRevision: self.revision } });
               } else {
-                for (const c of self.changes) if (c.revision > since) yield msg({ case: "change", value: c });
+                for (const c of self.changes) if (c.revision > since && wants(c)) yield msg({ case: "change", value: c });
               }
             }
             yield msg({ case: "caughtUp", value: { revision: self.revision } });
@@ -366,11 +430,14 @@ export class FakeDaemon {
     this.revision++;
     const id = init.id || this.newId();
     const prev = this.items.get(id);
-    const item = prev ? merged(prev, init) : create(ItemSchema, { status: Status.INBOX, createdAt: timestampNow(), ...init });
+    const now = this.stamp();
+    const item = prev ? merged(prev, init) : create(ItemSchema, { status: Status.INBOX, createdAt: now, ...init });
     item.id = id;
     settleStatus(item, Object.keys(init), prev);
+    if (init.updatedAt === undefined) item.updatedAt = now;
     item.relations = this.relationsOf(id);
     item.revision = this.revision;
+    this.settle(item);
     this.items.set(id, item);
     this.log({ kind: OpKind.UNSPECIFIED, actor: "system", summary: "", events: prev ? diff(prev, item) : [{ kind: "create", itemId: id }] });
     this.publish({ revision: this.revision, topic: Topic.ITEM, id, resource: { case: "item", value: item } });
@@ -387,6 +454,26 @@ export class FakeDaemon {
     this.revision++;
     this.items.delete(id);
     this.publish({ revision: this.revision, topic: Topic.ITEM, id, deleted: true });
+  }
+
+  /** Changes a saved view and publishes its Change, as an edit will (views are read-only over the API until M6). */
+  updateView(id: string, patch: MessageInitShape<typeof ViewSchema>): View {
+    const prev = this.views.get(id);
+    if (!prev) throw new Error(`no view ${id}`);
+    const fields = create(ViewSchema, patch) as unknown as Fields;
+    const view = clone(ViewSchema, prev);
+    for (const k of Object.keys(patch)) (view as unknown as Fields)[k] = fields[k];
+    Object.assign(view, { id, revision: ++this.revision, updatedAt: this.stamp() });
+    this.views.set(id, view);
+    this.publish({ revision: view.revision, topic: Topic.VIEW, id, resource: { case: "view", value: view } });
+    return view;
+  }
+
+  /** Deletes a saved view and publishes a deleted Change. */
+  removeView(id: string): void {
+    this.revision++;
+    this.views.delete(id);
+    this.publish({ revision: this.revision, topic: Topic.VIEW, id, deleted: true });
   }
 
   /** Fails every open Subscribe stream, as if the connection dropped. */
@@ -407,7 +494,7 @@ export class FakeDaemon {
     this.ops.length = 0;
     this.requests.clear();
     for (const item of items) {
-      this.items.set(item.id, item);
+      this.items.set(item.id, this.settle(item));
       for (const r of item.relations) this.relations.set(relationKey(r), clone(RelationSchema, r));
     }
     this.truncateChanges();
@@ -419,18 +506,170 @@ export class FakeDaemon {
     this.replayFloor = this.revision;
   }
 
+  /** Today in the daemon's zone at `at` (a reference_time), or now. */
+  today(at?: Timestamp): number {
+    return dayIn(this.timeZone, at === undefined ? this.now().getTime() : epochMs(at));
+  }
+
+  /**
+   * The seeded views (todo_core::view::defaults()), each with a revision and
+   * a TOPIC_VIEW Change, as the store seeds an empty database: no op is
+   * written.
+   */
+  private seedViews(): void {
+    const at = this.stamp();
+    for (const init of defaultViews()) {
+      const view = create(ViewSchema, { ...init, id: ulid(), revision: ++this.revision, createdAt: at, updatedAt: at });
+      this.views.set(view.id, view);
+      this.publish({ revision: view.revision, topic: Topic.VIEW, id: view.id, resource: { case: "view", value: view } });
+    }
+  }
+
+  /** Every view in tab order. */
+  private tabOrder(): View[] {
+    return [...this.views.values()].sort((a, b) => a.position - b.position || cmp(a.id, b.id));
+  }
+
+  /**
+   * A write time: now, or just after the last one when the clock has not
+   * moved on since (it reads in milliseconds).
+   */
+  private stamp(): Timestamp {
+    const ns = BigInt(this.now().getTime()) * 1_000_000n;
+    this.lastWrite = ns > this.lastWrite ? ns : this.lastWrite + 1n;
+    const seconds = this.lastWrite / NANOS - (this.lastWrite % NANOS < 0n ? 1n : 0n);
+    return create(TimestampSchema, { seconds, nanos: Number(this.lastWrite - seconds * NANOS) });
+  }
+
+  /** Today for a request's reference_time, as the daemon reads it (INVALID_ARGUMENT on "reference_time"). */
+  private referenceDay(t: Timestamp | undefined): number {
+    if (t === undefined) return this.today();
+    const ns = t.seconds * NANOS + BigInt(t.nanos);
+    if (t.nanos < 0 || t.nanos >= 1e9) throw badRequest("reference_time", `nanos ${t.nanos} out of range`);
+    if (ns < -(2n ** 63n) || ns >= 2n ** 63n) {
+      throw badRequest("reference_time", "must be between 1677-09-21T00:12:44Z and 2262-04-11T23:47:16Z");
+    }
+    return this.today(t);
+  }
+
+  /** Derives a stored Item's effective_priority and is_overdue (status is kept with its triple). */
+  private settle(item: Item): Item {
+    item.effectivePriority = effectivePriority(item);
+    item.isOverdue = isOverdue(item, this.today());
+    return item;
+  }
+
+  /** `item` as read on day `today`: is_overdue is for that day. */
+  private present(item: Item, today: number): Item {
+    const overdue = isOverdue(item, today);
+    return item.isOverdue === overdue ? item : { ...item, isOverdue: overdue };
+  }
+
+  /** The stored Items `filter` passes. */
+  private passing(filter: Filter, today: number): Item[] {
+    const resolved = resolveFilter(filter, today);
+    if (!resolved) throw new ConnectError("a stored filter does not resolve", Code.Internal);
+    return [...this.items.values()].filter((i) => passes(i, resolved));
+  }
+
+  /**
+   * ListItems, with the daemon's errors in its order: reference_time, the
+   * filter's first INVALID, the sort, the filter's UNIMPLEMENTED, page_size,
+   * view_id; then the page token, the view (VIEW_NOT_FOUND), and the token's
+   * fit to the effective filter and sort.
+   */
+  private list(req: ListItemsRequest): MessageInitShape<typeof ListItemsResponseSchema> {
+    const requested = this.referenceDay(req.referenceTime);
+    const filter = req.filter ?? create(FilterSchema);
+    const filterProblem = checkFilter(filter, requested);
+    if (filterProblem?.kind === "invalid") throw problemError(filterProblem);
+    const sortProblem = checkSort(req.sort);
+    if (sortProblem) throw problemError(sortProblem);
+    if (filterProblem) throw problemError(filterProblem);
+    if (req.pageSize < 0) throw badRequest("page_size", "must not be negative");
+    const viewId = req.viewId ? canonicalUlid(req.viewId) : undefined;
+    if (viewId === null) throw badRequest("view_id", "must be a ULID");
+    const cursor = req.pageToken === "" ? undefined : decodeCursor(req.pageToken);
+    if (cursor === undefined && req.pageToken !== "") throw badRequest("page_token", "invalid page token");
+    let effective = { filter, sort: req.sort };
+    if (viewId !== undefined) {
+      const view = this.views.get(viewId);
+      if (!view) throw errorInfo(Code.NotFound, "VIEW_NOT_FOUND", `view ${viewId} not found`, { view_id: viewId });
+      effective = narrow(view, filter, req.sort);
+    }
+    const keys = sortKeys(effective.sort);
+    const bound = fingerprint(effective.filter, keys);
+    if (cursor && (cursor.fingerprint !== bound || cursor.after.length !== keys.length)) {
+      throw badRequest("page_token", "invalid page token");
+    }
+    // A later page keeps the first page's today.
+    const today = cursor?.today ?? requested;
+    const resolved = resolveFilter(effective.filter, today);
+    if (!resolved) throw badRequest("page_token", "invalid page token");
+    const rows = [...this.items.values()]
+      .filter((i) => passes(i, resolved))
+      .map((item) => ({ item, place: sortTuple(item, keys, today) }))
+      .sort((a, b) => compareTuples(a.place, b.place, keys));
+    const after = cursor ? rows.filter((r) => compareTuples(r.place, cursor.after, keys) > 0) : rows;
+    const size = Math.min(req.pageSize === 0 ? DEFAULT_PAGE_SIZE : req.pageSize, this.maxPageSize);
+    const page = after.slice(0, size);
+    const last = page.at(-1);
+    return {
+      items: page.map((r) => this.present(r.item, today)),
+      nextPageToken: last && after.length > page.length ? encodeCursor({ fingerprint: bound, today, after: last.place }) : "",
+      revision: this.revision,
+    };
+  }
+
+  /** GetStatusCounts: each count, and each counted view's, passes the implicit rules, as a listing does. */
+  private statusCounts(req: GetStatusCountsRequest): MessageInitShape<typeof GetStatusCountsResponseSchema> {
+    const today = this.referenceDay(req.referenceTime);
+    const count = (filter: Filter) => this.passing(filter, today).length;
+    const one = (target: ItemField, op: Operator, operand: MessageInitShape<typeof OperandSchema>) =>
+      create(FilterSchema, { allOf: [{ kind: { case: "predicate", value: { target, op, operands: [operand] } } }] });
+    const inbox = one(ItemField.STATUS, Operator.IN, { kind: { case: "value", value: { kind: { case: "status", value: Status.INBOX } } } });
+    const onToday = { kind: { case: "relativeDate", value: { anchor: RelativeDate_Anchor.TODAY } } } as const;
+    return {
+      counts: {
+        inbox: count(inbox),
+        due: count(one(ItemField.DUE_DATE, Operator.LE, onToday)),
+        overdue: count(one(ItemField.DUE_DATE, Operator.LT, onToday)),
+      },
+      views: req.includeViews
+        ? this.tabOrder()
+            .filter((v) => v.showCount)
+            .map((v) => ({ viewId: v.id, count: count(narrow(v, undefined, []).filter) }))
+        : [],
+      revision: this.revision,
+      today: protoDate(today),
+    };
+  }
+
+  /** ParseDate: the capture date grammar, with an optional leading "^". */
+  private parseDate(req: ParseDateRequest): MessageInitShape<typeof ParseDateResponseSchema> {
+    if (overCaptureLimit(req.text)) throw badRequest("text", TOO_LONG);
+    const today = this.referenceDay(req.referenceTime);
+    const typed = rustTrim(req.text);
+    const parsed = parseDateExpr(typed.startsWith("^") ? typed.slice(1) : typed, today);
+    if ("day" in parsed) return { date: protoDate(parsed.day), warning: "" };
+    // As ParseCapture words a ^ token that is not a date.
+    return { warning: typed === "" ? parsed.reason : `${typed}: ${parsed.reason}` };
+  }
+
   private capture(req: CaptureItemRequest): { item: Item; result: MutationResult } {
     this.check();
     const requestId = requestIdOf(req.requestId);
     if (overCaptureLimit(req.text)) throw badRequest("text", TOO_LONG);
     if (req.text.trim() === "") throw badRequest("text", "must not be empty");
+    if (req.referenceTime !== undefined) this.referenceDay(req.referenceTime);
     const parentId = req.parentId === undefined ? undefined : canonicalUlid(req.parentId);
     if (parentId === null) throw badRequest("parent_id", "must be a ULID");
     const recorded = this.recorded("CaptureItem", requestId);
-    if (recorded) return { item: this.get(recorded.id), result: recorded.result };
+    if (recorded) return { item: this.present(this.get(recorded.id), this.today()), result: recorded.result };
     const problem = parentId === undefined ? undefined : this.batch().unusableParent(parentId);
     if (problem) throw badRequest("parent_id", problem);
-    const now = timestampNow();
+    // The reference time is the new Item's created_at, as a spool import's capture time is.
+    const now = req.referenceTime ?? this.stamp();
     const item = create(ItemSchema, {
       id: this.newId(),
       title: req.text,
@@ -444,7 +683,7 @@ export class FakeDaemon {
       ...(parentId !== undefined && { parentId }),
     });
     item.revision = ++this.revision;
-    this.items.set(item.id, item);
+    this.items.set(item.id, this.settle(item));
     const op = this.log({ kind: OpKind.CAPTURE, actor: "user", summary: `capture ${quoted(item.title)}`, events: [{ kind: "create", itemId: item.id }] });
     this.publish({ revision: item.revision, topic: Topic.ITEM, id: item.id, resource: { case: "item", value: item } });
     return { item, result: this.record("CaptureItem", requestId, item.id, op) };
@@ -471,8 +710,8 @@ export class FakeDaemon {
     // A single-item op names its Item, so the same request id on another Item
     // is a different request; a batch is matched by its RPC alone.
     const recorded = this.recorded(rpc, requestId, kind === OpKind.BATCH ? undefined : planned[0]!.id);
-    if (recorded) return { items: planned.map((p) => this.get(p.id)), result: recorded.result };
-    const now = timestampNow();
+    if (recorded) return { items: planned.map((p) => this.present(this.get(p.id), this.today())), result: recorded.result };
+    const now = this.stamp();
     const batch = this.batch();
     // For the summary: the Items a cascade took along that no mutation names.
     const named = new Set(planned.map((p) => p.id));
@@ -536,7 +775,7 @@ export class FakeDaemon {
     const actions = planned.map((p, i) => ({ verb: verbOf(p), status: p.kind === "setStatus", id: p.id, title: batch.items[slots[i]!]!.title }));
     const op = this.commit(batch, kind, mutationSummary(actions, subtasks.size), now);
     const result = this.record(rpc, requestId, planned[0]!.id, op);
-    return { items: slots.map((s) => batch.items[s]!), result };
+    return { items: slots.map((s) => this.present(batch.items[s]!, this.today())), result };
   }
 
   /**
@@ -575,7 +814,7 @@ export class FakeDaemon {
       return { result: this.record(rpc, requestId, "", op), items: [], skipped: [] };
     }
     const summary = `${verb}: ${entry.summary}`;
-    const now = timestampNow();
+    const now = this.stamp();
     const steps = inverse(this.sourceOf(entry, redo).events, now);
     // The parent rule holds where the undo leaves the Items, as for a batch,
     // not after each step: a batch may pass through a live Item under a
@@ -737,7 +976,7 @@ export class FakeDaemon {
     this.changeRelation(batch, relation, add);
     const words = RELATION_WORDS[relation.kind];
     const summary = `${add ? "relate" : "unrelate"} ${quoted(batch.items[from]!.title)} ${words} ${quoted(batch.items[to]!.title)}`;
-    const op = this.commit(batch, add ? OpKind.ADD_RELATION : OpKind.REMOVE_RELATION, summary, timestampNow());
+    const op = this.commit(batch, add ? OpKind.ADD_RELATION : OpKind.REMOVE_RELATION, summary, this.stamp());
     return { fromItem: batch.items[from]!, toItem: batch.items[to]!, result: this.record(rpc, requestId, relationKey(relation), op) };
   }
 
@@ -769,7 +1008,7 @@ export class FakeDaemon {
       const item = batch.items[slot]!;
       item.updatedAt = now;
       item.revision = ++this.revision;
-      this.items.set(item.id, item);
+      this.items.set(item.id, this.settle(item));
       this.publish({ revision: item.revision, topic: Topic.ITEM, id: item.id, resource: { case: "item", value: item } });
     }
     return this.log({ kind, actor: "user", summary, events: batch.events, ...extra });
@@ -783,7 +1022,7 @@ export class FakeDaemon {
   private log(parts: Pick<FakeOp, "kind" | "actor" | "summary" | "events" | "entryOp" | "skipped">): FakeOp {
     const entry = parts.actor === "user" && parts.kind !== OpKind.UNDO && parts.kind !== OpKind.REDO && parts.events.length > 0;
     if (entry) for (const op of this.ops) if (op.undoState === "undone") op.undoState = "discarded";
-    const op: FakeOp = { id: ulid(), seq: this.ops.length + 1, at: timestampNow(), revision: this.revision, undoState: entry ? "done" : undefined, ...parts };
+    const op: FakeOp = { id: ulid(), seq: this.ops.length + 1, at: this.stamp(), revision: this.revision, undoState: entry ? "done" : undefined, ...parts };
     this.ops.push(op);
     return op;
   }
@@ -1289,6 +1528,25 @@ function notFound(id: string): ConnectError {
   return errorInfo(Code.NotFound, "ITEM_NOT_FOUND", `item ${id} not found`, { item_id: id });
 }
 
+/**
+ * A refused filter or sort as the daemon sends it: INVALID_ARGUMENT naming
+ * the path, or UNIMPLEMENTED with ErrorInfo NOT_IMPLEMENTED and the path as
+ * "field".
+ */
+function problemError(p: FilterProblem): ConnectError {
+  if (p.kind === "invalid") return badRequest(p.path, p.reason);
+  return errorInfo(Code.Unimplemented, "NOT_IMPLEMENTED", `${p.path}: ${p.reason}`, { field: p.path });
+}
+
+/** Which Changes a Subscribe asks for: those of its topics, or every one when it names none. */
+function topicFilter(topics: readonly Topic[]): (c: Change) => boolean {
+  for (const t of topics) {
+    if (t === Topic.UNSPECIFIED) throw badRequest("topics", "value must not be UNSPECIFIED");
+    if (Topic[t] === undefined) throw badRequest("topics", `unknown enum value ${t}`);
+  }
+  return (c) => topics.length === 0 || topics.includes(c.topic);
+}
+
 /** INVALID_ARGUMENT with one BadRequest violation, as the daemon sends them. */
 function badRequest(field: string, description: string): ConnectError {
   return new ConnectError(`${field}: ${description}`, Code.InvalidArgument, undefined, [
@@ -1467,13 +1725,3 @@ function maskOf(req: UpdateItemRequest, prefix: string): { paths: readonly strin
   return { paths, values };
 }
 
-/** A date as a sortable `YYYYMMDD` number. */
-function dateKey(d: MessageInitShape<typeof DateSchema>): number {
-  return (d.year ?? 0) * 10_000 + (d.month ?? 0) * 100 + (d.day ?? 0);
-}
-
-/** Today in the local time zone, as a dateKey. */
-function localToday(): number {
-  const now = new Date();
-  return dateKey({ year: now.getFullYear(), month: now.getMonth() + 1, day: now.getDate() });
-}

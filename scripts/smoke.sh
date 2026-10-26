@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Smoke test: auto-spawn, a TS watcher over Subscribe, the single-daemon lock
 # under parallel --detach, the long-path socket fallback (P0), parsed capture
-# and the capture spool round trip (P1 M1), and undo/redo of a capture (P1 M2).
+# and the capture spool round trip (P1 M1), undo/redo of a capture (P1 M2),
+# and `todo status` and the seeded Today view (P1 M3).
 # Usage: scripts/smoke.sh   (TODO_BIN overrides the binary; default: cargo build)
 set -euo pipefail
 
@@ -78,6 +79,11 @@ start_watcher() {
 # Prints every item as protobuf JSON, one per line.
 list_items() {
   (cd "$repo/packages/client" && corepack pnpm exec tsx scripts/smoke-watch.ts --list)
+}
+
+# Prints the items the view seeded from $1 lists, in its order, as list_items does.
+list_view() {
+  (cd "$repo/packages/client" && corepack pnpm exec tsx scripts/smoke-watch.ts --view "$1")
 }
 
 wait_watcher_sees() {
@@ -189,4 +195,34 @@ grep -q '"deletedAt"' "$root/watch5.out" && { cat "$root/watch5.out" >&2; fail "
 grep -qF '"priority":"PRIORITY_HIGH"' "$root/watch5.out" || { cat "$root/watch5.out" >&2; fail "the redone capture lost its priority"; }
 out=$("$TODO_BIN" redo)
 [[ $out == "Nothing to redo" ]] || fail "unexpected second redo output: $out"
+"$TODO_BIN" daemon stop >/dev/null
+
+# 7. `todo status --short` prints nothing and starts no daemon while none
+#    runs, then counts the inbox and what is due; the TS client lists the
+#    seeded Today view: overdue first, then by priority, whatever the
+#    capture order.
+step "status and the Today view"
+home=$root/status
+new_home "$home"
+export TODO_TUI_HOME=$home
+out=$("$TODO_BIN" status --short) || fail "status --short failed without a daemon"
+[[ -z $out ]] || fail "status --short printed '$out' without a daemon"
+[[ -e $home/run || -e $home/data ]] && fail "status --short started a daemon"
+"$TODO_BIN" add "due today ^today" >/dev/null
+"$TODO_BIN" add "overdue +4 ^2020-01-01" >/dev/null
+"$TODO_BIN" add "urgent +1 ^today" >/dev/null
+"$TODO_BIN" add "not due ^2999-12-31" >/dev/null
+# It prints nothing when the daemon misses its 40 ms deadline, so ask again.
+for _ in 1 2 3 4 5; do
+  out=$("$TODO_BIN" status --short)
+  [[ -n $out ]] && break
+done
+[[ $out == '📥4 ⏰3' ]] || fail "unexpected status --short output: '$out'"
+"$TODO_BIN" status >"$root/status.out" || fail "status failed"
+for line in '⏰ Due: 3 (1 overdue)' '  Today: 3'; do
+  grep -qxF "$line" "$root/status.out" || { cat "$root/status.out" >&2; fail "status lacks '$line'"; }
+done
+list_view today >"$root/today.items" || fail "listing the Today view failed"
+titles=$(sed -n 's/.*"title":"\([^"]*\)".*/\1/p' "$root/today.items" | paste -sd, -)
+[[ $titles == "overdue,urgent,due today" ]] || { cat "$root/today.items" >&2; fail "unexpected Today view: $titles"; }
 "$TODO_BIN" daemon stop >/dev/null

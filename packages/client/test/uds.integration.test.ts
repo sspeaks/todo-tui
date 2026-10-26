@@ -16,6 +16,7 @@ import type { LiveStore } from "../src/live-store.js";
 import { updateItem } from "../src/mutations.js";
 import { resolvePaths, envFromProcess } from "../src/paths.js";
 import { ulid } from "../src/ulid.js";
+import { FILTER_ZONE, filterViewsConformance } from "./conformance/filter-views.js";
 import { undoRelationsConformance } from "./conformance/undo-relations.js";
 
 const TODO_BIN = process.env.TODO_BIN;
@@ -34,10 +35,14 @@ afterEach(async () => {
   for (const c of cleanups.splice(0).reverse()) await c();
 });
 
-/** A fresh TODO_TUI_HOME with an auto-spawned daemon; shut down after the test. */
-async function home() {
+/**
+ * A fresh TODO_TUI_HOME with an auto-spawned daemon, which sees `extra` in
+ * its environment; shut down after the test, or by `close` when not
+ * `tracked`.
+ */
+async function home(extra: NodeJS.ProcessEnv = {}, tracked = true) {
   const dir = mkdtempSync(join(tmpdir(), "todo-uds-"));
-  const env = { ...process.env, TODO_TUI_HOME: dir };
+  const env = { ...process.env, ...extra, TODO_TUI_HOME: dir };
   const conns: TodoConnection[] = [];
   const open = async (kind = ClientKind.INTERACTIVE) => {
     const c = await connect({ env, clientKind: kind, todoBin: TODO_BIN!, spawnBudgetMs: 5000 });
@@ -45,7 +50,7 @@ async function home() {
     return c;
   };
   const add = (text: string) => run(TODO_BIN!, ["add", text], { env });
-  cleanups.push(async () => {
+  const close = async () => {
     for (const c of conns) c.close();
     try {
       // Any api_minor will do for a shutdown.
@@ -56,8 +61,9 @@ async function home() {
       // already down
     }
     rmSync(dir, { recursive: true, force: true });
-  });
-  return { dir, env, open, add, socket: resolvePaths(envFromProcess(env)).socket };
+  };
+  if (tracked) cleanups.push(close);
+  return { dir, env, open, add, close, socket: resolvePaths(envFromProcess(env)).socket };
 }
 
 function track(store: LiveStore) {
@@ -245,5 +251,16 @@ describe.skipIf(!TODO_BIN)("undo, parent rules and relations against $TODO_BIN",
     const h = await home();
     const conn = await h.open();
     return { items: conn.items, transport: conn.transport };
+  });
+});
+
+describe.skipIf(!TODO_BIN)("filters, views, counts and ParseDate against $TODO_BIN", { timeout: 60_000 }, () => {
+  // The suite FakeDaemon runs too, on a daemon spawned in the same zone. A
+  // daemon serves a whole describe of read-only cases, so it is closed by
+  // the suite rather than after each test.
+  filterViewsConformance(async () => {
+    const h = await home({ TZ: FILTER_ZONE }, false);
+    const conn = await h.open();
+    return { items: conn.items, transport: conn.transport, timeZone: FILTER_ZONE, close: h.close };
   });
 });

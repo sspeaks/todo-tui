@@ -25,7 +25,7 @@ use todo_proto::v1::{
     RedoResponse, Relation, RelationKind, RemoveRelationRequest, SetStatusRequest, ShutdownRequest,
     SortKey, Status, SubscribeRequest, SubscribeResponse, Topic, UnarchiveItemRequest,
     UndeleteItemRequest, UndoRequest, UndoResponse, UndoSkip, UndoSkipReason, UpdateItemRequest,
-    clause, field_value, mutation, operand, person_ref, subscribe_response::Message,
+    View, clause, field_value, mutation, operand, person_ref, subscribe_response::Message,
 };
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -292,35 +292,7 @@ async fn handshake_reports_version_and_api_minor() {
         .into_inner();
     assert_eq!(info.daemon_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(info.api_minor, todo_proto::API_MINOR);
-    assert_eq!(info.api_minor, 4);
-    d.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn m3_rpcs_are_not_implemented_yet() {
-    let d = start().await;
-    let mut items = d.items().await;
-    let mut views = ViewServiceClient::new(d.channel().await);
-    let statuses = [
-        items
-            .get_status_counts(GetStatusCountsRequest::default())
-            .await
-            .unwrap_err(),
-        items
-            .parse_date(ParseDateRequest {
-                text: "fri".into(),
-                reference_time: None,
-            })
-            .await
-            .unwrap_err(),
-        views
-            .list_views(ListViewsRequest::default())
-            .await
-            .unwrap_err(),
-    ];
-    for status in statuses {
-        assert!(error_info(&status, Code::Unimplemented, "NOT_IMPLEMENTED").is_empty());
-    }
+    assert_eq!(info.api_minor, 5);
     d.stop().await;
 }
 
@@ -767,6 +739,281 @@ async fn list_items_today_is_the_reference_time() {
     let before = midnight - jiff::SignedDuration::from_nanos(1);
     assert_eq!(listed(&mut items, before).await, 0);
     assert_eq!(listed(&mut items, midnight).await, 1);
+    d.stop().await;
+}
+
+/// ListViews returns the seeded defaults in tab order, each as the change
+/// stream carries it.
+#[tokio::test(flavor = "multi_thread")]
+async fn list_views_returns_the_seeded_views_in_tab_order() {
+    let d = start().await;
+    let listed = ViewServiceClient::new(d.channel().await)
+        .list_views(ListViewsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.revision, SEEDED);
+    let defaults = todo_core::view::defaults();
+    assert_eq!(listed.views.len(), defaults.len());
+    for (i, (view, default)) in listed.views.iter().zip(&defaults).enumerate() {
+        // The default as stored: with an id, a revision and timestamps.
+        let stored = View {
+            id: view.id.clone(),
+            revision: view.revision,
+            created_at: view.created_at,
+            updated_at: view.updated_at,
+            ..View::from(default)
+        };
+        assert_eq!(*view, stored);
+        assert!(view.id.parse::<ulid::Ulid>().is_ok(), "{}", view.id);
+        assert_eq!((view.position, view.revision), (i as u32, i as u64 + 1));
+        assert!(view.created_at.is_some() && view.created_at == view.updated_at);
+    }
+    let tabs: Vec<_> = (listed.views.iter())
+        .map(|v| (v.name.as_str(), v.show_count))
+        .collect();
+    assert_eq!(
+        tabs,
+        [
+            ("Inbox", true),
+            ("Today", true),
+            ("Next", true),
+            ("Waiting", true),
+            ("Someday", false),
+            ("Archive", false),
+        ]
+    );
+    let mut stream = d
+        .subscribe(SubscribeRequest {
+            since_revision: Some(0),
+            topics: Vec::new(),
+        })
+        .await;
+    for view in &listed.views {
+        let Message::Change(c) = next(&mut stream).await else {
+            panic!("expected a change");
+        };
+        let resource = todo_proto::v1::change::Resource::View(Box::new(view.clone()));
+        assert_eq!((c.revision, c.resource), (view.revision, Some(resource)));
+    }
+    d.stop().await;
+}
+
+/// GetStatusCounts on a fixed day: the status counts pass the implicit
+/// rules, and each counted view's count is the length of its listing.
+#[tokio::test(flavor = "multi_thread")]
+async fn status_counts_match_the_listings() {
+    use jiff::ToSpan as _;
+    let d = start().await;
+    let mut items = d.items().await;
+    let day = jiff::civil::date(2030, 6, 3);
+    let noon = day.at(12, 0, 0, 0).to_zoned(TimeZone::system()).unwrap();
+    let reference_time = Some(timestamp_to_proto(noon.timestamp()));
+    // A ^ token for the day `n` days from the reference day.
+    let due = |n: i64| format!("^{}", day.checked_add(n.days()).unwrap());
+    for text in [
+        "plain".to_owned(),
+        format!("due today {}", due(0)),
+        format!("overdue {}", due(-1)),
+        format!("later {}", due(1)),
+        format!("next overdue >next {}", due(-2)),
+        "waiting ~bob".to_owned(),
+        "someday >someday".to_owned(),
+    ] {
+        capture(&mut items, &text).await;
+    }
+    let started = capture(&mut items, "started").await;
+    (items.set_status(status_req(&started.id, Status::InProgress)))
+        .await
+        .unwrap();
+    // Due, but each hidden by an implicit rule.
+    let done = capture(&mut items, &format!("done {}", due(-1))).await;
+    (items.set_status(status_req(&done.id, Status::Done)))
+        .await
+        .unwrap();
+    let archived = capture(&mut items, &format!("archived {}", due(-1))).await;
+    items.archive_item(archive_req(&archived.id)).await.unwrap();
+    let deferred = capture(&mut items, &format!("deferred {}", due(-1))).await;
+    let defer = Item {
+        defer_until: Some(date_to_proto(day.tomorrow().unwrap())),
+        ..Default::default()
+    };
+    (items.update_item(update_req(&deferred.id, defer, &["defer_until"])))
+        .await
+        .unwrap();
+    let deleted = capture(&mut items, &format!("deleted {}", due(-1))).await;
+    items.delete_item(delete_req(&deleted.id)).await.unwrap();
+
+    let req = |include_views| GetStatusCountsRequest {
+        include_views,
+        reference_time,
+    };
+    let got = items
+        .get_status_counts(req(true))
+        .await
+        .unwrap()
+        .into_inner();
+    let counts = got.counts.unwrap();
+    assert_eq!((counts.inbox, counts.due, counts.overdue), (5, 3, 2));
+    assert_eq!(got.today, Some(date_to_proto(day)));
+    // The counted views, in tab order.
+    let views = ViewServiceClient::new(d.channel().await)
+        .list_views(ListViewsRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .views;
+    let counted: Vec<_> = (views.iter().filter(|v| v.show_count))
+        .map(|v| v.id.clone())
+        .collect();
+    let ids: Vec<_> = got.views.iter().map(|v| v.view_id.clone()).collect();
+    assert_eq!(ids, counted);
+    let mut listed = Vec::new();
+    for v in &got.views {
+        let req = ListItemsRequest {
+            view_id: Some(v.view_id.clone()),
+            reference_time,
+            page_size: 1000,
+            ..Default::default()
+        };
+        let page = items.list_items(req).await.unwrap().into_inner();
+        assert_eq!(page.revision, got.revision);
+        assert_eq!(v.count as usize, page.items.len(), "{}", v.view_id);
+        listed.push(page.items.into_iter().map(|i| i.title).collect::<Vec<_>>());
+    }
+    assert_eq!(
+        listed,
+        [
+            vec!["plain", "due today", "overdue", "later", "waiting"],
+            vec!["next overdue", "overdue", "due today", "started"],
+            vec!["next overdue", "started"],
+            vec!["waiting"],
+        ]
+    );
+    // Without include_views only the status counts.
+    let plain = items
+        .get_status_counts(req(false))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(plain.counts, Some(counts));
+    assert!(plain.views.is_empty());
+    assert_eq!(plain.revision, got.revision);
+
+    // Each call reads the store as it is now, on the daemon's today.
+    capture(&mut items, &format!("due now {}", due(0))).await;
+    let before = jiff::Zoned::now().date();
+    let now = (items.get_status_counts(GetStatusCountsRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    let after = jiff::Zoned::now().date();
+    assert_eq!(now.revision, got.revision + 1);
+    assert!(now.views.is_empty());
+    let today = now.today.unwrap();
+    assert!([date_to_proto(before), date_to_proto(after)].contains(&today));
+    assert_eq!(now.counts.unwrap().inbox, 6);
+
+    let status = items
+        .get_status_counts(GetStatusCountsRequest {
+            include_views: true,
+            reference_time: Some(prost_types::Timestamp {
+                seconds: 9_223_372_037,
+                nanos: 0,
+            }),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(violation(&status).0, "reference_time");
+    d.stop().await;
+}
+
+/// ParseDate resolves the date grammar on the reference day, with or
+/// without a leading ^, and words what does not parse as ParseCapture
+/// words a ^ token.
+#[tokio::test(flavor = "multi_thread")]
+async fn parse_date_resolves_the_date_grammar() {
+    use jiff::ToSpan as _;
+    let d = start().await;
+    let mut items = d.items().await;
+    let day = jiff::civil::date(2030, 6, 3);
+    let noon = day.at(12, 0, 0, 0).to_zoned(TimeZone::system()).unwrap();
+    let parse_req = |text: &str| ParseDateRequest {
+        text: text.to_owned(),
+        reference_time: Some(timestamp_to_proto(noon.timestamp())),
+    };
+    let mut parse = async |text: &str| {
+        let res = items.parse_date(parse_req(text)).await.unwrap();
+        let res = res.into_inner();
+        (res.date, res.warning)
+    };
+    let on = |date: jiff::civil::Date| (Some(date_to_proto(date)), String::new());
+    let not = |warning: &str| (None, warning.to_owned());
+    let friday = day.nth_weekday(1, jiff::civil::Weekday::Friday).unwrap();
+    let tomorrow = day.tomorrow().unwrap();
+    assert_eq!(parse("fri").await, on(friday));
+    assert_eq!(parse("^fri").await, on(friday));
+    assert_eq!(parse("+3d").await, on(day.checked_add(3.days()).unwrap()));
+    assert_eq!(parse("^tomorrow").await, on(tomorrow));
+    assert_eq!(parse(" ^TOM\n").await, on(tomorrow));
+    assert_eq!(
+        parse("^2026-11-02").await,
+        on(jiff::civil::date(2026, 11, 2))
+    );
+    assert_eq!(parse("someday").await, not("someday: not a date"));
+    // Only one ^ is stripped.
+    assert_eq!(parse("^^fri").await, not("^^fri: not a date"));
+    // Empty text is a warning, not an error.
+    assert_eq!(parse("").await, not("empty date"));
+    assert_eq!(parse(" ^ ").await, not("^: empty date"));
+
+    let mut warnings = Vec::new();
+    for typed in ["^someday", "^feb30", "^+3x", "^nov"] {
+        let (date, warning) = parse(typed).await;
+        assert_eq!(date, None, "{typed}");
+        warnings.push(warning);
+    }
+    for (typed, warning) in ["^someday", "^feb30", "^+3x", "^nov"].iter().zip(warnings) {
+        let req = ParseCaptureRequest {
+            text: format!("x {typed}"),
+            reference_time: None,
+        };
+        let draft = items.parse_capture(req).await.unwrap().into_inner();
+        assert_eq!(draft.draft.unwrap().warnings, [warning]);
+    }
+
+    // Without a reference time, today is the daemon's.
+    let before = jiff::Zoned::now().date();
+    let req = ParseDateRequest {
+        text: "today".into(),
+        reference_time: None,
+    };
+    let today = items.parse_date(req).await.unwrap().into_inner().date;
+    let after = jiff::Zoned::now().date();
+    assert!(
+        [before, after]
+            .map(|d| Some(date_to_proto(d)))
+            .contains(&today)
+    );
+
+    // Text over the capture limit is refused without being parsed.
+    let over = "x".repeat(MAX_CAPTURE_BYTES + 1);
+    let status = items.parse_date(parse_req(&over)).await.unwrap_err();
+    assert_eq!(
+        violation(&status),
+        ("text".to_owned(), "is longer than 64 KiB".to_owned())
+    );
+    let status = items
+        .parse_date(ParseDateRequest {
+            text: "fri".into(),
+            reference_time: Some(prost_types::Timestamp {
+                seconds: -9_223_372_037,
+                nanos: 0,
+            }),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(violation(&status).0, "reference_time");
     d.stop().await;
 }
 

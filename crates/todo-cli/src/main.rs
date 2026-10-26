@@ -3,6 +3,7 @@
 mod add;
 mod rpc;
 mod spawn;
+mod status;
 mod tui;
 mod undo;
 
@@ -38,6 +39,14 @@ enum Command {
     Undo,
     /// Redo the most recently undone change.
     Redo,
+    /// Show the inbox and due counts, and the count of each view.
+    Status {
+        /// Print one line for a shell prompt, e.g. `📥3 ⏰1`, leaving out
+        /// zero counts. Prints nothing, and still succeeds, when the daemon
+        /// is not running or does not answer within 40 ms; never starts it.
+        #[arg(long)]
+        short: bool,
+    },
     /// Run the daemon (in the foreground unless --detach).
     Daemon {
         /// Start the daemon in the background and return once it is listening.
@@ -59,6 +68,10 @@ fn main() -> ExitCode {
         eprintln!("todo: {:#}", tui::launch());
         return ExitCode::FAILURE;
     };
+    // Ahead of anything that could fail: a prompt hook must not.
+    if let Command::Status { short: true } = command {
+        return status::short();
+    }
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
@@ -81,6 +94,8 @@ async fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
         Command::Add { text } => return add::add(&paths, text).await,
         Command::Undo => return undo::undo(&paths, undo::Direction::Undo).await,
         Command::Redo => return undo::undo(&paths, undo::Direction::Redo).await,
+        // `--short` is run by main.
+        Command::Status { .. } => return status::status(&paths).await,
         Command::Daemon {
             action: Some(DaemonAction::Stop),
             ..
@@ -170,6 +185,13 @@ mod tests {
         let cli = Cli::try_parse_from(["todo", "redo"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Redo)));
         assert!(Cli::try_parse_from(["todo", "undo", "extra"]).is_err());
+        let cli = Cli::try_parse_from(["todo", "status"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Status { short: false })
+        ));
+        let cli = Cli::try_parse_from(["todo", "status", "--short"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Status { short: true })));
         // Without a command, `todo` opens the TUI; --help still helps.
         assert!(Cli::try_parse_from(["todo"]).unwrap().command.is_none());
         let help = Cli::try_parse_from(["todo", "--help"]).err().unwrap();

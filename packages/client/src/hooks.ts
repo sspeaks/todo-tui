@@ -1,6 +1,6 @@
 import { createContext, createElement, type ReactNode, useContext, useMemo, useSyncExternalStore } from "react";
 import type { Item } from "./gen/todo/v1/item_pb.js";
-import type { ConnectionSnapshot, LiveStore, ViewQuery, ViewSnapshot } from "./live-store.js";
+import type { ConnectionSnapshot, CountsSnapshot, LiveStore, SavedViewsSnapshot, ViewQuery, ViewSnapshot } from "./live-store.js";
 
 const LiveStoreContext = createContext<LiveStore | null>(null);
 
@@ -33,4 +33,19 @@ export function useItem(id: string | undefined): Item | undefined {
 export function useConnection(): ConnectionSnapshot {
   const store = useLiveStore();
   return useSyncExternalStore(store.subscribe, store.getConnection);
+}
+
+/** The saved views (the tabs) in tab order, kept live from TOPIC_VIEW changes. */
+export function useViews(): SavedViewsSnapshot {
+  const store = useLiveStore();
+  return useSyncExternalStore(store.subscribe, store.getViews);
+}
+
+/**
+ * The status and tab counts (GetStatusCounts with include_views), re-read
+ * (debounced) after Item and view changes while a component observes them.
+ */
+export function useStatusCounts(): CountsSnapshot {
+  const store = useLiveStore();
+  return useSyncExternalStore(store.subscribeCounts, store.getCounts);
 }
