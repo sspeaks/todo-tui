@@ -104,6 +104,18 @@ pub(crate) fn store(e: StoreError) -> Status {
             bad_request("request_id", "was already used for a different request")
         }
         StoreError::InvalidPageToken => bad_request("page_token", e.to_string()),
+        StoreError::ViewNotFound(id) => error_info(
+            Code::NotFound,
+            "VIEW_NOT_FOUND",
+            e.to_string(),
+            [("view_id", id.to_string())],
+        ),
+        // A sort's paths start with `sort`; a filter's are relative to it.
+        StoreError::Filter(e) => {
+            let sort = e.path == "sort" || e.path.starts_with("sort[");
+            let e = ConvertError::from(e);
+            convert(if sort { e } else { e.within("filter") })
+        }
         // Undo and Redo: another client changed the stack meanwhile.
         StoreError::UndoStackChanged { expected, top } => error_info(
             Code::Aborted,

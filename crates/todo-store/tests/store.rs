@@ -4,14 +4,15 @@ use std::path::PathBuf;
 use jiff::civil::{Date, date};
 use jiff::{SignedDuration, Timestamp};
 use rusqlite::Connection;
+use todo_core::filter::{Operand, Operator, Predicate};
 use todo_core::{
     Actor, ArchiveReason, Archived, CaptureDraft, CreatedVia, FieldChange, FieldUpdate, FieldValue,
-    Item, ItemField, ItemId, Mutation, MutationError, MutationOp, PersonRef, Priority, Relation,
-    RelationKind, ResolutionKind, Revision, SkipReason, StalenessSignals, Status, StatusCategory,
-    StatusFields, TodoRefinement, Topic, Waiting, new_ulid,
+    Filter, Item, ItemField, ItemId, Mutation, MutationError, MutationOp, PersonRef, Priority,
+    Relation, RelationKind, ResolutionKind, Revision, SkipReason, StalenessSignals, Status,
+    StatusCategory, StatusFields, TodoRefinement, Topic, Waiting, new_ulid,
 };
 use todo_store::{
-    CaptureInput, ChangesSinceError, EndProblem, Expired, ListQuery, MutateInput, MutateOutput,
+    CaptureInput, ChangesSinceError, EndProblem, Expired, ListInput, MutateInput, MutateOutput,
     OpKind, RelationInput, RelationOutput, Resource, SCHEMA_VERSION, Store, StoreError, UndoInput,
     UndoOutput, UndoSkipRow, UndoState,
 };
@@ -37,6 +38,16 @@ fn open() -> Db {
 
 fn ts(seconds: i64) -> Timestamp {
     Timestamp::from_second(seconds).unwrap()
+}
+
+/// The revision a new database starts at: one per default view, seeded
+/// when the store opens it.
+const SEEDED: Revision = 6;
+
+/// Revision `n` after [`SEEDED`], as the `changes` and `ops` columns hold
+/// it.
+fn rev(n: i64) -> i64 {
+    SEEDED as i64 + n
 }
 
 fn today() -> Date {
@@ -77,6 +88,8 @@ async fn migrates_an_empty_database() {
         "request_ids",
         "spool_imports",
         "relations",
+        "views",
+        "view_seeds",
     ] {
         let n: i64 = conn
             .query_row(
@@ -87,12 +100,13 @@ async fn migrates_an_empty_database() {
             .unwrap();
         assert_eq!(n, 1, "{table}");
     }
-    assert_eq!(db.store.current_revision(), 0);
+    assert_eq!(db.store.current_revision(), SEEDED);
+    assert_eq!(SEEDED, todo_core::view::defaults().len() as Revision);
 
-    // Reopening is a no-op migration.
+    // Reopening is a no-op migration, and seeds nothing.
     drop(db.store);
     let reopened = Store::open(&db.path).unwrap();
-    assert_eq!(reopened.current_revision(), 0);
+    assert_eq!(reopened.current_revision(), SEEDED);
 }
 
 #[tokio::test]
@@ -161,14 +175,14 @@ async fn fts5_indexes_items() {
 async fn capture_and_list_round_trip() {
     let db = open();
     let (item, result) = db.store.capture(input("call dentist", 100)).await.unwrap();
-    assert_eq!(result.revision, 1);
-    assert_eq!(item.revision, 1);
+    assert_eq!(result.revision, SEEDED + 1);
+    assert_eq!(item.revision, SEEDED + 1);
     assert_eq!(item.status(), Status::Inbox);
     assert_eq!(item.created_via, CreatedVia::Cli);
-    assert_eq!(db.store.current_revision(), 1);
+    assert_eq!(db.store.current_revision(), SEEDED + 1);
 
-    let page = db.store.list_items(ListQuery::default()).await.unwrap();
-    assert_eq!(page.revision, 1);
+    let page = db.store.list_items(ListInput::default()).await.unwrap();
+    assert_eq!(page.revision, SEEDED + 1);
     assert_eq!(page.next_page_token, None);
     assert_eq!(page.items, vec![item.clone()]);
 
@@ -204,8 +218,8 @@ async fn capture_is_idempotent_on_request_and_spool_id() {
     let d = db.store.capture(spooled).await.unwrap();
     assert_eq!(c, d);
 
-    assert_eq!(db.store.current_revision(), 2);
-    let page = db.store.list_items(ListQuery::default()).await.unwrap();
+    assert_eq!(db.store.current_revision(), SEEDED + 2);
+    let page = db.store.list_items(ListInput::default()).await.unwrap();
     assert_eq!(page.items.len(), 2);
 }
 
@@ -279,6 +293,29 @@ async fn capture_under_a_missing_or_deleted_parent_fails() {
     assert_eq!(snapshot(&db).await, before);
 }
 
+/// `status IN (statuses)`.
+fn status_in(statuses: &[Status]) -> Filter {
+    let operands = statuses
+        .iter()
+        .map(|&s| Operand::Value(FieldValue::Status(s)))
+        .collect();
+    Filter {
+        all_of: vec![Predicate::new(ItemField::Status, Operator::In, operands).into()],
+        ..Filter::default()
+    }
+}
+
+/// Every Item, whatever the implicit rules would hide.
+fn everything() -> Filter {
+    Filter {
+        include_archived: true,
+        include_done: true,
+        include_deferred: true,
+        include_deleted: true,
+        ..Filter::default()
+    }
+}
+
 async fn set_columns(db: &Db, id: &Item, set: &'static str) {
     let id = id.id.to_string();
     db.store
@@ -335,9 +372,9 @@ async fn list_applies_implicit_rules_and_status_filter() {
             .map(|i| i.core.title)
             .collect::<Vec<_>>()
     };
-    let q = ListQuery {
+    let q = ListInput {
         today,
-        ..ListQuery::default()
+        ..ListInput::default()
     };
     let page = db.store.list_items(q.clone()).await.unwrap();
     assert!(
@@ -349,20 +386,19 @@ async fn list_applies_implicit_rules_and_status_filter() {
 
     let page = db
         .store
-        .list_items(ListQuery {
-            statuses: vec![Status::Next, Status::Done],
-            include_done: true,
+        .list_items(ListInput {
+            filter: Filter {
+                include_done: true,
+                ..status_in(&[Status::Next, Status::Done])
+            },
             ..q.clone()
         })
         .await
         .unwrap();
     assert_eq!(titles(page), ["next", "done"]);
 
-    let everything = ListQuery {
-        include_archived: true,
-        include_done: true,
-        include_deferred: true,
-        include_deleted: true,
+    let everything = ListInput {
+        filter: everything(),
         ..q.clone()
     };
     assert_eq!(
@@ -370,15 +406,17 @@ async fn list_applies_implicit_rules_and_status_filter() {
         8
     );
 
-    let later = ListQuery {
+    let later = ListInput {
         today: Some(jiff::civil::date(2026, 6, 1)),
-        ..ListQuery::default()
+        ..ListInput::default()
     };
     assert!(titles(db.store.list_items(later).await.unwrap()).contains(&"deferred".to_owned()));
 
-    let done = db.store.list_items(ListQuery {
-        include_done: true,
-        statuses: vec![Status::Cancelled],
+    let done = db.store.list_items(ListInput {
+        filter: Filter {
+            include_done: true,
+            ..status_in(&[Status::Cancelled])
+        },
         ..q
     });
     let page = done.await.unwrap();
@@ -398,9 +436,9 @@ async fn list_pages_are_ordered_and_report_their_read_revision() {
             .await
             .unwrap();
     }
-    let mut query = ListQuery {
+    let mut query = ListInput {
         page_size: 2,
-        ..ListQuery::default()
+        ..ListInput::default()
     };
     let mut seen = Vec::new();
     let mut revisions = Vec::new();
@@ -419,11 +457,11 @@ async fn list_pages_are_ordered_and_report_their_read_revision() {
         }
     }
     assert_eq!(seen, ["t1", "t2", "t3", "t4", "t5", "t9"]);
-    assert_eq!(revisions, [5, 6, 6]);
+    assert_eq!(revisions, [SEEDED + 5, SEEDED + 6, SEEDED + 6]);
 
-    let bad = ListQuery {
+    let bad = ListInput {
         page_token: Some("garbage".into()),
-        ..ListQuery::default()
+        ..ListInput::default()
     };
     assert!(matches!(
         db.store.list_items(bad).await,
@@ -442,27 +480,30 @@ async fn page_tokens_are_bound_to_their_query() {
     }
     let first = db
         .store
-        .list_items(ListQuery {
+        .list_items(ListInput {
             page_size: 1,
-            ..ListQuery::default()
+            ..ListInput::default()
         })
         .await
         .unwrap();
     let token = first.next_page_token.unwrap();
-    let other = ListQuery {
+    let other = ListInput {
+        filter: Filter {
+            include_done: true,
+            ..Filter::default()
+        },
         page_size: 1,
-        include_done: true,
         page_token: Some(token.clone()),
-        ..ListQuery::default()
+        ..ListInput::default()
     };
     assert!(matches!(
         db.store.list_items(other).await,
         Err(StoreError::InvalidPageToken)
     ));
-    let same = ListQuery {
+    let same = ListInput {
         page_size: 1,
         page_token: Some(token),
-        ..ListQuery::default()
+        ..ListInput::default()
     };
     let page = db.store.list_items(same).await.unwrap();
     assert_eq!(page.items[0].core.title, "t2");
@@ -505,20 +546,20 @@ async fn revisions_are_monotonic_and_contiguous_under_concurrent_writes() {
     }
     let total = total as u64;
     assert_eq!(all.len() as u64, total);
-    assert_eq!(all, (1..=total).collect());
-    assert_eq!(db.store.current_revision(), total);
+    assert_eq!(all, (SEEDED + 1..=SEEDED + total).collect());
+    assert_eq!(db.store.current_revision(), SEEDED + total);
 
-    let mut last = 0;
+    let mut last = SEEDED;
     for _ in 0..total {
         let change = rx.recv().await.unwrap();
         assert_eq!(change.revision, last + 1);
         last = change.revision;
     }
 
-    let replay = db.store.changes_since(0).await.unwrap();
+    let replay = db.store.changes_since(SEEDED).await.unwrap();
     assert_eq!(
         replay.iter().map(|c| c.revision).collect::<Vec<_>>(),
-        (1..=total).collect::<Vec<_>>()
+        (SEEDED + 1..=SEEDED + total).collect::<Vec<_>>()
     );
 }
 
@@ -538,17 +579,18 @@ async fn changes_since_replays_expires_and_detects_ahead() {
         })
         .await
         .unwrap();
-    assert_eq!(db.store.current_revision(), 3);
+    const S: Revision = SEEDED;
+    assert_eq!(db.store.current_revision(), S + 3);
 
-    let all = db.store.changes_since(0).await.unwrap();
+    let all = db.store.changes_since(S).await.unwrap();
     assert_eq!(
         all.iter()
             .map(|c| (c.revision, c.id.as_str()))
             .collect::<Vec<_>>(),
         [
-            (1, a_id.as_str()),
-            (2, b.id.to_string().as_str()),
-            (3, a_id.as_str())
+            (S + 1, a_id.as_str()),
+            (S + 2, b.id.to_string().as_str()),
+            (S + 3, a_id.as_str())
         ]
     );
     // Replay carries the current state.
@@ -557,35 +599,29 @@ async fn changes_since_replays_expires_and_detects_ahead() {
     };
     assert_eq!(first.core.title, "a2");
 
-    let tail = db.store.changes_since(2).await.unwrap();
+    let tail = db.store.changes_since(S + 2).await.unwrap();
     assert_eq!(tail.len(), 1);
-    assert_eq!(tail[0].revision, 3);
-    assert!(db.store.changes_since(3).await.unwrap().is_empty());
+    assert_eq!(tail[0].revision, S + 3);
+    assert!(db.store.changes_since(S + 3).await.unwrap().is_empty());
 
     assert!(matches!(
-        db.store.changes_since(4).await,
-        Err(ChangesSinceError::Ahead {
-            since: 4,
-            current: 3
-        })
+        db.store.changes_since(S + 4).await,
+        Err(ChangesSinceError::Ahead { since, current }) if (since, current) == (S + 4, S + 3)
     ));
 
     db.store
         .write(|tx| {
             tx.conn()
-                .execute("DELETE FROM changes WHERE revision <= 2", [])?;
+                .execute("DELETE FROM changes WHERE revision <= ?1", [rev(2)])?;
             Ok(())
         })
         .await
         .unwrap();
     assert!(matches!(
         db.store.changes_since(0).await,
-        Err(ChangesSinceError::Expired(Expired {
-            since: 0,
-            oldest: 3
-        }))
+        Err(ChangesSinceError::Expired(Expired { since: 0, oldest })) if oldest == S + 3
     ));
-    assert_eq!(db.store.changes_since(2).await.unwrap().len(), 1);
+    assert_eq!(db.store.changes_since(S + 2).await.unwrap().len(), 1);
 
     db.store
         .write(|tx| {
@@ -595,13 +631,10 @@ async fn changes_since_replays_expires_and_detects_ahead() {
         .await
         .unwrap();
     assert!(matches!(
-        db.store.changes_since(2).await,
-        Err(ChangesSinceError::Expired(Expired {
-            since: 2,
-            oldest: 4
-        }))
+        db.store.changes_since(S + 2).await,
+        Err(ChangesSinceError::Expired(e)) if e == Expired { since: S + 2, oldest: S + 4 }
     ));
-    assert!(db.store.changes_since(3).await.unwrap().is_empty());
+    assert!(db.store.changes_since(S + 3).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -618,8 +651,8 @@ async fn broadcast_happens_only_after_commit() {
         .await;
     assert!(failed.is_err());
     assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
-    assert_eq!(db.store.current_revision(), 0);
-    assert!(db.store.changes_since(0).await.unwrap().is_empty());
+    assert_eq!(db.store.current_revision(), SEEDED);
+    assert!(db.store.changes_since(SEEDED).await.unwrap().is_empty());
 
     // A panicking closure rolls back too, and the writer survives.
     let panicked = db
@@ -636,7 +669,7 @@ async fn broadcast_happens_only_after_commit() {
 
     let (item, _) = db.store.capture(input("live", 1)).await.unwrap();
     let change = rx.recv().await.unwrap();
-    assert_eq!(change.revision, 1);
+    assert_eq!(change.revision, SEEDED + 1);
     assert_eq!(change.topic, Topic::Item);
     assert_eq!(change.id, item.id.to_string());
     assert_eq!(change.resource, Some(Resource::Item(item.into())));
@@ -669,7 +702,7 @@ async fn capture_stores_every_draft_field() {
         ..CaptureDraft::from_title("call the vendor")
     };
     let (item, result) = db.store.capture(capture).await.unwrap();
-    assert_eq!(result.revision, 1);
+    assert_eq!(result.revision, SEEDED + 1);
     assert_eq!(item.core.title, "call the vendor");
     assert_eq!(item.core.priority, Priority::High);
     assert_eq!(item.core.due_date, Some(date(2026, 2, 27)));
@@ -730,7 +763,7 @@ async fn capture_rejects_an_empty_title_and_people() {
         }) => {}
         other => panic!("expected an unsupported person, got {other:?}"),
     }
-    assert_eq!(snapshot(&db).await, (0, [0; 4], vec![]));
+    assert_eq!(snapshot(&db).await, (SEEDED, [0, 0, rev(0), 0], vec![]));
 }
 
 fn mutation(id: ItemId, op: MutationOp) -> Mutation {
@@ -777,13 +810,10 @@ async fn snapshot(db: &Db) -> (Revision, [i64; 4], Vec<Item>) {
         })
         .await
         .unwrap();
-    let all = ListQuery {
-        include_archived: true,
-        include_done: true,
-        include_deferred: true,
-        include_deleted: true,
+    let all = ListInput {
+        filter: everything(),
         today: Some(today()),
-        ..ListQuery::default()
+        ..ListInput::default()
     };
     let items = db.store.list_items(all).await.unwrap().items;
     (db.store.current_revision(), counts, items)
@@ -865,7 +895,7 @@ async fn mutate_records_one_op_with_an_event_per_changed_field() {
         OpKind::Update,
         vec![Mutation {
             id: item.id,
-            expected_revision: Some(1),
+            expected_revision: Some(SEEDED + 1),
             op: MutationOp::Update(vec![
                 update(
                     ItemField::Title,
@@ -880,12 +910,12 @@ async fn mutate_records_one_op_with_an_event_per_changed_field() {
     );
     let request_id = req.request_id.clone();
     let out = db.store.mutate(req).await.unwrap();
-    assert_eq!(out.result.revision, 2);
-    assert_eq!(db.store.current_revision(), 2);
+    assert_eq!(out.result.revision, SEEDED + 2);
+    assert_eq!(db.store.current_revision(), SEEDED + 2);
     let [after] = out.items.as_slice() else {
         panic!("expected one item, got {:?}", out.items);
     };
-    assert_eq!(after.revision, 2);
+    assert_eq!(after.revision, SEEDED + 2);
     assert_eq!(after.core.title, "call the dentist");
     assert_eq!(after.core.priority, Priority::High);
     assert_eq!(after.updated_at, ts(1_000));
@@ -897,7 +927,7 @@ async fn mutate_records_one_op_with_an_event_per_changed_field() {
 
     assert_eq!(
         op_row(&db, out.result.op_id).await,
-        ("update".into(), "user".into(), Some(request_id), 2)
+        ("update".into(), "user".into(), Some(request_id), rev(2))
     );
     let event = |field, old, new| EventRow {
         item_id: item.id.to_string(),
@@ -941,7 +971,10 @@ async fn mutate_records_one_op_with_an_event_per_changed_field() {
             ..item.derived.staleness
         }
     );
-    assert_eq!(change_rows(&db, 1).await, [(2, item.id.to_string(), false)]);
+    assert_eq!(
+        change_rows(&db, rev(1)).await,
+        [(rev(2), item.id.to_string(), false)]
+    );
     // Nothing else: one op, four events, one change, one request id.
     assert_eq!(
         snapshot(&db).await.1,
@@ -950,7 +983,7 @@ async fn mutate_records_one_op_with_an_event_per_changed_field() {
 
     // Broadcast after commit: an independent reader already sees the row.
     let change = rx.try_recv().unwrap();
-    assert_eq!((change.revision, change.deleted), (2, false));
+    assert_eq!((change.revision, change.deleted), (SEEDED + 2, false));
     assert_eq!(change.resource, Some(Resource::Item(after.clone().into())));
     assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
     let stored: String = Connection::open(&db.path)
@@ -1018,7 +1051,7 @@ async fn an_update_rewrites_every_other_column_unchanged() {
     let mut want = before;
     want.core.title = "renamed".into();
     want.updated_at = ts(1_000);
-    want.revision = 4;
+    want.revision = SEEDED + 4;
     assert_eq!(out.items, [want.clone()]);
     assert_eq!(find(snapshot(&db).await.2), want);
 
@@ -1113,24 +1146,24 @@ async fn revision_mismatch_writes_nothing() {
     let before = snapshot(&db).await;
     let stale = Mutation {
         id: b.id,
-        expected_revision: Some(1),
+        expected_revision: Some(SEEDED + 1),
         op: MutationOp::Archive,
     };
     let mut req = mutate(OpKind::Batch, vec![title(a.id, "a2"), stale]);
     match db.store.mutate(req.clone()).await {
         Err(StoreError::RevisionMismatch {
             id,
-            expected: 1,
-            actual: 2,
-        }) => assert_eq!(id, b.id),
+            expected,
+            actual,
+        }) => assert_eq!((id, expected, actual), (b.id, SEEDED + 1, SEEDED + 2)),
         other => panic!("expected RevisionMismatch, got {other:?}"),
     }
     assert_eq!(snapshot(&db).await, before);
 
     // The failed request did not use up its request id.
-    req.mutations[1].expected_revision = Some(2);
+    req.mutations[1].expected_revision = Some(SEEDED + 2);
     let out = db.store.mutate(req).await.unwrap();
-    assert_eq!(out.result.revision, 4);
+    assert_eq!(out.result.revision, SEEDED + 4);
 }
 
 #[tokio::test]
@@ -1143,24 +1176,27 @@ async fn an_item_mutated_twice_in_a_batch_gets_one_revision() {
             OpKind::Batch,
             vec![
                 Mutation {
-                    expected_revision: Some(1),
+                    expected_revision: Some(SEEDED + 1),
                     ..title(a.id, "a2")
                 },
                 Mutation {
-                    expected_revision: Some(1),
+                    expected_revision: Some(SEEDED + 1),
                     ..mutation(a.id, MutationOp::SetStatus(Status::Next))
                 },
             ],
         ))
         .await
         .unwrap();
-    assert_eq!(out.result.revision, 2);
+    assert_eq!(out.result.revision, SEEDED + 2);
     assert_eq!(out.items.len(), 2);
     assert_eq!(out.items[0], out.items[1]);
     assert_eq!(out.items[0].core.title, "a2");
     assert_eq!(out.items[0].status(), Status::Next);
-    assert_eq!(out.items[0].revision, 2);
-    assert_eq!(change_rows(&db, 1).await, [(2, a.id.to_string(), false)]);
+    assert_eq!(out.items[0].revision, SEEDED + 2);
+    assert_eq!(
+        change_rows(&db, rev(1)).await,
+        [(rev(2), a.id.to_string(), false)]
+    );
     let fields: Vec<ItemField> = events(&db, out.result.op_id)
         .await
         .into_iter()
@@ -1194,25 +1230,29 @@ async fn a_batch_allocates_contiguous_revisions_in_first_touch_order() {
     );
     let request_id = req.request_id.clone();
     let out = db.store.mutate(req).await.unwrap();
-    assert_eq!(out.result.revision, 6);
-    assert_eq!(db.store.current_revision(), 6);
+    const S: Revision = SEEDED;
+    assert_eq!(out.result.revision, S + 6);
+    assert_eq!(db.store.current_revision(), S + 6);
     let revisions: Vec<(ItemId, Revision)> = out.items.iter().map(|i| (i.id, i.revision)).collect();
-    assert_eq!(revisions, [(c.id, 4), (a.id, 5), (c.id, 4), (b.id, 6)]);
+    assert_eq!(
+        revisions,
+        [(c.id, S + 4), (a.id, S + 5), (c.id, S + 4), (b.id, S + 6)]
+    );
     assert_eq!(out.items[0].core.title, "c2");
     assert_eq!(
-        change_rows(&db, 3).await,
+        change_rows(&db, rev(3)).await,
         [
-            (4, c.id.to_string(), false),
-            (5, a.id.to_string(), false),
-            (6, b.id.to_string(), false),
+            (rev(4), c.id.to_string(), false),
+            (rev(5), a.id.to_string(), false),
+            (rev(6), b.id.to_string(), false),
         ]
     );
     assert_eq!(
         op_row(&db, out.result.op_id).await,
-        ("batch".into(), "user".into(), Some(request_id), 6)
+        ("batch".into(), "user".into(), Some(request_id), rev(6))
     );
     let live: Vec<Revision> = (0..3).map(|_| rx.try_recv().unwrap().revision).collect();
-    assert_eq!(live, [4, 5, 6]);
+    assert_eq!(live, [S + 4, S + 5, S + 6]);
     assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
 }
 
@@ -1223,7 +1263,7 @@ async fn a_replayed_request_returns_the_original_result_and_current_state() {
     let req = mutate(
         OpKind::Update,
         vec![Mutation {
-            expected_revision: Some(1),
+            expected_revision: Some(SEEDED + 1),
             ..title(a.id, "a2")
         }],
     );
@@ -1317,19 +1357,23 @@ async fn a_batch_that_changes_nothing_records_an_op_without_a_revision() {
     );
     let request_id = req.request_id.clone();
     let out = db.store.mutate(req.clone()).await.unwrap();
-    assert_eq!(out.result.revision, 1);
+    assert_eq!(out.result.revision, SEEDED + 1);
     assert_eq!(out.items, [a.clone(), a]);
-    assert_eq!(db.store.current_revision(), 1);
+    assert_eq!(db.store.current_revision(), SEEDED + 1);
     assert_eq!(
         op_row(&db, out.result.op_id).await,
-        ("batch".into(), "user".into(), Some(request_id), 1)
+        ("batch".into(), "user".into(), Some(request_id), rev(1))
     );
     assert_eq!(events(&db, out.result.op_id).await, []);
-    assert_eq!(change_rows(&db, 1).await, []);
+    assert_eq!(change_rows(&db, rev(1)).await, []);
     assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
     assert_eq!(
         snapshot(&db).await,
-        (1, [ops + 1, events_n, changes, requests + 1], items)
+        (
+            SEEDED + 1,
+            [ops + 1, events_n, changes, requests + 1],
+            items
+        )
     );
 
     let replay = db.store.mutate(req).await.unwrap();
@@ -1337,9 +1381,12 @@ async fn a_batch_that_changes_nothing_records_an_op_without_a_revision() {
 }
 
 async fn titles(db: &Db, include_deleted: bool) -> Vec<String> {
-    let query = ListQuery {
-        include_deleted,
-        ..ListQuery::default()
+    let query = ListInput {
+        filter: Filter {
+            include_deleted,
+            ..Filter::default()
+        },
+        ..ListInput::default()
     };
     let page = db.store.list_items(query).await.unwrap();
     page.items.into_iter().map(|i| i.core.title).collect()
@@ -1370,7 +1417,10 @@ async fn delete_hides_an_item_until_undelete() {
     );
 
     // Watchers see an ordinary change carrying the tombstone.
-    assert_eq!(change_rows(&db, 2).await, [(3, a.id.to_string(), false)]);
+    assert_eq!(
+        change_rows(&db, rev(2)).await,
+        [(rev(3), a.id.to_string(), false)]
+    );
     let change = rx.try_recv().unwrap();
     assert!(!change.deleted);
     assert_eq!(
@@ -1405,7 +1455,7 @@ async fn delete_hides_an_item_until_undelete() {
         ))
         .await
         .unwrap();
-    assert_eq!(again.result.revision, 3);
+    assert_eq!(again.result.revision, SEEDED + 3);
     assert_eq!(again.items[0], *tombstone);
 
     let restored = db
@@ -1416,7 +1466,7 @@ async fn delete_hides_an_item_until_undelete() {
         ))
         .await
         .unwrap();
-    assert_eq!(restored.result.revision, 4);
+    assert_eq!(restored.result.revision, SEEDED + 4);
     assert_eq!(restored.items[0].derived.deleted_at, None);
     assert_eq!(titles(&db, false).await, ["a", "b"]);
 }
@@ -1593,7 +1643,7 @@ async fn person_references_wait_for_people() {
     unsupported(db.store.mutate(req).await, ItemField::WaitingOn);
     let stored = db.store.get_item(a.id, today()).await.unwrap().item;
     assert_eq!(stored.overlay.waiting, Some(vendor));
-    assert_eq!(db.store.current_revision(), 2);
+    assert_eq!(db.store.current_revision(), SEEDED + 2);
 }
 
 #[tokio::test]
@@ -1667,7 +1717,7 @@ async fn get_item_reads_missing_deleted_and_merged_items() {
     let got = db.store.get_item(c.id, today()).await.unwrap();
     assert_eq!(
         (got.item, got.revision, got.resolved_from),
-        (c.clone(), 3, None)
+        (c.clone(), SEEDED + 3, None)
     );
 
     // A soft-deleted Item is returned as is.
@@ -1680,14 +1730,14 @@ async fn get_item_reads_missing_deleted_and_merged_items() {
         .unwrap();
     let got = db.store.get_item(b.id, today()).await.unwrap();
     assert_eq!(got.item.derived.deleted_at, Some(ts(1_000)));
-    assert_eq!((got.revision, got.resolved_from), (4, None));
+    assert_eq!((got.revision, got.resolved_from), (SEEDED + 4, None));
 
     // a merged into b, b into c: a resolves to c.
     merge(&db, &a, b.id).await;
     merge(&db, &b, c.id).await;
     let got = db.store.get_item(a.id, today()).await.unwrap();
     assert_eq!(got.item, c);
-    assert_eq!((got.revision, got.resolved_from), (4, Some(a.id)));
+    assert_eq!((got.revision, got.resolved_from), (SEEDED + 4, Some(a.id)));
 
     // A merge cycle or a dangling target is corrupt.
     merge(&db, &c, a.id).await;
@@ -3471,9 +3521,12 @@ async fn relations_change_as_ops_on_both_ends() {
     let mut rx = db.store.subscribe();
     let req = relation_input(blocks);
     let out = db.store.add_relation(req.clone()).await.unwrap();
-    assert_eq!(out.result.revision, 5);
+    assert_eq!(out.result.revision, SEEDED + 5);
     assert_eq!((out.from_item.id, out.to_item.id), (a.id, b.id));
-    assert_eq!((out.from_item.revision, out.to_item.revision), (4, 5));
+    assert_eq!(
+        (out.from_item.revision, out.to_item.revision),
+        (SEEDED + 4, SEEDED + 5)
+    );
     assert_eq!(out.from_item.updated_at, ts(1_000));
     assert_eq!(
         (
@@ -3483,8 +3536,11 @@ async fn relations_change_as_ops_on_both_ends() {
         ([blocks].as_slice(), [blocks].as_slice())
     );
     assert_eq!(
-        change_rows(&db, 3).await,
-        [(4, a.id.to_string(), false), (5, b.id.to_string(), false)]
+        change_rows(&db, rev(3)).await,
+        [
+            (rev(4), a.id.to_string(), false),
+            (rev(5), b.id.to_string(), false)
+        ]
     );
     let change = rx.try_recv().unwrap();
     assert_eq!(
@@ -3565,7 +3621,7 @@ async fn relations_change_as_ops_on_both_ends() {
     assert_eq!(get(&db, a.id).await.relations, on_a);
     assert_eq!(get(&db, b.id).await.relations, [blocks]);
     assert_eq!(get(&db, c.id).await.relations, [relates]);
-    let page = db.store.list_items(ListQuery::default()).await.unwrap();
+    let page = db.store.list_items(ListInput::default()).await.unwrap();
     let mut listed: Vec<(ItemId, Vec<Relation>)> = page
         .items
         .into_iter()
@@ -3579,7 +3635,7 @@ async fn relations_change_as_ops_on_both_ends() {
     ];
     want.sort();
     assert_eq!(listed, want);
-    let replayed = db.store.changes_since(3).await.unwrap();
+    let replayed = db.store.changes_since(SEEDED + 3).await.unwrap();
     let last = replayed
         .iter()
         .rev()

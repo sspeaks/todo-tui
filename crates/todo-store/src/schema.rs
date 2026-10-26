@@ -13,6 +13,7 @@ use crate::{Result, StoreError};
 const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_undo_relations.sql"),
+    include_str!("../migrations/0003_views_fts.sql"),
 ];
 
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;

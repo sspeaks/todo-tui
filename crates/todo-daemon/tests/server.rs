@@ -18,9 +18,9 @@ use todo_proto::v1::view_service_client::ViewServiceClient;
 use todo_proto::v1::watch_service_client::WatchServiceClient;
 use todo_proto::v1::{
     AddRelationRequest, ArchiveItemRequest, ArchiveReason, BatchMutateRequest, CaptureItemRequest,
-    CaptureTokenKind, Clause, ClientKind, CreatedVia, DeleteItemRequest, FieldValue, Filter,
-    GetItemRequest, GetServerInfoRequest, GetStatusCountsRequest, GetUndoStateRequest, Item,
-    ItemField, ListItemsRequest, ListViewsRequest, Mutation, MutationResult, OpKind, Operand,
+    CaptureTokenKind, Clause, ClauseGroup, ClientKind, CreatedVia, DeleteItemRequest, FieldValue,
+    Filter, GetItemRequest, GetServerInfoRequest, GetStatusCountsRequest, GetUndoStateRequest,
+    Item, ItemField, ListItemsRequest, ListViewsRequest, Mutation, MutationResult, OpKind, Operand,
     Operator, ParseCaptureRequest, ParseDateRequest, PersonRef, Predicate, Priority, RedoRequest,
     RedoResponse, Relation, RelationKind, RemoveRelationRequest, SetStatusRequest, ShutdownRequest,
     SortKey, Status, SubscribeRequest, SubscribeResponse, Topic, UnarchiveItemRequest,
@@ -35,6 +35,9 @@ use tonic::transport::Channel;
 use tonic_types::StatusExt;
 
 const WAIT: Duration = Duration::from_secs(10);
+
+/// A new store's revision: one per default view, seeded when it opens.
+const SEEDED: u64 = 6;
 
 struct TestDaemon {
     home: TempDir,
@@ -390,11 +393,19 @@ async fn capture_then_list() {
         .unwrap()
         .into_inner();
     assert_eq!(sorted.items.len(), 2);
-    let status = items
+    // Any sortable key, in either direction.
+    let newest = items
         .list_items(sort(&[(ItemField::CreatedAt, true)]))
         .await
+        .unwrap()
+        .into_inner();
+    let ids: Vec<_> = newest.items.iter().map(|i| i.id.as_str()).collect();
+    assert_eq!(ids, [b.id.as_str(), a.id.as_str()]);
+    let status = items
+        .list_items(sort(&[(ItemField::Labels, false)]))
+        .await
         .unwrap_err();
-    assert_eq!(status.code(), Code::Unimplemented);
+    assert_eq!(violation(&status).0, "sort[0].key");
     d.stop().await;
 }
 
@@ -470,8 +481,58 @@ async fn invalid_requests_carry_bad_request_details() {
         })
         .await
         .unwrap_err();
-    assert_eq!(status.code(), Code::Unimplemented);
-    assert!(status.get_details_error_info().is_some());
+    assert_eq!(
+        violation(&status),
+        ("view_id".to_owned(), "must be a ULID".to_owned())
+    );
+    let unknown = rid();
+    let status = items
+        .list_items(ListItemsRequest {
+            view_id: Some(unknown.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error_info(&status, Code::NotFound, "VIEW_NOT_FOUND")["view_id"],
+        unknown
+    );
+    // Filter errors name their path in the request.
+    let labels_eq = ListItemsRequest {
+        filter: Some(Filter {
+            any_of: vec![Clause {
+                kind: Some(clause::Kind::Group(ClauseGroup {
+                    all_of: vec![Clause {
+                        kind: Some(clause::Kind::Predicate(Predicate {
+                            target: ItemField::Labels.into(),
+                            op: Operator::Eq.into(),
+                            operands: vec![Operand {
+                                kind: Some(operand::Kind::Value(FieldValue {
+                                    kind: Some(field_value::Kind::StringValue("x".into())),
+                                })),
+                            }],
+                        })),
+                    }],
+                    any_of: vec![],
+                })),
+            }],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let status = items.list_items(labels_eq).await.unwrap_err();
+    assert_eq!(
+        violation(&status).0,
+        "filter.any_of[0].group.all_of[0].predicate.op"
+    );
+    let status = items
+        .list_items(ListItemsRequest {
+            page_token: "p2.0000000000000000.1.01JB8X4Z5Q6R7S8T9V0W1X2Y3Z".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(violation(&status).0, "page_token");
     let status = items
         .list_items(ListItemsRequest {
             reference_time: Some(prost_types::Timestamp {
@@ -483,6 +544,196 @@ async fn invalid_requests_carry_bad_request_details() {
         .await
         .unwrap_err();
     assert_eq!(violation(&status).0, "reference_time");
+    d.stop().await;
+}
+
+/// A new store's views replay from revision 0 on TOPIC_VIEW, and ListItems
+/// lists through one, narrowed by the request.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_seeded_views_replay_and_list_items_through_them() {
+    let d = start().await;
+    let mut items = d.items().await;
+    let mut stream = d
+        .subscribe(SubscribeRequest {
+            since_revision: Some(0),
+            topics: vec![Topic::View.into()],
+        })
+        .await;
+    let mut views = Vec::new();
+    for revision in 1..=SEEDED {
+        let Message::Change(c) = next(&mut stream).await else {
+            panic!("expected a change");
+        };
+        assert_eq!(
+            (c.revision, c.topic, c.deleted),
+            (revision, Topic::View as i32, false)
+        );
+        let Some(todo_proto::v1::change::Resource::View(view)) = c.resource else {
+            panic!("expected a View");
+        };
+        assert_eq!(view.id, c.id);
+        views.push(*view);
+    }
+    assert!(matches!(next(&mut stream).await, Message::CaughtUp(c) if c.revision == SEEDED));
+    let seeds: Vec<_> = views.iter().map(|v| v.seed.as_deref().unwrap()).collect();
+    assert_eq!(
+        seeds,
+        ["inbox", "today", "next", "waiting", "someday", "archive"]
+    );
+
+    // On a fixed day the Today view lists what is due by then, overdue
+    // first.
+    let day = jiff::civil::date(2030, 6, 3);
+    let due = |title: &'static str, on: jiff::civil::Date| {
+        let mut items = items.clone();
+        async move {
+            let item = capture(&mut items, title).await;
+            let due = Item {
+                due_date: Some(date_to_proto(on)),
+                ..Default::default()
+            };
+            items
+                .update_item(update_req(&item.id, due, &["due_date"]))
+                .await
+                .unwrap();
+            item.id
+        }
+    };
+    let today = due("today", day).await;
+    let later = due("later", day.tomorrow().unwrap()).await;
+    let overdue = due("overdue", day.yesterday().unwrap()).await;
+    let noon = day.at(12, 0, 0, 0).to_zoned(TimeZone::system()).unwrap();
+    let in_view = |filter: Option<Filter>| ListItemsRequest {
+        filter,
+        view_id: Some(views[1].id.clone()),
+        reference_time: Some(timestamp_to_proto(noon.timestamp())),
+        ..Default::default()
+    };
+    let listed = items.list_items(in_view(None)).await.unwrap().into_inner();
+    let ids: Vec<_> = listed.items.iter().map(|i| i.id.clone()).collect();
+    assert_eq!(ids, [overdue.clone(), today]);
+    assert!(listed.items[0].is_overdue && !listed.items[1].is_overdue);
+    assert!(!ids.contains(&later));
+    // The request's clauses narrow the view.
+    let titled_overdue = Filter {
+        all_of: vec![Clause {
+            kind: Some(clause::Kind::Predicate(Predicate {
+                target: ItemField::Title.into(),
+                op: Operator::Eq.into(),
+                operands: vec![Operand {
+                    kind: Some(operand::Kind::Value(FieldValue {
+                        kind: Some(field_value::Kind::StringValue("overdue".into())),
+                    })),
+                }],
+            })),
+        }],
+        ..Default::default()
+    };
+    let narrowed = items
+        .list_items(in_view(Some(titled_overdue)))
+        .await
+        .unwrap()
+        .into_inner();
+    let ids: Vec<_> = narrowed.items.iter().map(|i| i.id.clone()).collect();
+    assert_eq!(ids, [overdue]);
+    d.stop().await;
+}
+
+/// ListItems with a general filter and sort pages with `p3` tokens bound to
+/// them. A filter that is valid but not built yet is UNIMPLEMENTED, unless
+/// the request is also invalid.
+#[tokio::test(flavor = "multi_thread")]
+async fn list_items_filters_sorts_and_pages() {
+    let d = start().await;
+    let mut items = d.items().await;
+    for title in ["a", "b", "c", "d", "e"] {
+        capture(&mut items, title).await;
+    }
+    let predicate = |target: ItemField, op: Operator, operands: Vec<operand::Kind>| Clause {
+        kind: Some(clause::Kind::Predicate(Predicate {
+            target: target.into(),
+            op: op.into(),
+            operands: operands
+                .into_iter()
+                .map(|kind| Operand { kind: Some(kind) })
+                .collect(),
+        })),
+    };
+    let title = |t: &str| {
+        operand::Kind::Value(FieldValue {
+            kind: Some(field_value::Kind::StringValue(t.into())),
+        })
+    };
+    let sort = |key: ItemField, descending| SortKey {
+        key: key.into(),
+        descending,
+    };
+    let middle = ListItemsRequest {
+        filter: Some(Filter {
+            all_of: vec![predicate(
+                ItemField::Title,
+                Operator::In,
+                vec![title("b"), title("c"), title("d")],
+            )],
+            ..Default::default()
+        }),
+        sort: vec![sort(ItemField::Title, true)],
+        page_size: 2,
+        ..Default::default()
+    };
+    let first = items.list_items(middle.clone()).await.unwrap().into_inner();
+    assert!(first.next_page_token.starts_with("p3."));
+    let next = ListItemsRequest {
+        page_token: first.next_page_token.clone(),
+        ..middle.clone()
+    };
+    let second = items.list_items(next.clone()).await.unwrap().into_inner();
+    assert!(second.next_page_token.is_empty());
+    let titles: Vec<_> = (first.items.iter().chain(&second.items))
+        .map(|i| i.title.as_str())
+        .collect();
+    assert_eq!(titles, ["d", "c", "b"]);
+    // The token is bound to the sort as well as the filter.
+    let resorted = ListItemsRequest {
+        sort: vec![sort(ItemField::Title, false)],
+        ..next
+    };
+    let status = items.list_items(resorted).await.unwrap_err();
+    assert_eq!(violation(&status).0, "page_token");
+
+    // Relative dates on instants are not built yet.
+    let unbuilt = Filter {
+        all_of: vec![predicate(
+            ItemField::CreatedAt,
+            Operator::Ge,
+            vec![operand::Kind::RelativeDate(todo_proto::v1::RelativeDate {
+                anchor: todo_proto::v1::relative_date::Anchor::Today.into(),
+                offset_days: 0,
+            })],
+        )],
+        ..Default::default()
+    };
+    let status = items
+        .list_items(ListItemsRequest {
+            filter: Some(unbuilt.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error_info(&status, Code::Unimplemented, "NOT_IMPLEMENTED")["field"],
+        "filter.all_of[0].predicate.operands[0]"
+    );
+    // An invalid sort wins over that.
+    let status = items
+        .list_items(ListItemsRequest {
+            filter: Some(unbuilt),
+            sort: vec![sort(ItemField::Labels, false)],
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(violation(&status).0, "sort[0].key");
     d.stop().await;
 }
 
@@ -781,7 +1032,7 @@ async fn parse_capture_previews_without_writing() {
         .unwrap()
         .into_inner();
     assert!(page.items.is_empty());
-    assert_eq!(page.revision, 0);
+    assert_eq!(page.revision, SEEDED);
     d.stop().await;
 }
 
@@ -1604,9 +1855,10 @@ async fn subscribe_replays_then_goes_live_without_loss_or_duplicates() {
             })
         })
         .collect();
-    let mut from_zero = d
+    // From the first Item change: the seeded views come before it.
+    let mut from_start = d
         .subscribe(SubscribeRequest {
-            since_revision: Some(0),
+            since_revision: Some(SEEDED),
             topics: vec![],
         })
         .await;
@@ -1620,19 +1872,20 @@ async fn subscribe_replays_then_goes_live_without_loss_or_duplicates() {
     let mut changes = Vec::new();
     let mut caught_up = None;
     while changes.len() < total {
-        match next(&mut from_zero).await {
+        match next(&mut from_start).await {
             Message::Change(c) => changes.push((c.revision, c.id)),
             Message::CaughtUp(c) => {
                 assert!(caught_up.is_none(), "CaughtUp sent twice");
-                assert_eq!(c.revision, changes.last().map_or(0, |(r, _)| *r));
+                assert_eq!(c.revision, changes.last().map_or(SEEDED, |(r, _)| *r));
                 caught_up = Some(c.revision);
             }
             other => panic!("unexpected {other:?}"),
         }
     }
-    assert!(caught_up.unwrap() >= BEFORE as u64);
+    assert!(caught_up.unwrap() >= SEEDED + BEFORE as u64);
     let revisions: Vec<u64> = changes.iter().map(|(r, _)| *r).collect();
-    assert_eq!(revisions, (1..=total as u64).collect::<Vec<_>>());
+    let total = total as u64;
+    assert_eq!(revisions, (SEEDED + 1..=SEEDED + total).collect::<Vec<_>>());
     let seen: HashSet<_> = changes.into_iter().map(|(_, id)| id).collect();
     assert_eq!(seen, expected.iter().cloned().collect::<HashSet<_>>());
 
@@ -1640,11 +1893,11 @@ async fn subscribe_replays_then_goes_live_without_loss_or_duplicates() {
     let Message::CaughtUp(start) = next(&mut from_now).await else {
         panic!("expected CaughtUp first");
     };
-    let tail = collect_changes(&mut from_now, total - start.revision as usize).await;
+    let tail = collect_changes(&mut from_now, (SEEDED + total - start.revision) as usize).await;
     let tail: Vec<u64> = tail.into_iter().map(|(r, _)| r).collect();
     assert_eq!(
         tail,
-        (start.revision + 1..=total as u64).collect::<Vec<_>>()
+        (start.revision + 1..=SEEDED + total).collect::<Vec<_>>()
     );
     d.stop().await;
 }
@@ -1740,7 +1993,7 @@ async fn many_concurrent_writers_stream_in_order() {
     const N: usize = 1600;
     let d = start().await;
     let mut stream = d.subscribe(SubscribeRequest::default()).await;
-    assert!(matches!(next(&mut stream).await, Message::CaughtUp(c) if c.revision == 0));
+    assert!(matches!(next(&mut stream).await, Message::CaughtUp(c) if c.revision == SEEDED));
     let items = d.items().await;
     let writers: Vec<_> = (0..8)
         .map(|w| {
@@ -1760,7 +2013,10 @@ async fn many_concurrent_writers_stream_in_order() {
         .into_iter()
         .map(|(r, _)| r)
         .collect();
-    assert_eq!(revisions, (1..=N as u64).collect::<Vec<_>>());
+    assert_eq!(
+        revisions,
+        (SEEDED + 1..=SEEDED + N as u64).collect::<Vec<_>>()
+    );
     d.stop().await;
 }
 
@@ -2255,7 +2511,7 @@ async fn undo_on_an_empty_stack_succeeds_and_keeps_its_request_id() {
     assert_eq!((empty.items.len(), empty.skipped.len()), (0, 0));
     let result = empty.result.clone().unwrap();
     assert!(result.op_id.parse::<ulid::Ulid>().is_ok());
-    assert_eq!(result.revision, 0);
+    assert_eq!(result.revision, SEEDED);
     let out = redo(&mut items).await;
     assert_eq!(out.entry, None);
     assert_eq!(undo_state(&mut items).await, (None, None));

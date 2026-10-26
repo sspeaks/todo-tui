@@ -308,7 +308,7 @@ mod tests {
     use std::collections::HashMap;
 
     use todo_core::new_ulid;
-    use todo_store::ListQuery;
+    use todo_store::ListInput;
 
     use super::*;
     use crate::ShutdownHandle;
@@ -340,9 +340,9 @@ mod tests {
 
     /// How many Items have each title.
     async fn titles(store: &Store) -> HashMap<String, usize> {
-        let query = ListQuery {
+        let query = ListInput {
             page_size: 1000,
-            ..ListQuery::default()
+            ..ListInput::default()
         };
         let mut counts = HashMap::new();
         for item in store.list_items(query).await.unwrap().items {

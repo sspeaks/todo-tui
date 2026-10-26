@@ -854,6 +854,12 @@ impl Filter {
         self.check(Checker::new(None))
     }
 
+    /// [`Filter::validate`] with the relative dates resolved for `today`
+    /// too, so that one out of range is reported in its place.
+    pub fn validate_on(&self, today: Date) -> Result<(), FilterError> {
+        self.check(Checker::new(Some(today)))
+    }
+
     /// The filter with its relative dates resolved for `today`, which it
     /// keeps, after the checks of [`Filter::validate`] with a date out of
     /// range reported in its place. The size limits do not apply: they
@@ -2083,9 +2089,24 @@ mod tests {
                 "all_of[0].predicate.operands[0].relative_date.offset_days"
             )
         );
+        // So does validating on a today, which keeps the limits too.
+        let e = filter.validate_on(SUN).unwrap_err();
+        assert_eq!(
+            e.path,
+            "all_of[0].predicate.operands[0].relative_date.offset_days"
+        );
+        let deep = (0..=MAX_GROUP_DEPTH).fold(p(F::Title, O::Eq, vec![s("x")]), |c, _| {
+            group(vec![c], vec![])
+        });
+        let filter = all_of(vec![deep]);
+        assert!(filter.resolve(SUN).is_ok());
+        let deepest = ["all_of[0].group"; MAX_GROUP_DEPTH + 1].join(".");
+        assert_eq!(filter.validate_on(SUN).unwrap_err().path, deepest);
         let filter = all_of(vec![p(F::DueDate, O::Eq, vec![rel(Anchor::Today, 1)])]);
         assert!(filter.resolve(SUN).is_ok());
+        assert!(filter.validate_on(SUN).is_ok());
         assert!(filter.resolve(date(9999, 12, 31)).is_err());
+        assert!(filter.validate_on(date(9999, 12, 31)).is_err());
         // Nothing unbuilt resolves.
         let filter = all_of(vec![p(F::RemoteExtras, O::IsSet, vec![])]);
         assert_eq!(filter.resolve(SUN).unwrap_err().kind, U);

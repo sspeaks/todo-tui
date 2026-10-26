@@ -5,10 +5,12 @@
 //! call; reads run on a small pool of read-only connections (WAL mode).
 
 mod codec;
+mod query;
 mod relation;
 mod schema;
 mod summary;
 mod undo;
+mod view;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -20,18 +22,17 @@ use std::thread::{self, JoinHandle};
 use jiff::Timestamp;
 use jiff::civil::Date;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use todo_core::filter::SortKey;
+use todo_core::view::{View, ViewId};
 use todo_core::{
-    Actor, Applied, ApplyCtx, CaptureDraft, CreatedVia, FieldChange, FieldValue, Item, ItemField,
-    ItemId, Mutation, MutationError, MutationOp, MutationResult, PersonRef, Relation, Revision,
-    SkipReason, Status, StatusFields, Topic, apply, new_ulid,
+    Actor, Applied, ApplyCtx, CaptureDraft, CreatedVia, FieldChange, FieldValue, Filter,
+    FilterError, Item, ItemField, ItemId, Mutation, MutationError, MutationOp, MutationResult,
+    PersonRef, Relation, Revision, SkipReason, StatusFields, Topic, apply, new_ulid,
 };
 use tokio::sync::{Semaphore, broadcast, oneshot};
 use ulid::Ulid;
 
-use codec::{
-    ITEM_COLUMNS, SqlEnum, date_to_sql, is_overdue, item_from_row, load_item, rev_from_sql,
-    rev_to_sql, ts_to_sql,
-};
+use codec::{SqlEnum, is_overdue, load_item, rev_from_sql, rev_to_sql, ts_to_sql};
 pub use schema::SCHEMA_VERSION;
 use summary::Action;
 
@@ -64,6 +65,16 @@ pub enum StoreError {
     RequestIdReused,
     #[error("invalid page token")]
     InvalidPageToken,
+    /// A listing names a view that does not exist. The daemon maps it to
+    /// NOT_FOUND with ErrorInfo `VIEW_NOT_FOUND` (`view_id`).
+    #[error("view {0} not found")]
+    ViewNotFound(ViewId),
+    /// A listing's filter or sort is invalid, or valid but not built yet
+    /// ([`todo_core::FilterErrorKind`]). The path is relative to the filter
+    /// (`all_of[0].predicate.op`, empty for the whole filter) or starts with
+    /// `sort`.
+    #[error("{0}")]
+    Filter(FilterError),
     /// [`Store::undo`] or [`Store::redo`] was guarded by `expected`, but the
     /// entry it would act on is `top` (`None`: that stack is empty). Nothing
     /// is written. The daemon maps it to ABORTED with ErrorInfo
@@ -141,6 +152,7 @@ pub enum ChangesSinceError {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Resource {
     Item(Arc<Item>),
+    View(Arc<View>),
 }
 
 /// One row of the `changes` table: one revision (D9) for one resource.
@@ -148,7 +160,8 @@ pub enum Resource {
 pub struct ChangeRow {
     pub revision: Revision,
     pub topic: Topic,
-    /// Resource id (an Item ULID for [`Topic::Item`]).
+    /// Resource id (an Item ULID for [`Topic::Item`], a view ULID for
+    /// [`Topic::View`]).
     pub id: String,
     pub deleted: bool,
     /// The resource's state, `None` when `deleted`. On the live broadcast it
@@ -326,22 +339,28 @@ pub struct GetItemOutput {
     pub resolved_from: Option<ItemId>,
 }
 
-/// P0 query: the implicit view rules and paging. P1 replaces this with a
-/// compiled `todo.v1.Filter`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ListQuery {
-    /// `status IN (...)`; empty matches any status.
-    pub statuses: Vec<Status>,
-    pub include_archived: bool,
-    pub include_done: bool,
-    pub include_deferred: bool,
-    pub include_deleted: bool,
+/// Input for [`Store::list_items`] (`ListItemsRequest`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ListInput {
+    /// Matched with the implicit rules its flags leave (filter.proto). An
+    /// invalid one fails with [`StoreError::Filter`].
+    pub filter: Filter,
+    /// Applied in order, then the tie-break `created_at`, `id`; empty for
+    /// just the tie-break.
+    pub sort: Vec<SortKey>,
+    /// Narrows this view: the effective filter is the view's AND `filter`
+    /// (as one group), each include flag is set in either, and a non-empty
+    /// `sort` replaces the view's. A view that does not exist fails with
+    /// [`StoreError::ViewNotFound`].
+    pub view_id: Option<ViewId>,
     /// 0 means the default (100); values above 1000 are clamped.
     pub page_size: u32,
-    /// Opaque token from a previous [`ItemPage`].
+    /// Opaque token from a previous [`ItemPage`] of the same listing.
     pub page_token: Option<String>,
-    /// "Today" for `defer_until`, in the user's zone.
-    pub today: Option<jiff::civil::Date>,
+    /// "Today" in the user's zone, for relative dates, `is_overdue` and the
+    /// defer rule; `None` for the system zone's. Ignored with a page token,
+    /// which keeps the first page's.
+    pub today: Option<Date>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -352,6 +371,24 @@ pub struct ItemPage {
     /// The revision this page was read at. Each page reads live data, so a
     /// later page may report a higher revision than the first; a consumer
     /// that needs a consistent view subscribes from the first page's revision.
+    pub revision: Revision,
+}
+
+/// [`Store::status_counts`] (`GetStatusCountsResponse`). Each count passes
+/// the implicit rules: deleted, archived, done, cancelled and deferred
+/// Items are not counted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusCounts {
+    /// `status = inbox`.
+    pub inbox: u32,
+    /// `due_date <= today`: due today or overdue.
+    pub due: u32,
+    /// The part of `due` with `due_date < today`.
+    pub overdue: u32,
+    /// When asked for: each view whose `show_count` is set, in tab order,
+    /// with the number of Items listing it returns.
+    pub views: Vec<(ViewId, u32)>,
+    /// The revision this was read at.
     pub revision: Revision,
 }
 
@@ -479,8 +516,9 @@ impl Drop for Pooled {
 
 impl Store {
     /// Opens (creating if needed) the database at `path`: WAL mode, runs
-    /// pending migrations (D10), starts the writer thread and read pool.
-    /// Fails with [`StoreError::SchemaTooNew`] for a newer database.
+    /// pending migrations (D10), seeds the default views not seeded yet (in
+    /// one transaction, a revision each), starts the writer thread and read
+    /// pool. Fails with [`StoreError::SchemaTooNew`] for a newer database.
     pub fn open(path: &Path) -> Result<Store> {
         let mut writer_conn = schema::open_writer(path)?;
         let revision = current_revision_in(&writer_conn)?;
@@ -492,6 +530,7 @@ impl Store {
             revision: AtomicU64::new(revision),
             changes: broadcast::channel(BROADCAST_CAPACITY).0,
         });
+        run_write(&mut writer_conn, &shared, view::seed_tx)?;
         let (jobs, rx) = mpsc::channel::<Job>();
         let writer = thread::Builder::new()
             .name("todo-store-writer".into())
@@ -660,15 +699,33 @@ impl Store {
         self.read(move |conn| get_item_tx(conn, id, today)).await
     }
 
-    /// Lists Items matching `query`, ordered by `created_at` then id.
+    /// Lists the Items `input` matches, in its sort order (design 4.8).
     ///
-    /// Later pages continue after the previous page's last key and read live
-    /// data at their own revision: Items changed since the first page appear
-    /// in their current state, and the caller also receives those changes
-    /// (and any Item created behind the cursor) by subscribing from the first
-    /// page's revision. A token is only accepted by the query that issued it.
-    pub async fn list_items(&self, query: ListQuery) -> Result<ItemPage> {
-        self.read(move |conn| list_items_tx(conn, query)).await
+    /// Later pages continue after the previous page's last row (keyset
+    /// paging) and read live data at their own revision: Items changed since
+    /// the first page appear in their current state, and the caller also
+    /// receives those changes (and any Item created behind the cursor) by
+    /// subscribing from the first page's revision. A token keeps the first
+    /// page's today and is only accepted by a listing with the same
+    /// effective filter and sort; any other token fails with
+    /// [`StoreError::InvalidPageToken`].
+    pub async fn list_items(&self, input: ListInput) -> Result<ItemPage> {
+        self.read(move |conn| query::list_items_tx(conn, input))
+            .await
+    }
+
+    /// Every view, in tab order, with the revision they were read at.
+    pub async fn list_views(&self) -> Result<(Vec<View>, Revision)> {
+        self.read(view::list_views_tx).await
+    }
+
+    /// The status counts on `today` and, with `include_views`, the count of
+    /// each view whose `show_count` is set, all read at one revision. A
+    /// view's count is the number of Items [`Store::list_items`] lists for
+    /// it with nothing to narrow it.
+    pub async fn status_counts(&self, today: Date, include_views: bool) -> Result<StatusCounts> {
+        self.read(move |conn| query::status_counts_tx(conn, today, include_views))
+            .await
     }
 
     /// Changes with revision greater than `since`, ascending, up to the
@@ -1633,59 +1690,9 @@ fn get_item_tx(conn: &Connection, id: ItemId, today: Date) -> Result<GetItemOutp
     })
 }
 
-/// `p2.<query fingerprint>.<created_at ns>.<id>`: the last key, bound to the
-/// query it came from.
-struct PageToken {
-    query: u64,
-    created_at: i64,
-    id: String,
-}
-
-impl PageToken {
-    fn encode(&self) -> String {
-        format!("p2.{:016x}.{}.{}", self.query, self.created_at, self.id)
-    }
-
-    fn decode(s: &str, query: u64) -> Result<Self> {
-        let mut parts = s.split('.');
-        let (Some("p2"), Some(fp), Some(at), Some(id), None) = (
-            parts.next(),
-            parts.next(),
-            parts.next(),
-            parts.next(),
-            parts.next(),
-        ) else {
-            return Err(StoreError::InvalidPageToken);
-        };
-        if u64::from_str_radix(fp, 16) != Ok(query) {
-            return Err(StoreError::InvalidPageToken);
-        }
-        codec::item_id_from_str(id).map_err(|_| StoreError::InvalidPageToken)?;
-        Ok(PageToken {
-            query,
-            created_at: at.parse().map_err(|_| StoreError::InvalidPageToken)?,
-            id: id.to_owned(),
-        })
-    }
-}
-
-/// FNV-1a over the parts of a [`ListQuery`] that select rows, so a token is
-/// only accepted by the query that issued it. `today` is left out: paging
-/// across midnight stays valid.
-fn query_fingerprint(query: &ListQuery) -> u64 {
-    let mut statuses: Vec<&str> = query.statuses.iter().map(|s| s.as_sql()).collect();
-    statuses.sort_unstable();
-    statuses.dedup();
-    let flags = [
-        query.include_archived,
-        query.include_done,
-        query.include_deferred,
-        query.include_deleted,
-    ]
-    .map(|b| if b { "1" } else { "0" })
-    .concat();
-    let key = format!("{}|{flags}", statuses.join(","));
-    key.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+/// 64-bit FNV-1a, for fingerprints that bind page tokens to their query.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
         (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
     })
 }
@@ -1696,98 +1703,6 @@ fn today_local() -> jiff::civil::Date {
 
 fn current_revision_in(conn: &Connection) -> Result<Revision> {
     rev_from_sql(conn.query_row("SELECT revision FROM meta", [], |r| r.get(0))?)
-}
-
-fn list_items_tx(conn: &Connection, query: ListQuery) -> Result<ItemPage> {
-    use rusqlite::types::Value;
-
-    let page_size = match query.page_size {
-        0 => DEFAULT_PAGE_SIZE,
-        n => n.min(MAX_PAGE_SIZE),
-    } as usize;
-    let fingerprint = query_fingerprint(&query);
-    let token = query
-        .page_token
-        .as_deref()
-        .map(|t| PageToken::decode(t, fingerprint))
-        .transpose()?;
-    let today = query.today.unwrap_or_else(today_local);
-
-    let tx = conn.unchecked_transaction()?;
-    let revision = current_revision_in(&tx)?;
-
-    let mut clauses: Vec<String> = Vec::new();
-    let mut args: Vec<Value> = Vec::new();
-    if !query.statuses.is_empty() {
-        let marks = vec!["?"; query.statuses.len()].join(", ");
-        clauses.push(format!("status IN ({marks})"));
-        args.extend(
-            query
-                .statuses
-                .iter()
-                .map(|s| Value::Text(s.as_sql().into())),
-        );
-    }
-    if !query.include_deleted {
-        clauses.push("deleted_at IS NULL".into());
-    }
-    if !query.include_archived {
-        clauses.push("archived_at IS NULL".into());
-    }
-    if !query.include_done {
-        clauses.push("status NOT IN ('done', 'cancelled')".into());
-    }
-    if !query.include_deferred {
-        clauses.push("(defer_until IS NULL OR defer_until <= ?)".into());
-        args.push(Value::Text(date_to_sql(today)));
-    }
-    if let Some(t) = &token {
-        clauses.push("(created_at, id) > (?, ?)".into());
-        args.push(Value::Integer(t.created_at));
-        args.push(Value::Text(t.id.clone()));
-    }
-    let where_sql = if clauses.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", clauses.join(" AND "))
-    };
-    args.push(Value::Integer(page_size as i64 + 1));
-    let sql = format!(
-        "SELECT {ITEM_COLUMNS}, created_at FROM items {where_sql}
-         ORDER BY created_at, id LIMIT ?"
-    );
-
-    let mut stmt = tx.prepare(&sql)?;
-    let created_at_col = stmt.column_count() - 1;
-    let mut rows = stmt.query(rusqlite::params_from_iter(args))?;
-    let mut items = Vec::new();
-    let mut last_created_at = 0;
-    let mut has_more = false;
-    while let Some(row) = rows.next()? {
-        if items.len() == page_size {
-            has_more = true;
-            break;
-        }
-        items.push(item_from_row(row, Some(today))?);
-        last_created_at = row.get(created_at_col)?;
-    }
-    relation::attach(&tx, &mut items)?;
-    let next_page_token = match items.last() {
-        Some(last) if has_more => Some(
-            PageToken {
-                query: fingerprint,
-                created_at: last_created_at,
-                id: last.id.to_string(),
-            }
-            .encode(),
-        ),
-        _ => None,
-    };
-    Ok(ItemPage {
-        items,
-        next_page_token,
-        revision,
-    })
 }
 
 fn changes_since_tx(
@@ -1816,16 +1731,18 @@ fn changes_since_tx(
         .map_err(StoreError::from)?;
     let mut rows = stmt.query([rev_to_sql(since)?]).map_err(StoreError::from)?;
     let mut changes = Vec::new();
-    // Each Item is loaded once, and their relations in one query.
+    // Each Item and view is loaded once, and the Items' relations in one
+    // query.
     let mut slots: HashMap<String, usize> = HashMap::new();
     let mut items: Vec<Item> = Vec::new();
+    let mut views: HashMap<String, Option<Arc<View>>> = HashMap::new();
     while let Some(row) = rows.next().map_err(StoreError::from)? {
         let revision = rev_from_sql(row.get(0).map_err(StoreError::from)?)?;
         let topic = Topic::from_sql(&row.get::<_, String>(1).map_err(StoreError::from)?)?;
         let id: String = row.get(2).map_err(StoreError::from)?;
-        let deleted: bool = row.get(3).map_err(StoreError::from)?;
-        let slot = match topic {
-            Topic::Item if !deleted => Some(match slots.get(&id) {
+        let mut deleted: bool = row.get(3).map_err(StoreError::from)?;
+        let replayed = match topic {
+            Topic::Item if !deleted => Replayed::Item(match slots.get(&id) {
                 Some(&slot) => slot,
                 None => {
                     let item = load_item(&tx, &id, Some(today))?.ok_or_else(|| {
@@ -1836,20 +1753,49 @@ fn changes_since_tx(
                     items.len() - 1
                 }
             }),
-            _ => None,
+            Topic::View if !deleted => {
+                let view = match views.get(&id) {
+                    Some(view) => view.clone(),
+                    None => {
+                        let view_id: ViewId = id.parse().map_err(|_| {
+                            StoreError::Corrupt(format!("change {revision} names view {id:?}"))
+                        })?;
+                        let view = view::load(&tx, view_id)?.map(Arc::new);
+                        views.insert(id.clone(), view.clone());
+                        view
+                    }
+                };
+                // A view deleted since replays as deleted: views leave no
+                // tombstone.
+                deleted = view.is_none();
+                view.map_or(Replayed::None, Replayed::View)
+            }
+            _ => Replayed::None,
         };
-        changes.push((revision, topic, id, deleted, slot));
+        changes.push((revision, topic, id, deleted, replayed));
     }
     relation::attach(&tx, &mut items)?;
     let items: Vec<Arc<Item>> = items.into_iter().map(Arc::new).collect();
     Ok(changes
         .into_iter()
-        .map(|(revision, topic, id, deleted, slot)| ChangeRow {
+        .map(|(revision, topic, id, deleted, replayed)| ChangeRow {
             revision,
             topic,
             id,
             deleted,
-            resource: slot.map(|slot| Resource::Item(Arc::clone(&items[slot]))),
+            resource: match replayed {
+                Replayed::Item(slot) => Some(Resource::Item(Arc::clone(&items[slot]))),
+                Replayed::View(view) => Some(Resource::View(view)),
+                Replayed::None => None,
+            },
         })
         .collect())
+}
+
+/// The resource a replayed change carries.
+enum Replayed {
+    /// The slot of the Item, loaded once per replay.
+    Item(usize),
+    View(Arc<View>),
+    None,
 }

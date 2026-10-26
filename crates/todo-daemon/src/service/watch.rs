@@ -135,6 +135,7 @@ fn message(m: Message) -> SubscribeResponse {
 fn change_message(row: ChangeRow) -> SubscribeResponse {
     let resource = row.resource.map(|r| match r {
         Resource::Item(item) => change::Resource::Item(Box::new(v1::Item::from(&*item))),
+        Resource::View(view) => change::Resource::View(Box::new(v1::View::from(&*view))),
     });
     message(Message::Change(v1::Change {
         revision: row.revision,
@@ -193,7 +194,9 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        assert!(matches!(next(&mut stream).await, Message::CaughtUp(c) if c.revision == 0));
+        // The store starts at the revision of its seeded views.
+        let seeded = store.current_revision();
+        assert!(matches!(next(&mut stream).await, Message::CaughtUp(c) if c.revision == seeded));
 
         capture(&store, N as usize).await;
         let mut revisions = Vec::new();
@@ -203,6 +206,6 @@ mod tests {
                 other => panic!("unexpected {other:?}"),
             }
         }
-        assert_eq!(revisions, (1..=N).collect::<Vec<_>>());
+        assert_eq!(revisions, (seeded + 1..=seeded + N).collect::<Vec<_>>());
     }
 }

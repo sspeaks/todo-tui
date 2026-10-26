@@ -1435,6 +1435,7 @@ name = "todo-store"
 version = "0.1.0"
 dependencies = [
  "jiff",
+ "prost",
  "rusqlite",
  "serde_json",
  "tempfile",

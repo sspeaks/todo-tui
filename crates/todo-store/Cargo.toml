@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 todo-core.workspace = true
 jiff.workspace = true
+prost.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
