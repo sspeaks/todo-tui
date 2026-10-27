@@ -3,13 +3,15 @@
 // Redo, expected_op_id) through. The daemon does all validation.
 
 import type { MessageInitShape } from "@bufbuild/protobuf";
+import { type Timestamp, timestampFromDate } from "@bufbuild/protobuf/wkt";
 import { type CallOptions, type Client, ConnectError } from "@connectrpc/connect";
 import { ErrorInfoSchema } from "./gen/google/rpc/error_details_pb.js";
-import type { ItemSchema, Status } from "./gen/todo/v1/item_pb.js";
+import type { CreatedVia, ItemSchema, Status } from "./gen/todo/v1/item_pb.js";
 import type {
   AddRelationResponse,
   ArchiveItemResponse,
   BatchMutateResponse,
+  CaptureItemResponse,
   DeleteItemResponse,
   GetUndoStateResponse,
   ItemService,
@@ -40,6 +42,36 @@ export interface MutationOptions extends CallOptions {
 function split({ expectedRevision, requestId, ...call }: MutationOptions) {
   const fields = { requestId: requestId ?? ulid(), ...(expectedRevision !== undefined && { expectedRevision }) };
   return [fields, call] as const;
+}
+
+export interface CaptureOptions extends CallOptions {
+  /** Who captured it (Item.created_via), e.g. CreatedVia.TUI. */
+  createdVia: CreatedVia;
+  /** Captures it as a child of this Item, which must be live (else INVALID_ARGUMENT on parent_id). */
+  parentId?: string;
+  /** "Now" for relative dates (^fri) and created_at; defaults to the daemon's clock. */
+  referenceTime?: Date | Timestamp;
+  /** Defaults to a new ULID. Reuse one to retry a call idempotently. */
+  requestId?: string;
+}
+
+/**
+ * CaptureItem (design 2.3): the daemon parses `text` (ParseCapture) and
+ * creates the Item; the response's draft carries the tokens and warnings.
+ */
+export function captureItem(client: ItemsClient, text: string, opts: CaptureOptions): Promise<CaptureItemResponse> {
+  const { createdVia, parentId, referenceTime, requestId, ...call } = opts;
+  const at = referenceTime instanceof Date ? timestampFromDate(referenceTime) : referenceTime;
+  return client.captureItem(
+    {
+      requestId: requestId ?? ulid(),
+      text,
+      createdVia,
+      ...(parentId !== undefined && { parentId }),
+      ...(at !== undefined && { referenceTime: at }),
+    },
+    call,
+  );
 }
 
 /**

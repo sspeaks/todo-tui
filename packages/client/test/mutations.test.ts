@@ -1,11 +1,12 @@
 import { Code, ConnectError, createClient, createRouterTransport } from "@connectrpc/connect";
 import { describe, expect, it } from "vitest";
 import { ErrorInfoSchema } from "../src/gen/google/rpc/error_details_pb.js";
-import { Status } from "../src/gen/todo/v1/item_pb.js";
+import { CreatedVia, Status } from "../src/gen/todo/v1/item_pb.js";
 import {
   type AddRelationRequest,
   type ArchiveItemRequest,
   type BatchMutateRequest,
+  type CaptureItemRequest,
   type DeleteItemRequest,
   ItemService,
   type RedoRequest,
@@ -17,10 +18,12 @@ import {
   type UpdateItemRequest,
 } from "../src/gen/todo/v1/item_service_pb.js";
 import { RelationKind } from "../src/gen/todo/v1/relation_pb.js";
+import { FakeDaemon } from "../src/fake-daemon.js";
 import {
   addRelation,
   archiveItem,
   batchMutate,
+  captureItem,
   deleteItem,
   errorReason,
   getUndoState,
@@ -50,6 +53,7 @@ function recorder() {
     getUndoState: 0,
     addRelation: [] as AddRelationRequest[],
     removeRelation: [] as RemoveRelationRequest[],
+    captureItem: [] as CaptureItemRequest[],
   };
   const transport = createRouterTransport(({ service }) => {
     service(ItemService, {
@@ -65,6 +69,7 @@ function recorder() {
       getUndoState: () => (got.getUndoState++, {}),
       addRelation: (req) => (got.addRelation.push(req), {}),
       removeRelation: (req) => (got.removeRelation.push(req), {}),
+      captureItem: (req) => (got.captureItem.push(req), {}),
     });
   });
   return { client: createClient(ItemService, transport), got };
@@ -103,6 +108,30 @@ describe("mutation helpers", () => {
     expect(got.setStatus[0]?.status).toBe(Status.DONE);
     for (const r of reqs) expect(r.requestId).toMatch(ULID);
     expect(new Set(reqs.map((r) => r.requestId)).size).toBe(reqs.length);
+  });
+
+  it("CaptureItem sends the text, created_via, a fresh request id, and parent_id and reference_time only when given", async () => {
+    const { client, got } = recorder();
+    await captureItem(client, "call dentist ^fri", { createdVia: CreatedVia.TUI });
+    const at = new Date(Date.UTC(2026, 9, 26, 12));
+    await captureItem(client, "child", { createdVia: CreatedVia.MCP, parentId: "P", referenceTime: at, requestId: "01JRETRY000000000000000000" });
+    const [plain, child] = got.captureItem;
+    expect(plain?.requestId).toMatch(ULID);
+    expect([plain?.text, plain?.createdVia, plain?.parentId, plain?.referenceTime]).toEqual(["call dentist ^fri", CreatedVia.TUI, undefined, undefined]);
+    expect([child?.text, child?.createdVia, child?.parentId, child?.requestId]).toEqual(["child", CreatedVia.MCP, "P", "01JRETRY000000000000000000"]);
+    expect(child?.referenceTime?.seconds).toBe(BigInt(at.getTime() / 1000));
+  });
+
+  it("CaptureItem captures under a parent on FakeDaemon", async () => {
+    const daemon = new FakeDaemon();
+    const client = createClient(ItemService, daemon.transport);
+    const parent = daemon.put({ title: "parent" });
+    const res = await captureItem(client, "child", { createdVia: CreatedVia.TUI, parentId: parent.id });
+    expect(res.item).toMatchObject({ title: "child", parentId: parent.id, createdVia: CreatedVia.TUI });
+    expect(res.result?.revision).toBe(daemon.revision);
+    await expect(captureItem(client, "orphan", { createdVia: CreatedVia.TUI, parentId: "01J00000000000000000000000" })).rejects.toMatchObject({
+      code: Code.InvalidArgument,
+    });
   });
 
   it("reuses a given request id, for retries", async () => {

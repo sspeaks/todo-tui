@@ -47,3 +47,5 @@ jobs:
         run: pnpm typecheck
       - name: pnpm test
         run: pnpm test
+      - name: TUI bundle smoke
+        run: pnpm -C tui build && node tui/dist/tui.js --smoke

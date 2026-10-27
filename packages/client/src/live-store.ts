@@ -6,6 +6,7 @@ import { Topic } from "./gen/todo/v1/common_pb.js";
 import type { FilterSchema, SortKeySchema } from "./gen/todo/v1/filter_pb.js";
 import type { Item } from "./gen/todo/v1/item_pb.js";
 import { ItemService, type ListItemsRequest, ListItemsRequestSchema, type StatusCounts } from "./gen/todo/v1/item_service_pb.js";
+import type { OpSummary } from "./gen/todo/v1/op_pb.js";
 import type { View } from "./gen/todo/v1/view_pb.js";
 import { ViewService } from "./gen/todo/v1/view_service_pb.js";
 import { type Change, type Notice, WatchService } from "./gen/todo/v1/watch_service_pb.js";
@@ -60,6 +61,15 @@ export interface CountsSnapshot {
   readonly error?: unknown;
 }
 
+/** GetUndoState, kept live while observed: what Undo and Redo would act on next. */
+export interface UndoSnapshot {
+  readonly status: "loading" | "ready" | "error";
+  /** The top of the global undo stack; its op_id is Undo's expected_op_id. */
+  readonly undo?: OpSummary;
+  readonly redo?: OpSummary;
+  readonly error?: unknown;
+}
+
 export interface LiveStoreOptions {
   transport: Transport;
   /** Delay before re-running a view's ListItems, or the counts, after changes (default 150). */
@@ -103,6 +113,8 @@ export class LiveStore {
   private savedSnap: SavedViewsSnapshot = { status: "loading", views: [] };
   private savedSeq = 0;
   private readonly liveCounts: LiveCounts;
+  /** GetItem calls in flight, by id. */
+  private readonly fetches = new Map<string, Promise<Item | undefined>>();
   private readonly listeners = new Set<Listener>();
   private readonly noticeListeners = new Set<(n: Notice) => void>();
   private readonly itemsClient: Client<typeof ItemService>;
@@ -119,6 +131,8 @@ export class LiveStore {
   readonly debounceMs: number;
   readonly pageSize: number;
   readonly viewGraceMs: number;
+  /** The undo and redo entries, kept live while observed (useUndoState). */
+  readonly undoState: LiveUndoState;
 
   constructor(private readonly opts: LiveStoreOptions) {
     this.itemsClient = createClient(ItemService, opts.transport);
@@ -128,6 +142,7 @@ export class LiveStore {
     this.pageSize = opts.pageSize ?? MAX_PAGE_SIZE;
     this.viewGraceMs = opts.viewGraceMs ?? 5_000;
     this.liveCounts = new LiveCounts(this);
+    this.undoState = new LiveUndoState(this);
   }
 
   get started(): boolean {
@@ -147,6 +162,7 @@ export class LiveStore {
     this.abort.abort();
     for (const v of this.views.values()) v.cancelTimers();
     this.liveCounts.cancelTimers();
+    this.undoState.cancelTimers();
     await this.runLoop;
     this.setConn({ state: "closed" });
   }
@@ -188,6 +204,45 @@ export class LiveStore {
     if (!this.loaded) return;
     for (const v of this.views.values()) void v.load();
     this.liveCounts.reload();
+  }
+
+  /**
+   * Applies Items a mutation returned, read at `revision` (its
+   * MutationResult.revision), so that they show before the change stream
+   * brings them, e.g. while it is down. What is already newer is kept.
+   * Membership and order still come from each view's next ListItems.
+   */
+  applyItems(items: readonly Item[], revision: bigint): void {
+    this.applyList(items, revision);
+    this.bump();
+  }
+
+  /**
+   * GetItem: reads an Item that no view holds (a parent, a relation's other
+   * end; deleted ones too) into the store, where changes keep it fresh
+   * from then on. Resolves to undefined when the daemon has no such Item, and
+   * rejects on other failures. Concurrent calls for one id share a request.
+   */
+  fetchItem(id: string): Promise<Item | undefined> {
+    let fetch = this.fetches.get(id);
+    if (!fetch) {
+      fetch = this.itemsClient
+        .getItem({ id }, this.callOptions())
+        .then(
+          (res) => {
+            if (!res.item) return undefined;
+            this.applyItems([res.item], res.revision);
+            return this.items.get(res.item.id) ?? res.item;
+          },
+          (err: unknown) => {
+            if (ConnectError.from(err).code === Code.NotFound) return undefined;
+            throw err;
+          },
+        )
+        .finally(() => this.fetches.delete(id));
+      this.fetches.set(id, fetch);
+    }
+    return fetch;
   }
 
   onNotice(listener: (n: Notice) => void): () => void {
@@ -253,6 +308,11 @@ export class LiveStore {
   /** @internal GetStatusCounts with the tab counts. */
   fetchCounts() {
     return this.itemsClient.getStatusCounts({ includeViews: true }, this.callOptions());
+  }
+
+  /** @internal */
+  fetchUndoState() {
+    return this.itemsClient.getUndoState({}, this.callOptions());
   }
 
   private callOptions() {
@@ -395,6 +455,7 @@ export class LiveStore {
             for (const v of this.views.values()) if (v.needsLoad) void v.load();
             if (this.savedSnap.status !== "ready") void this.loadSavedViews();
             if (this.liveCounts.wanted && this.liveCounts.needsLoad) void this.liveCounts.load();
+            if (this.undoState.wanted && this.undoState.needsLoad) void this.undoState.load();
           }
           break;
         case "resyncRequired":
@@ -438,6 +499,9 @@ export class LiveStore {
     this.conn = { ...this.conn, revision: this.revision };
     for (const v of this.views.values()) if (!v.viewGone) v.scheduleRequery();
     this.liveCounts.scheduleRequery();
+    // Every undo entry changes some Item, so Item changes are what can
+    // move the stack.
+    this.undoState.scheduleRequery();
     this.bump();
   }
 
@@ -458,13 +522,15 @@ export class LiveStore {
   /**
    * The loads of a baseline or a resync: every view, the saved views, and
    * the counts when observed; unobserved counts are left for their next
-   * observer to reload.
+   * observer to reload. The undo state carries no revision, so it is
+   * re-read alongside without holding up the subscribe point.
    */
   private loads(): Promise<bigint>[] {
     const loads = [...this.views.values()].map((v) => v.load(true));
     loads.push(this.loadSavedViews(true));
     if (this.liveCounts.wanted) loads.push(this.liveCounts.load(true));
     else this.liveCounts.reload();
+    this.undoState.invalidate();
     return loads;
   }
 
@@ -734,6 +800,116 @@ class LiveCounts {
   };
 
   getSnapshot = (): CountsSnapshot => this.snap;
+}
+
+/**
+ * GetUndoState kept live by its LiveStore while observed: re-read
+ * (debounced) after Item changes, since every undo entry changes some Item,
+ * and at once on {@link reload}. Nothing on the stream carries the stack
+ * itself, so an entry another client drops without changing an Item shows
+ * only on the next re-read; Undo's expected_op_id guard fails safe then.
+ */
+export class LiveUndoState {
+  private snap: UndoSnapshot = { status: "loading" };
+  private loaded = false;
+  /** Changes arrived while unobserved, or a re-read failed: the snapshot may be out of date. */
+  private stale = false;
+  private seq = 0;
+  /** The newest read applied: an older response arriving later is discarded. */
+  private applied = 0;
+  private refs = 0;
+  private debounce: ReturnType<typeof setTimeout> | undefined;
+
+  constructor(private readonly store: LiveStore) {}
+
+  /** @internal */
+  get wanted(): boolean {
+    return this.refs > 0;
+  }
+
+  /** @internal */
+  get needsLoad(): boolean {
+    return !this.loaded || this.snap.status === "error" || this.stale;
+  }
+
+  /** @internal Runs GetUndoState; a failure keeps the last snapshot (marked stale), or shows as an error before the first. */
+  async load(): Promise<void> {
+    const seq = ++this.seq;
+    try {
+      const res = await this.store.fetchUndoState();
+      if (seq > this.applied) {
+        this.applied = seq;
+        this.snap = {
+          status: "ready",
+          ...(res.undo !== undefined && { undo: res.undo }),
+          ...(res.redo !== undefined && { redo: res.redo }),
+        };
+        this.loaded = true;
+        this.stale = false;
+        this.store.bump();
+      }
+    } catch (err) {
+      if (seq > this.applied) {
+        if (this.loaded) {
+          this.stale = true;
+        } else {
+          this.snap = { ...this.snap, status: "error", error: err };
+          this.store.bump();
+        }
+      }
+    }
+  }
+
+  /**
+   * Re-reads the undo state now, observed or not. Resolves once this read
+   * (or a newer one) is applied, or has failed: a client awaits it after
+   * its own op so that the next Undo names that op.
+   */
+  reload(): Promise<void> {
+    this.cancelTimers();
+    return this.load();
+  }
+
+  /** @internal After a baseline or a resync: re-read now while observed, else by the next observer. */
+  invalidate(): void {
+    if (this.wanted) void this.reload();
+    else this.stale = true;
+  }
+
+  /** @internal After a change: re-reads, debounced, while observed; otherwise the next observer does. */
+  scheduleRequery(): void {
+    if (!this.wanted) {
+      this.stale = true;
+      return;
+    }
+    if (this.debounce) clearTimeout(this.debounce);
+    this.debounce = setTimeout(() => {
+      this.debounce = undefined;
+      void this.load();
+    }, this.store.debounceMs);
+  }
+
+  /** @internal */
+  cancelTimers(): void {
+    if (this.debounce) clearTimeout(this.debounce);
+    this.debounce = undefined;
+  }
+
+  /** Observes the undo state: it loads, and stays live, only while observed. */
+  subscribe = (listener: () => void): (() => void) => {
+    this.refs++;
+    const unsub = this.store.subscribe(listener);
+    if (this.refs === 1 && this.needsLoad && this.store.loaded) void this.load();
+    return () => {
+      unsub();
+      if (--this.refs === 0 && this.debounce) {
+        this.cancelTimers();
+        this.stale = true;
+      }
+    };
+  };
+
+  getSnapshot = (): UndoSnapshot => this.snap;
 }
 
 /** Whether ListItems failed because its view_id names no saved view. */

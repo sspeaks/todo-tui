@@ -1,63 +1,91 @@
-import { useConnection, useView } from "@todo-tui/client";
-import { Box, Text, useApp, useInput, useWindowSize } from "ink";
-import { useEffect, useMemo, useRef, useState } from "react";
-import { inboxQuery } from "./inbox.js";
-import { ItemList } from "./ItemList.js";
-import { StatusBar } from "./StatusBar.js";
-import { useFreshIds } from "./useFreshIds.js";
+import { ClientsProvider, type LiveStore, LiveStoreProvider, type TodoClients } from "@todo-tui/client";
+import { Box, Text, useApp, useInput, usePaste, useWindowSize } from "ink";
+import { useEffect } from "react";
+import { DetailPane } from "./components/DetailPane.js";
+import { HelpOverlay } from "./components/HelpOverlay.js";
+import { ControllerContext, useRows, useUi } from "./components/hooks.js";
+import { ListPane } from "./components/ListPane.js";
+import { MessageLine } from "./components/MessageLine.js";
+import { StatusBar } from "./components/StatusBar.js";
+import { TabBar } from "./components/TabBar.js";
+import type { Controller } from "./controller/controller.js";
+import { type Layout, MIN_COLUMNS, MIN_ROWS, layout } from "./state/layout.js";
+import { reconcile } from "./state/selection.js";
+import type { TabId } from "./state/types.js";
 
-const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n));
-
-/** The Inbox list; expects a started LiveStore from <LiveStoreProvider>. */
-export function App() {
-  const { items, status, error: viewError } = useView(inboxQuery);
-  const connection = useConnection();
-  const { exit } = useApp();
-  const { rows } = useWindowSize();
-  const height = Math.max(1, (rows || 24) - 2);
-
-  const [selectedId, setSelectedId] = useState<string>();
-  const lastIndex = useRef(0);
-  const offset = useRef(0);
-
-  let index = selectedId === undefined ? -1 : items.findIndex((i) => i.id === selectedId);
-  if (index < 0) index = clamp(lastIndex.current, 0, items.length - 1);
-  const selected = items[index];
-  lastIndex.current = Math.max(index, 0);
-  offset.current = clamp(offset.current, index - height + 1, index);
-  offset.current = clamp(offset.current, 0, Math.max(0, items.length - height));
-
-  // Pin the fallback selection so later inserts don't shift it.
-  useEffect(() => {
-    if (selected && selected.id !== selectedId) setSelectedId(selected.id);
-  }, [selected, selectedId]);
-
-  const ids = useMemo(() => items.map((i) => i.id), [items]);
-  const fresh = useFreshIds(ids, status === "ready");
-
-  useInput((input, key) => {
-    if (input === "q" || (key.ctrl && input === "c")) {
-      exit();
-      return;
-    }
-    const step = input === "j" || key.downArrow ? 1 : input === "k" || key.upArrow ? -1 : 0;
-    const next = items[clamp(index + step, 0, items.length - 1)];
-    if (step && next) setSelectedId(next.id);
-  });
-
+/** The TUI with its providers: a started LiveStore, the RPC clients, and the controller driving it. */
+export function Tui({ store, clients, controller }: { store: LiveStore; clients: TodoClients; controller: Controller }) {
   return (
-    <Box flexDirection="column">
-      <Text bold>
-        Inbox <Text dimColor>{items.length}</Text>
-      </Text>
-      {status === "ready" && !items.length ? (
-        <Box height={height}>
-          <Text dimColor>Inbox is empty.</Text>
-        </Box>
-      ) : (
-        <ItemList items={items} selectedId={selected?.id} fresh={fresh} offset={offset.current} height={height} />
-      )}
-      <StatusBar connection={connection} count={items.length} viewError={viewError} />
-    </Box>
+    <LiveStoreProvider store={store}>
+      <ClientsProvider clients={clients}>
+        <App controller={controller} />
+      </ClientsProvider>
+    </LiveStoreProvider>
   );
+}
+
+/** The shell (design 2.2): tab bar, list (and detail), status bar, message line; exactly the terminal's rows. */
+export function App({ controller }: { controller: Controller }) {
+  const { exit } = useApp();
+  const { columns, rows } = useWindowSize();
+  useEffect(() => controller.setSize(columns, rows), [controller, columns, rows]);
+  useEffect(() => {
+    controller.onQuit = () => exit();
+    controller.start();
+    return () => {
+      controller.stop();
+      controller.onQuit = undefined;
+    };
+  }, [controller, exit]);
+  useInput((input, key) => controller.input(input, key));
+  // Always on, so that a paste in normal mode never runs as keys.
+  usePaste((text) => controller.paste(text));
+
+  const shape = layout(columns, rows);
+  return (
+    <ControllerContext.Provider value={controller}>
+      {shape.tooSmall ? (
+        <Text wrap="truncate-end">
+          Terminal too small (need {MIN_COLUMNS}×{MIN_ROWS})
+        </Text>
+      ) : (
+        <Box flexDirection="column" width={columns} height={rows}>
+          <TabBar width={columns} />
+          <Body shape={shape} />
+          <StatusBar width={columns} />
+          <MessageLine width={columns} />
+        </Box>
+      )}
+    </ControllerContext.Provider>
+  );
+}
+
+function Body({ shape }: { shape: Layout }) {
+  const tab = useUi((s) => s.tab);
+  const help = useUi((s) => s.mode.kind === "help");
+  const overlay = useUi((s) => s.overlay.kind === "detail");
+  const focused = useUi((s) => s.focus === "detail");
+  const height = shape.bodyHeight;
+  if (help) return <HelpOverlay width={shape.columns} height={height} />;
+  if (tab === undefined) return <Box height={height} />;
+  if (shape.wide) {
+    return (
+      <Box height={height}>
+        <ListPane key={tab} tab={tab} width={shape.listWidth} height={height} />
+        <Box width={1} height={height} flexShrink={0}>
+          <Text color={focused ? "cyan" : "gray"}>{Array.from({ length: height }, () => "│").join("\n")}</Text>
+        </Box>
+        <SelectedDetail tab={tab} width={shape.detailWidth} height={height} focused={focused} />
+      </Box>
+    );
+  }
+  if (overlay) return <SelectedDetail tab={tab} width={shape.columns} height={height} focused />;
+  return <ListPane key={tab} tab={tab} width={shape.listWidth} height={height} />;
+}
+
+/** The detail of the tab's selected Item. */
+function SelectedDetail({ tab, width, height, focused }: { tab: TabId; width: number; height: number; focused: boolean }) {
+  const { snap, ids, list } = useRows(tab);
+  const id = snap.status === "ready" ? reconcile(list, ids, height).selectedId : list.selectedId;
+  return <DetailPane id={id} width={width} height={height} focused={focused} />;
 }

@@ -1,10 +1,11 @@
-// Thin helpers over the read RPCs behind the tab bar, the counts and the
-// date prompts: ListViews, GetStatusCounts and ParseDate. The daemon does
-// all the work; "today" is always the daemon's, in its zone.
+// Thin helpers over the read RPCs behind the tab bar, the counts, the
+// date prompts and the quick-add preview: ListViews, GetStatusCounts,
+// ParseDate and ParseCapture. The daemon does all the work; "today" is
+// always the daemon's, in its zone.
 
 import { type Timestamp, timestampFromDate } from "@bufbuild/protobuf/wkt";
 import type { CallOptions, Client } from "@connectrpc/connect";
-import type { GetStatusCountsResponse, ParseDateResponse } from "./gen/todo/v1/item_service_pb.js";
+import type { GetStatusCountsResponse, ParseCaptureResponse, ParseDateResponse } from "./gen/todo/v1/item_service_pb.js";
 import type { ListViewsResponse, ViewService } from "./gen/todo/v1/view_service_pb.js";
 import type { ItemsClient } from "./mutations.js";
 
@@ -48,4 +49,14 @@ export function getStatusCounts(
 export function parseDate(client: ItemsClient, text: string, opts: ReferenceOptions = {}): Promise<ParseDateResponse> {
   const [fields, call] = reference(opts);
   return client.parseDate({ ...fields, text }, call);
+}
+
+/**
+ * Parses capture text as CaptureItem would (design 2.3) without writing
+ * anything: the draft's title and fields, its tokens (offsets in code
+ * points) and its warnings. Blank text gives an empty draft.
+ */
+export function parseCapture(client: ItemsClient, text: string, opts: ReferenceOptions = {}): Promise<ParseCaptureResponse> {
+  const [fields, call] = reference(opts);
+  return client.parseCapture({ ...fields, text }, call);
 }

@@ -10,7 +10,7 @@ import { FakeDaemon } from "../src/fake-daemon.js";
 import { MAX_PAGE_SIZE } from "../src/limits.js";
 import { LiveStore, type LiveStoreOptions } from "../src/live-store.js";
 import { RelationKind } from "../src/gen/todo/v1/relation_pb.js";
-import { addRelation, deleteItem, removeRelation, undeleteItem, undo } from "../src/mutations.js";
+import { addRelation, deleteItem, removeRelation, setStatus, undeleteItem, undo } from "../src/mutations.js";
 
 async function waitFor(cond: () => boolean, timeoutMs = 2000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -602,5 +602,144 @@ describe("LiveStore saved views, counts and paging", () => {
     unsubscribe();
     expect(debounces).toBe(0);
     expect(store.getItem(late.id)).toBeUndefined();
+  });
+});
+
+describe("LiveStore Items on demand and the undo state", () => {
+  it("applies mutation responses at once with applyItems, keeping anything newer", async () => {
+    // No re-query and no stream within the test: what the store holds comes from applyItems.
+    const { daemon, store } = setup(1, { debounceMs: 60_000 });
+    const items = createClient(ItemService, daemon.transport);
+    const view = store.view();
+    store.start();
+    await waitFor(() => store.getConnection().state === "live");
+    const [first] = view.getSnapshot().items;
+    await store.stop();
+
+    const res = await setStatus(items, first!.id, Status.DONE);
+    const version = store.getVersion();
+    store.applyItems([res.item!], res.result!.revision);
+    expect(store.getVersion()).toBeGreaterThan(version);
+    expect(store.getItem(first!.id)?.status).toBe(Status.DONE);
+    // A response read at an older revision does not undo it.
+    store.applyItems([{ ...res.item!, status: Status.INBOX }], res.result!.revision - 1n);
+    expect(store.getItem(first!.id)?.status).toBe(Status.DONE);
+  });
+
+  it("fetches an Item no view holds, deleted ones too, and keeps it fresh from changes", async () => {
+    const { daemon, store } = setup(0);
+    const items = createClient(ItemService, daemon.transport);
+    const parent = daemon.put({ title: "parent", status: Status.DONE });
+    const gone = daemon.put({ title: "gone" });
+    await deleteItem(items, gone.id);
+    store.view({ filter: { allOf: [] } });
+    store.start();
+    await waitFor(() => store.getConnection().state === "live");
+    expect(store.getItem(parent.id)).toBeUndefined();
+
+    const before = daemon.calls.listItems;
+    const [a, b] = await Promise.all([store.fetchItem(parent.id), store.fetchItem(parent.id)]);
+    expect(a?.title).toBe("parent");
+    expect(b).toBe(a);
+    expect(store.getItem(parent.id)).toBe(a);
+    expect(daemon.calls.listItems).toBe(before);
+    expect((await store.fetchItem(gone.id))?.deletedAt).toBeDefined();
+    expect(await store.fetchItem("01J00000000000000000000000")).toBeUndefined();
+
+    daemon.update(parent.id, { title: "renamed parent" });
+    await waitFor(() => store.getItem(parent.id)?.title === "renamed parent");
+  });
+
+  it("rejects a fetch the daemon cannot answer", async () => {
+    const { daemon, store } = setup(1);
+    daemon.down = true;
+    await expect(store.fetchItem("01J00000000000000000000000")).rejects.toMatchObject({ code: Code.Unavailable });
+  });
+
+  it("keeps the undo state live while observed, re-reading it after Item changes", async () => {
+    const { daemon, store } = setup(1);
+    const items = createClient(ItemService, daemon.transport);
+    const view = store.view();
+    store.start();
+    await waitFor(() => store.getConnection().state === "live");
+    expect(store.undoState.getSnapshot().status).toBe("loading");
+
+    const unsubscribe = store.undoState.subscribe(() => {});
+    await waitFor(() => store.undoState.getSnapshot().status === "ready");
+    expect(store.undoState.getSnapshot().undo).toBeUndefined();
+
+    const [first] = view.getSnapshot().items;
+    const res = await setStatus(items, first!.id, Status.DONE);
+    await waitFor(() => store.undoState.getSnapshot().undo?.opId === res.result?.opId);
+    expect(store.undoState.getSnapshot().undo?.description).toBe(`mark done "item 0"`);
+
+    await undo(items, { expectedOpId: res.result!.opId });
+    await waitFor(() => store.undoState.getSnapshot().redo?.opId === res.result?.opId);
+    expect(store.undoState.getSnapshot().undo).toBeUndefined();
+    unsubscribe();
+  });
+
+  it("re-reads the undo state on reload(), observed or not, and only on demand while unobserved", async () => {
+    const { daemon, store } = setup(1);
+    const items = createClient(ItemService, daemon.transport);
+    const view = store.view();
+    store.start();
+    await waitFor(() => store.getConnection().state === "live");
+    const [first] = view.getSnapshot().items;
+    const res = await setStatus(items, first!.id, Status.DONE);
+    await sleep(60);
+    // Unobserved: changes do not re-read it.
+    expect(store.undoState.getSnapshot().status).toBe("loading");
+
+    await store.undoState.reload();
+    expect(store.undoState.getSnapshot().undo?.opId).toBe(res.result?.opId);
+  });
+
+  it("applies the newest undo state read when reads overlap", async () => {
+    const { daemon, store } = setup(1);
+    const items = createClient(ItemService, daemon.transport);
+    const view = store.view();
+    store.start();
+    await waitFor(() => store.getConnection().state === "live");
+    const [first] = view.getSnapshot().items;
+    // The older read sees the stack before the op, and its answer arrives last.
+    const before = await store.fetchUndoState();
+    let answer = () => {};
+    vi.spyOn(store, "fetchUndoState").mockImplementationOnce(() => new Promise((resolve) => (answer = () => resolve(before))));
+    const older = store.undoState.reload();
+    const res = await setStatus(items, first!.id, Status.DONE);
+    await store.undoState.reload();
+    expect(store.undoState.getSnapshot().undo?.opId).toBe(res.result?.opId);
+    answer();
+    await older;
+    expect(store.undoState.getSnapshot().undo?.opId).toBe(res.result?.opId);
+  });
+
+  it("stops re-reading the undo state when the store stops", async () => {
+    const { daemon, store } = setup(1, { debounceMs: 200 });
+    store.view();
+    const unsubscribe = store.undoState.subscribe(() => {});
+    store.start();
+    await waitFor(() => store.undoState.getSnapshot().status === "ready");
+    const reads = vi.spyOn(store, "fetchUndoState");
+    const late = daemon.put({ title: "late" });
+    await waitFor(() => store.getItem(late.id) !== undefined);
+    await store.stop();
+    await sleep(300);
+    expect(reads).not.toHaveBeenCalled();
+    unsubscribe();
+  });
+
+  it("shows a first undo-state failure as an error", async () => {
+    const { daemon, store } = setup(1);
+    store.view();
+    store.start();
+    await waitFor(() => store.getConnection().state === "live");
+    daemon.down = true;
+    await store.undoState.reload();
+    expect(store.undoState.getSnapshot()).toMatchObject({ status: "error" });
+    daemon.down = false;
+    await store.undoState.reload();
+    expect(store.undoState.getSnapshot()).toMatchObject({ status: "ready" });
   });
 });
