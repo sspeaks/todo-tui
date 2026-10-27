@@ -3,16 +3,28 @@
 // enter captures and stays open, enter on blank text closes, esc
 // discards. A paste of several lines captures each non-blank line in
 // order, as `todo add` reads stdin; text over 64 KiB is refused here and
-// kept.
+// kept. `A` captures as a child of the selected Item.
 
-import { CreatedVia, MAX_CAPTURE_BYTES, type ParseCaptureResponse, Status, captureItem, parseCapture } from "@todo-tui/client";
+import {
+  BadRequestSchema,
+  Code,
+  ConnectError,
+  CreatedVia,
+  MAX_CAPTURE_BYTES,
+  type ParseCaptureResponse,
+  Status,
+  captureItem,
+  isConnectionFailure,
+  parseCapture,
+  ulid,
+} from "@todo-tui/client";
 import { singleLine, truncate } from "../format/text.js";
 import { editLine, emptyLine, insert, type LineState, lineOf } from "../keys/line-editor.js";
 import { isChar, type KeyToken } from "../keys/tokenize.js";
 import { type Mode, normalMode } from "../state/types.js";
 import type { Controller } from "./controller.js";
 import { Latest } from "./latest.js";
-import { errorText } from "./messages.js";
+import { DaemonUnavailable, errorText } from "./messages.js";
 import type { Input } from "./queue.js";
 import { single } from "./pipeline.js";
 
@@ -61,8 +73,25 @@ export function typedLines(inputs: readonly Input[]): { lines: string[]; dropped
   return { lines: out.filter((l) => l.trim() !== ""), dropped: inputs.length - i };
 }
 
+/** Whether a failed capture may still have been saved: no answer came (the daemon down past the retry window, or the deadline). */
+export const outcomeUnknown = (err: unknown): boolean =>
+  err instanceof DaemonUnavailable || isConnectionFailure(err) || ConnectError.from(err).code === Code.DeadlineExceeded;
+
+/** Whether the daemon refused the capture's parent_id: the parent was deleted (or is gone) since `A`. */
+const parentRefused = (err: unknown): boolean =>
+  ConnectError.from(err).code === Code.InvalidArgument &&
+  ConnectError.from(err)
+    .findDetails(BadRequestSchema)
+    .some((d) => d.fieldViolations.some((v) => v.field === "parent_id"));
+
 export class QuickAdd {
   private readonly previews: Latest<string, ParseCaptureResponse | undefined>;
+  /**
+   * The last capture whose outcome is unknown: enter on the same text (and
+   * parent) sends its request_id again, which the daemon answers with the
+   * Item it made, if it made one, so a capture never lands twice.
+   */
+  private unknown: { text: string; parentId: string | undefined; requestId: string } | undefined;
 
   constructor(private readonly c: Controller) {
     this.previews = new Latest(
@@ -79,6 +108,13 @@ export class QuickAdd {
 
   open(): void {
     this.c.setMode({ kind: "quickAdd", line: emptyLine });
+  }
+
+  /** A: quick-add under the selected Item (never the marked ones). */
+  openChild(): void {
+    const parent = this.c.selectedItem();
+    if (!parent) return this.c.toast("info", "Select an Item to add a subtask to");
+    this.c.setMode({ kind: "quickAdd", parentId: parent.id, parentTitle: parent.title, line: emptyLine });
   }
 
   /** Resolves once the preview has caught up with the text (tests). */
@@ -164,16 +200,24 @@ export class QuickAdd {
     if (!same && text) this.previews.request(text);
   }
 
-  /** One CaptureItem (created_via TUI); says where the Item went when this tab won't show it. */
+  /**
+   * One CaptureItem (created_via TUI); says where the Item went when this
+   * tab won't show it. The text stays in the line when it fails.
+   */
   private async capture(text: string): Promise<boolean> {
     const { mode } = this.c.state;
     const parentId = mode.kind === "quickAdd" ? mode.parentId : undefined;
+    const again = this.unknown?.text === text && this.unknown.parentId === parentId ? this.unknown : undefined;
+    const requestId = again?.requestId ?? ulid();
     const out = await this.c.pipeline.run({
       call: (opts) => captureItem(this.c.items, text, { ...opts, createdVia: CreatedVia.TUI, ...(parentId !== undefined && { parentId }) }),
       items: single,
+      requestId,
     });
+    this.unknown = !out.ok && outcomeUnknown(out.err) ? { text, parentId, requestId } : undefined;
     if (!out.ok) {
-      this.c.failed(errorText(out.err));
+      const parentGone = parentId !== undefined && parentRefused(out.err);
+      this.c.failed(parentGone ? "The parent was deleted — esc, then a, to add at the top level" : errorText(out.err));
       return false;
     }
     const { item, result } = out.res;

@@ -14,6 +14,32 @@ export function parseLabels(text: string): string[] {
   return out;
 }
 
+/** Bulk `t`'s text: the labels to add and to remove. */
+export interface LabelEdits {
+  readonly add: readonly string[];
+  readonly remove: readonly string[];
+}
+
+/** "+a -b #c d": -word removes a label, any other word (+, # optional) adds one; the last word for a label wins. */
+export function parseLabelEdits(text: string): LabelEdits {
+  const edits = new Map<string, boolean>();
+  for (const word of text.split(/\s+/)) {
+    const remove = word.startsWith("-");
+    const label = word.replace(/^[-+]/, "").replace(/^#+/, "");
+    if (!label) continue;
+    edits.delete(label);
+    edits.set(label, !remove);
+  }
+  const all = [...edits];
+  return { add: all.filter(([, add]) => add).map(([l]) => l), remove: all.filter(([, add]) => !add).map(([l]) => l) };
+}
+
+/** An Item's labels after `edits`: its own, minus those removed, then those added it lacked. */
+export function applyLabelEdits(labels: readonly string[], edits: LabelEdits): string[] {
+  const kept = labels.filter((l) => !edits.remove.includes(l));
+  return [...kept, ...edits.add.filter((l) => !kept.includes(l))];
+}
+
 /** Whether two label lists hold the same set. */
 export const sameLabels = (a: readonly string[], b: readonly string[]): boolean => a.length === b.length && a.every((l) => b.includes(l));
 

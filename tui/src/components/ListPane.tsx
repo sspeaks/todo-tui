@@ -4,6 +4,7 @@ import { type RowCells, priorityLabel, rowCells, statusGlyph } from "../format/i
 import { displayWidth, fit, singleLine } from "../format/text.js";
 import { GAP, type RowColumns, rowColumns } from "../state/layout.js";
 import { reconcile } from "../state/selection.js";
+import { searchQuery } from "../state/tabs.js";
 import type { TabId } from "../state/types.js";
 import { useFreshIds } from "../useFreshIds.js";
 import { useRows, useToday, useUi } from "./hooks.js";
@@ -32,6 +33,9 @@ export function ListPane({ tab, width, height }: { tab: TabId; width: number; he
   const seed = useViews().views.find((v) => v.id === tab)?.seed;
   const today = useToday();
   const fresh = useFreshIds(ids, snap.status === "ready");
+  const marks = useUi((s) => s.marks);
+  const narrow = useUi((s) => s.narrow?.shown);
+  const search = searchQuery(tab);
 
   let body;
   if (snap.status === "loading") {
@@ -44,7 +48,10 @@ export function ListPane({ tab, width, height }: { tab: TabId; width: number; he
       </Text>
     );
   } else if (!snap.items.length) {
-    body = <Text dimColor wrap="truncate-end">{EMPTY[seed ?? ""] ?? "No Items match this view"}</Text>;
+    let empty = EMPTY[seed ?? ""] ?? "No Items match this view";
+    if (search !== undefined) empty = `No Items match “${singleLine(search)}”`;
+    if (narrow !== undefined) empty = `Nothing here matches “${singleLine(narrow)}” · esc clears`;
+    body = <Text dimColor wrap="truncate-end">{empty}</Text>;
   } else {
     const r = reconcile(list, ids, height);
     const rows = snap.items.slice(r.offset, r.offset + height);
@@ -64,6 +71,7 @@ export function ListPane({ tab, width, height }: { tab: TabId; width: number; he
         cells={cells[i] ?? rowCells(item, today)}
         cols={cols}
         selected={item.id === r.selectedId}
+        marked={marks.has(item.id)}
         active={focus === "list"}
         fresh={fresh.has(item.id)}
         dim={!live}
@@ -84,6 +92,8 @@ interface RowProps {
   cells: RowCells;
   cols: RowColumns;
   selected: boolean;
+  /** Marked (m, V): a • after the selection marker, the row in magenta. */
+  marked: boolean;
   /** The list has focus: the selection shows in inverse. */
   active: boolean;
   fresh: boolean;
@@ -91,18 +101,20 @@ interface RowProps {
   dim: boolean;
 }
 
-/** One row: "› ○ +3  title  ^Fri  ⧗dana 3d  ⏸Nov 3", archived rows dimmed. */
-function Row({ item, cells, cols, selected, active, fresh, dim }: RowProps) {
+/** One row: "› ○ +3  title  ^Fri  ⧗dana 3d  ⏸Nov 3" ("›•○" when marked), archived rows dimmed. */
+function Row({ item, cells, cols, selected, marked, active, fresh, dim }: RowProps) {
   const archived = item.archived !== undefined;
   return (
     <Text
       wrap="truncate-end"
       inverse={selected && active}
       dimColor={dim || archived}
-      color={fresh ? "green" : undefined}
-      bold={fresh}
+      color={fresh ? "green" : marked ? "magenta" : undefined}
+      bold={fresh || marked}
     >
-      {selected ? "›" : " "} {statusGlyph(item.status)} {fit(priorityLabel(item), 3)} {fit(singleLine(item.title), cols.title)}
+      {selected ? "›" : " "}
+      {marked ? "•" : " "}
+      {statusGlyph(item.status)} {fit(priorityLabel(item), 3)} {fit(singleLine(item.title), cols.title)}
       {cell(cells.key, cols.key)}
       <Text color={cells.overdue ? "red" : undefined}>{cell(cells.due, cols.due)}</Text>
       <Text color={cells.followUpDue ? "yellow" : undefined} bold={cells.followUpDue}>

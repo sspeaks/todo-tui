@@ -238,8 +238,12 @@ titles=$(sed -n 's/.*"title":"\([^"]*\)".*/\1/p' "$root/today.items" | paste -sd
 
 # 8. The TUI in a private tmux server, against a scratch daemon it spawns:
 #    quick-add with the live preview, x takes the row out of the Inbox and u
-#    brings it back, q leaves the terminal as it was. The TS client checks
-#    the daemon. Frames are polled with capture-pane, not fixed sleeps.
+#    brings it back, m m x completes two rows in one op and u brings both
+#    back, E edits the description in $EDITOR (a script) with the terminal
+#    resized meanwhile, ctrl-z without job control comes straight back, q
+#    leaves the terminal as it was, and ctrl-z / fg in a job-control shell
+#    stop and resume it. The TS client checks the
+#    daemon. Frames are polled with capture-pane, not fixed sleeps.
 step "the TUI in tmux"
 if ! command -v tmux >/dev/null; then
   echo "smoke: tmux not found; skipping the TUI step"
@@ -266,9 +270,15 @@ else
     fail "the TUI never showed $2"
   }
   keys() { tmx send-keys -t tui "$@"; }
+  # E's editor: says it started, waits to be let go (so the terminal can be
+  # resized meanwhile), then appends to the description.
+  editor=$root/editor.sh
+  printf '%s\n' '#!/bin/sh' ": >'$root/editing'" "while [ ! -e '$root/go' ]; do sleep 0.05; done" 'printf "edited by smoke" >>"$1"' >"$editor"
+  chmod +x "$editor"
   # `todo` with no command runs the bundle; the line before it and the
   # line after it show whether quitting restored the screen.
   tmx new-session -d -s tui -x 100 -y 20 -e "TODO_TUI_HOME=$home" -e "TODO_BIN=$TODO_BIN" -e "TODO_TUI_ENTRY=$TODO_TUI_ENTRY" \
+    -e "VISUAL=$editor" -e "EDITOR=$editor" \
     "echo before-the-tui; \"\$TODO_BIN\"; echo \"the tui exited \$?\"; sleep 600"
   see '● live' "the live connection"
   see 'Inbox zero' "the empty Inbox"
@@ -298,12 +308,77 @@ else
   list_items >"$root/tui.items" || fail "listing items failed"
   grep -qF '"status":"STATUS_INBOX"' "$root/tui.items" || { cat "$root/tui.items" >&2; fail "u did not bring it back"; }
 
-  # (M4 phase 3: E, with a non-interactive EDITOR, goes here.)
+  # Two marked rows, done in one op, and back with one u.
+  keys a
+  see '^ADD · ' "quick-add"
+  keys -l 'second item'
+  keys Enter
+  see '^  ○ +second item' "the second row"
+  keys Escape
+  see '^NORMAL · ' "normal mode"
+  keys g g m m
+  see '· 2 marked' "two marks"
+  keys x
+  see '^mark done \(2 items\) · u undo' "the bulk x toast"
+  see 'Inbox zero' "both rows leaving the Inbox"
+  list_items >"$root/tui.items" || fail "listing items failed"
+  grep -qF '"title":"' "$root/tui.items" && { cat "$root/tui.items" >&2; fail "m m x left an Item open"; }
+  keys u
+  see '^Undid: mark done \(2 items\)' "the bulk undo toast"
+  see '^  ○ +second item' "both rows back"
+  list_items >"$root/tui.items" || fail "listing items failed"
+  [[ $(grep -c '"status":"STATUS_INBOX"' "$root/tui.items") == 2 ]] || { cat "$root/tui.items" >&2; fail "u did not bring both back"; }
+
+  # E on the first row, the terminal resized while the editor runs: the
+  # TUI comes back at the new size, and the description is saved.
+  keys g g E
+  for _ in $(seq 1 100); do [[ -e $root/editing ]] && break; sleep 0.1; done
+  [[ -e $root/editing ]] || { screen >&2; fail "E did not start the editor"; }
+  tmx resize-window -t tui -x 80 -y 16
+  : >"$root/go"
+  see '^edit "smoke item" · u undo' "the E toast"
+  [[ $(screen | wc -l | tr -d ' ') == 16 ]] || { screen >&2; fail "the TUI did not come back at the new size"; }
+  screen | sed -n 15p | grep -q '^NORMAL · ● live' || { screen >&2; fail "the TUI did not redraw at the new size"; }
+  list_items >"$root/tui.items" || fail "listing items failed"
+  grep -qF '"description":"edited by smoke"' "$root/tui.items" || { cat "$root/tui.items" >&2; fail "E did not save the description"; }
+
+  # ctrl-z with no job control (the session's shell runs the TUI with none):
+  # nothing can stop it, so it takes the terminal back at once and says so.
+  keys C-z
+  see '^Cannot suspend: no job control here' "the ctrl-z toast"
+  keys j
+  see '^› ○ +second item' "the TUI taking keys after ctrl-z"
+
   keys q
   see '^the tui exited 0$' "a clean exit"
   # The alternate screen is gone: the shell's lines are back, the TUI's are not.
   screen | grep -qx 'before-the-tui' || { screen >&2; fail "quitting did not restore the screen"; }
   screen | grep -q '● live' && { screen >&2; fail "the TUI's frame stayed on the screen"; }
+
+  # ctrl-z in a shell with job control stops the TUI; fg brings it back,
+  # redrawn, with what changed meanwhile.
+  tmx new-window -t tui -n job -e "TODO_TUI_HOME=$home" -e "TODO_BIN=$TODO_BIN" -e "TODO_TUI_ENTRY=$TODO_TUI_ENTRY" -e "PS1=$ " \
+    "env -u TMUX bash --norc --noprofile -i"
+  jscreen() { tmx capture-pane -p -t tui:job; }
+  jsee() {
+    for _ in $(seq 1 100); do
+      jscreen | grep -Eq -- "$1" && return 0
+      sleep 0.1
+    done
+    jscreen >&2
+    fail "the job-control shell never showed $2"
+  }
+  tmx send-keys -t tui:job '"$TODO_BIN"' Enter
+  jsee '● live' "the TUI"
+  tmx send-keys -t tui:job C-z
+  jsee 'Stopped' "the TUI stopped"
+  "$TODO_BIN" add "while stopped" >/dev/null
+  tmx send-keys -t tui:job fg Enter
+  jsee '○ +while stopped' "the TUI resumed with the change"
+  jsee '^NORMAL · ● live' "the TUI live again"
+  tmx send-keys -t tui:job q
+  # The prompt is back, alone on its line (capture-pane drops its trailing space).
+  jsee '^\$$' "the shell after the TUI quit"
   tmx kill-server
   rm -rf "$tmux_dir"
   tmux_dir=

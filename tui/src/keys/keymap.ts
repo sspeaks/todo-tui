@@ -21,7 +21,7 @@ export type Action =
   | { type: "help" }
   | { type: "command" }
   | { type: "quit" }
-  // Phase 2 and 3 of M4.
+  | { type: "suspend" }
   | { type: "narrow" }
   | { type: "quick_add"; child: boolean }
   | { type: "prompt"; prompt: PromptKind }
@@ -61,9 +61,6 @@ export interface Binding {
   readonly available?: () => boolean;
 }
 
-/** Bindings whose actions arrive in a later phase of M4. */
-const later = () => false;
-
 const priorities: readonly [string, Priority][] = [
   ["1", Priority.HIGHEST],
   ["2", Priority.HIGH],
@@ -81,7 +78,7 @@ export const BINDINGS: readonly Binding[] = [
   { id: "half_page_up", keys: ["ctrl+u", "pageup"], action: { type: "half_page", dir: -1 }, section: "Navigation", help: "Half a page up" },
   { id: "focus_toggle", keys: ["tab"], action: { type: "focus_toggle" }, section: "Navigation", help: "Focus list ↔ detail" },
   { id: "open_detail", keys: ["enter"], action: { type: "open_detail" }, section: "Navigation", help: "Open the detail" },
-  { id: "back", keys: ["esc"], action: { type: "back" }, section: "Navigation", help: "Back: close the detail, clear" },
+  { id: "back", keys: ["esc"], action: { type: "back" }, section: "Navigation", help: "Back: close the detail, end V, clear /, the marks" },
   ...Array.from({ length: 9 }, (_, i): Binding => ({
     id: `view_${i + 1}`,
     keys: [String(i + 1)],
@@ -92,12 +89,12 @@ export const BINDINGS: readonly Binding[] = [
   })),
   { id: "view_prev", keys: ["["], action: { type: "view_step", by: -1 }, section: "Views", help: "Previous view" },
   { id: "view_next", keys: ["]"], action: { type: "view_step", by: 1 }, section: "Views", help: "Next view" },
-  { id: "narrow", keys: ["/"], action: { type: "narrow" }, section: "Views", help: "Narrow this view", available: later },
+  { id: "narrow", keys: ["/"], action: { type: "narrow" }, section: "Views", help: "Narrow this view (enter keeps, esc clears)" },
 
   { id: "quick_add", keys: ["a"], action: { type: "quick_add", child: false }, section: "Items", help: "Quick-add" },
-  { id: "quick_add_child", keys: ["A"], action: { type: "quick_add", child: true }, section: "Items", help: "Quick-add a subtask", available: later },
+  { id: "quick_add_child", keys: ["A"], action: { type: "quick_add", child: true }, section: "Items", help: "Quick-add a subtask of this Item" },
   { id: "edit_title", keys: ["i"], action: { type: "prompt", prompt: "title" }, section: "Items", help: "Edit the title" },
-  { id: "edit_description", keys: ["E"], action: { type: "edit_description" }, section: "Items", help: "Edit the description in $EDITOR", available: later },
+  { id: "edit_description", keys: ["E"], action: { type: "edit_description" }, section: "Items", help: "Edit the description in $EDITOR" },
   ...priorities.map(
     ([key, priority]): Binding => ({
       id: `set_priority_${key}`,
@@ -121,8 +118,8 @@ export const BINDINGS: readonly Binding[] = [
   { id: "toggle_archive", keys: ["z"], action: { type: "archive_toggle" }, markAware: true, section: "Items", help: "Archive / unarchive" },
   { id: "delete", keys: ["d d"], action: { type: "delete" }, markAware: true, section: "Items", help: "Delete (confirm)" },
 
-  { id: "mark", keys: ["m"], action: { type: "mark" }, section: "Marks", help: "Mark and move down", available: later },
-  { id: "visual_mark", keys: ["V"], action: { type: "visual" }, section: "Marks", help: "Mark a range", available: later },
+  { id: "mark", keys: ["m"], action: { type: "mark" }, section: "Marks", help: "Mark / unmark, and move down" },
+  { id: "visual_mark", keys: ["V"], action: { type: "visual" }, section: "Marks", help: "Mark a range as you move; V or esc ends it" },
 
   { id: "undo", keys: ["u"], action: { type: "undo" }, section: "Undo", help: "Undo" },
   { id: "redo", keys: ["ctrl+r"], action: { type: "redo" }, section: "Undo", help: "Redo" },
@@ -130,6 +127,7 @@ export const BINDINGS: readonly Binding[] = [
   { id: "command", keys: [":"], action: { type: "command" }, section: "App", help: "Command line" },
   { id: "help", keys: ["?", "fkey"], action: { type: "help" }, section: "App", help: "This help" },
   { id: "quit", keys: ["q", "ctrl+c"], action: { type: "quit" }, section: "App", help: "Quit" },
+  { id: "suspend", keys: ["ctrl+z"], action: { type: "suspend" }, section: "App", help: "Suspend to the shell (fg resumes)" },
 
   // In help, the navigation actions scroll it.
   { id: "help_down", keys: ["j", "down"], action: { type: "move", by: 1 }, modes: ["help"], section: "Help", help: "Scroll down" },

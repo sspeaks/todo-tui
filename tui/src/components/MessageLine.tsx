@@ -1,5 +1,5 @@
 import { Box, Text } from "ink";
-import { STATUS_CHOICES } from "../controller/actions.js";
+import { STATUS_CHOICES, sharedStatus } from "../controller/actions.js";
 import { PROMPT_LABELS } from "../controller/prompts.js";
 import { sanitize, singleLine, truncate } from "../format/text.js";
 import { type LineState, visibleLine } from "../keys/line-editor.js";
@@ -19,13 +19,16 @@ function Editor({ label, line, width }: { label: string; line: LineState; width:
   );
 }
 
-/** The status picker: a letter per status, the one j/k is on in inverse, the Item's current status ticked. */
+/** " (3 marked)" after a prompt's label when it acts on the marks. */
+const marked = (target: { bulk: boolean; ids: readonly string[] }) => (target.bulk ? ` (${target.ids.length} marked)` : "");
+
+/** The status picker: a letter per status, the one j/k is on in inverse, the current status ticked (with marks, the one they share). */
 function Picker({ mode }: { mode: Extract<Mode, { kind: "picker" }> }) {
   const { store } = useController();
-  const current = store.getItem(mode.target.ids[0] ?? "")?.status;
+  const current = sharedStatus(mode.target, store.getItem);
   return (
     <Text wrap="truncate-end">
-      <Text bold>Status: </Text>
+      <Text bold>Status{marked(mode.target)}: </Text>
       {STATUS_CHOICES.map((c, i) => (
         <Text key={c.key}>
           {i ? <Text dimColor> · </Text> : null}
@@ -46,8 +49,10 @@ export function MessageLine({ width }: { width: number }) {
   let content;
   if (mode.kind === "command") {
     content = <Editor label=":" line={mode.line} width={width} />;
+  } else if (mode.kind === "search") {
+    content = <Editor label="/" line={mode.line} width={width} />;
   } else if (mode.kind === "prompt") {
-    content = <Editor label={`${PROMPT_LABELS[mode.prompt]}: `} line={mode.line} width={width} />;
+    content = <Editor label={`${PROMPT_LABELS[mode.prompt]}${marked(mode.target)}: `} line={mode.line} width={width} />;
   } else if (mode.kind === "picker") {
     content = <Picker mode={mode} />;
   } else if (mode.kind === "confirm") {
@@ -79,6 +84,12 @@ const PROMPT_HINTS: Readonly<Record<Extract<Mode, { kind: "prompt" }>["prompt"],
   due: "a date: fri, +3d, eow, nov2, 2026-11-02 · empty clears",
   defer: "a date: fri, +3d, eow, nov2, 2026-11-02 · empty clears",
   waiting: "<person> [^date] · tab completes the person · empty clears",
+};
+
+/** The hints of a prompt acting on marks, where they differ. */
+const BULK_HINTS: Partial<Record<Extract<Mode, { kind: "prompt" }>["prompt"], string>> = {
+  labels: "+a adds · -b removes, on each marked Item · enter saves · esc cancels",
+  waiting: "<person> [^date] for each marked Item · tab completes the person · empty clears",
 };
 
 /**
@@ -114,7 +125,7 @@ export function PromptPreviewLine({ width }: { width: number }) {
   } else {
     content = (
       <Text dimColor wrap="truncate-end">
-        {PROMPT_HINTS[mode.prompt]}
+        {(mode.target.bulk && BULK_HINTS[mode.prompt]) || PROMPT_HINTS[mode.prompt]}
       </Text>
     );
   }

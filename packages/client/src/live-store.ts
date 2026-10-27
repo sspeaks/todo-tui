@@ -252,8 +252,12 @@ export class LiveStore {
     };
   }
 
-  /** The live view for a query; equal queries share one view. */
-  view(query: ViewQuery = {}): LiveView {
+  /**
+   * The live view for a query; equal queries share one view. `graceMs`
+   * overrides viewGraceMs for this view from now on: 0 drops it as soon as
+   * nothing observes it, as for a search typed one key at a time.
+   */
+  view(query: ViewQuery = {}, opts: { graceMs?: number } = {}): LiveView {
     const request = create(ListItemsRequestSchema, {
       ...(query.filter !== undefined && { filter: query.filter }),
       ...(query.sort !== undefined && { sort: query.sort }),
@@ -266,6 +270,7 @@ export class LiveStore {
       this.views.set(key, view);
       if (this.loaded) void view.load();
     }
+    if (opts.graceMs !== undefined) view.graceMs = opts.graceMs;
     return view;
   }
 
@@ -584,6 +589,8 @@ export class LiveView {
   private refs = 0;
   private snap: ViewSnapshot = { status: "loading", items: [], revision: 0n };
   private snapVersion = -1;
+  /** @internal How long it is kept once unobserved, when not the store's viewGraceMs. */
+  graceMs: number | undefined;
 
   constructor(
     private readonly store: LiveStore,
@@ -674,7 +681,7 @@ export class LiveView {
     return () => {
       unsub();
       if (--this.refs === 0) {
-        this.grace = setTimeout(() => this.store.dropView(this.key), this.store.viewGraceMs);
+        this.grace = setTimeout(() => this.store.dropView(this.key), this.graceMs ?? this.store.viewGraceMs);
       }
     };
   };

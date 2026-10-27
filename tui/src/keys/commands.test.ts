@@ -7,6 +7,8 @@ describe("command line", () => {
     expect(resolveCommand(" quit ")).toEqual({ kind: "run", command: "quit", args: "" });
     expect(resolveCommand("h")).toEqual({ kind: "run", command: "help", args: "" });
     expect(resolveCommand("ref")).toEqual({ kind: "run", command: "refresh", args: "" });
+    expect(resolveCommand("search  milk  shake")).toEqual({ kind: "run", command: "search", args: "milk shake" });
+    expect(resolveCommand("s milk")).toEqual({ kind: "run", command: "search", args: "milk" });
     expect(resolveCommand("")).toEqual({ kind: "none" });
   });
 
@@ -16,8 +18,6 @@ describe("command line", () => {
     expect(resolveCommand("export")).toEqual({ kind: "message", level: "info", text: ":export arrives in M6" });
     expect(resolveCommand("view new x")).toEqual({ kind: "message", level: "info", text: ":view arrives with view editing in M6" });
     expect(resolveCommand("review")).toMatchObject({ text: ":review arrives with the weekly review in P4" });
-    expect(resolveCommand("search milk")).toEqual({ kind: "message", level: "info", text: ":search is coming soon" });
-    expect(resolveCommand("s")).toMatchObject({ text: ":search is coming soon" });
   });
 
   it("completes the command name to the longest shared prefix", () => {

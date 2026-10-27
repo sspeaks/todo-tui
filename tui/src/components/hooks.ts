@@ -6,6 +6,7 @@ import { createContext, useContext, useEffect, useMemo, useState, useSyncExterna
 import type { Controller } from "../controller/controller.js";
 import { dayOf, localDay } from "../format/dates.js";
 import { initialList, type ListState } from "../state/selection.js";
+import { tabQuery } from "../state/tabs.js";
 import type { TabId, UiState } from "../state/types.js";
 
 export const ControllerContext = createContext<Controller | null>(null);
@@ -22,9 +23,10 @@ export function useUi<T>(select: (s: UiState) => T): T {
   return useSyncExternalStore(ui.subscribe, () => select(ui.getState()));
 }
 
-/** A tab's rows, their ids, and its stored selection. */
+/** A tab's rows as listed (narrowed while `/` narrows it), their ids, and its stored selection. */
 export function useRows(tab: TabId): { snap: ViewSnapshot; ids: readonly string[]; list: ListState } {
-  const snap = useView({ viewId: tab });
+  const narrow = useUi((s) => (s.tab === tab ? s.narrow?.shown : undefined));
+  const snap = useView(tabQuery(tab, narrow));
   const ids = useMemo(() => snap.items.map((i) => i.id), [snap.items]);
   const list = useUi((s) => s.lists.get(tab)) ?? initialList;
   return { snap, ids, list };

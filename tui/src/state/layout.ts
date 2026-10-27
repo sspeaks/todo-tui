@@ -95,11 +95,12 @@ export const TAB_SEPARATOR = " │ ";
 
 /**
  * The tab bar's labels: "1 Inbox 3", the count left out when zero or not
- * counted. When they do not fit, the other tabs shorten to "2 T5" (the
- * initial and the count), the current one staying whole.
+ * counted; a tab with `numbered: false` (Search) has no digit. When they do
+ * not fit, the other tabs shorten to "2 T5" (the initial and the count),
+ * the current one staying whole.
  */
 export function tabLabels(
-  views: readonly { id: string; name: string }[],
+  views: readonly { id: string; name: string; numbered?: boolean }[],
   counts: ReadonlyMap<string, number>,
   current: string | undefined,
   width: number,
@@ -108,11 +109,12 @@ export function tabLabels(
     const n = counts.get(id) ?? 0;
     return n > 0 ? String(n) : "";
   };
+  const digit = (i: number) => (views[i]?.numbered === false ? "" : `${i + 1} `);
   const full = views.map((v, i) => {
     const n = count(v.id);
-    return { id: v.id, text: `${i + 1} ${v.name}${n ? ` ${n}` : ""}`, current: v.id === current };
+    return { id: v.id, text: `${digit(i)}${v.name}${n ? ` ${n}` : ""}`, current: v.id === current };
   });
   const total = (labels: TabLabel[]) => labels.reduce((sum, l, i) => sum + displayWidth(l.text) + (i ? TAB_SEPARATOR.length : 0), 0);
   if (total(full) <= width) return full;
-  return full.map((label, i) => (label.current ? label : { ...label, text: `${i + 1} ${[...(views[i]?.name ?? "")][0] ?? ""}${count(label.id)}` }));
+  return full.map((label, i) => (label.current ? label : { ...label, text: `${digit(i)}${[...(views[i]?.name ?? "")][0] ?? ""}${count(label.id)}` }));
 }

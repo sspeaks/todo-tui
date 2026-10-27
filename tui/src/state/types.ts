@@ -7,7 +7,7 @@ import type { LineState } from "../keys/line-editor.js";
 import type { KeyToken } from "../keys/tokenize.js";
 import type { ListState } from "./selection.js";
 
-/** A saved view's id; `search:<q>` for a :search tab (phase 3). */
+/** A saved view's id; `search:<q>` for the :search tab (state/tabs.ts). */
 export type TabId = string;
 
 /** What an action acts on, frozen when it starts: the marked ids in list order, else the selected one. */
@@ -33,7 +33,9 @@ export type Mode =
   | { readonly kind: "normal"; readonly pending: readonly KeyToken[] }
   | {
       readonly kind: "quickAdd";
+      /** A: captures as a child of this Item, named as `parentTitle` above the line. */
       readonly parentId?: string;
+      readonly parentTitle?: string;
       readonly line: LineState;
       /** ParseCapture's draft for `text`; shown only while `text` is what is typed. */
       readonly preview?: { readonly text: string; readonly draft: CaptureDraft };
@@ -64,6 +66,7 @@ export type Mode =
   /** `dd`: y confirms, any other key cancels and is swallowed. */
   | { readonly kind: "confirm"; readonly text: string; readonly action: "delete"; readonly target: Target }
   | { readonly kind: "command"; readonly line: LineState }
+  /** `/`: the text narrowing the tab, live as it is typed. */
   | { readonly kind: "search"; readonly line: LineState }
   /** `pending`: a prefix of one of help's own bindings (gg), when one is typed. */
   | { readonly kind: "help"; readonly scroll: number; readonly pending?: readonly KeyToken[] };
@@ -72,6 +75,28 @@ export type ModeKind = Mode["kind"];
 
 /** The full-screen detail of narrow layouts, orthogonal to the mode. */
 export type Overlay = { readonly kind: "none" } | { readonly kind: "detail" };
+
+/**
+ * `/` narrowing the current tab (Decision 9): the list shows the tab's
+ * rows that match `shown`, once ListItems has answered for it.
+ */
+export interface Narrow {
+  /** The text asked for last (trimmed); undefined for blank or token-less text, which narrows nothing. */
+  readonly want?: string;
+  /** The text whose rows the list shows; undefined while it shows the tab's own rows. */
+  readonly shown?: string;
+  /** The tab's selection and scroll before narrowing: esc while typing goes back to it. */
+  readonly saved: ListState;
+}
+
+/** V: marking the rows between the one it started on and the selection (Decision 8). */
+export interface Visual {
+  readonly anchorId: string;
+  /** The anchor's index, for when its Item leaves the list. */
+  readonly anchor: number;
+  /** The marks from before V, which the range adds to. */
+  readonly base: ReadonlySet<string>;
+}
 
 export interface Toast {
   readonly id: number;
@@ -84,6 +109,13 @@ export interface UiState {
   readonly tab?: TabId;
   /** Selection and scroll per tab. */
   readonly lists: ReadonlyMap<TabId, ListState>;
+  /** The current tab's marked Items (Decision 8); cleared on a tab switch. */
+  readonly marks: ReadonlySet<string>;
+  readonly visual?: Visual;
+  /** The current tab's `/` narrowing; cleared on a tab switch. */
+  readonly narrow?: Narrow;
+  /** The :search tab, after the views, while open: its query, and the tab esc goes back to. */
+  readonly search?: { readonly query: string; readonly from?: TabId };
   readonly mode: Mode;
   readonly overlay: Overlay;
   /** Which pane j/k act on. */
@@ -100,8 +132,11 @@ export interface UiState {
 
 export const normalMode: Mode = { kind: "normal", pending: [] };
 
+export const noMarks: ReadonlySet<string> = new Set();
+
 export const initialUiState = (size = { columns: 80, rows: 24 }): UiState => ({
   lists: new Map(),
+  marks: noMarks,
   mode: normalMode,
   overlay: { kind: "none" },
   focus: "list",

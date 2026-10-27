@@ -368,6 +368,20 @@ describe("LiveStore", () => {
     expect(store.view()).not.toBe(view);
   });
 
+  it("drops a view at once when its own grace is 0, keeping the others' default", async () => {
+    const { store } = setup(1, { viewGraceMs: 5_000 });
+    const query = { sort: [{ key: 10 }] };
+    const view = store.view(query, { graceMs: 0 });
+    const kept = store.view();
+    // A later lookup without the option leaves the view's grace as set.
+    expect(store.view(query)).toBe(view);
+    view.subscribe(() => {})();
+    kept.subscribe(() => {})();
+    await sleep(10);
+    expect(store.view(query)).not.toBe(view);
+    expect(store.view()).toBe(kept);
+  });
+
   it("delivers notices", async () => {
     const { store } = setup(0);
     const seen: string[] = [];

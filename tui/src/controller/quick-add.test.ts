@@ -1,4 +1,4 @@
-import { Code, ConnectError, CreatedVia, MAX_CAPTURE_BYTES, Priority, Status } from "@todo-tui/client";
+import { Code, ConnectError, CreatedVia, type ItemsClient, MAX_CAPTURE_BYTES, Priority, Status, deleteItem } from "@todo-tui/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fakeDaemon, item, rows } from "../fake.test-util.js";
 import { parseKeys } from "../keys/tokenize.js";
@@ -223,6 +223,102 @@ describe("quick-add", () => {
     t.daemon.down = false;
     await t.c.press("<enter>");
     expect(captured(t).map((i) => i?.title)).toEqual(["milk"]);
+  });
+});
+
+describe("quick-add: no capture lands twice", () => {
+  /** A client whose captures reach the daemon, but whose answers are lost while `lose` says so; it records the request_ids. */
+  function losing() {
+    const ids: string[] = [];
+    const state = { lose: true };
+    return {
+      ids,
+      state,
+      wrap: (items: ItemsClient): ItemsClient =>
+        new Proxy(items, {
+          get: (target, prop, receiver) =>
+            prop === "captureItem"
+              ? async (req: { requestId: string }, opts: never) => {
+                  ids.push(req.requestId);
+                  const res = await target.captureItem(req as never, opts);
+                  if (state.lose) throw new ConnectError("deadline", Code.DeadlineExceeded);
+                  return res;
+                }
+              : Reflect.get(target, prop, receiver),
+        }),
+    };
+  }
+
+  it("sends the same request_id again for the same text after an unknown outcome, a new one for new text", async () => {
+    const l = losing();
+    const t = await setup(dated(), { items: l.wrap });
+    await t.c.press("amilk<enter>");
+    expect(t.toast()).toBe("The daemon did not answer; the change may not be saved");
+    expect(await quickAdd(t)).toMatchObject({ line: { text: "milk" } });
+    // It did land; enter again replays it rather than adding a second.
+    l.state.lose = false;
+    await t.c.press("<enter>");
+    expect(l.ids).toHaveLength(2);
+    expect(l.ids[1]).toBe(l.ids[0]);
+    expect(captured(t).map((i) => i?.title)).toEqual(["milk"]);
+    expect(await quickAdd(t)).toMatchObject({ line: { text: "" } });
+    // After a success, the same text again is a new capture.
+    await t.c.press("milk<enter>");
+    expect(l.ids[2]).not.toBe(l.ids[1]);
+    expect(captured(t).map((i) => i?.title)).toEqual(["milk", "milk"]);
+    // Text changed after an unknown outcome: a fresh id.
+    l.state.lose = true;
+    await t.c.press("bread<enter>");
+    l.state.lose = false;
+    await t.c.press("<backspace>s<enter>");
+    expect(l.ids[4]).not.toBe(l.ids[3]);
+    expect(captured(t).map((i) => i?.title)).toEqual(["milk", "milk", "bread", "breas"]);
+  });
+
+  it("also after the daemon stayed down past the retry window", async () => {
+    const l = losing();
+    l.state.lose = false;
+    const t = await setup(dated(), { timing: { retryMs: 200 }, items: l.wrap });
+    await t.c.press("amilk");
+    t.daemon.down = true;
+    await t.c.press("<enter>");
+    expect(t.toast()).toBe("Not saved: daemon unavailable");
+    t.daemon.down = false;
+    await t.c.press("<enter>");
+    expect(new Set(l.ids).size).toBe(1);
+    expect(captured(t).map((i) => i?.title)).toEqual(["milk"]);
+  });
+});
+
+describe("A", () => {
+  it("captures a subtask of the selected Item, named above the line", async () => {
+    const t = await setup(dated(rows(2)));
+    await t.c.press("jA");
+    const parent = t.byTitle("row 1")!;
+    expect(t.mode()).toMatchObject({ kind: "quickAdd", parentId: parent.id, parentTitle: "row 1" });
+    await t.c.press("step one<enter>step two<enter><esc>");
+    expect(captured(t).map((i) => [i?.title, i?.parentId])).toEqual([
+      ["step one", parent.id],
+      ["step two", parent.id],
+    ]);
+    // a, after it, adds at the top level.
+    await t.c.press("aloose<enter><esc>");
+    expect(t.byTitle("loose")?.parentId).toBeUndefined();
+  });
+
+  it("keeps the text and says why when the parent was deleted while typing (hard case 43)", async () => {
+    const t = await setup(dated(rows(2)));
+    await t.c.press("A");
+    const parent = t.byTitle("row 0")!;
+    await t.c.press("child");
+    await deleteItem(t.clients().items, parent.id);
+    await t.c.press("<enter>");
+    expect(t.state().toast).toMatchObject({ level: "error", text: "The parent was deleted — esc, then a, to add at the top level" });
+    expect(await quickAdd(t)).toMatchObject({ line: { text: "child" }, parentId: parent.id });
+    expect(captured(t)).toEqual([]);
+    await t.c.press("<esc>a");
+    expect(t.mode()).toMatchObject({ kind: "quickAdd", line: { text: "" } });
+    expect(t.mode()).not.toHaveProperty("parentId");
   });
 });
 

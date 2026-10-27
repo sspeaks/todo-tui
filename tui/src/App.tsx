@@ -27,17 +27,19 @@ export function Tui({ store, clients, controller }: { store: LiveStore; clients:
 
 /** The shell (design 2.2): tab bar, list (and detail), status bar, message line; exactly the terminal's rows. */
 export function App({ controller }: { controller: Controller }) {
-  const { exit } = useApp();
+  const { exit, suspendTerminal } = useApp();
   const { columns, rows } = useWindowSize();
   useEffect(() => controller.setSize(columns, rows), [controller, columns, rows]);
   useEffect(() => {
     controller.onQuit = () => exit();
+    controller.suspendTerminal = suspendTerminal;
     controller.start();
     return () => {
       controller.stop();
       controller.onQuit = undefined;
+      controller.suspendTerminal = undefined;
     };
-  }, [controller, exit]);
+  }, [controller, exit, suspendTerminal]);
   useInput((input, key) => controller.input(input, key));
   // Always on, so that a paste in normal mode never runs as keys.
   usePaste((text) => controller.paste(text));
@@ -67,6 +69,9 @@ export function App({ controller }: { controller: Controller }) {
 
 function Body({ shape }: { shape: Layout }) {
   const tab = useUi((s) => s.tab);
+  // Remounted per narrowing too, so that rows `/` brings in are not lit up as new.
+  const narrow = useUi((s) => s.narrow?.shown);
+  const key = `${tab}\0${narrow ?? ""}`;
   const help = useUi((s) => s.mode.kind === "help");
   const overlay = useUi((s) => s.overlay.kind === "detail");
   const focused = useUi((s) => s.focus === "detail");
@@ -76,7 +81,7 @@ function Body({ shape }: { shape: Layout }) {
   if (shape.wide) {
     return (
       <Box height={height}>
-        <ListPane key={tab} tab={tab} width={shape.listWidth} height={height} />
+        <ListPane key={key} tab={tab} width={shape.listWidth} height={height} />
         <Box width={1} height={height} flexShrink={0}>
           <Text color={focused ? "cyan" : "gray"}>{Array.from({ length: height }, () => "│").join("\n")}</Text>
         </Box>
@@ -85,7 +90,7 @@ function Body({ shape }: { shape: Layout }) {
     );
   }
   if (overlay) return <SelectedDetail tab={tab} width={shape.columns} height={height} focused />;
-  return <ListPane key={tab} tab={tab} width={shape.listWidth} height={height} />;
+  return <ListPane key={key} tab={tab} width={shape.listWidth} height={height} />;
 }
 
 /** The detail of the tab's selected Item. */

@@ -14,7 +14,8 @@ describe("help", () => {
       expect(row, first!.id).toHaveLength(1);
     }
     expect(text.find((t) => t.includes("Mark done"))).toMatch(/^ {2}x /);
-    expect(text.some((t) => t.includes("Mark a range"))).toBe(false);
+    expect(text.find((t) => t.includes("Mark a range"))).toMatch(/^ {2}V /);
+    expect(text.find((t) => t.includes("act on every marked Item"))).toMatch(/^ {2}x X s p \^ D w W /);
     expect(text.find((t) => t.includes("Go to view N"))).toMatch(/1–9/);
     expect(text.find((t) => t.includes("First row"))).toMatch(/gg home/);
   });
@@ -23,7 +24,7 @@ describe("help", () => {
     const text = helpLines().map((l) => l.text).join("\n");
     expect(text).toMatch(/:quit :q\s+Quit/);
     expect(text).toContain(":refresh");
-    expect(text).not.toContain(":search");
+    expect(text).toMatch(/:search <query>\s+Search everything/);
     expect(text).toMatch(/\^<date>\s+due date/);
     expect(text).toMatch(/eow eom/);
   });

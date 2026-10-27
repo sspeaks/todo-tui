@@ -1,8 +1,9 @@
 import { type ConnectionSnapshot, useConnection, useUndoState } from "@todo-tui/client";
 import { Box, Text } from "ink";
-import { displayWidth, singleLine } from "../format/text.js";
+import { displayWidth, singleLine, truncate } from "../format/text.js";
 import type { UiState } from "../state/types.js";
-import { useController, useUi } from "./hooks.js";
+import { tabQuery } from "../state/tabs.js";
+import { useController, useOptionalView, useUi } from "./hooks.js";
 
 const describe = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
@@ -20,7 +21,8 @@ const connectionError = ({ state, error }: ConnectionSnapshot): string =>
 function modeLabel(s: UiState): string {
   switch (s.mode.kind) {
     case "normal":
-      return s.focus === "detail" ? "DETAIL" : "NORMAL";
+      if (s.focus === "detail") return "DETAIL";
+      return s.visual ? "VISUAL" : "NORMAL";
     case "help":
       return "HELP";
     case "command":
@@ -33,8 +35,8 @@ function modeLabel(s: UiState): string {
       return "STATUS";
     case "confirm":
       return "CONFIRM";
-    default:
-      return s.mode.kind.toUpperCase();
+    case "search":
+      return "SEARCH";
   }
 }
 
@@ -52,28 +54,43 @@ function hints(s: UiState): string {
       return "letter or j/k enter · esc cancel";
     case "confirm":
       return "y yes · any other key no";
+    case "search":
+      return "enter keep · esc clear";
     default:
+      if (s.visual) return "move to mark · V or esc ends";
       return s.focus === "detail" ? "j/k scroll · esc back · q quit" : "? help · : command · q quit";
   }
 }
 
+/** "3 marked", or "3 marked (1 hidden)" while `/` hides some. */
+function marksLabel(marks: ReadonlySet<string>, listed: readonly { id: string }[], narrowed: boolean): string {
+  if (!marks.size) return "";
+  const hidden = narrowed ? marks.size - listed.filter((i) => marks.has(i.id)).length : 0;
+  return `${marks.size} marked${hidden ? ` (${hidden} hidden)` : ""}`;
+}
+
 /**
- * Mode · connection · saving… · pending prefix · the undo hint, and the keys for this
- * mode on the right. The undo hint and the error detail are cut first; the
- * key hints give way when the mode, the connection and a pending prefix
- * would not fit beside them.
+ * Mode · connection · saving… · marks · pending prefix · the narrowing ·
+ * the undo hint, and the keys for this mode on the right. The undo hint
+ * and the error detail are cut first; the key hints give way when the
+ * essentials would not fit beside them.
  */
 export function StatusBar({ width }: { width: number }) {
   const controller = useController();
   const state = useUi((s) => s);
   const connection = useConnection();
   const undo = useUndoState().undo;
+  const listed = useOptionalView(state.tab === undefined ? undefined : tabQuery(state.tab, state.narrow?.shown));
   const mode = modeLabel(state);
   const conn = connectionState(connection);
   const pending = state.mode.kind === "normal" && state.mode.pending.length ? controller.whichKey(state.mode.pending) : "";
   const busy = state.busy ?? "";
+  const narrowed = state.narrow?.shown;
+  const rows = listed?.items ?? [];
+  const marks = marksLabel(state.marks, rows, narrowed !== undefined);
+  const narrow = narrowed === undefined ? "" : `/${truncate(singleLine(narrowed), 24)} · ${rows.length}`;
   const keys = ` ${hints(state)}`;
-  const essential = `${mode} · ${conn}${busy ? ` · ${busy}` : ""}${pending ? ` · ${pending}` : ""}`;
+  const essential = [mode, conn, busy, marks, pending, narrow].filter(Boolean).join(" · ");
   const showKeys = displayWidth(essential) + displayWidth(keys) <= width;
   const live = connection.state === "live";
   const error = connectionError(connection);
@@ -85,7 +102,9 @@ export function StatusBar({ width }: { width: number }) {
           <Text dimColor> · </Text>
           <Text color={live ? "green" : "yellow"}>{conn}</Text>
           {busy ? <Text color="yellow"> · {busy}</Text> : null}
+          {marks ? <Text color="magenta"> · {marks}</Text> : null}
           {pending ? <Text color="cyan"> · {pending}</Text> : null}
+          {narrow ? <Text color="cyan"> · {narrow}</Text> : null}
           {error ? <Text color="yellow">{error}</Text> : null}
           {undo ? <Text dimColor> · u: {singleLine(undo.description)}</Text> : null}
         </Text>

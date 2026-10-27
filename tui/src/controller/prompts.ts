@@ -4,7 +4,9 @@
 // Only i and t send expected_revision: their text was made from the
 // rendered value, so a conflict rebases silently when that field is
 // unchanged on the server, and otherwise keeps the text for enter to
-// overwrite.
+// overwrite. With marks, t ^ D w act on every marked Item in one
+// BatchMutate (Decision 8): t then takes "+a -b", applied to each Item's
+// own labels.
 
 import {
   type Item,
@@ -19,12 +21,22 @@ import {
   updateItem,
 } from "@todo-tui/client";
 import { dayLabel, dayOf, isoDay } from "../format/dates.js";
-import { commonPrefix, formatLabels, parseLabels, parseWaiting, sameLabels, waitingPrefix } from "../format/fields.js";
+import {
+  applyLabelEdits,
+  commonPrefix,
+  formatLabels,
+  parseLabelEdits,
+  parseLabels,
+  parseWaiting,
+  sameLabels,
+  waitingPrefix,
+} from "../format/fields.js";
 import { singleLine } from "../format/text.js";
 import type { PromptKind } from "../keys/keymap.js";
 import { editLine, insert, type LineState, lineOf } from "../keys/line-editor.js";
 import { isChar, type KeyToken } from "../keys/tokenize.js";
 import { type Mode, normalMode, type PromptPreview, type Target } from "../state/types.js";
+import { Bulk, type BulkStep, bulkText, stepsOf, updateStep } from "./bulk.js";
 import type { Controller } from "./controller.js";
 import { Latest } from "./latest.js";
 import { errorText, opText, quoted } from "./messages.js";
@@ -65,10 +77,18 @@ function dateText(kind: PromptKind, text: string): string | undefined {
   return undefined;
 }
 
+/** The one value `of` gives every Item, else undefined: a bulk prompt's prefill. */
+function shared(items: readonly Item[], of: (item: Item) => string): string | undefined {
+  const values = new Set(items.map(of));
+  return values.size === 1 ? [...values][0] : undefined;
+}
+
 export class Prompts {
   private readonly dates: Latest<{ kind: PromptKind; text: string }, ParseDateResponse | undefined>;
+  private readonly bulk: Bulk;
 
   constructor(private readonly c: Controller) {
+    this.bulk = new Bulk(c);
     this.dates = new Latest(
       ({ kind, text }) => {
         const date = dateText(kind, text);
@@ -78,7 +98,7 @@ export class Prompts {
         const { mode } = this.c.state;
         // A response for text since edited is stale: the newer request follows.
         if (mode.kind !== "prompt" || mode.prompt !== kind || mode.line.text !== text) return;
-        this.c.setMode({ ...mode, preview: this.previewOf(kind, text, res) });
+        this.c.setMode({ ...mode, preview: this.previewOf(kind, text, res, mode.target.ids.length) });
       },
     );
   }
@@ -89,9 +109,11 @@ export class Prompts {
    * right after it completes.
    */
   open(kind: PromptKind): void | Promise<void> {
-    const target = this.c.target();
+    // The title is the selected Item's own; the rest act on the marks when there are some.
+    const target = this.c.target(kind !== "title");
     const item = target && this.c.store.getItem(target.ids[0] ?? "");
     if (!target || !item) return;
+    if (target.bulk) return this.openBulk(kind, target);
     let text = "";
     let base: Prompt["base"];
     switch (kind) {
@@ -115,6 +137,21 @@ export class Prompts {
         break;
     }
     this.c.setMode({ kind: "prompt", prompt: kind, target, line: lineOf(text), ...(base && { base }) });
+    this.preview();
+    if (kind === "waiting") return this.loadPeople(target);
+  }
+
+  /**
+   * The bulk prompt: empty for t ("+a -b"); for a date or waiting, the
+   * value the marked Items share, if they share one.
+   */
+  private openBulk(kind: PromptKind, target: Target): void | Promise<void> {
+    const items = this.bulk.items(target);
+    let text: string | undefined;
+    if (kind === "due") text = shared(items, (i) => (i.dueDate ? isoDay(dayOf(i.dueDate)) : ""));
+    if (kind === "defer") text = shared(items, (i) => (i.deferUntil ? isoDay(dayOf(i.deferUntil)) : ""));
+    if (kind === "waiting") text = shared(items, waitingText);
+    this.c.setMode({ kind: "prompt", prompt: kind, target, line: lineOf(text ?? "") });
     this.preview();
     if (kind === "waiting") return this.loadPeople(target);
   }
@@ -155,19 +192,20 @@ export class Prompts {
     return this.dates.idle();
   }
 
-  private previewOf(kind: PromptKind, text: string, res: ParseDateResponse | undefined): PromptPreview {
+  private previewOf(kind: PromptKind, text: string, res: ParseDateResponse | undefined, bulk = 1): PromptPreview {
     const today = this.c.today();
+    const of = bulk > 1 ? ` of ${bulk} items` : "";
     const date = res?.date ? dayLabel(dayOf(res.date), today) : undefined;
     const warn = (t: string): PromptPreview => ({ for: text, text: t, warn: true });
     const info = (t: string): PromptPreview => ({ for: text, text: t, warn: false });
     if (kind === "waiting") {
       const w = parseWaiting(text);
-      if (!w.person && w.date === undefined) return info("enter clears waiting");
+      if (!w.person && w.date === undefined) return info(`enter clears waiting${bulk > 1 ? ` on ${bulk} items` : ""}`);
       if (!w.person) return warn("who is it waiting on? type a name before the ^date");
       if (w.date === undefined) return info(`→ ⧗${singleLine(w.person)}`);
       return date ? info(`→ ⧗${singleLine(w.person)} · follow up ${date}`) : warn(singleLine(res?.warning ?? ""));
     }
-    if (!text.trim()) return info(`enter clears the ${kind === "due" ? "due" : "defer"} date`);
+    if (!text.trim()) return info(`enter clears the ${kind === "due" ? "due" : "defer"} date${of}`);
     return date ? info(`→ ${date}`) : warn(singleLine(res?.warning ?? ""));
   }
 
@@ -219,6 +257,7 @@ export class Prompts {
   // --- enter ---
 
   private submit(mode: Prompt): void | Promise<void> {
+    if (mode.target.bulk) return this.saveBulk(mode);
     const id = mode.target.ids[0] ?? "";
     const item = this.c.store.getItem(id);
     return item ? this.save(mode, item) : this.saveFetched(mode, id);
@@ -377,13 +416,99 @@ export class Prompts {
     this.c.toastIfLeft(item.id, out.res.result?.opId, opText("edit", item.title));
   }
 
+  // --- with marks ---
+
+  /**
+   * enter on a bulk prompt: one step per marked Item it changes, in one
+   * BatchMutate; nothing to change closes the prompt with a word.
+   */
+  private async saveBulk(mode: Prompt): Promise<void> {
+    const items = this.bulk.items(mode.target);
+    let steps: BulkStep[];
+    switch (mode.prompt) {
+      case "title":
+        return;
+      case "labels": {
+        const edits = parseLabelEdits(mode.line.text);
+        steps = stepsOf(items, (i) => {
+          const labels = applyLabelEdits(i.labels, edits);
+          return sameLabels(labels, i.labels) ? undefined : updateStep({ id: i.id, labels }, ["labels"]);
+        });
+        if (!steps.length) return this.done("Labels unchanged");
+        break;
+      }
+      case "due":
+      case "defer": {
+        const due = mode.prompt === "due";
+        const text = mode.line.text.trim();
+        let date: ProtoDate | undefined;
+        if (text) {
+          date = await this.parse(mode, undefined, text);
+          if (!date) return;
+        }
+        steps = stepsOf(items, (i) =>
+          sameDate(date, due ? i.dueDate : i.deferUntil)
+            ? undefined
+            : updateStep(due ? { id: i.id, dueDate: date } : { id: i.id, deferUntil: date }, [due ? "due_date" : "defer_until"]),
+        );
+        if (!steps.length) return this.done(due ? "Due dates unchanged" : "Defer dates unchanged");
+        break;
+      }
+      case "waiting": {
+        const w = await this.bulkWaiting(mode, items);
+        if (!w) return;
+        steps = w;
+        if (!steps.length) return this.done("Waiting unchanged");
+        break;
+      }
+    }
+    if (await this.bulk.run(steps, (done) => bulkText("edit", done))) this.c.setMode(normalMode);
+  }
+
+  /** Closes the prompt, saying why nothing was sent. */
+  private done(text: string): void {
+    this.c.setMode(normalMode);
+    this.c.toast("info", text);
+  }
+
+  /**
+   * w with marks, per Item as for one: the same person changes only the
+   * follow-up, another person replaces waiting, and empty clears it.
+   * Undefined when the prompt stays open.
+   */
+  private async bulkWaiting(mode: Prompt, items: readonly Item[]): Promise<BulkStep[] | undefined> {
+    const { person, date: dateText } = parseWaiting(mode.line.text);
+    if (!person) {
+      if (dateText !== undefined) {
+        this.refuse(mode, "Who is it waiting on? Type a name before the ^date");
+        return undefined;
+      }
+      return stepsOf(items, (i) => (i.waiting ? updateStep({ id: i.id }, ["waiting"]) : undefined));
+    }
+    let followUpOn: ProtoDate | undefined;
+    if (dateText !== undefined) {
+      followUpOn = await this.parse(mode, undefined, dateText);
+      if (!followUpOn) return undefined;
+    }
+    return stepsOf(items, (i) => {
+      const current = i.waiting;
+      if (current && waitingOn(i) === person) {
+        if (sameDate(followUpOn, current.followUpOn)) return undefined;
+        const waiting = { on: current.on, since: current.since, reason: current.reason, followUpOn };
+        return updateStep({ id: i.id, waiting }, ["waiting.follow_up_on"]);
+      }
+      const waiting = { on: { ref: { case: "freeText" as const, value: person } }, ...(followUpOn && { followUpOn }) };
+      return updateStep({ id: i.id, waiting }, ["waiting"]);
+    });
+  }
+
   /** ParseDate on enter (the preview may be stale): the date, or the prompt kept open with the warning. */
-  private async parse(mode: Prompt, item: Item, text: string): Promise<ProtoDate | undefined> {
+  private async parse(mode: Prompt, item: Item | undefined, text: string): Promise<ProtoDate | undefined> {
     let res: ParseDateResponse;
     try {
       res = await this.c.pipeline.call(({ timeoutMs }) => parseDate(this.c.items, text, { ...(timeoutMs !== undefined && { timeoutMs }) }));
     } catch (err) {
-      this.c.failed(errorText(err, item.title));
+      this.c.failed(errorText(err, item?.title));
       return undefined;
     }
     if (res.date) return res.date;

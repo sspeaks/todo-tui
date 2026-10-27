@@ -4,7 +4,7 @@
 // its selection pinned, and runs the midnight poll. No Ink here, so the
 // controller tests drive it directly.
 
-import type { Item, ItemsClient, LiveStore, LiveView, ViewSnapshot } from "@todo-tui/client";
+import { type Item, type ItemsClient, type LiveStore, type LiveView, type ViewSnapshot, envFromProcess, resolvePaths } from "@todo-tui/client";
 import type { Key } from "ink";
 import { dayOf, localDay } from "../format/dates.js";
 import { singleLine } from "../format/text.js";
@@ -15,10 +15,16 @@ import { editLine, emptyLine, insert, type LineState, lineOf } from "../keys/lin
 import { isChar, type KeyToken, keyLabel, parseKeys, tokenize } from "../keys/tokenize.js";
 import { buildTrie, continuations, step, type TrieNode } from "../keys/trie.js";
 import { layout } from "../state/layout.js";
+import { anchorIndex, markedInOrder, pruneMarks, rangeMarks, toggleMark } from "../state/marks.js";
 import { halfPage, initialList, type ListState, listOf, move, reconcile, type Resolved, sameList, select } from "../state/selection.js";
-import { type Mode, normalMode, type TabId, type Target, type UiState } from "../state/types.js";
+import { matchText, searchQuery, searchTab, tabQuery } from "../state/tabs.js";
+import { type Mode, noMarks, normalMode, type TabId, type Target, type UiState } from "../state/types.js";
 import { UiStore } from "../state/ui-store.js";
 import { ItemActions } from "./actions.js";
+import { MAX_BULK, TOO_MANY } from "./bulk.js";
+import { DescriptionEditor, type EditorRunner, type Suspend, systemEditor } from "./editor.js";
+import { Narrowing } from "./narrow.js";
+import { stopSelf } from "./job.js";
 import { DEFAULT_TIMING, Pipeline, type Timing } from "./pipeline.js";
 import { Prompts } from "./prompts.js";
 import { QuickAdd, typedLines } from "./quick-add.js";
@@ -38,6 +44,12 @@ export interface ControllerOptions {
   now?: () => Date;
   /** Delays and deadlines (tests shorten them). */
   timing?: Partial<Timing>;
+  /** E's editor (default: $VISUAL / $EDITOR through the shell's suspendTerminal). */
+  editor?: EditorRunner;
+  /** Where E keeps a description it could not save, under recovered/ (default: the state dir, paths.ts). */
+  stateDir?: string;
+  /** ctrl-z: stops the process as a shell job, resolving once it continues; false when nothing stopped it (default: job.ts). */
+  stopProcess?: () => Promise<boolean>;
 }
 
 const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n));
@@ -53,9 +65,14 @@ export class Controller {
   readonly pipeline: Pipeline;
   /** Quits the app (Ink's exit); set by the shell. */
   onQuit: (() => void) | undefined;
+  /** Hands the terminal over and back (Ink's suspendTerminal), for E and ctrl-z; set by the shell. */
+  suspendTerminal: Suspend | undefined;
   private readonly actions: ItemActions;
   private readonly prompts: Prompts;
   private readonly quickAdd: QuickAdd;
+  private readonly narrowing: Narrowing;
+  private readonly editor: DescriptionEditor;
+  private readonly stopProcess: () => Promise<boolean>;
   private readonly now: () => Date;
   private readonly queue: InputQueue;
   private readonly tries: Readonly<Record<KeymapMode, TrieNode>>;
@@ -66,7 +83,8 @@ export class Controller {
   private toastSeq = 0;
   /** The daemon's today the midnight poll last refreshed for. */
   private refreshedFor: number | undefined;
-  private idsCache: { snap: ViewSnapshot; ids: readonly string[] } | undefined;
+  private readonly idsCache = new WeakMap<ViewSnapshot, readonly string[]>();
+  private readonly idSets = new WeakMap<ViewSnapshot, ReadonlySet<string>>();
 
   constructor(opts: ControllerOptions) {
     this.store = opts.store;
@@ -82,12 +100,20 @@ export class Controller {
     this.pipeline = new Pipeline(
       this.store,
       this.timing,
-      () => this.currentView(),
+      () => this.currentViews(),
       (busy) => this.ui.setState((s) => (s.busy === busy ? s : { ...s, busy })),
     );
     this.actions = new ItemActions(this);
     this.prompts = new Prompts(this);
     this.quickAdd = new QuickAdd(this);
+    this.narrowing = new Narrowing(this);
+    const stateDir = opts.stateDir;
+    this.editor = new DescriptionEditor(
+      this,
+      opts.editor ?? systemEditor(() => this.suspendTerminal),
+      () => stateDir ?? resolvePaths(envFromProcess()).logs,
+    );
+    this.stopProcess = opts.stopProcess ?? (() => stopSelf());
   }
 
   /** Observes the store: the tabs, the current view, the counts and the undo state; starts the midnight poll. */
@@ -106,6 +132,7 @@ export class Controller {
     for (const stop of this.stops.splice(0)) stop();
     this.watched?.stop();
     this.watched = undefined;
+    this.narrowing.release();
     if (this.toastTimer) clearTimeout(this.toastTimer);
     this.toastTimer = undefined;
   }
@@ -133,9 +160,9 @@ export class Controller {
     return this.queue.idle();
   }
 
-  /** Resolves once the quick-add and prompt previews have caught up with the text (tests). */
+  /** Resolves once the quick-add and prompt previews, and `/`'s rows, have caught up with the text (tests). */
   async previewIdle(): Promise<void> {
-    await Promise.all([this.quickAdd.previewIdle(), this.prompts.previewIdle()]);
+    await Promise.all([this.quickAdd.previewIdle(), this.prompts.previewIdle(), this.narrowing.idle()]);
   }
 
   /**
@@ -190,21 +217,40 @@ export class Controller {
     return id === undefined ? undefined : this.store.getItem(id);
   }
 
-  /** What an action started now acts on: the selected Item, with the revision rendered (marks come with phase 3). */
-  target(): Target | undefined {
-    const item = this.selectedItem();
-    return item && { ids: [item.id], bulk: false, revisions: new Map([[item.id, item.revision]]) };
+  /**
+   * What an action started now acts on, with the revisions rendered: for a
+   * mark-aware key in a tab with marks, every marked Item in list order
+   * (Decision 8), else the selected Item. More than a BatchMutate takes is
+   * refused, with a toast, and nothing acts.
+   */
+  target(markAware = false): Target | undefined {
+    const marked = markAware ? this.markedIds() : [];
+    if (marked.length > MAX_BULK) {
+      this.toast("error", TOO_MANY);
+      return undefined;
+    }
+    const ids = marked.length ? marked : [this.selectedId()].filter((id) => id !== undefined);
+    const items = ids.flatMap((id) => this.store.getItem(id) ?? []);
+    if (!items.length) return undefined;
+    return { ids: items.map((i) => i.id), bulk: marked.length > 0, revisions: new Map(items.map((i) => [i.id, i.revision])) };
   }
 
-  /** The current tab's ids, as last loaded. */
+  /** The marked ids still in the tab's own rows, in their order. */
+  markedIds(): string[] {
+    return markedInOrder(this.state.marks, this.base()?.ids ?? []);
+  }
+
+  /** The current tab's ids as listed (narrowed, when `/` narrows), as last loaded. */
   currentIds(): readonly string[] {
     return this.current()?.ids ?? [];
   }
 
-  /** The current tab's live view. */
-  currentView(): LiveView | undefined {
-    const { tab } = this.state;
-    return tab === undefined ? undefined : this.store.view({ viewId: tab });
+  /** The views an action's settle reloads: the rows shown, and the tab's own (whose ids the marks follow). */
+  currentViews(): LiveView[] {
+    const { tab, narrow } = this.state;
+    if (tab === undefined) return [];
+    const base = this.store.view(tabQuery(tab));
+    return narrow?.shown === undefined ? [base] : [this.store.view(tabQuery(tab, narrow.shown)), base];
   }
 
   /** Selects `id` in the current tab, scrolled into view, if the tab lists it. */
@@ -213,6 +259,47 @@ export class Controller {
     const at = cur?.ids.indexOf(id) ?? -1;
     if (!cur || at < 0) return;
     this.setList(cur.tab, listOf(select(this.listState(cur.tab), cur.ids, this.height, at)));
+  }
+
+  /** Selects row `index` (clamped) of the current tab. */
+  selectIndex(index: number): void {
+    const cur = this.current();
+    if (!cur || cur.snap.status !== "ready") return;
+    this.setList(cur.tab, listOf(select(this.listState(cur.tab), cur.ids, this.height, index)));
+  }
+
+  /** The row index of the first marked Item listed; -1 when none is. */
+  firstMarkedIndex(): number {
+    const { marks } = this.state;
+    return marks.size ? this.currentIds().findIndex((id) => marks.has(id)) : -1;
+  }
+
+  /** Clears the marks, and V's range. */
+  clearMarks(): void {
+    this.ui.setState((s) => (s.marks.size || s.visual ? { ...s, marks: noMarks, visual: undefined } : s));
+  }
+
+  /**
+   * After the rows shown changed under `/`: the selection stays on its Item
+   * when it is still listed, else goes to the first row (Decision 9).
+   */
+  keepOrFirst(): void {
+    const cur = this.current();
+    if (!cur || cur.snap.status !== "ready") return;
+    const list = this.listState(cur.tab);
+    const kept = list.selectedId !== undefined && cur.ids.includes(list.selectedId);
+    this.setList(cur.tab, listOf(kept ? reconcile(list, cur.ids, this.height) : select({ ...initialList }, cur.ids, this.height, 0)));
+  }
+
+  /** Puts back a tab's selection and scroll as they were (esc while typing `/`). */
+  restoreList(tab: TabId, list: ListState): void {
+    this.setList(tab, list);
+    this.sync();
+  }
+
+  /** Re-settles the selection on the rows now shown. */
+  resync(): void {
+    this.sync();
   }
 
   /** The daemon's today as a day number (the local date until the counts load). */
@@ -268,11 +355,11 @@ export class Controller {
    * An action's toast (design 2.8): the undo entry's description, when the
    * top of the undo stack is this action's op, and how to undo it. When
    * another op landed on top first, `fallback` says what was done, and u
-   * is not offered: it would undo that other op.
+   * is not offered: it would undo that other op. `more` goes at the end.
    */
-  toastOp(opId: string | undefined, fallback: string): void {
+  toastOp(opId: string | undefined, fallback: string, more = ""): void {
     const top = this.store.undoState.getSnapshot().undo;
-    this.toast("info", top && opId !== undefined && top.opId === opId ? `${singleLine(top.description)} · u undo` : fallback);
+    this.toast("info", `${top && opId !== undefined && top.opId === opId ? `${singleLine(top.description)} · u undo` : fallback}${more}`);
   }
 
   /** A plain edit's toast: only when the Item left the current tab. */
@@ -328,7 +415,8 @@ export class Controller {
     return layout(size.columns, size.rows, mode.kind).bodyHeight;
   }
 
-  private listState(tab: TabId): ListState {
+  /** A tab's selection and scroll. */
+  listState(tab: TabId): ListState {
     return this.state.lists.get(tab) ?? initialList;
   }
 
@@ -336,36 +424,67 @@ export class Controller {
     this.ui.setState((s) => ({ ...s, lists: new Map(s.lists).set(tab, list) }));
   }
 
-  /** The current tab and its rows. */
+  private rows(tab: TabId, narrow?: string): { tab: TabId; snap: ViewSnapshot; ids: readonly string[] } {
+    const snap = this.store.view(tabQuery(tab, narrow)).getSnapshot();
+    let ids = this.idsCache.get(snap);
+    if (!ids) this.idsCache.set(snap, (ids = snap.items.map((i) => i.id)));
+    return { tab, snap, ids };
+  }
+
+  /** The current tab and the rows it lists: narrowed, while `/` narrows it. */
   private current(): { tab: TabId; snap: ViewSnapshot; ids: readonly string[] } | undefined {
+    const { tab, narrow } = this.state;
+    return tab === undefined ? undefined : this.rows(tab, narrow?.shown);
+  }
+
+  /** The current tab's own rows, never narrowed: the marks follow these. */
+  private base(): { tab: TabId; snap: ViewSnapshot; ids: readonly string[] } | undefined {
     const { tab } = this.state;
-    if (tab === undefined) return undefined;
-    const snap = this.store.view({ viewId: tab }).getSnapshot();
-    if (this.idsCache?.snap !== snap) this.idsCache = { snap, ids: snap.items.map((i) => i.id) };
-    return { tab, snap, ids: this.idsCache.ids };
+    return tab === undefined ? undefined : this.rows(tab);
   }
 
   /**
    * After any store change: keeps the tab one that exists, observes its
-   * view, and pins its selection, so that a later change starts from where
-   * this one left it and background changes never move the selection.
+   * view, drops the marks whose Item left it, and pins its selection, so
+   * that a later change starts from where this one left it and background
+   * changes never move the selection.
    */
   private sync(): void {
     const { views } = this.store.getViews();
     const { tab } = this.state;
     const first = views[0];
-    if (first && (tab === undefined || !views.some((v) => v.id === tab))) this.ui.setState((s) => ({ ...s, tab: first.id }));
+    if (first && (tab === undefined || (searchQuery(tab) === undefined && !views.some((v) => v.id === tab)))) {
+      this.narrowing.release();
+      this.ui.setState((s) => ({ ...s, ...leftTab(s), tab: first.id }));
+    }
     const current = this.state.tab;
     if (this.watched?.tab !== current) {
       this.watched?.stop();
-      this.watched = current === undefined ? undefined : { tab: current, stop: this.store.view({ viewId: current }).subscribe(() => {}) };
+      // A Search tab's view goes as soon as the tab closes, as `/`'s do.
+      const grace = current !== undefined && searchQuery(current) !== undefined ? { graceMs: 0 } : {};
+      this.watched = current === undefined ? undefined : { tab: current, stop: this.store.view(tabQuery(current), grace).subscribe(() => {}) };
     }
+    this.prune();
     const cur = this.current();
     // A view still loading (after a tab switch, say) has no rows yet; its selection waits for them.
     if (!cur || cur.snap.status !== "ready") return;
     const list = this.listState(cur.tab);
     const next = listOf(reconcile(list, cur.ids, this.height));
     if (!sameList(list, next)) this.setList(cur.tab, next);
+  }
+
+  /** Drops the marks whose Item the tab's own rows no longer hold (not those `/` only hides). */
+  private prune(): void {
+    const { marks, visual } = this.state;
+    if (!marks.size && !visual) return;
+    const base = this.base();
+    if (!base || base.snap.status !== "ready") return;
+    let present = this.idSets.get(base.snap);
+    if (!present) this.idSets.set(base.snap, (present = new Set(base.ids)));
+    const kept = pruneMarks(marks, present);
+    const keptBase = visual && pruneMarks(visual.base, present);
+    if (kept === marks && keptBase === visual?.base) return;
+    this.ui.setState((s) => ({ ...s, marks: kept, ...(visual && keptBase && { visual: { ...visual, base: keptBase } }) }));
   }
 
   // --- keys ---
@@ -390,9 +509,8 @@ export class Controller {
         return this.actions.pickerKey(mode, input);
       case "confirm":
         return this.actions.confirmKey(mode, input);
-      default:
-        // Search arrives in phase 3 of M4.
-        if (input === "esc" || input === "ctrl+c") this.setMode(normalMode);
+      case "search":
+        return this.narrowing.key(mode, input);
     }
   }
 
@@ -442,6 +560,8 @@ export class Controller {
         return this.quickAdd.paste(mode, text);
       case "prompt":
         return this.prompts.paste(mode, text);
+      case "search":
+        return this.narrowing.paste(mode, text);
       case "confirm":
         // Anything but y cancels.
         return this.setMode(normalMode);
@@ -464,7 +584,23 @@ export class Controller {
         this.store.refresh();
         void this.store.undoState.reload();
         return this.toast("info", "Refreshed");
+      case "search":
+        return this.openSearch(r.args);
     }
+  }
+
+  /**
+   * :search q: the "Search: q" tab after the views (Decision 9), over
+   * everything but deleted Items, most recently changed first. A new
+   * search replaces it; leaving it closes it.
+   */
+  private openSearch(text: string): void {
+    const query = matchText(text);
+    if (query === undefined) return this.toast("info", "Search for what? :search <words>");
+    if (Buffer.byteLength(query, "utf8") > 1024) return this.toast("error", "Search text is limited to 1024 bytes");
+    const { tab, search } = this.state;
+    const from = tab !== undefined && searchQuery(tab) !== undefined ? search?.from : tab;
+    this.switchTab(searchTab(query), { query, ...(from !== undefined && { from }) });
   }
 
   private runBinding(b: Binding): void | Promise<void> {
@@ -487,9 +623,9 @@ export class Controller {
       case "view":
         return this.switchTab(this.store.getViews().views[action.position - 1]?.id);
       case "view_step": {
-        const { views } = this.store.getViews();
-        const at = views.findIndex((v) => v.id === this.state.tab);
-        return this.switchTab(views[(at + action.by + views.length) % views.length]?.id);
+        const tabs = this.tabs();
+        const at = tabs.findIndex((t) => t === this.state.tab);
+        return this.switchTab(tabs[(at + action.by + tabs.length) % tabs.length]);
       }
       case "focus_toggle":
         if (layout(this.state.size.columns, this.state.size.rows).wide) {
@@ -499,8 +635,7 @@ export class Controller {
       case "open_detail":
         return this.openDetail();
       case "back":
-        if (this.state.overlay.kind === "detail" || this.state.focus === "detail") this.closeOverlay();
-        return;
+        return this.back();
       case "help":
         return this.setMode({ kind: "help", scroll: 0 });
       case "help_close":
@@ -509,8 +644,18 @@ export class Controller {
         return this.setMode({ kind: "command", line: emptyLine });
       case "quit":
         return this.quit();
+      case "suspend":
+        return this.suspendJob();
+      case "narrow":
+        return this.narrowing.open();
+      case "mark":
+        return this.mark();
+      case "visual":
+        return this.visual();
+      case "edit_description":
+        return this.editor.edit();
       case "quick_add":
-        return action.child ? this.toast("info", "Not available yet") : this.quickAdd.open();
+        return action.child ? this.quickAdd.openChild() : this.quickAdd.open();
       case "prompt":
         return this.prompts.open(action.prompt);
       case "status_picker":
@@ -529,8 +674,6 @@ export class Controller {
         return this.actions.undo(false);
       case "redo":
         return this.actions.undo(true);
-      default:
-        return this.toast("info", "Not available yet");
     }
   }
 
@@ -555,7 +698,60 @@ export class Controller {
     }
     const cur = this.current();
     if (!cur || cur.snap.status !== "ready") return;
-    this.setList(cur.tab, listOf(list(this.listState(cur.tab), cur.ids)));
+    const next = list(this.listState(cur.tab), cur.ids);
+    this.setList(cur.tab, listOf(next));
+    // V: the range follows the selection.
+    const { visual } = this.state;
+    if (visual) this.ui.setState((s) => ({ ...s, marks: rangeMarks(visual, cur.ids, next.index) }));
+  }
+
+  /** m: marks the selected Item, or unmarks it, and moves down (ending a V range, keeping its marks). */
+  private mark(): void {
+    const cur = this.current();
+    const id = this.selectedId();
+    if (!cur || id === undefined) return;
+    this.ui.setState((s) => ({ ...s, visual: undefined, marks: toggleMark(s.marks, id) }));
+    this.setList(cur.tab, listOf(move(this.listState(cur.tab), cur.ids, this.height, 1)));
+  }
+
+  /** V: starts marking the rows between here and the selection as it moves; V again ends it, keeping the marks. */
+  private visual(): void {
+    if (this.state.visual) return this.ui.setState((s) => ({ ...s, visual: undefined }));
+    const cur = this.current();
+    const id = this.selectedId();
+    if (!cur || id === undefined) return;
+    const visual = { anchorId: id, anchor: cur.ids.indexOf(id), base: this.state.marks };
+    this.ui.setState((s) => ({ ...s, visual, marks: rangeMarks(visual, cur.ids, anchorIndex(visual, cur.ids)) }));
+  }
+
+  /**
+   * esc in normal mode steps back one level per press (Decision 5): the
+   * detail, then a V range (its marks kept), then the narrowing, then the
+   * marks; on the Search tab with nothing else to undo, back to the tab it
+   * was opened from.
+   */
+  private back(): void {
+    const s = this.state;
+    if (s.overlay.kind === "detail" || s.focus === "detail") return this.closeOverlay();
+    if (s.visual) return this.ui.setState((st) => ({ ...st, visual: undefined }));
+    if (s.narrow) return this.narrowing.clear();
+    if (s.marks.size) return this.clearMarks();
+    if (s.tab !== undefined && searchQuery(s.tab) !== undefined && s.search?.from !== undefined) this.switchTab(s.search.from);
+  }
+
+  /**
+   * ctrl-z: stops the TUI as a shell job, the terminal handed back; fg
+   * resumes it, redrawn, and the stream catches up. With no job control
+   * nothing stops it, and it takes the terminal back at once.
+   */
+  private async suspendJob(): Promise<void> {
+    const suspend = this.suspendTerminal;
+    if (!suspend) return this.toast("info", "Cannot suspend here");
+    let stopped = false;
+    await suspend(async () => {
+      stopped = await this.stopProcess();
+    });
+    if (!stopped) this.toast("info", "Cannot suspend: no job control here");
   }
 
   /** Focuses the detail pane: beside the list when wide, else as the full-screen overlay. */
@@ -570,10 +766,26 @@ export class Controller {
     this.ui.setState((s) => ({ ...s, focus: "list", overlay: { kind: "none" } }));
   }
 
-  private switchTab(tab: TabId | undefined): void {
-    if (tab === undefined || tab === this.state.tab) return;
-    this.ui.setState((s) => ({ ...s, tab, focus: "list", overlay: { kind: "none" } }));
+  /**
+   * Goes to `tab`, with its own selection. The marks and the narrowing
+   * belong to the tab left, and go; so does the Search tab, when left.
+   */
+  private switchTab(tab: TabId | undefined, search?: UiState["search"]): void {
+    if (tab === undefined || (tab === this.state.tab && !search)) return;
+    this.narrowing.release();
+    this.ui.setState((s) => {
+      const left = leftTab(s);
+      // A new search starts from its first row.
+      const lists = search && left.lists.has(tab) ? new Map([...left.lists].filter(([t]) => t !== tab)) : left.lists;
+      return { ...s, ...left, lists, tab, focus: "list", overlay: { kind: "none" }, search };
+    });
     this.sync();
+  }
+
+  /** The tabs, in order: the views, then the Search tab while open. */
+  private tabs(): TabId[] {
+    const { search } = this.state;
+    return [...this.store.getViews().views.map((v) => v.id), ...(search ? [searchTab(search.query)] : [])];
   }
 
   private clearToast(): void {
@@ -581,4 +793,10 @@ export class Controller {
     this.toastTimer = undefined;
     this.ui.setState((s) => ({ ...s, toast: undefined }));
   }
+}
+
+/** What leaving a tab clears: its marks, its V range and its narrowing; a Search tab's selection too, as the tab closes. */
+function leftTab(s: UiState): Pick<UiState, "lists" | "marks" | "visual" | "narrow"> {
+  const lists = s.tab !== undefined && searchQuery(s.tab) !== undefined ? new Map([...s.lists].filter(([t]) => t !== s.tab)) : s.lists;
+  return { lists, marks: noMarks, visual: undefined, narrow: undefined };
 }

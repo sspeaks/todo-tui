@@ -111,8 +111,8 @@ describe("keys", () => {
     expect(t.state().toast).toMatchObject({ level: "error", text: "Not a command: zz" });
     await t.c.press(":sync<enter>");
     expect(t.state().toast).toMatchObject({ level: "info", text: ":sync arrives with Jira sync in P2" });
-    await t.c.press(":search milk<enter>");
-    expect(t.state().toast?.text).toBe(":search is coming soon");
+    await t.c.press(":search  <enter>");
+    expect(t.state().toast?.text).toBe("Search for what? :search <words>");
     await t.c.press(":re<tab>");
     expect(t.state().mode).toMatchObject({ kind: "command", line: { text: "refresh" } });
     const calls = t.daemon.calls.listItems;

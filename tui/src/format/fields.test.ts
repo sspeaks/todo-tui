@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { commonPrefix, formatLabels, parseLabels, parseWaiting, sameLabels, waitingPrefix } from "./fields.js";
+import { applyLabelEdits, commonPrefix, formatLabels, parseLabelEdits, parseLabels, parseWaiting, sameLabels, waitingPrefix } from "./fields.js";
 
 describe("the t and w texts", () => {
   it("reads labels as a set of words, # optional", () => {
@@ -8,6 +8,17 @@ describe("the t and w texts", () => {
     expect(parseLabels("# ")).toEqual([]);
     expect(sameLabels(["a", "b"], ["b", "a"])).toBe(true);
     expect(sameLabels(["a"], ["a", "b"])).toBe(false);
+  });
+
+  it("reads bulk t's +a -b and applies it to each Item's own labels", () => {
+    expect(parseLabelEdits(" +a -b #c d -#e + -")).toEqual({ add: ["a", "c", "d"], remove: ["b", "e"] });
+    // The last word for a label wins.
+    expect(parseLabelEdits("+a -a")).toEqual({ add: [], remove: ["a"] });
+    expect(parseLabelEdits("-a a")).toEqual({ add: ["a"], remove: [] });
+    const edits = parseLabelEdits("+urgent -later");
+    expect(applyLabelEdits(["later", "home"], edits)).toEqual(["home", "urgent"]);
+    expect(applyLabelEdits(["urgent"], edits)).toEqual(["urgent"]);
+    expect(applyLabelEdits([], parseLabelEdits(""))).toEqual([]);
   });
 
   it("reads <person> [^date], the person with spaces, only a last ^word a date", () => {

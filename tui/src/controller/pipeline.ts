@@ -35,6 +35,8 @@ export type CallOpts = CallOptions & { requestId: string };
 export interface Effect<R> {
   /** The RPC; called again with the same options after a connection failure. */
   readonly call: (opts: CallOpts) => Promise<R>;
+  /** The request_id to send (default: a new one), e.g. the one of a capture whose outcome is unknown. */
+  readonly requestId?: string;
   /** The Items the response carries, and the revision they were read at. */
   readonly items: (res: R) => { readonly items: readonly Item[]; readonly revision: bigint };
 }
@@ -53,8 +55,8 @@ export class Pipeline {
   constructor(
     private readonly store: LiveStore,
     private readonly timing: Timing,
-    /** The current tab's view, reloaded after each action. */
-    private readonly view: () => LiveView | undefined,
+    /** The current tab's views (the rows shown, and its own), reloaded after each action. */
+    private readonly views: () => readonly LiveView[],
     /** Sets (or, with undefined, clears) the status bar's "saving…". */
     private readonly busy: (label: string | undefined) => void,
   ) {}
@@ -63,7 +65,7 @@ export class Pipeline {
   async run<R>(effect: Effect<R>): Promise<Outcome<R>> {
     const saving = setTimeout(() => this.busy("saving…"), this.timing.savingMs);
     try {
-      const res = await this.call(effect.call);
+      const res = await this.call(effect.call, effect.requestId);
       const { items, revision } = effect.items(res);
       this.store.applyItems(items, revision);
       await this.settle(revision);
@@ -77,12 +79,12 @@ export class Pipeline {
   }
 
   /**
-   * Re-reads the current view and the undo state: the next key sees the
+   * Re-reads the current views and the undo state: the next key sees the
    * list as the action left it (read at `revision` or later), and u names
    * the action.
    */
   async settle(revision = 0n): Promise<void> {
-    await Promise.all([this.reloadView(revision), this.store.undoState.reload()]);
+    await Promise.all([...this.views().map((v) => this.reloadView(v, revision)), this.store.undoState.reload()]);
   }
 
   /**
@@ -90,9 +92,7 @@ export class Pipeline {
    * the change's own debounced requery starts meanwhile discards this
    * one's rows, and a failed load keeps the old ones.
    */
-  private async reloadView(revision: bigint): Promise<void> {
-    const view = this.view();
-    if (!view) return;
+  private async reloadView(view: LiveView, revision: bigint): Promise<void> {
     for (let tries = 0; tries < SETTLE_TRIES; tries++) {
       await view.load();
       if (view.getSnapshot().revision >= revision) return;
@@ -106,8 +106,8 @@ export class Pipeline {
    * applies once (Decision 6); after `retryMs` it gives up with
    * DaemonUnavailable.
    */
-  async call<R>(call: (opts: CallOpts) => Promise<R>): Promise<R> {
-    const opts: CallOpts = { requestId: ulid(), timeoutMs: this.timing.rpcTimeoutMs };
+  async call<R>(call: (opts: CallOpts) => Promise<R>, requestId: string = ulid()): Promise<R> {
+    const opts: CallOpts = { requestId, timeoutMs: this.timing.rpcTimeoutMs };
     let deadline: number | undefined;
     for (;;) {
       try {

@@ -2,7 +2,7 @@ import type { ItemsClient, LiveStore, LiveStoreOptions } from "@todo-tui/client"
 import { expect, type Mock, vi } from "vitest";
 import { type FakeDaemonHandle, fakeDaemon, rows } from "../fake.test-util.js";
 import { initialList } from "../state/selection.js";
-import { Controller } from "./controller.js";
+import { Controller, type ControllerOptions } from "./controller.js";
 import type { Timing } from "./pipeline.js";
 
 const running: { c: Controller; store: LiveStore }[] = [];
@@ -23,6 +23,8 @@ export interface SetupOptions {
   timing?: Partial<Timing>;
   /** The ItemService client actions call (default: the daemon's), e.g. one that holds or fails calls. */
   items?: (items: ItemsClient) => ItemsClient;
+  /** E's editor, the state dir, ctrl-z's stop. */
+  controller?: Pick<ControllerOptions, "editor" | "stateDir" | "stopProcess">;
 }
 
 /** A started controller over FakeDaemon, 100×30 (a 27-row list), on the first tab with its rows loaded. */
@@ -31,7 +33,7 @@ export async function setup(fd: FakeDaemonHandle = fakeDaemon(rows(5)), opts: Se
   const store = fd.store(opts.store);
   const daemonItems = fd.clients().items;
   const items = opts.items ? opts.items(daemonItems) : daemonItems;
-  const c = new Controller({ store, items, ...(now && { now }), ...(timing && { timing }) });
+  const c = new Controller({ store, items, ...(now && { now }), ...(timing && { timing }), ...opts.controller });
   running.push({ c, store });
   const quit: Mock<() => void> = vi.fn();
   c.onQuit = quit;
@@ -47,7 +49,8 @@ export async function setup(fd: FakeDaemonHandle = fakeDaemon(rows(5)), opts: Se
   await vi.waitFor(() => expect(store.undoState.getSnapshot().status).toBe("ready"));
   const list = () => state().lists.get(state().tab ?? "") ?? initialList;
   const tabIs = (seed: string) => state().tab === fd.viewId(seed);
-  const titles = () => store.view({ viewId: state().tab ?? "" }).getSnapshot().items.map((i) => i.title);
+  /** The titles the current tab lists (narrowed while `/` narrows it). */
+  const titles = () => c.currentIds().map((id) => store.getItem(id)?.title);
   /** The ops the user's own RPCs made (not the tests' put and update). */
   const userOps = () => fd.daemon.ops.filter((o) => o.actor === "user");
   /** An Item in the daemon by title. */
