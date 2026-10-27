@@ -8,6 +8,10 @@ describe("layout", () => {
     expect(layout(39, 30).tooSmall).toBe(true);
     expect(layout(40, 7).tooSmall).toBe(true);
     expect(layout(40, 8)).toMatchObject({ tooSmall: false, bodyHeight: 5 });
+    // Quick-add's input and preview, and a prompt's preview line, come out of the body.
+    expect(layout(120, 30, "quickAdd").bodyHeight).toBe(25);
+    expect(layout(120, 30, "prompt").bodyHeight).toBe(26);
+    expect(layout(120, 30, "picker").bodyHeight).toBe(27);
   });
 
   it("drops row columns in order (markers, waiting, key, due) to keep the title at least 20", () => {

@@ -2,22 +2,26 @@ import { type MessageInitShape, clone, create, equals } from "@bufbuild/protobuf
 import { type Timestamp, TimestampSchema } from "@bufbuild/protobuf/wkt";
 import { Code, ConnectError, type Transport, createRouterTransport } from "@connectrpc/connect";
 import { BadRequestSchema, ErrorInfoSchema } from "./gen/google/rpc/error_details_pb.js";
-import { type MutationResultSchema, Topic } from "./gen/todo/v1/common_pb.js";
+import { DateSchema } from "./gen/google/type/date_pb.js";
+import { type MutationResultSchema, type PersonRef, PersonRefSchema, Topic } from "./gen/todo/v1/common_pb.js";
 import { ItemField } from "./gen/todo/v1/field_pb.js";
 import { type Filter, FilterSchema, type OperandSchema, Operator, RelativeDate_Anchor } from "./gen/todo/v1/filter_pb.js";
 import {
   ArchiveReason,
   ArchivedSchema,
+  CreatedVia,
   type Item,
   ItemSchema,
-  Priority,
   ResolutionKind,
   Status,
   StatusCategory,
   TodoRefinement,
+  type Waiting,
+  WaitingSchema,
 } from "./gen/todo/v1/item_pb.js";
 import {
   type AddRelationRequest,
+  type CaptureDraft,
   type CaptureItemRequest,
   type GetStatusCountsRequest,
   type GetStatusCountsResponseSchema,
@@ -25,6 +29,7 @@ import {
   type ListItemsRequest,
   type ListItemsResponseSchema,
   type Mutation,
+  type ParseCaptureRequest,
   type ParseDateRequest,
   type ParseDateResponseSchema,
   type RedoRequest,
@@ -38,6 +43,7 @@ import { SystemService } from "./gen/todo/v1/system_service_pb.js";
 import { type View, ViewSchema } from "./gen/todo/v1/view_pb.js";
 import { ViewService } from "./gen/todo/v1/view_service_pb.js";
 import { type Change, ChangeSchema, type SubscribeResponse, SubscribeResponseSchema, WatchService } from "./gen/todo/v1/watch_service_pb.js";
+import { parseCaptureText } from "./capture.js";
 import { dayIn, epochMs, parseDateExpr, protoDate, rustTrim } from "./dates.js";
 import { defaultViews } from "./default-views.js";
 import {
@@ -141,7 +147,7 @@ interface Planned {
   idPath: string;
   /** Whether it is part of a BatchMutate, whose precondition failures name `idPath`. */
   batched: boolean;
-  /** UpdateItem: the mask's paths, in order, and the values of their top-level fields. */
+  /** UpdateItem: the mask's paths, in order, and the request's values for them, by path. */
   mask?: { paths: readonly string[]; values: Fields };
   /** SetStatus: the target. */
   status?: Status;
@@ -258,26 +264,36 @@ export interface FakeDaemonOptions {
  * - Relations (design 3.6): canonical RELATES_TO, no-op adds and removes,
  *   both ends bumped and published, Item.relations on both ends; a
  *   relation outlives a deleted end, and undo and redo change it anyway.
+ * - Capture (design 2.3): ParseCapture, and CaptureItem parsing its text,
+ *   with todo_core::capture ported (capture.ts) on the reference day: the
+ *   tokens with code-point offsets, the warnings, last-wins, the escape;
+ *   a ~ token waits on free text since that day. created_via must be TUI,
+ *   CLI or MCP; a replay by request_id or spool_id returns the original
+ *   capture, with the text parsed on the day the Item was created.
+ * - UpdateItem checks its mask's paths as the daemon does: Item field paths
+ *   only, each field once; status, archived, relations and read-only paths
+ *   are refused. Of the values it checks titles (stored trimmed, then
+ *   non-empty, at most 64 KiB and one line), labels (non-empty, with no
+ *   whitespace or control character, deduplicated), parent_id and a
+ *   waiting's `on` (free text stored trimmed, not empty);
+ *   a waiting without `since` is waiting since today. A nested waiting
+ *   path changes only that field and fails while waiting is unset.
+ *   SetStatus checks its status and decomposes it into the triple as the
+ *   daemon does.
  *
  * put and update are the tests' off-stack changes: an op by the system,
  * never an undo stack entry and leaving the redo stack alone, so a later
  * Undo skips what they changed. remove is a hard removal.
  *
- * What it does not model: capture parsing (the title is the text, and
- * reference_time only sets created_at) and spool_id; field values and
- * read-only fields are not checked, except the 64 KiB limit on capture
- * text, titles (stored trimmed, then non-empty and at most 64 KiB), labels
- * (deduplicated), parent_id and SetStatus's status.
- * SetStatus decomposes the status into the triple as the daemon does.
- * UpdateItem checks its mask's paths as the daemon does (Item field paths
- * only, each field once; status, archived and relations paths are refused)
- * and copies the top-level fields they name, so for it a nested path such
- * as "waiting.reason" changes, records and restores the whole `waiting`.
- * Staleness signals are not maintained or restored (`updated_at` is set on
- * every op that touches an Item); request ids never expire. MATCHES
- * approximates the full-text index (lower case, accents stripped, runs of
- * letters and digits), so it agrees on ASCII and Latin text but not on
- * every script or symbol. ParseCapture is not implemented (UNIMPLEMENTED).
+ * What it does not model: other field values are not checked (enums, dates,
+ * numbers, estimates, focus_week, people, and the tracker-only fields of an
+ * unlinked Item are taken as given). An op records a changed top-level
+ * field as one event, so a nested waiting path records, and its undo
+ * restores, the whole `waiting`. Staleness signals are not maintained or
+ * restored (`updated_at` is set on every op that touches an Item); request
+ * ids never expire. MATCHES approximates the full-text index (lower case,
+ * accents stripped, runs of letters and digits), so it agrees on ASCII and
+ * Latin text but not on every script or symbol.
  */
 export class FakeDaemon {
   revision = 0n;
@@ -303,6 +319,8 @@ export class FakeDaemon {
   private readonly watchers = new Set<Waiter>();
   /** Requests by request_id (upper case), for replays. */
   private readonly requests = new Map<string, Recorded>();
+  /** Captures by spool_id (upper case), for replays. */
+  private readonly spools = new Map<string, Recorded>();
   /** Every relation, by relationKey. */
   private readonly relations = new Map<string, Relation>();
   private nextId = 0;
@@ -324,6 +342,10 @@ export class FakeDaemon {
       });
       service(ItemService, {
         captureItem: (req) => this.capture(req),
+        parseCapture: (req) => {
+          this.check();
+          return this.parseCapture(req);
+        },
         parseDate: (req) => {
           this.check();
           return this.parseDate(req);
@@ -343,7 +365,7 @@ export class FakeDaemon {
           this.check();
           return { item: this.present(this.get(idOf("id", req.id)), this.today()), revision: this.revision };
         },
-        updateItem: (req) => this.single("UpdateItem", OpKind.UPDATE, req.requestId, () => planUpdate(req, "")),
+        updateItem: (req) => this.single("UpdateItem", OpKind.UPDATE, req.requestId, () => planUpdate(req, "", this.today())),
         setStatus: (req) => this.single("SetStatus", OpKind.SET_STATUS, req.requestId, () => planSetStatus(req, "")),
         archiveItem: (req) => this.single("ArchiveItem", OpKind.ARCHIVE, req.requestId, () => planItemOp("archive", req, "")),
         unarchiveItem: (req) => this.single("UnarchiveItem", OpKind.UNARCHIVE, req.requestId, () => planItemOp("unarchive", req, "")),
@@ -355,7 +377,8 @@ export class FakeDaemon {
           if (req.mutations.length < 1 || req.mutations.length > MAX_BATCH) {
             throw badRequest("mutations", `must hold 1 to ${MAX_BATCH} mutations`);
           }
-          const planned = req.mutations.map((m, i) => planMutation(m, `mutations[${i}].`));
+          const today = this.today();
+          const planned = req.mutations.map((m, i) => planMutation(m, `mutations[${i}].`, today));
           return this.mutate("BatchMutate", OpKind.BATCH, requestId, planned);
         },
         undo: (req) => this.undoTx("Undo", req, false),
@@ -493,6 +516,7 @@ export class FakeDaemon {
     this.relations.clear();
     this.ops.length = 0;
     this.requests.clear();
+    this.spools.clear();
     for (const item of items) {
       this.items.set(item.id, this.settle(item));
       for (const r of item.relations) this.relations.set(relationKey(r), clone(RelationSchema, r));
@@ -656,37 +680,62 @@ export class FakeDaemon {
     return { warning: typed === "" ? parsed.reason : `${typed}: ${parsed.reason}` };
   }
 
-  private capture(req: CaptureItemRequest): { item: Item; result: MutationResult } {
+  /** ParseCapture: the capture syntax on the reference day; blank text gives an empty draft. */
+  private parseCapture(req: ParseCaptureRequest): { draft: CaptureDraft } {
+    if (overCaptureLimit(req.text)) throw badRequest("text", TOO_LONG);
+    return { draft: parseCaptureText(req.text, this.referenceDay(req.referenceTime)) };
+  }
+
+  /**
+   * CaptureItem, with the daemon's checks in its order. The text is parsed
+   * on the reference day, which is the new Item's created_at; a replay (by
+   * request_id, then by spool_id) returns the original result, the Item's
+   * current state and the text parsed on the day it was created.
+   */
+  private capture(req: CaptureItemRequest): { item: Item; result: MutationResult; draft: CaptureDraft } {
     this.check();
     const requestId = requestIdOf(req.requestId);
     if (overCaptureLimit(req.text)) throw badRequest("text", TOO_LONG);
-    if (req.text.trim() === "") throw badRequest("text", "must not be empty");
+    if (rustTrim(req.text) === "") throw badRequest("text", "must not be empty");
+    checkCreatedVia(req.createdVia);
     if (req.referenceTime !== undefined) this.referenceDay(req.referenceTime);
     const parentId = req.parentId === undefined ? undefined : canonicalUlid(req.parentId);
     if (parentId === null) throw badRequest("parent_id", "must be a ULID");
-    const recorded = this.recorded("CaptureItem", requestId);
-    if (recorded) return { item: this.present(this.get(recorded.id), this.today()), result: recorded.result };
+    const spoolId = req.spoolId ? canonicalUlid(req.spoolId) : undefined;
+    if (spoolId === null) throw badRequest("spool_id", "must be a ULID");
+    const recorded = this.recorded("CaptureItem", requestId) ?? (spoolId === undefined ? undefined : this.spools.get(spoolId));
+    if (recorded) {
+      const item = this.present(this.get(recorded.id), this.today());
+      return { item, result: recorded.result, draft: parseCaptureText(req.text, this.today(item.createdAt)) };
+    }
     const problem = parentId === undefined ? undefined : this.batch().unusableParent(parentId);
     if (problem) throw badRequest("parent_id", problem);
     // The reference time is the new Item's created_at, as a spool import's capture time is.
     const now = req.referenceTime ?? this.stamp();
+    const day = this.today(now);
+    const draft = parseCaptureText(req.text, day);
     const item = create(ItemSchema, {
       id: this.newId(),
-      title: req.text,
+      title: draft.title,
       createdVia: req.createdVia,
       createdAt: now,
       updatedAt: now,
       itemType: "task",
-      priority: Priority.NONE,
-      ...INBOX_TRIPLE,
-      status: Status.INBOX,
+      priority: draft.priority,
+      labels: draft.labels,
+      ...withStatus(INBOX_TRIPLE, draft.status),
+      status: draft.status,
+      ...(draft.dueDate !== undefined && { dueDate: draft.dueDate }),
+      ...(draft.waitingOn !== undefined && { waiting: { on: draft.waitingOn, reason: "", since: protoDate(day) } }),
       ...(parentId !== undefined && { parentId }),
     });
     item.revision = ++this.revision;
     this.items.set(item.id, this.settle(item));
     const op = this.log({ kind: OpKind.CAPTURE, actor: "user", summary: `capture ${quoted(item.title)}`, events: [{ kind: "create", itemId: item.id }] });
     this.publish({ revision: item.revision, topic: Topic.ITEM, id: item.id, resource: { case: "item", value: item } });
-    return { item, result: this.record("CaptureItem", requestId, item.id, op) };
+    const result = this.record("CaptureItem", requestId, item.id, op);
+    if (spoolId !== undefined) this.spools.set(spoolId, this.requests.get(requestId)!);
+    return { item, result, draft };
   }
 
   /** A single-item RPC: checks `requestId`, converts the request with `plan` and runs it as one op of `kind`. */
@@ -1276,9 +1325,12 @@ class Working {
 /**
  * The fields a mutation sets on `item` (empty when it changes nothing). For
  * UpdateItem it checks the mask's paths in order, as the store applies them:
- * a path that repeats or overlaps an earlier one, a status or archived
- * path, a title that is empty once trimmed or too long, and a parent_id
- * that names the Item itself; labels are deduplicated, keeping the first.
+ * a path that repeats or overlaps an earlier one, a status, archived or
+ * read-only path, a title that is empty once trimmed, too long or more than
+ * one line, a parent_id that names the Item itself, a waiting's `on`, a
+ * nested waiting path while waiting is unset, and an empty label or one
+ * with whitespace or a control character; labels are deduplicated, keeping
+ * the first.
  */
 function patchOf(p: Planned, item: Item, now: Timestamp): Fields {
   switch (p.kind) {
@@ -1289,17 +1341,35 @@ function patchOf(p: Planned, item: Item, now: Timestamp): Fields {
         const top = path.split(".")[0]!;
         const overlaps = (earlier: string) => earlier === path || earlier === top || earlier.split(".")[0] === path;
         if (paths.slice(0, at).some(overlaps)) throw badRequest(`${p.prefix}update_mask`, `${JSON.stringify(path)} repeats or overlaps an earlier path`);
-        if (STATUS_PATHS.has(path)) throw badRequest(`${p.prefix}item.${path}`, "changes only through SetStatus");
-        if (top === "archived") throw badRequest(`${p.prefix}item.${path}`, "changes only through ArchiveItem and UnarchiveItem");
+        const where = `${p.prefix}item.${path}`;
+        if (STATUS_PATHS.has(path)) throw badRequest(where, "changes only through SetStatus");
+        if (top === "archived") throw badRequest(where, "changes only through ArchiveItem and UnarchiveItem");
+        if (!WRITABLE.has(top)) throw badRequest(where, "is read-only");
         const field = FIELDS_BY_NAME.get(top)!.localName;
-        let value = values[field];
-        if (field === "title" && typeof value === "string") {
-          value = value.trim();
-          if (value === "") throw badRequest(`${p.prefix}item.title`, "must not be empty");
-          if (overCaptureLimit(value as string)) throw badRequest(`${p.prefix}item.title`, TOO_LONG);
+        let value = values[path];
+        if (path.startsWith("waiting.")) {
+          // Only that field changes; the event still records the whole waiting.
+          const waiting = (patch.waiting ?? item.waiting) as Waiting | undefined;
+          if (waiting === undefined) throw badRequest(where, "cannot be set while waiting is unset");
+          value = withWaitingField(waiting, path, value, p.prefix);
+        } else if (field === "waiting" && value !== undefined) {
+          const waiting = clone(WaitingSchema, value as Waiting);
+          waiting.on = waitingOn(waiting.on!, p.prefix);
+          value = waiting;
         }
-        if (field === "parentId" && value === item.id) throw badRequest(`${p.prefix}item.parent_id`, "an Item cannot be its own parent");
-        if (field === "labels" && Array.isArray(value)) value = [...new Set(value)];
+        if (field === "title" && typeof value === "string") {
+          value = rustTrim(value);
+          if (value === "") throw badRequest(where, "must not be empty");
+          if (overCaptureLimit(value as string)) throw badRequest(where, TOO_LONG);
+          if (LINE_BREAK.test(value as string)) throw badRequest(where, "must be a single line");
+        }
+        if (field === "parentId" && value === item.id) throw badRequest(where, "an Item cannot be its own parent");
+        if (field === "labels" && Array.isArray(value)) {
+          if (value.some((l: string) => l === "" || BAD_LABEL.test(l))) {
+            throw badRequest(where, "labels must be non-empty and contain no whitespace or control characters");
+          }
+          value = [...new Set(value)];
+        }
         patch[field] = value;
       }
       return patch;
@@ -1590,6 +1660,15 @@ function requestIdOf(requestId: string): string {
   return id;
 }
 
+/** CaptureItem's created_via, converted and checked as the daemon does: TUI, CLI or MCP. */
+function checkCreatedVia(via: CreatedVia): void {
+  if (via === CreatedVia.UNSPECIFIED) throw badRequest("created_via", "value must not be UNSPECIFIED");
+  if (CreatedVia[via] === undefined) throw badRequest("created_via", `unknown enum value ${via}`);
+  if (via !== CreatedVia.TUI && via !== CreatedVia.CLI && via !== CreatedVia.MCP) {
+    throw badRequest("created_via", "must be TUI, CLI or MCP; the other values are reserved for the daemon");
+  }
+}
+
 /** The ULID at request field `path`, in canonical (upper) case. */
 function idOf(path: string, id: string): string {
   const canonical = canonicalUlid(id);
@@ -1641,14 +1720,14 @@ function merged(prev: Item, init: MessageInitShape<typeof ItemSchema>): Item {
 }
 
 /** One mutation of a BatchMutate, converted as the daemon does: errors name `mutations[i].<case>.<path>`. */
-function planMutation(m: Mutation, prefix: string): Planned {
+function planMutation(m: Mutation, prefix: string, today: number): Planned {
   const k = m.kind;
   if (k.case === undefined) throw badRequest(`${prefix}kind`, "required field is missing");
   const inner = `${prefix}${k.case.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`)}.`;
   if (k.value.requestId !== "") throw badRequest(`${inner}request_id`, "must be empty in a batch: the batch's request_id covers it");
   switch (k.case) {
     case "updateItem":
-      return planUpdate(k.value, inner);
+      return planUpdate(k.value, inner, today);
     case "setStatus":
       return planSetStatus(k.value, inner);
     case "archiveItem":
@@ -1662,10 +1741,11 @@ function planMutation(m: Mutation, prefix: string): Planned {
   }
 }
 
-function planUpdate(req: UpdateItemRequest, prefix: string): Planned {
+/** UpdateItem; `today` is the day a `waiting` without `since` is waiting since. */
+function planUpdate(req: UpdateItemRequest, prefix: string, today: number): Planned {
   const idPath = `${prefix}item.id`;
   const id = idOf(idPath, req.item?.id ?? "");
-  return { kind: "update", id, expectedRevision: req.expectedRevision, prefix, idPath, batched: prefix !== "", mask: maskOf(req, prefix) };
+  return { kind: "update", id, expectedRevision: req.expectedRevision, prefix, idPath, batched: prefix !== "", mask: maskOf(req, prefix, today) };
 }
 
 function planSetStatus(req: { id: string; status: Status; expectedRevision?: bigint | undefined }, prefix: string): Planned {
@@ -1699,13 +1779,15 @@ function knownPath(path: string): boolean {
 }
 
 /**
- * The update mask's paths and the request's values of their top-level
- * fields, converted as the daemon converts the request, before it looks at
- * the Item: it rejects a missing or empty mask, "*", relations, an unknown
- * path, and a parent_id that is not a ULID (read, like every value, only
- * up to the first repeated path).
+ * The update mask's paths and the request's values for them by path (for a
+ * nested waiting path, that field of the request's waiting), converted as
+ * the daemon converts the request, before it looks at the Item: it rejects
+ * a missing or empty mask, "*", relations, an unknown path, a parent_id
+ * that is not a ULID and a waiting without `on`, and a waiting without
+ * `since` is waiting since `today` (read, like every value, only up to the
+ * first repeated path).
  */
-function maskOf(req: UpdateItemRequest, prefix: string): { paths: readonly string[]; values: Fields } {
+function maskOf(req: UpdateItemRequest, prefix: string, today: number): { paths: readonly string[]; values: Fields } {
   if (req.updateMask === undefined) throw badRequest(`${prefix}update_mask`, "required field is missing");
   const paths = req.updateMask.paths;
   if (paths.length === 0) throw badRequest(`${prefix}update_mask`, "must not be empty");
@@ -1718,10 +1800,92 @@ function maskOf(req: UpdateItemRequest, prefix: string): { paths: readonly strin
     if (!knownPath(path)) throw badRequest(`${prefix}update_mask`, `unknown field path ${JSON.stringify(path)}`);
     repeated ||= paths.indexOf(path) < at;
     if (repeated) continue;
-    const field = FIELDS_BY_NAME.get(path.split(".")[0]!)!.localName;
+    const [top, sub] = path.split(".");
+    const field = FIELDS_BY_NAME.get(top!)!.localName;
     const value = source[field];
-    values[field] = field === "parentId" && typeof value === "string" ? idOf(`${prefix}item.parent_id`, value) : value;
+    if (sub !== undefined) {
+      const waiting = top === "waiting" ? (value as Waiting | undefined) : undefined;
+      // An unset reason is "", as proto3 reads it.
+      values[path] = sub === "reason" ? (waiting?.reason ?? "") : (waiting as unknown as Fields | undefined)?.[WAITING_FIELDS.get(sub) ?? ""];
+    } else if (field === "parentId" && typeof value === "string") {
+      values[path] = idOf(`${prefix}item.parent_id`, value);
+    } else if (field === "waiting" && value !== undefined) {
+      const waiting = value as Waiting;
+      if (waiting.on === undefined) throw badRequest(`${prefix}item.waiting.on`, "required field is missing");
+      const out = clone(WaitingSchema, waiting);
+      out.since ??= create(DateSchema, protoDate(today));
+      values[path] = out;
+    } else {
+      values[path] = value;
+    }
   }
   return { paths, values };
+}
+
+/** Waiting's fields' localNames by name. */
+const WAITING_FIELDS = new Map(WaitingSchema.fields.map((f) => [f.name, f.localName]));
+
+/**
+ * The top-level Item fields UpdateItem writes; the others are status
+ * fields (SetStatus), archived (ArchiveItem) or read-only.
+ */
+const WRITABLE = new Set([
+  "title",
+  "description",
+  "item_type",
+  "priority",
+  "assignee",
+  "labels",
+  "components",
+  "fix_versions",
+  "due_date",
+  "parent_id",
+  "story_points",
+  "original_estimate",
+  "remaining_estimate",
+  "waiting",
+  "defer_until",
+  "private_notes",
+  "focus_week",
+  "local_priority_override",
+]);
+
+/** What todo_core takes for a line break, which a title must not have. */
+const LINE_BREAK = /[\n\r\v\f\u0085\u2028\u2029]/;
+
+/** What a label must not contain: Unicode White_Space or a control character, as todo_core checks. */
+const BAD_LABEL = /[\p{White_Space}\p{Cc}]/u;
+
+/** `on` as the daemon stores a waiting's person: free text trimmed, and then not empty. */
+function waitingOn(on: PersonRef, prefix: string): PersonRef {
+  if (on.ref.case !== "freeText") return on;
+  const text = rustTrim(on.ref.value);
+  if (text === "") throw badRequest(`${prefix}item.waiting.on`, "free text must not be empty");
+  return create(PersonRefSchema, { ref: { case: "freeText", value: text } });
+}
+
+/**
+ * `waiting` with its field at `path` (e.g. "waiting.reason") set to `value`,
+ * as the daemon sets a nested waiting path: only that field changes, `on`
+ * cannot be cleared (clear waiting instead) and `since` cannot be cleared.
+ */
+function withWaitingField(waiting: Waiting, path: string, value: unknown, prefix: string): Waiting {
+  const out = clone(WaitingSchema, waiting);
+  switch (path) {
+    case "waiting.on":
+      if (value === undefined) throw badRequest(`${prefix}item.waiting.on`, "clear waiting instead");
+      out.on = waitingOn(value as PersonRef, prefix);
+      break;
+    case "waiting.reason":
+      out.reason = value as string;
+      break;
+    case "waiting.since":
+      if (value === undefined) throw badRequest(`${prefix}item.waiting.since`, "cannot be cleared");
+      out.since = value as Waiting["since"];
+      break;
+    default:
+      out.followUpOn = value as Waiting["followUpOn"];
+  }
+  return out;
 }
 

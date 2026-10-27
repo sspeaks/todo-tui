@@ -10,6 +10,11 @@ describe("tokenize", () => {
     expect(tokenize("j\x04k", {})).toEqual(["j", "ctrl+d", "k"]);
   });
 
+  it("reads a run of line breaks in one chunk as one enter (CRLF, blank lines)", () => {
+    expect(tokenize("milk\r\n\r\nbread\r\n", {})).toEqual(["m", "i", "l", "k", "enter", "b", "r", "e", "a", "d", "enter"]);
+    expect(tokenize("\r\r", {})).toEqual(["enter"]);
+  });
+
   it("reads meta+key as esc then the key (hard case 3)", () => {
     expect(tokenize("j", { meta: true })).toEqual(["esc", "j"]);
     expect(tokenize("", { escape: true, meta: true })).toEqual(["esc", "esc"]);

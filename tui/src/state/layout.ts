@@ -3,6 +3,7 @@
 // clears and redraws it whole on every frame.
 
 import { displayWidth } from "../format/text.js";
+import type { ModeKind } from "./types.js";
 
 export const MIN_COLUMNS = 40;
 export const MIN_ROWS = 8;
@@ -10,6 +11,14 @@ export const MIN_ROWS = 8;
 export const SPLIT_COLUMNS = 110;
 /** The tab bar, the status bar and the message line. */
 export const CHROME_ROWS = 3;
+/** Quick-add's input and preview, above the list. */
+export const QUICK_ADD_ROWS = 2;
+/** A prompt's preview (or conflict) line, above the status bar. */
+export const PROMPT_ROWS = 1;
+
+/** The rows a mode takes from the body. */
+export const modeRows = (mode: ModeKind | undefined): number =>
+  mode === "quickAdd" ? QUICK_ADD_ROWS : mode === "prompt" ? PROMPT_ROWS : 0;
 
 export interface Layout {
   readonly columns: number;
@@ -17,14 +26,15 @@ export interface Layout {
   /** Below MIN_COLUMNS × MIN_ROWS only "Terminal too small" is shown. */
   readonly tooSmall: boolean;
   readonly wide: boolean;
-  /** The rows between the tab bar and the status bar. */
+  /** The rows for the list and the detail, between the tab bar (and quick-add) and the status bar (and a prompt's preview). */
   readonly bodyHeight: number;
   readonly listWidth: number;
   /** The detail pane's width: about 40% beside the list, or the whole width as an overlay. */
   readonly detailWidth: number;
 }
 
-export function layout(columns: number, rows: number): Layout {
+/** The screen for a terminal size, with the rows `mode` takes left out of the body. */
+export function layout(columns: number, rows: number, mode?: ModeKind): Layout {
   const wide = columns >= SPLIT_COLUMNS;
   const detailWidth = wide ? Math.floor(columns * 0.4) : columns;
   return {
@@ -32,7 +42,7 @@ export function layout(columns: number, rows: number): Layout {
     rows,
     tooSmall: columns < MIN_COLUMNS || rows < MIN_ROWS,
     wide,
-    bodyHeight: Math.max(1, rows - CHROME_ROWS),
+    bodyHeight: Math.max(1, rows - CHROME_ROWS - modeRows(mode)),
     // One column for the separator.
     listWidth: wide ? columns - detailWidth - 1 : columns,
     detailWidth,

@@ -79,16 +79,24 @@ export function editLine(line: LineState, key: KeyToken): LineState | undefined 
 }
 
 /**
+ * The code points a field `width` cells wide shows, [start, end), scrolled
+ * to keep the cursor in view. The cursor takes a cell of its own, also at
+ * the end. Widths count code points.
+ */
+export function lineWindow(line: LineState, width: number): { start: number; end: number } {
+  const w = Math.max(1, width);
+  const start = Math.max(0, line.cursor - w + 1);
+  return { start, end: Math.min([...line.text].length, start + w) };
+}
+
+/**
  * The part of the line a field `width` cells wide shows, scrolled to keep
  * the cursor in view; `under` is the character under the cursor (a space at
- * the end). Widths count code points.
+ * the end).
  */
 export function visibleLine(line: LineState, width: number): { before: string; under: string; after: string } {
   const cps = [...line.text];
-  const w = Math.max(1, width);
-  // The cursor takes a cell of its own, also at the end.
-  const start = Math.max(0, line.cursor - w + 1);
-  const end = start + w;
+  const { start, end } = lineWindow(line, width);
   return {
     before: cps.slice(start, line.cursor).join(""),
     under: cps[line.cursor] ?? " ",

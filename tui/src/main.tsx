@@ -15,10 +15,11 @@ Options:
 async function smoke(): Promise<number> {
   const daemon = new FakeDaemon(sampleItems(new Date()));
   const store = new LiveStore({ transport: daemon.transport, debounceMs: 5 });
-  const controller = new Controller({ store });
+  const clients = createClients(daemon.transport);
+  const controller = new Controller({ store, items: clients.items });
   const term = virtualTerminal(120, 16);
   store.start();
-  const app = render(<Tui store={store} clients={createClients(daemon.transport)} controller={controller} />, term.options);
+  const app = render(<Tui store={store} clients={clients} controller={controller} />, term.options);
   try {
     const deadline = Date.now() + 5_000;
     while (!/● live[\s\S]*Call dentist|Call dentist[\s\S]*● live/.test(term.stdout.lastFrame())) {
@@ -47,7 +48,7 @@ async function main(args: string[]): Promise<number> {
 
   const conn = await connect({ clientKind: ClientKind.INTERACTIVE });
   const store = new LiveStore({ transport: conn.transport, ensureDaemon: conn.ensureDaemon });
-  const controller = new Controller({ store });
+  const controller = new Controller({ store, items: conn.items });
   store.start();
   try {
     // ctrl-c is a key: it quits in normal mode and cancels in the others.

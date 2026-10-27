@@ -42,6 +42,13 @@ export function shortDay(n: number, today: number): string {
   return isoDay(n);
 }
 
+/** "Fri Oct 30", with the year when it is not `today`'s: the date previews. */
+export function dayLabel(n: number, today: number): string {
+  const p = parts(n);
+  const year = p.year === parts(today).year ? "" : ` ${p.year}`;
+  return `${WEEKDAYS[p.weekday]} ${MONTHS[p.month - 1]} ${p.day}${year}`;
+}
+
 /** Fri Oct 30 2026 */
 export function longDay(n: number): string {
   const p = parts(n);

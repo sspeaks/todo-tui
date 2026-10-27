@@ -388,10 +388,15 @@ export class LiveStore {
     let attempt = 0;
     let spawnedThisOutage = false;
     while (!signal.aborted) {
-      let healthy = false;
       try {
         if (this.revision === undefined) await this.loadBaseline();
-        healthy = await this.consume(signal);
+        // The stream's first message ends the outage. A live stream mostly
+        // ends by failing (the daemon killed), and the outage that starts
+        // then respawns the daemon again and backs off from the start.
+        await this.consume(signal, () => {
+          attempt = 0;
+          spawnedThisOutage = false;
+        });
       } catch (err) {
         if (signal.aborted) break;
         if (isConnectionFailure(err) && this.opts.ensureDaemon && !spawnedThisOutage) {
@@ -401,10 +406,6 @@ export class LiveStore {
         this.conn = { ...this.conn, error: err };
       }
       if (signal.aborted) break;
-      if (healthy) {
-        attempt = 0;
-        spawnedThisOutage = false;
-      }
       attempt++;
       this.setConn({ state: "reconnecting", attempt });
       const initial = this.opts.backoff?.initialMs ?? 100;
@@ -432,15 +433,18 @@ export class LiveStore {
         : (await this.itemsClient.listItems({ pageSize: 1 })).revision;
   }
 
-  /** Subscribes from the current revision. Returns true when the stream got any message. */
-  private async consume(signal: AbortSignal): Promise<boolean> {
+  /** Subscribes from the current revision; `onHealthy` runs when the stream gets its first message. */
+  private async consume(signal: AbortSignal, onHealthy: () => void): Promise<void> {
     let healthy = false;
     const stream = this.watchClient.subscribe({ sinceRevision: this.revision ?? 0n, topics: [] }, { signal });
     for await (const res of stream) {
       // A message that arrives as the store stops is dropped: applying it
       // would set the re-query timers stop() has just cleared.
       if (signal.aborted) break;
-      if (!healthy) healthy = true;
+      if (!healthy) {
+        healthy = true;
+        onHealthy();
+      }
       const msg = res.message;
       switch (msg.case) {
         case "change":
@@ -472,7 +476,6 @@ export class LiveStore {
           break;
       }
     }
-    return healthy;
   }
 
   private applyChange(change: Change): void {

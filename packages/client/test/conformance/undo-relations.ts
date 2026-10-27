@@ -504,6 +504,42 @@ export function undoRelationsConformance(open: () => Promise<UndoTarget>): void 
       }
       expect(await rejected(update({}, ["archived.at"]))).toEqual(["item.archived.at", "changes only through ArchiveItem and UnarchiveItem"]);
       expect(await rejected(update({}, ["status_category"]))).toEqual(["item.status_category", "changes only through SetStatus"]);
+      // Read-only fields, top-level and nested, wherever they come in the mask.
+      for (const path of [
+        "id",
+        "created_via",
+        "created_at",
+        "updated_at",
+        "revision",
+        "remote_link",
+        "remote_link.key",
+        "remote_status_name",
+        "reporter",
+        "sprint",
+        "resolution",
+        "remote_created_at",
+        "recurrence.series_id",
+        "remote_extras",
+        "effective_priority",
+        "is_mine",
+        "pending_fields",
+        "has_conflict",
+        "description_dirty",
+        "staleness",
+        "staleness.waiting_since",
+        "scopes",
+        "deleted_at",
+        "merged_into",
+        "is_overdue",
+      ]) {
+        expect(await rejected(update({ title: "b" }, ["title", path]))).toEqual([`item.${path}`, "is read-only"]);
+      }
+      const readOnly = batchMutate(items, [{ kind: { case: "updateItem", value: { item: { id: a.item.id }, updateMask: { paths: ["created_at"] } } } }]);
+      expect(await rejected(readOnly)).toEqual(["mutations[0].update_item.item.created_at", "is read-only"]);
+      // A title is one line: any line break inside it is refused.
+      for (const title of ["a\nb", "a\rb", "a\u000bb", "a\u000cb", "a\u0085b", "a\u2028b", "a\u2029b"]) {
+        expect(await rejected(update({ title }, ["title"])), JSON.stringify(title)).toEqual(["item.title", "must be a single line"]);
+      }
       // A field once, and not with its parent or a child of it.
       for (const [paths, repeated] of [
         [["title", "title"], "title"],
@@ -517,6 +553,8 @@ export function undoRelationsConformance(open: () => Promise<UndoTarget>): void 
       expect(await rejected(update({ title: " \t " }, ["title"]))).toEqual(["item.title", "must not be empty"]);
       expect(await revision()).toBe(rev);
       expect((await update({ title: "  b  " }, ["title"])).item?.title).toBe("b");
+      // Line breaks at either end are trimmed away, NEL as well.
+      expect((await update({ title: "\n\u0085b\r\n" }, ["title"])).item?.title).toBe("b");
       expect((await state()).undo?.description).toBe('edit "b"');
 
       // Labels are a set: repeating one changes nothing, and is no entry.
@@ -530,6 +568,12 @@ export function undoRelationsConformance(open: () => Promise<UndoTarget>): void 
       expect((await get(a.item.id)).labels).toEqual(["x"]);
       const deduped = await update({ labels: ["y", "x", "y"] }, ["labels"]);
       expect(deduped.item?.labels).toEqual(["y", "x"]);
+      // A label is one word: not empty, no whitespace or control character.
+      for (const label of ["", "a b", "a\tb", "a b", "a　b", "a\u0007b", "a\u001bb", "a\u0085b"]) {
+        const description = "labels must be non-empty and contain no whitespace or control characters";
+        expect(await rejected(update({ labels: ["ok", label] }, ["labels"])), JSON.stringify(label)).toEqual(["item.labels", description]);
+      }
+      expect((await update({ labels: ["é#🏷️", "a-b"] }, ["labels"])).item?.labels).toEqual(["é#🏷️", "a-b"]);
     });
 
     it("checks parent_id: it must name a live Item and not make a cycle", async () => {

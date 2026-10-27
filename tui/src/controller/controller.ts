@@ -1,10 +1,10 @@
 // The dispatcher (Decision 2): every key goes through the input queue to
-// the mode that owns it, and becomes a change to the UiStore (or, from
-// phase 2, an RPC). It also keeps the current tab's view observed and its
-// selection pinned, and runs the midnight poll. No Ink here, so the
+// the mode that owns it, and becomes a change to the UiStore or an action
+// through the pipeline. It also keeps the current tab's view observed and
+// its selection pinned, and runs the midnight poll. No Ink here, so the
 // controller tests drive it directly.
 
-import type { LiveStore, ViewSnapshot } from "@todo-tui/client";
+import type { Item, ItemsClient, LiveStore, LiveView, ViewSnapshot } from "@todo-tui/client";
 import type { Key } from "ink";
 import { dayOf, localDay } from "../format/dates.js";
 import { singleLine } from "../format/text.js";
@@ -12,12 +12,16 @@ import { completeCommand, resolveCommand } from "../keys/commands.js";
 import { helpLines } from "../keys/help.js";
 import { type Action, BINDINGS, type Binding, isAvailable, type KeymapMode } from "../keys/keymap.js";
 import { editLine, emptyLine, insert, type LineState, lineOf } from "../keys/line-editor.js";
-import { type KeyToken, keyLabel, parseKeys, tokenize } from "../keys/tokenize.js";
+import { isChar, type KeyToken, keyLabel, parseKeys, tokenize } from "../keys/tokenize.js";
 import { buildTrie, continuations, step, type TrieNode } from "../keys/trie.js";
 import { layout } from "../state/layout.js";
 import { halfPage, initialList, type ListState, listOf, move, reconcile, type Resolved, sameList, select } from "../state/selection.js";
-import { type Mode, normalMode, type TabId, type UiState } from "../state/types.js";
+import { type Mode, normalMode, type TabId, type Target, type UiState } from "../state/types.js";
 import { UiStore } from "../state/ui-store.js";
+import { ItemActions } from "./actions.js";
+import { DEFAULT_TIMING, Pipeline, type Timing } from "./pipeline.js";
+import { Prompts } from "./prompts.js";
+import { QuickAdd, typedLines } from "./quick-add.js";
 import { type Input, InputQueue } from "./queue.js";
 
 export const INFO_TOAST_MS = 4_000;
@@ -27,9 +31,13 @@ export const MIDNIGHT_POLL_MS = 60_000;
 
 export interface ControllerOptions {
   store: LiveStore;
+  /** The ItemService client actions call. */
+  items: ItemsClient;
   ui?: UiStore;
   /** The clock the midnight poll compares with the daemon's today (default: the system clock). */
   now?: () => Date;
+  /** Delays and deadlines (tests shorten them). */
+  timing?: Partial<Timing>;
 }
 
 const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n));
@@ -38,9 +46,16 @@ const describe = (err: unknown) => (err instanceof Error ? err.message : String(
 
 export class Controller {
   readonly store: LiveStore;
+  readonly items: ItemsClient;
   readonly ui: UiStore;
+  readonly timing: Timing;
+  /** Runs actions: the RPC, the response into the store, the reload. */
+  readonly pipeline: Pipeline;
   /** Quits the app (Ink's exit); set by the shell. */
   onQuit: (() => void) | undefined;
+  private readonly actions: ItemActions;
+  private readonly prompts: Prompts;
+  private readonly quickAdd: QuickAdd;
   private readonly now: () => Date;
   private readonly queue: InputQueue;
   private readonly tries: Readonly<Record<KeymapMode, TrieNode>>;
@@ -55,13 +70,24 @@ export class Controller {
 
   constructor(opts: ControllerOptions) {
     this.store = opts.store;
+    this.items = opts.items;
     this.ui = opts.ui ?? new UiStore();
     this.now = opts.now ?? (() => new Date());
+    this.timing = { ...DEFAULT_TIMING, ...opts.timing };
     this.tries = { normal: buildTrie(BINDINGS, "normal"), help: buildTrie(BINDINGS, "help") };
     this.queue = new InputQueue(
       (input) => this.handle(input),
       (err) => this.toast("error", describe(err)),
     );
+    this.pipeline = new Pipeline(
+      this.store,
+      this.timing,
+      () => this.currentView(),
+      (busy) => this.ui.setState((s) => (s.busy === busy ? s : { ...s, busy })),
+    );
+    this.actions = new ItemActions(this);
+    this.prompts = new Prompts(this);
+    this.quickAdd = new QuickAdd(this);
   }
 
   /** Observes the store: the tabs, the current view, the counts and the undo state; starts the midnight poll. */
@@ -88,23 +114,44 @@ export class Controller {
 
   /** One useInput event. */
   input(input: string, key: Partial<Key>): void {
-    this.queue.push(tokenize(input, key));
+    this.push(tokenize(input, key));
   }
 
   /** One usePaste event. */
   paste(text: string): void {
-    this.queue.push([{ paste: text }]);
+    this.push([{ paste: text }]);
   }
 
   /** Feeds keys written as parseKeys reads them ("jj<esc>"), and resolves once they are handled. */
   press(keys: string): Promise<void> {
-    this.queue.push(parseKeys(keys));
+    this.push(parseKeys(keys));
     return this.queue.idle();
   }
 
   /** Resolves once every input so far is handled. */
   idle(): Promise<void> {
     return this.queue.idle();
+  }
+
+  /** Resolves once the quick-add and prompt previews have caught up with the text (tests). */
+  async previewIdle(): Promise<void> {
+    await Promise.all([this.quickAdd.previewIdle(), this.prompts.previewIdle()]);
+  }
+
+  /**
+   * Queues input behind the action in flight, if any. Only q or ctrl-c in
+   * normal mode, with nothing else waiting, goes past it: quitting waits
+   * for the action at most a second.
+   */
+  private push(inputs: readonly Input[]): void {
+    const { mode } = this.state;
+    const [first] = inputs;
+    const quitKey = first === "q" || first === "ctrl+c";
+    if (quitKey && this.queue.inFlight && !this.queue.waiting && mode.kind === "normal" && !mode.pending.length) {
+      void this.quit();
+      return;
+    }
+    this.queue.push(inputs);
   }
 
   /** The terminal size; crossing the split breakpoint closes the overlay and gives the list focus. */
@@ -137,6 +184,102 @@ export class Controller {
     return `${pending.map(keyLabel).join(" ")}… ${hints.join(" · ")}`;
   }
 
+  /** The selected Item in the current tab, as the store holds it. */
+  selectedItem(): Item | undefined {
+    const id = this.selectedId();
+    return id === undefined ? undefined : this.store.getItem(id);
+  }
+
+  /** What an action started now acts on: the selected Item, with the revision rendered (marks come with phase 3). */
+  target(): Target | undefined {
+    const item = this.selectedItem();
+    return item && { ids: [item.id], bulk: false, revisions: new Map([[item.id, item.revision]]) };
+  }
+
+  /** The current tab's ids, as last loaded. */
+  currentIds(): readonly string[] {
+    return this.current()?.ids ?? [];
+  }
+
+  /** The current tab's live view. */
+  currentView(): LiveView | undefined {
+    const { tab } = this.state;
+    return tab === undefined ? undefined : this.store.view({ viewId: tab });
+  }
+
+  /** Selects `id` in the current tab, scrolled into view, if the tab lists it. */
+  selectId(id: string): void {
+    const cur = this.current();
+    const at = cur?.ids.indexOf(id) ?? -1;
+    if (!cur || at < 0) return;
+    this.setList(cur.tab, listOf(select(this.listState(cur.tab), cur.ids, this.height, at)));
+  }
+
+  /** The daemon's today as a day number (the local date until the counts load). */
+  today(): number {
+    const today = this.store.getCounts().today;
+    return today ? dayOf(today) : localDay(this.now());
+  }
+
+  /** The current mode, for the modes' own handlers. */
+  get state(): UiState {
+    return this.ui.getState();
+  }
+
+  setMode(mode: Mode): void {
+    this.ui.setState((s) => ({ ...s, mode }));
+  }
+
+  /**
+   * After an action failed: the keys queued behind it are dropped, since
+   * they were meant for the state a success would have left; the error
+   * toast says how many. In quick-add, text typed behind a failed capture
+   * is kept as lines to capture next (Decision 6: typed text is never lost).
+   */
+  failed(text: string): void {
+    const queued = this.queue.take();
+    let dropped = queued.length;
+    const { mode } = this.state;
+    if (mode.kind === "quickAdd" && queued.length) {
+      const typed = typedLines(queued);
+      dropped = typed.dropped;
+      if (typed.lines.length) this.setMode({ ...mode, rest: [...(mode.rest ?? []), ...typed.lines] });
+    }
+    this.toast("error", dropped ? `${text} · ${dropped} key${dropped === 1 ? "" : "s"} dropped` : text);
+  }
+
+  /**
+   * A typed character and the ones queued right behind it, as one run of
+   * text: a text mode inserts a burst (or a paste without bracketed
+   * paste) at once, with one preview request.
+   */
+  charRun(first: KeyToken): string {
+    const run = [first, ...this.queue.takeWhile((i) => typeof i === "string" && isChar(i))];
+    return run.map((k) => (k === "space" ? " " : k)).join("");
+  }
+
+  /** The keys queued behind an action that kept its mode open (a conflict): dropped, with a notice when there were any. */
+  dropQueued(): void {
+    const dropped = this.queue.take().length;
+    if (dropped) this.toast("info", `${dropped} key${dropped === 1 ? "" : "s"} dropped`);
+  }
+
+  /**
+   * An action's toast (design 2.8): the undo entry's description, when the
+   * top of the undo stack is this action's op, and how to undo it. When
+   * another op landed on top first, `fallback` says what was done, and u
+   * is not offered: it would undo that other op.
+   */
+  toastOp(opId: string | undefined, fallback: string): void {
+    const top = this.store.undoState.getSnapshot().undo;
+    this.toast("info", top && opId !== undefined && top.opId === opId ? `${singleLine(top.description)} · u undo` : fallback);
+  }
+
+  /** A plain edit's toast: only when the Item left the current tab. */
+  toastIfLeft(id: string, opId: string | undefined, fallback: string): void {
+    if (!this.currentIds().includes(id)) this.toastOp(opId, fallback);
+  }
+
   /** Shows a toast on the message line: info for 4 s, an error for 8 s or until the next key. */
   toast(level: "info" | "error", text: string): void {
     const id = ++this.toastSeq;
@@ -151,9 +294,15 @@ export class Controller {
     );
   }
 
-  quit(): void {
+  /** Quits; with an action in flight, once it settles or a second has passed. */
+  async quit(): Promise<void> {
     if (this.state.quitting) return;
     this.ui.setState((s) => ({ ...s, quitting: true }));
+    if (this.queue.inFlight) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([this.queue.settled(), new Promise<void>((resolve) => (timer = setTimeout(resolve, this.timing.quitMs)))]);
+      clearTimeout(timer);
+    }
     this.onQuit?.();
   }
 
@@ -173,13 +322,10 @@ export class Controller {
 
   // --- state ---
 
-  private get state(): UiState {
-    return this.ui.getState();
-  }
-
+  /** The list's height, without the rows the mode takes. */
   private get height(): number {
-    const { columns, rows } = this.state.size;
-    return layout(columns, rows).bodyHeight;
+    const { size, mode } = this.state;
+    return layout(size.columns, size.rows, mode.kind).bodyHeight;
   }
 
   private listState(tab: TabId): ListState {
@@ -188,10 +334,6 @@ export class Controller {
 
   private setList(tab: TabId, list: ListState): void {
     this.ui.setState((s) => ({ ...s, lists: new Map(s.lists).set(tab, list) }));
-  }
-
-  private setMode(mode: Mode): void {
-    this.ui.setState((s) => ({ ...s, mode }));
   }
 
   /** The current tab and its rows. */
@@ -240,13 +382,21 @@ export class Controller {
         return this.helpKey(mode, input);
       case "command":
         return this.commandKey(mode.line, input);
+      case "quickAdd":
+        return this.quickAdd.key(mode, input);
+      case "prompt":
+        return this.prompts.key(mode, input);
+      case "picker":
+        return this.actions.pickerKey(mode, input);
+      case "confirm":
+        return this.actions.confirmKey(mode, input);
       default:
-        // The other modes arrive in phases 2 and 3 of M4.
+        // Search arrives in phase 3 of M4.
         if (input === "esc" || input === "ctrl+c") this.setMode(normalMode);
     }
   }
 
-  private normalKey(pending: readonly KeyToken[], key: KeyToken): void {
+  private normalKey(pending: readonly KeyToken[], key: KeyToken): void | Promise<void> {
     if (pending.length && (key === "esc" || key === "ctrl+c")) return this.setMode(normalMode);
     const r = step(this.tries.normal, pending, key);
     if (r.kind === "pending") return this.setMode({ kind: "normal", pending: r.pending });
@@ -256,17 +406,17 @@ export class Controller {
   }
 
   /** Help's keys, through its own trie: a prefix (g) waits for the next key, and esc drops it. */
-  private helpKey(mode: Extract<Mode, { kind: "help" }>, key: KeyToken): void {
+  private helpKey(mode: Extract<Mode, { kind: "help" }>, key: KeyToken): void | Promise<void> {
     const pending = mode.pending ?? [];
     const settled: Mode = { kind: "help", scroll: mode.scroll };
     if (pending.length && (key === "esc" || key === "ctrl+c")) return this.setMode(settled);
     const r = step(this.tries.help, pending, key);
     if (r.kind === "pending") return this.setMode({ ...settled, pending: r.pending });
     if (pending.length) this.setMode(settled);
-    if (r.kind === "run") this.runBinding(r.binding);
+    if (r.kind === "run") return this.runBinding(r.binding);
   }
 
-  private commandKey(line: LineState, key: KeyToken): void {
+  private commandKey(line: LineState, key: KeyToken): void | Promise<void> {
     switch (key) {
       case "esc":
       case "ctrl+c":
@@ -280,16 +430,28 @@ export class Controller {
         // As in vim, backspace on an empty command line leaves it.
         if (line.text === "") return this.setMode(normalMode);
     }
-    const next = editLine(line, key);
+    const next = isChar(key) ? insert(line, this.charRun(key)) : editLine(line, key);
     if (next) this.setMode({ kind: "command", line: next });
   }
 
-  private onPaste(mode: Mode, text: string): void {
-    if (mode.kind === "command") this.setMode({ kind: "command", line: insert(mode.line, singleLine(text)) });
-    else if (mode.kind === "normal") this.toast("info", "Paste ignored: no text field is open");
+  private onPaste(mode: Mode, text: string): void | Promise<void> {
+    switch (mode.kind) {
+      case "command":
+        return this.setMode({ kind: "command", line: insert(mode.line, singleLine(text)) });
+      case "quickAdd":
+        return this.quickAdd.paste(mode, text);
+      case "prompt":
+        return this.prompts.paste(mode, text);
+      case "confirm":
+        // Anything but y cancels.
+        return this.setMode(normalMode);
+      case "normal":
+        // Never keys: a pasted "xxdd" must not run.
+        return this.toast("info", "Paste ignored: press a to add");
+    }
   }
 
-  private runCommand(text: string): void {
+  private runCommand(text: string): void | Promise<void> {
     const r = resolveCommand(text);
     if (r.kind === "message") return this.toast(r.level, r.text);
     if (r.kind === "none") return;
@@ -305,12 +467,12 @@ export class Controller {
     }
   }
 
-  private runBinding(b: Binding): void {
+  private runBinding(b: Binding): void | Promise<void> {
     if (!isAvailable(b)) return this.toast("info", `${b.help}: not available yet`);
-    this.run(b.action);
+    return this.run(b.action);
   }
 
-  private run(action: Action): void {
+  private run(action: Action): void | Promise<void> {
     const h = this.height;
     const half = Math.max(1, Math.floor(h / 2));
     switch (action.type) {
@@ -347,6 +509,26 @@ export class Controller {
         return this.setMode({ kind: "command", line: emptyLine });
       case "quit":
         return this.quit();
+      case "quick_add":
+        return action.child ? this.toast("info", "Not available yet") : this.quickAdd.open();
+      case "prompt":
+        return this.prompts.open(action.prompt);
+      case "status_picker":
+        return this.actions.openPicker();
+      case "set_status":
+        return this.actions.setStatus(action.status);
+      case "set_priority":
+        return this.actions.setPriority(action.priority);
+      case "clear_waiting":
+        return this.actions.clearWaiting();
+      case "archive_toggle":
+        return this.actions.toggleArchive();
+      case "delete":
+        return this.actions.confirmDelete();
+      case "undo":
+        return this.actions.undo(false);
+      case "redo":
+        return this.actions.undo(true);
       default:
         return this.toast("info", "Not available yet");
     }

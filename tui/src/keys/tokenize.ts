@@ -62,6 +62,10 @@ export function tokenize(input: string, key: Partial<Key>): KeyToken[] {
   const tokens = [...esc];
   for (const ch of input) {
     const t = charToken(ch);
+    // A run of line breaks in one chunk is one enter: a CRLF, or a blank
+    // line in text pasted without bracketed paste, would otherwise close
+    // quick-add with the rest of the text still to come.
+    if (t === "enter" && tokens.at(-1) === "enter") continue;
     if (t !== undefined) tokens.push(t);
   }
   return tokens;

@@ -25,6 +25,14 @@ function modeLabel(s: UiState): string {
       return "HELP";
     case "command":
       return "COMMAND";
+    case "quickAdd":
+      return "ADD";
+    case "prompt":
+      return "EDIT";
+    case "picker":
+      return "STATUS";
+    case "confirm":
+      return "CONFIRM";
     default:
       return s.mode.kind.toUpperCase();
   }
@@ -36,13 +44,21 @@ function hints(s: UiState): string {
       return "j/k scroll · esc close";
     case "command":
       return "enter run · tab complete · esc cancel";
+    case "quickAdd":
+      return "enter add · enter on empty closes · esc discard";
+    case "prompt":
+      return s.mode.prompt === "waiting" ? "enter save · tab complete · esc cancel" : "enter save · esc cancel";
+    case "picker":
+      return "letter or j/k enter · esc cancel";
+    case "confirm":
+      return "y yes · any other key no";
     default:
       return s.focus === "detail" ? "j/k scroll · esc back · q quit" : "? help · : command · q quit";
   }
 }
 
 /**
- * Mode · connection · pending prefix · the undo hint, and the keys for this
+ * Mode · connection · saving… · pending prefix · the undo hint, and the keys for this
  * mode on the right. The undo hint and the error detail are cut first; the
  * key hints give way when the mode, the connection and a pending prefix
  * would not fit beside them.
@@ -55,8 +71,9 @@ export function StatusBar({ width }: { width: number }) {
   const mode = modeLabel(state);
   const conn = connectionState(connection);
   const pending = state.mode.kind === "normal" && state.mode.pending.length ? controller.whichKey(state.mode.pending) : "";
+  const busy = state.busy ?? "";
   const keys = ` ${hints(state)}`;
-  const essential = `${mode} · ${conn}${pending ? ` · ${pending}` : ""}`;
+  const essential = `${mode} · ${conn}${busy ? ` · ${busy}` : ""}${pending ? ` · ${pending}` : ""}`;
   const showKeys = displayWidth(essential) + displayWidth(keys) <= width;
   const live = connection.state === "live";
   const error = connectionError(connection);
@@ -67,6 +84,7 @@ export function StatusBar({ width }: { width: number }) {
           <Text bold>{mode}</Text>
           <Text dimColor> · </Text>
           <Text color={live ? "green" : "yellow"}>{conn}</Text>
+          {busy ? <Text color="yellow"> · {busy}</Text> : null}
           {pending ? <Text color="cyan"> · {pending}</Text> : null}
           {error ? <Text color="yellow">{error}</Text> : null}
           {undo ? <Text dimColor> · u: {singleLine(undo.description)}</Text> : null}

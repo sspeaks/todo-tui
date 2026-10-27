@@ -25,13 +25,16 @@ describe("the keymap", () => {
     expect(() => buildTrie([dd, dd], "normal")).toThrow(/used twice/);
   });
 
-  it("binds the phase 1 navigation and leaves the later actions unavailable", () => {
+  it("binds navigation and triage, and leaves the phase 3 actions unavailable", () => {
     const available = BINDINGS.filter((b) => bindingModes(b).includes("normal") && isAvailable(b)).map((b) => b.id);
     expect(available).toEqual(
       expect.arrayContaining(["move_down", "move_up", "top", "bottom", "half_page_down", "half_page_up", "view_1", "view_9", "view_prev", "view_next", "help", "command", "quit"]),
     );
-    expect(available).not.toContain("mark_done");
-    expect(available).not.toContain("delete");
+    expect(available).toEqual(
+      expect.arrayContaining(["mark_done", "mark_cancelled", "set_status", "set_priority_1", "clear_priority", "toggle_archive", "delete", "undo", "redo"]),
+    );
+    expect(available).toEqual(expect.arrayContaining(["quick_add", "edit_title", "edit_labels", "set_due", "defer", "set_waiting", "clear_waiting"]));
+    for (const later of ["mark", "visual_mark", "narrow", "quick_add_child", "edit_description"]) expect(available).not.toContain(later);
   });
 });
 

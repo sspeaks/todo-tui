@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { dayNumber, isoDay, localDay, longDay, relativeDays, shortDay } from "./dates.js";
+import { dayLabel, dayNumber, isoDay, localDay, longDay, relativeDays, shortDay } from "./dates.js";
 import { rowCells } from "./item.js";
 import { create, ItemSchema, Status } from "@todo-tui/client";
 
@@ -14,6 +14,8 @@ describe("date labels", () => {
     expect(shortDay(today - 2, today)).toBe("Oct 24");
     expect(shortDay(dayNumber(2027, 1, 5), today)).toBe("2027-01-05");
     expect(longDay(today + 4)).toBe("Fri Oct 30 2026");
+    expect(dayLabel(today + 4, today)).toBe("Fri Oct 30");
+    expect(dayLabel(dayNumber(2027, 1, 5), today)).toBe("Tue Jan 5 2027");
     expect(isoDay(today)).toBe("2026-10-26");
     expect([relativeDays(today, today), relativeDays(today + 3, today), relativeDays(today - 2, today)]).toEqual([
       "today",

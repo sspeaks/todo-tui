@@ -2,7 +2,7 @@
 // to, what the message line says. Server data stays in LiveStore.
 
 import type { CaptureDraft } from "@todo-tui/client";
-import type { Action, PromptKind } from "../keys/keymap.js";
+import type { PromptKind } from "../keys/keymap.js";
 import type { LineState } from "../keys/line-editor.js";
 import type { KeyToken } from "../keys/tokenize.js";
 import type { ListState } from "./selection.js";
@@ -18,6 +18,15 @@ export interface Target {
   readonly revisions: ReadonlyMap<string, bigint>;
 }
 
+/** What a prompt's text resolves to, shown under it: "→ Fri Oct 30", or a warning. */
+export interface PromptPreview {
+  /** The text it previews: a response for other text is stale. */
+  readonly for: string;
+  readonly text: string;
+  /** A warning (red): enter keeps the prompt open. */
+  readonly warn: boolean;
+}
+
 /** One input mode at a time owns the keys (m4_arch §1.1). */
 export type Mode =
   /** `pending`: a prefix typed so far, such as ["g"] or ["d"]. */
@@ -26,22 +35,34 @@ export type Mode =
       readonly kind: "quickAdd";
       readonly parentId?: string;
       readonly line: LineState;
+      /** ParseCapture's draft for `text`; shown only while `text` is what is typed. */
       readonly preview?: { readonly text: string; readonly draft: CaptureDraft };
-      readonly error?: string;
+      /** Lines still to capture, after one failed: each comes into the line once the one before is saved. */
+      readonly rest?: readonly string[];
     }
   | {
       readonly kind: "prompt";
       readonly prompt: PromptKind;
+      /** Frozen when the prompt opens (hard case 46). */
       readonly target: Target;
       readonly line: LineState;
-      /** The field value the edit started from, for the rebase on a conflict. */
-      readonly base?: unknown;
-      readonly preview?: string;
+      /**
+       * For the edits made from a rendered value (i, t): the field as the
+       * edit started from it and the revision sent as expected_revision;
+       * both move to the server's after a conflict (Decision 6).
+       */
+      readonly base?: { readonly value: string; readonly revision: bigint };
+      readonly preview?: PromptPreview;
+      /** Why enter did not save, shown instead of the preview until the next edit. */
       readonly error?: string;
+      /** The field's value on the server after a conflict, which the next enter overwrites. */
+      readonly conflict?: string;
+      /** `w`: the people already waited on, for tab. */
+      readonly people?: readonly string[];
     }
   | { readonly kind: "picker"; readonly picker: "status"; readonly target: Target; readonly index: number }
-  /** `dd`: y confirms, any other key cancels. */
-  | { readonly kind: "confirm"; readonly text: string; readonly onYes: Action }
+  /** `dd`: y confirms, any other key cancels and is swallowed. */
+  | { readonly kind: "confirm"; readonly text: string; readonly action: "delete"; readonly target: Target }
   | { readonly kind: "command"; readonly line: LineState }
   | { readonly kind: "search"; readonly line: LineState }
   /** `pending`: a prefix of one of help's own bindings (gg), when one is typed. */
@@ -72,6 +93,8 @@ export interface UiState {
   /** The message line: one toast, newest wins. */
   readonly toast?: Toast;
   readonly size: { readonly columns: number; readonly rows: number };
+  /** An action that has run for a while: "saving…" in the status bar. */
+  readonly busy?: string;
   readonly quitting: boolean;
 }
 

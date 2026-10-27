@@ -1,40 +1,13 @@
-import { type LiveStore, type LiveStoreOptions, Status, setStatus } from "@todo-tui/client";
+import { Status, setStatus } from "@todo-tui/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { type FakeDaemonHandle, fakeDaemon, item, rows } from "../fake.test-util.js";
-import { initialList } from "../state/selection.js";
-import { Controller, ERROR_TOAST_MS, INFO_TOAST_MS, MIDNIGHT_POLL_MS } from "./controller.js";
+import { fakeDaemon, item, rows } from "../fake.test-util.js";
+import { ERROR_TOAST_MS, INFO_TOAST_MS, MIDNIGHT_POLL_MS } from "./controller.js";
+import { setup, stopControllers } from "./setup.test-util.js";
 
-const running: { c: Controller; store: LiveStore }[] = [];
 afterEach(async () => {
-  for (const { c, store } of running.splice(0)) {
-    c.stop();
-    await store.stop();
-  }
+  await stopControllers();
   vi.useRealTimers();
 });
-
-/** A started controller over FakeDaemon, 100×30 (a 27-row list), on the first tab with its rows loaded. */
-async function setup(
-  fd: FakeDaemonHandle = fakeDaemon(rows(5)),
-  { columns = 100, rows: height = 30, now, store: storeOptions }: { columns?: number; rows?: number; now?: () => Date; store?: Partial<LiveStoreOptions> } = {},
-) {
-  const store = fd.store(storeOptions);
-  const c = new Controller({ store, ...(now && { now }) });
-  running.push({ c, store });
-  const quit = vi.fn();
-  c.onQuit = quit;
-  c.setSize(columns, height);
-  store.start();
-  c.start();
-  const state = () => c.ui.getState();
-  await vi.waitFor(() => {
-    const tab = state().tab;
-    expect(tab && store.view({ viewId: tab }).getSnapshot().status).toBe("ready");
-  });
-  const list = () => state().lists.get(state().tab ?? "") ?? initialList;
-  const tabIs = (seed: string) => state().tab === fd.viewId(seed);
-  return { ...fd, c, store, quit, state, list, tabIs, selected: () => c.store.getItem(c.selectedId() ?? "")?.title };
-}
 
 describe("keys", () => {
   it("moves once per key of a burst (hard case 1)", async () => {
@@ -71,10 +44,10 @@ describe("keys", () => {
     expect(t.state().toast?.text).toBe("d j: not bound · ? for help");
     expect(t.selected()).toBe("row 0");
     expect(t.daemon.ops.filter((o) => o.actor === "user")).toEqual([]);
-    // dd is the delete, which arrives with phase 2.
+    // dd asks first.
     await t.c.press("dd");
-    expect(t.state().toast?.text).toBe("Delete (confirm): not available yet");
-    await t.c.press("p9");
+    expect(t.state().mode).toMatchObject({ kind: "confirm", text: 'Delete "row 0"? y/N' });
+    await t.c.press("<esc>p9");
     expect(t.state().toast?.text).toBe("p 9: not bound · ? for help");
     // esc or ctrl-c cancels a prefix, and the key after it runs alone.
     await t.c.press("g<esc>j");
@@ -157,8 +130,11 @@ describe("keys", () => {
     await t.c.press("<esc>");
     t.c.paste("xxdd");
     await t.c.idle();
-    expect(t.state().toast?.text).toBe("Paste ignored: no text field is open");
+    // Never keys (hard case 7).
+    expect(t.state().toast?.text).toBe("Paste ignored: press a to add");
     expect(t.selected()).toBe("row 0");
+    expect(t.state().mode).toEqual({ kind: "normal", pending: [] });
+    expect(t.daemon.ops.filter((o) => o.actor === "user")).toEqual([]);
   });
 });
 

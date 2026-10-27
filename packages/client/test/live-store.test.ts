@@ -208,6 +208,29 @@ describe("LiveStore", () => {
     expect(store.getConnection().attempt).toBe(0);
   });
 
+  it("asks for the daemon again in each later outage, and backs off from the start again", async () => {
+    let spawned = 0;
+    const { daemon, store } = setup(1, {
+      ensureDaemon: async () => {
+        spawned++;
+      },
+      backoff: { initialMs: 10, maxMs: 10_000 },
+    });
+    store.start();
+    await waitFor(() => store.getConnection().state === "live");
+    // A live stream that then fails (the daemon killed) ends with an error, not by returning.
+    for (const outage of [1, 2, 3]) {
+      daemon.down = true;
+      daemon.dropStreams();
+      await waitFor(() => store.getConnection().attempt >= 3);
+      expect(spawned).toBe(outage);
+      // The backoff restarts each outage: three attempts within 10 + 20 + 40 ms, not the last outage's 10 s.
+      expect(store.getConnection().attempt).toBeLessThan(5);
+      daemon.down = false;
+      await waitFor(() => store.getConnection().state === "live");
+    }
+  });
+
   it("reloads everything on ResyncRequired", async () => {
     const { daemon, store } = setup(2);
     const view = store.view();

@@ -2,8 +2,10 @@
 # Smoke test: auto-spawn, a TS watcher over Subscribe, the single-daemon lock
 # under parallel --detach, the long-path socket fallback (P0), parsed capture
 # and the capture spool round trip (P1 M1), undo/redo of a capture (P1 M2),
-# and `todo status` and the seeded Today view (P1 M3).
-# Usage: scripts/smoke.sh   (TODO_BIN overrides the binary; default: cargo build)
+# `todo status` and the seeded Today view (P1 M3), and the TUI driven in a
+# private tmux server (P1 M4; skipped without tmux).
+# Usage: scripts/smoke.sh   (TODO_BIN overrides the binary; default: cargo build;
+# TODO_TUI_ENTRY the TUI bundle; default: pnpm -C tui build)
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
@@ -18,6 +20,9 @@ export TODO_BIN
 root=$(cd "$(mktemp -d "${TMPDIR:-/tmp}/todo-smoke.XXXXXX")" && pwd)
 homes=()
 watcher_pid=
+# The private tmux server's socket directory (step 8), kept short: a unix
+# socket path must fit in about 100 bytes.
+tmux_dir=
 
 sha8() {
   if command -v sha256sum >/dev/null; then printf '%s' "$1" | sha256sum | cut -c1-8
@@ -37,6 +42,10 @@ lock_holders() { lock_holder_pids "$1" | sort -u | wc -l | tr -d ' '; }
 cleanup() {
   local status=$?
   [[ -n $watcher_pid ]] && kill "$watcher_pid" 2>/dev/null || true
+  if [[ -n $tmux_dir ]]; then
+    TMUX_TMPDIR=$tmux_dir tmux -L todo-smoke kill-server 2>/dev/null || true
+    rm -rf "$tmux_dir"
+  fi
   for h in "${homes[@]}"; do
     TODO_TUI_HOME=$h "$TODO_BIN" daemon stop >/dev/null 2>&1 || true
     # The lock file keeps the last daemon's pid after it exits; only kill a
@@ -226,3 +235,77 @@ list_view today >"$root/today.items" || fail "listing the Today view failed"
 titles=$(sed -n 's/.*"title":"\([^"]*\)".*/\1/p' "$root/today.items" | paste -sd, -)
 [[ $titles == "overdue,urgent,due today" ]] || { cat "$root/today.items" >&2; fail "unexpected Today view: $titles"; }
 "$TODO_BIN" daemon stop >/dev/null
+
+# 8. The TUI in a private tmux server, against a scratch daemon it spawns:
+#    quick-add with the live preview, x takes the row out of the Inbox and u
+#    brings it back, q leaves the terminal as it was. The TS client checks
+#    the daemon. Frames are polled with capture-pane, not fixed sleeps.
+step "the TUI in tmux"
+if ! command -v tmux >/dev/null; then
+  echo "smoke: tmux not found; skipping the TUI step"
+else
+  home=$root/tui
+  new_home "$home"
+  export TODO_TUI_HOME=$home
+  if [[ -z "${TODO_TUI_ENTRY:-}" ]]; then
+    corepack pnpm --silent -C "$repo/tui" build
+    TODO_TUI_ENTRY="$repo/tui/dist/tui.js"
+  fi
+  export TODO_TUI_ENTRY
+  tmux_dir=$(mktemp -d /tmp/todo-smoke-tmux.XXXXXX)
+  # No tmux.conf: the user's (plugins, default-terminal, hooks) must not change the run.
+  tmx() { TMUX_TMPDIR=$tmux_dir tmux -L todo-smoke -f /dev/null "$@"; }
+  screen() { tmx capture-pane -p -t tui; }
+  # Waits until the screen matches the extended regex $1 ($2 says what for).
+  see() {
+    for _ in $(seq 1 100); do
+      screen | grep -Eq -- "$1" && return 0
+      sleep 0.1
+    done
+    screen >&2
+    fail "the TUI never showed $2"
+  }
+  keys() { tmx send-keys -t tui "$@"; }
+  # `todo` with no command runs the bundle; the line before it and the
+  # line after it show whether quitting restored the screen.
+  tmx new-session -d -s tui -x 100 -y 20 -e "TODO_TUI_HOME=$home" -e "TODO_BIN=$TODO_BIN" -e "TODO_TUI_ENTRY=$TODO_TUI_ENTRY" \
+    "echo before-the-tui; \"\$TODO_BIN\"; echo \"the tui exited \$?\"; sleep 600"
+  see '● live' "the live connection"
+  see 'Inbox zero' "the empty Inbox"
+
+  keys a
+  see '^ADD · ' "quick-add"
+  keys -l 'smoke item +2 ^fri'
+  see '^→ smoke item · \+2 · \^Fri ' "the capture preview"
+  keys Enter
+  see '^› ○ \+2 +smoke item' "the captured row"
+  keys Escape
+  see '^NORMAL · ' "normal mode"
+  list_items >"$root/tui.items" || fail "listing items failed"
+  for field in '"title":"smoke item"' '"priority":"PRIORITY_HIGH"' '"dueDate":{' '"createdVia":"CREATED_VIA_TUI"' '"status":"STATUS_INBOX"'; do
+    grep -qF "$field" "$root/tui.items" || { cat "$root/tui.items" >&2; fail "the TUI's capture lacks $field"; }
+  done
+
+  keys x
+  see '^mark done "smoke item" · u undo' "the x toast"
+  see 'Inbox zero' "the row leaving the Inbox"
+  # ListItems leaves done Items out unless asked.
+  list_items >"$root/tui.items" || fail "listing items failed"
+  grep -qF '"title":"smoke item"' "$root/tui.items" && { cat "$root/tui.items" >&2; fail "x did not mark it done"; }
+  keys u
+  see '^Undid: mark done "smoke item"' "the undo toast"
+  see '^› ○ \+2 +smoke item' "the row back in the Inbox"
+  list_items >"$root/tui.items" || fail "listing items failed"
+  grep -qF '"status":"STATUS_INBOX"' "$root/tui.items" || { cat "$root/tui.items" >&2; fail "u did not bring it back"; }
+
+  # (M4 phase 3: E, with a non-interactive EDITOR, goes here.)
+  keys q
+  see '^the tui exited 0$' "a clean exit"
+  # The alternate screen is gone: the shell's lines are back, the TUI's are not.
+  screen | grep -qx 'before-the-tui' || { screen >&2; fail "quitting did not restore the screen"; }
+  screen | grep -q '● live' && { screen >&2; fail "the TUI's frame stayed on the screen"; }
+  tmx kill-server
+  rm -rf "$tmux_dir"
+  tmux_dir=
+  "$TODO_BIN" daemon stop >/dev/null
+fi

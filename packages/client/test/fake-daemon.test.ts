@@ -136,13 +136,24 @@ describe("FakeDaemon mutations", () => {
     expect(daemon.changes).toHaveLength(changes);
   });
 
-  it("UpdateItem copies the masked top-level fields, clearing unset ones", async () => {
+  it("UpdateItem copies the masked fields, clearing unset ones", async () => {
     const { client, a } = setup();
-    const paths = ["title", "labels", "waiting.reason"];
-    const res = await updateItem(client, { id: a.id, title: "renamed", priority: Priority.LOW }, paths);
+    const res = await updateItem(client, { id: a.id, title: "renamed", priority: Priority.LOW }, ["title", "labels"]);
     expect(res.item?.title).toBe("renamed");
     expect(res.item?.labels).toEqual([]);
     expect(res.item?.priority).toBe(Priority.HIGH);
+  });
+
+  it("records a nested waiting path as a change of the whole waiting, which undo restores", async () => {
+    const { daemon, client, a } = setup();
+    const on = { ref: { case: "freeText" as const, value: "dana" } };
+    await updateItem(client, { id: a.id, waiting: { on, since: { year: 2026, month: 10, day: 1 } } }, ["waiting"]);
+    const before = daemon.items.get(a.id)!.waiting;
+    await updateItem(client, { id: a.id, waiting: { reason: "quote" } }, ["waiting.reason"]);
+    const [event] = daemon.ops.at(-1)!.events;
+    expect(event).toMatchObject({ kind: "set", field: "waiting", old: before, new: { reason: "quote", since: before?.since } });
+    await undo(client);
+    expect(daemon.items.get(a.id)!.waiting).toEqual(before);
   });
 
   it("rejects malformed requests with BadRequest details, as the daemon does", async () => {
@@ -233,11 +244,6 @@ describe("FakeDaemon mutations", () => {
     expect(again.result).toEqual(first.result);
     expect(again.item?.id).toBe(first.item?.id);
     expect([...daemon.items.values()].filter((i) => i.title === "once")).toHaveLength(1);
-  });
-
-  it("answers the RPC it does not model, ParseCapture, with UNIMPLEMENTED", async () => {
-    const { client } = setup();
-    expect((await failure(client.parseCapture({ text: "x" })))?.code).toBe(Code.Unimplemented);
   });
 
   it("fails an unknown id with NOT_FOUND", async () => {
@@ -521,5 +527,26 @@ describe("FakeDaemon clock, zone and derived fields", () => {
     const spooled = timestampFromDate(new Date(Date.UTC(2026, 8, 30)));
     const c = await capture("c", spooled);
     expect([ns(c.createdAt), ns(c.updatedAt)]).toEqual([ns(spooled), ns(spooled)]);
+  });
+
+  it("parses capture text, and waits since today, on its clock's day in its zone", async () => {
+    // 23:30 on Sunday 2026-11-01 in New York is Monday in UTC.
+    let at = new Date(Date.UTC(2026, 10, 2, 4, 30));
+    const daemon = new FakeDaemon([], { now: () => at, timeZone: "America/New_York" });
+    const client = createClient(ItemService, daemon.transport);
+    const iso = (d?: { year: number; month: number; day: number }) => d && `${d.year}-${d.month}-${d.day}`;
+    expect(iso((await client.parseCapture({ text: "x ^tom" })).draft?.dueDate)).toBe("2026-11-2");
+    const res = await client.captureItem({ requestId: ulid(), text: "ask ~dana ^mon", createdVia: CreatedVia.TUI });
+    expect([iso(res.item?.waiting?.since), iso(res.item?.dueDate), iso(res.draft?.dueDate)]).toEqual(["2026-11-1", "2026-11-2", "2026-11-2"]);
+    at = new Date(Date.UTC(2026, 10, 3, 4, 30));
+    const on = { ref: { case: "freeText" as const, value: "sam" } };
+    const waited = await updateItem(client, { id: res.item!.id, waiting: { on } }, ["waiting"]);
+    expect(iso(waited.item?.waiting?.since)).toBe("2026-11-2");
+    // A replay a week later parses on the day the Item was created.
+    const spoolId = ulid();
+    const first = await client.captureItem({ requestId: ulid(), text: "x ^mon", createdVia: CreatedVia.TUI, spoolId });
+    at = new Date(Date.UTC(2026, 10, 10, 4, 30));
+    const again = await client.captureItem({ requestId: ulid(), text: "x ^mon", createdVia: CreatedVia.CLI, spoolId });
+    expect([again.item?.id, iso(first.draft?.dueDate), iso(again.draft?.dueDate)]).toEqual([first.item?.id, "2026-11-9", "2026-11-9"]);
   });
 });

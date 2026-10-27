@@ -41,11 +41,16 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test
         run: cargo test --workspace
+      # The todo binary for the TS suites below: with TODO_BIN set they also
+      # run their UDS and conformance cases against the real daemon, each in
+      # a fresh TODO_TUI_HOME, and in a fixed zone where a case needs one.
+      - name: build todo for the TS suites
+        run: cargo build -p todo-cli
       - name: pnpm gen
         run: pnpm gen
       - name: pnpm typecheck
         run: pnpm typecheck
       - name: pnpm test
-        run: pnpm test
+        run: TODO_BIN=$PWD/target/debug/todo pnpm test
       - name: TUI bundle smoke
         run: pnpm -C tui build && node tui/dist/tui.js --smoke

@@ -1,11 +1,12 @@
 import { ClientsProvider, type LiveStore, LiveStoreProvider, type TodoClients } from "@todo-tui/client";
 import { Box, Text, useApp, useInput, usePaste, useWindowSize } from "ink";
-import { useEffect } from "react";
+import { useEffect, useSyncExternalStore } from "react";
 import { DetailPane } from "./components/DetailPane.js";
 import { HelpOverlay } from "./components/HelpOverlay.js";
 import { ControllerContext, useRows, useUi } from "./components/hooks.js";
 import { ListPane } from "./components/ListPane.js";
-import { MessageLine } from "./components/MessageLine.js";
+import { MessageLine, PromptPreviewLine } from "./components/MessageLine.js";
+import { QuickAddBar } from "./components/QuickAddBar.js";
 import { StatusBar } from "./components/StatusBar.js";
 import { TabBar } from "./components/TabBar.js";
 import type { Controller } from "./controller/controller.js";
@@ -41,7 +42,9 @@ export function App({ controller }: { controller: Controller }) {
   // Always on, so that a paste in normal mode never runs as keys.
   usePaste((text) => controller.paste(text));
 
-  const shape = layout(columns, rows);
+  // Above the ControllerContext, so straight from the UiStore: the rows quick-add and a prompt take.
+  const mode = useSyncExternalStore(controller.ui.subscribe, () => controller.ui.getState().mode.kind);
+  const shape = layout(columns, rows, mode);
   return (
     <ControllerContext.Provider value={controller}>
       {shape.tooSmall ? (
@@ -51,7 +54,9 @@ export function App({ controller }: { controller: Controller }) {
       ) : (
         <Box flexDirection="column" width={columns} height={rows}>
           <TabBar width={columns} />
+          {mode === "quickAdd" ? <QuickAddBar width={columns} /> : null}
           <Body shape={shape} />
+          {mode === "prompt" ? <PromptPreviewLine width={columns} /> : null}
           <StatusBar width={columns} />
           <MessageLine width={columns} />
         </Box>

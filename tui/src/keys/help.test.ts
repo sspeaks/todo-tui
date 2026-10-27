@@ -13,7 +13,8 @@ describe("help", () => {
       const row = text.filter((t) => t.includes(bindingKeys(first!)) && t.endsWith(first!.help));
       expect(row, first!.id).toHaveLength(1);
     }
-    expect(text.some((t) => t.includes("Mark done"))).toBe(false);
+    expect(text.find((t) => t.includes("Mark done"))).toMatch(/^ {2}x /);
+    expect(text.some((t) => t.includes("Mark a range"))).toBe(false);
     expect(text.find((t) => t.includes("Go to view N"))).toMatch(/1–9/);
     expect(text.find((t) => t.includes("First row"))).toMatch(/gg home/);
   });

@@ -16,6 +16,7 @@ import type { LiveStore } from "../src/live-store.js";
 import { updateItem } from "../src/mutations.js";
 import { resolvePaths, envFromProcess } from "../src/paths.js";
 import { ulid } from "../src/ulid.js";
+import { CAPTURE_ZONE, captureConformance } from "./conformance/capture.js";
 import { FILTER_ZONE, filterViewsConformance } from "./conformance/filter-views.js";
 import { undoRelationsConformance } from "./conformance/undo-relations.js";
 
@@ -262,5 +263,14 @@ describe.skipIf(!TODO_BIN)("filters, views, counts and ParseDate against $TODO_B
     const h = await home({ TZ: FILTER_ZONE }, false);
     const conn = await h.open();
     return { items: conn.items, transport: conn.transport, timeZone: FILTER_ZONE, close: h.close };
+  });
+});
+
+describe.skipIf(!TODO_BIN)("capture syntax and waiting against $TODO_BIN", { timeout: 60_000 }, () => {
+  // The suite FakeDaemon runs too, on one daemon spawned in the same zone.
+  captureConformance(async () => {
+    const h = await home({ TZ: CAPTURE_ZONE }, false);
+    const conn = await h.open();
+    return { items: conn.items, timeZone: CAPTURE_ZONE, close: h.close };
   });
 });
