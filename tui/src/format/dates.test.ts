@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { dayLabel, dayNumber, isoDay, localDay, longDay, relativeDays, shortDay } from "./dates.js";
-import { rowCells } from "./item.js";
+import { fitWaiting, rowCells } from "./item.js";
 import { create, ItemSchema, Status } from "@todo-tui/client";
 
 const today = dayNumber(2026, 10, 26); // a Monday
@@ -45,9 +45,16 @@ describe("date labels", () => {
       due: "^Oct 25",
       overdue: true,
       waiting: "⧗dana 3d",
+      waitingAge: " 3d",
       followUpDue: true,
       markers: "⏸Nov 3 ↑ ! 🔁",
     });
     expect(rowCells(create(ItemSchema, { deferUntil: { year: 2026, month: 10, day: 26 } }), today)).toMatchObject({ due: "", waiting: "", markers: "" });
+  });
+
+  it("fits the waiting cell by cutting the name and keeping the age", () => {
+    expect(fitWaiting({ waiting: "⧗dana 3d", waitingAge: " 3d" }, 10)).toBe("⧗dana 3d  ");
+    expect(fitWaiting({ waiting: "⧗the account manager 12d", waitingAge: " 12d" }, 14)).toBe("⧗the acco… 12d");
+    expect(fitWaiting({ waiting: "⧗someone with no since", waitingAge: "" }, 8)).toBe("⧗someon…");
   });
 });

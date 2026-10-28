@@ -172,6 +172,14 @@ describe("t", () => {
     expect(t.byTitle("X")?.labels).toEqual(["home"]);
   });
 
+  it("keeps a label that starts with #, as capture makes them, when another label is added", async () => {
+    const t = await setup(fakeDaemon([item("X", { labels: ["#urgent", "home"] })]));
+    await t.c.press("t");
+    expect(t.mode()).toMatchObject({ kind: "prompt", prompt: "labels", line: { text: "##urgent #home " } });
+    await t.c.press("work<enter>");
+    expect(t.byTitle("X")?.labels).toEqual(["#urgent", "home", "work"]);
+  });
+
   it("shows a set changed elsewhere, and rebases when only another field changed", async () => {
     const t = await setup(fakeDaemon([item("X", { labels: ["a"] })]));
     const id = t.c.selectedId()!;

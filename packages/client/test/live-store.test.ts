@@ -208,6 +208,24 @@ describe("LiveStore", () => {
     expect(store.getConnection().attempt).toBe(0);
   });
 
+  it("asks for the daemon again every respawnMs while an outage lasts, in case a spawn failed", async () => {
+    let spawned = 0;
+    const { daemon, store } = setup(1, {
+      ensureDaemon: async () => {
+        spawned++;
+      },
+      backoff: { initialMs: 10, maxMs: 20 },
+      respawnMs: 100,
+    });
+    daemon.down = true;
+    store.start();
+    await waitFor(() => spawned >= 3);
+    // Not on every attempt: about one per respawnMs.
+    expect(store.getConnection().attempt).toBeGreaterThan(spawned);
+    daemon.down = false;
+    await waitFor(() => store.getConnection().state === "live");
+  });
+
   it("asks for the daemon again in each later outage, and backs off from the start again", async () => {
     let spawned = 0;
     const { daemon, store } = setup(1, {

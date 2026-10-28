@@ -34,6 +34,28 @@ describe("keys", () => {
     expect(t.selected()).toBe("row 1");
   });
 
+  it("reads alt with an arrow or backspace in a line as a word edit, never an esc that drops the text", async () => {
+    const t = await setup();
+    await t.c.press("abuy milk tomorrow");
+    t.c.input("", { leftArrow: true, meta: true });
+    t.c.input("", { backspace: true, meta: true });
+    t.c.input("", { upArrow: true, meta: true });
+    t.c.input("b", { meta: true });
+    await t.c.idle();
+    expect(t.state().mode).toMatchObject({ kind: "quickAdd", line: { text: "buy tomorrow", cursor: 0 } });
+    // The prompts and : edit the same way.
+    await t.c.press("<esc>:quit now");
+    t.c.input("", { backspace: true, meta: true });
+    await t.c.idle();
+    expect(t.state().mode).toMatchObject({ kind: "command", line: { text: "quit " } });
+    // Outside a line, alt+key is still esc then the key.
+    await t.c.press("<esc>");
+    t.c.input("", { downArrow: true, meta: true });
+    await t.c.idle();
+    expect(t.state().mode.kind).toBe("normal");
+    expect(t.selected()).toBe("row 1");
+  });
+
   it("drops an unbound continuation with a hint, and nothing runs (hard case 4)", async () => {
     const t = await setup();
     await t.c.press("d");

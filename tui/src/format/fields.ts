@@ -4,11 +4,15 @@
 /** "#a #b": the prefill of `t`. */
 export const formatLabels = (labels: readonly string[]): string => labels.map((l) => `#${l}`).join(" ");
 
-/** The labels typed into `t`: words, each without its leading #s, the first of each kept. */
+/**
+ * The labels typed into `t`: words, each without the one # in front of it
+ * (as capture reads #label: "##a" is the label "#a", which formatLabels
+ * gives back as typed), the first of each kept.
+ */
 export function parseLabels(text: string): string[] {
   const out: string[] = [];
   for (const word of text.split(/\s+/)) {
-    const label = word.replace(/^#+/, "");
+    const label = word.replace(/^#/, "");
     if (label && !out.includes(label)) out.push(label);
   }
   return out;
@@ -20,12 +24,12 @@ export interface LabelEdits {
   readonly remove: readonly string[];
 }
 
-/** "+a -b #c d": -word removes a label, any other word (+, # optional) adds one; the last word for a label wins. */
+/** "+a -b #c d": -word removes a label, any other word (+, # optional, as in parseLabels) adds one; the last word for a label wins. */
 export function parseLabelEdits(text: string): LabelEdits {
   const edits = new Map<string, boolean>();
   for (const word of text.split(/\s+/)) {
     const remove = word.startsWith("-");
-    const label = word.replace(/^[-+]/, "").replace(/^#+/, "");
+    const label = word.replace(/^[-+]/, "").replace(/^#/, "");
     if (!label) continue;
     edits.delete(label);
     edits.set(label, !remove);

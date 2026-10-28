@@ -275,6 +275,27 @@ describe("quick-add: no capture lands twice", () => {
     expect(captured(t).map((i) => i?.title)).toEqual(["milk", "milk", "bread", "breas"]);
   });
 
+  it("sends a new request_id once the line was emptied or quick-add closed: the same text later is a new capture", async () => {
+    const l = losing();
+    const t = await setup(dated(), { items: l.wrap });
+    // The capture lands, but its answer is lost.
+    await t.c.press("abuy milk<enter>");
+    expect(t.toast()).toBe("The daemon did not answer; the change may not be saved");
+    l.state.lose = false;
+    await t.c.press("<ctrl+u><esc>");
+    // Later, a second "buy milk" on purpose: a new Item, not the first one replayed.
+    await t.c.press("abuy milk<enter><esc>");
+    expect(l.ids[1]).not.toBe(l.ids[0]);
+    expect(captured(t).map((i) => i?.title)).toEqual(["buy milk", "buy milk"]);
+    // Emptying the line by hand, without closing, starts over too.
+    l.state.lose = true;
+    await t.c.press("aeggs<enter>");
+    l.state.lose = false;
+    await t.c.press("<backspace><backspace><backspace><backspace>eggs<enter><esc>");
+    expect(l.ids[3]).not.toBe(l.ids[2]);
+    expect(captured(t).map((i) => i?.title)).toEqual(["buy milk", "buy milk", "eggs", "eggs"]);
+  });
+
   it("also after the daemon stayed down past the retry window", async () => {
     const l = losing();
     l.state.lose = false;
@@ -306,19 +327,23 @@ describe("A", () => {
     expect(t.byTitle("loose")?.parentId).toBeUndefined();
   });
 
-  it("keeps the text and says why when the parent was deleted while typing (hard case 43)", async () => {
+  it("keeps the text, now for the top level, and says why when the parent was deleted while typing (hard case 43)", async () => {
     const t = await setup(dated(rows(2)));
     await t.c.press("A");
     const parent = t.byTitle("row 0")!;
-    await t.c.press("child");
+    await t.c.press("child +3");
     await deleteItem(t.clients().items, parent.id);
     await t.c.press("<enter>");
-    expect(t.state().toast).toMatchObject({ level: "error", text: "The parent was deleted — esc, then a, to add at the top level" });
-    expect(await quickAdd(t)).toMatchObject({ line: { text: "child" }, parentId: parent.id });
+    expect(t.state().toast).toMatchObject({ level: "error", text: "The parent was deleted: enter adds this at the top level · esc discards" });
+    const mode = await quickAdd(t);
+    expect(mode).toMatchObject({ line: { text: "child +3" } });
+    expect(mode.parentId).toBeUndefined();
+    expect(mode.parentTitle).toBeUndefined();
     expect(captured(t)).toEqual([]);
-    await t.c.press("<esc>a");
+    // The text typed is never lost: enter now adds it at the top level.
+    await t.c.press("<enter>");
+    expect(captured(t).map((i) => [i?.title, i?.parentId, i?.priority])).toEqual([["child", undefined, Priority.MEDIUM]]);
     expect(t.mode()).toMatchObject({ kind: "quickAdd", line: { text: "" } });
-    expect(t.mode()).not.toHaveProperty("parentId");
   });
 });
 

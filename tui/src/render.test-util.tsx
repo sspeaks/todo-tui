@@ -2,7 +2,7 @@ import type { ItemsClient, LiveStoreOptions } from "@todo-tui/client";
 import { render } from "ink";
 import { expect, vi } from "vitest";
 import { Tui } from "./App.js";
-import { Controller } from "./controller/controller.js";
+import { Controller, type ControllerOptions } from "./controller/controller.js";
 import type { Timing } from "./controller/pipeline.js";
 import { type FakeDaemonHandle, fakeDaemon } from "./fake.test-util.js";
 import { virtualTerminal } from "./term.js";
@@ -26,6 +26,8 @@ export interface TuiOptions {
   timing?: Partial<Timing>;
   /** The ItemService client actions call (default: the daemon's), e.g. one that holds calls. */
   items?: (items: ItemsClient) => ItemsClient;
+  /** E's editor and the state dir. */
+  controller?: Pick<ControllerOptions, "editor" | "stateDir">;
 }
 
 /** The whole TUI over FakeDaemon in an off-screen terminal of a set size. */
@@ -34,7 +36,7 @@ export function renderTui(opts: TuiOptions = {}) {
   const store = fd.store(opts.store);
   const clients = fd.clients();
   const items = opts.items ? opts.items(clients.items) : clients.items;
-  const controller = new Controller({ store, items, ...(opts.now && { now: opts.now }), ...(opts.timing && { timing: opts.timing }) });
+  const controller = new Controller({ store, items, ...(opts.now && { now: opts.now }), ...(opts.timing && { timing: opts.timing }), ...opts.controller });
   const term = virtualTerminal(opts.columns ?? 100, opts.rows ?? 30);
   store.start();
   const app = render(<Tui store={store} clients={clients} controller={controller} />, term.options);

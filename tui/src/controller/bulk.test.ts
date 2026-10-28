@@ -265,6 +265,22 @@ describe("bulk actions", () => {
     expect(t.toast()).toBe("delete 2 items and 1 subtask · u undo");
   });
 
+  it("dd with marks counts the subtasks that go with them in the confirm, those not marked themselves", async () => {
+    const a = item("a");
+    const b = item("b");
+    const t = await setup(
+      fakeDaemon([a, b, item("a.1", { parentId: a.id }), item("a.2", { parentId: a.id, status: Status.DONE }), item("b.1", { parentId: b.id }), item("c")]),
+    );
+    expect(t.titles()).toEqual(["a", "b", "a.1", "b.1", "c"]);
+    // a and b marked, and b.1: a's two subtasks (one done) go with it; b.1 is counted as marked.
+    await t.c.press("mmjm");
+    await t.c.press("dd");
+    expect(t.mode()).toMatchObject({ kind: "confirm", text: "Delete 3 items and their 2 subtasks? y/N" });
+    await t.c.press("y");
+    expect(t.titles()).toEqual(["c"]);
+    expect(t.byTitle("a.2")?.deletedAt).toBeDefined();
+  });
+
   it("t with marks takes +a -b, applied to each Item's own labels; unchanged ones are left out", async () => {
     const t = await setup(fakeDaemon([item("a", { labels: ["later", "home"] }), item("b", { labels: ["urgent"] }), item("c")]));
     await t.c.press("mmmt");

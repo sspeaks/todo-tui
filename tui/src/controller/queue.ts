@@ -51,6 +51,11 @@ export class InputQueue {
     return this.current ?? Promise.resolve();
   }
 
+  /** Puts inputs back at the front, to be handled next, in order. */
+  unshift(inputs: readonly Input[]): void {
+    this.queue.unshift(...inputs);
+  }
+
   /** Removes and returns the inputs waiting, e.g. to drop them after a failed action. */
   take(): Input[] {
     return this.queue.splice(0);

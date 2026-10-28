@@ -63,7 +63,7 @@ The TUI is designed for two speeds: **capture in under three seconds**, and **tr
 | Path | How | Notes |
 |---|---|---|
 | **CLI one-liner** | `todo add "call dentist ^fri +2"` (alias `todo a`) | Prints the short id and parsed fields, then exits. `todo add` with no argument reads stdin, **one capture per line**, for pasting a list or meeting notes. At a terminal each line is captured as it is entered, so Ctrl-C loses only lines not yet captured (normally just the one being typed); piped input is read whole first. |
-| **TUI quick-add** | `a` from any view | Inline input at the top of the list, with a **live preview** of parsed tokens as you type. `enter` saves and stays open for the next capture; `esc` closes. |
+| **TUI quick-add** | `a` from any view (`A`: as a subtask of the selected Item) | Inline input at the top of the list, with a **live preview** of parsed tokens as you type (`ParseCapture`, one request in flight, the latest text winning; a stale answer is never shown). `enter` saves and stays open for the next capture; `enter` on blank text closes; `esc` discards. A multi-line paste captures each non-blank line in order, as `todo add` reads stdin; text over the 64 KiB limit is refused in the client and kept. A capture whose answer was lost (daemon gone, deadline) is resent with the same `request_id` on the next `enter` of the same text, so it never lands twice; emptying the line or closing quick-add forgets it. If `A`'s parent is deleted while you type, the text stays, now for the top level. |
 | **MCP** | From Claude Code: "add a todo to fix the flaky test" | Uses the same capture call; `created_via = mcp`. |
 
 **Capture never fails for want of a daemon.** If the daemon cannot be reached or started within the auto-spawn budget, the CLI appends a line `{ "spool_id": <ULID>, "captured_at": <local timestamp with offset>, "text": "…" }` to `spool.jsonl` in the data directory (7.1), using an exclusive append lock, and exits successfully. The daemon imports the spool when it starts and every 30 s while it runs: each line with `ParseCapture(text, reference_time = captured_at)` so relative dates resolve against the capture time, `created_via = cli`, skipping any `spool_id` it has already imported (crash-safe). The file is truncated after a successful import; lines it cannot import (malformed, blank, or over the capture limit, 2.3) move to `spool.rejected.jsonl`. Text over the limit is neither sent nor spooled: the CLI reports it `NOT CAPTURED` and exits 1. Captures are always local first (`inbox`); nothing touches Jira until you promote.
@@ -95,6 +95,15 @@ Future capture surfaces (Raycast, macOS Shortcuts, mobile) are just more gRPC cl
 - **Right pane**: shows either the **detail** of the selected Item, or the **Suggestions** drawer (`S` toggles). It follows the list selection.
 - **Status bar**: mode, per-instance sync state (5.11), pending outbox count, global suggestion count, key hints.
 - **Responsive**: at ≥ 110 columns, list and right pane sit side by side (~60/40). Below that, the list is full width and detail/suggestions open as full-screen overlays (`enter` / `S`, `esc` to close). Long titles truncate, never wrap, in the list.
+
+**In P1 (M4)** the layout is this, minus what needs a P2+ service:
+- **Screen**: the alternate screen; two bottom lines, a **status bar** and a **message line** (toasts, prompts, the `:` and `/` lines, the `dd` confirm). The frame is computed from the terminal size and never exceeds its rows (Ink would redraw the whole frame every time); only the visible rows are rendered. Below 40×8 the TUI shows only "Terminal too small". Crossing 110 columns closes the overlay.
+- **Tab bar**: `View.name` and its `GetStatusCounts.views` count, zero counts omitted; when the tabs do not fit, the other tabs shorten to their initial and count, the current one whole. A transient `Search: q` tab follows the views while open (2.5).
+- **Rows**: status glyph, effective priority (`*` for an override), title, due (`^Today`, `^Tom`, a weekday within the week, `^Nov 2`, ISO in another year; red when overdue), waiting (`⧗dana 3d`, highlighted when the follow-up is due), then markers rendered from fields: `⏸Nov 3` when deferred into the future, `↑`, `!`, `🔁`. `✦` waits for P2. Archived rows are dimmed. Each column is as wide as its widest visible cell; when the title would get narrower than 20 cells the markers go first, then the waiting column is narrowed to 12 cells (names cut, the age kept) and then dropped, then the key, then the due. Relative labels and ages use `GetStatusCountsResponse.today`, the daemon's date.
+- **Sanitizing**: every piece of user text has C0/C1 controls, bidi overrides and escape sequences stripped before it is rendered: a title can hold ESC (only line breaks are refused), and Ink passes SGR codes through.
+- **Empty states** follow the view's seed ("Inbox zero · a to add", "Nothing due today", …; a user view says "No Items match this view"); a narrowed list says what it matched.
+- **Status bar**: mode (`NORMAL`, `ADD`, `EDIT`, `VISUAL`, …) · connection (`● live`, or `◌ reconnecting (n)` with the error, the list dimmed) · `saving…` once an action has run 250 ms · `N marked` (`(k hidden)` under `/`) · the pending prefix with its continuations (`p… 1–5 Set the priority · 0 Clear the priority`) · `/q · n` · `u: <undo entry>` (the top of the global undo stack, 3.10) · key hints. Sync state, the outbox count and suggestions join in P2.
+- **Detail pane** (read-only in P1): title, status, priority (and override), due, defer, waiting (person, since and age, follow-up, reason), labels, created (with `created_via`), updated, description; archived, type, story points, estimates and private notes when set; the parent's title; the subtasks (any status); relations as "Blocks / Blocked by / Duplicates / Duplicated by / Related to", a deleted end dimmed. It follows the selection after about 80 ms; `tab` focuses it to scroll it.
 
 ### 2.3 Inline capture syntax
 
@@ -137,45 +146,51 @@ Views are **saved queries**: a server-side filter + sort (4.3 rule 6). The defau
 
 Exact filters are in 4.8. Archive must show done Items: otherwise `x` makes an Item vanish from every tab until the M5 auto-archive (3.7).
 
-**Implicit rules** apply to every view, `ListItems` and count: exclude deleted; exclude archived; exclude `done`/`cancelled`; exclude `defer_until` in the future (a deferred Item is hidden from Today even when due). Only the filter's `include_*` flags lift them, never its clauses (4.8). `/` and `:search` are in 2.5.
+**Implicit rules** apply to every view, `ListItems` and count: exclude deleted; exclude archived; exclude `done`/`cancelled`; exclude `defer_until` in the future (a deferred Item is hidden from Today even when due). Only the filter's `include_*` flags lift them, never its clauses (4.8). `/` and `:search` are in 2.5. So an open Item deferred into the future, and not archived, is in no default view: until `:view new` (M6) can make a "Deferred" view, `:search` is the way back to it, and `D` with an empty date un-defers it.
 
 Views are stored **in the database** (not the TOML), one set per data directory, and created and edited with `:view new|edit|delete`, ordered by `:view move` (M6). View edits are not undo entries: they write no events (`:view delete` confirms instead). **Seeding**: the defaults are `todo_core::view::defaults()` (FakeDaemon mirrors them), each with a seed key (`inbox`, `today`, `next`, `waiting`, `someday`, `archive`). At `Store::open`, after migrations and in one transaction, each default whose key is not yet in `view_seeds` is appended after the existing views (a taken name gets a number), its key recorded, and a `view` Change written; no op or event. So the defaults appear on first run, a default added in a later version is seeded once into existing databases, and a deleted seeded view is never re-created. P2 seeds an instance's tab the same way, with key `instance:<id>`, when the instance first appears in config; P2 also decides where it goes (M3 seeds positions 0–5).
 
 ### 2.5 Keymap (normal mode)
 
-All bindings live in one declarative keymap table (4.6), are listed in the `F1` help overlay, and are user-overridable.
+All bindings live in one declarative keymap table (4.6), are listed in the `F1` help overlay, and are user-overridable. Each binding has a stable snake_case action id (`set_priority_1`, `mark_done`, `edit_labels`, …), which is what config names (8.2); the overrides arrive with config in M6. The help overlay is generated from the table (only what runs now, each binding once), plus a capture-syntax and date-grammar cheat sheet. It opens with `?`, any F-key (Ink delivers every F-key alike, so F1 cannot be told apart) or `:help`, the fallback for a terminal that keeps F1; in P4 the Ask bar takes `?` and help keeps the others.
 
-**Navigation**: `j`/`k` move · `gg`/`G` top/bottom · `ctrl-d`/`ctrl-u` half-page · `tab` cycle focus list ↔ right pane · `1`–`9`, `[`, `]` views · `/` incremental filter (below) · `esc` clear / close.
+**Key handling**: one input mode owns the keys at a time (normal, quick-add, prompt, status picker, confirm, command, `/`, help). Ink hands over a whole stdin chunk at once, so each chunk is split into one token per key: `jjj` is three moves, `milk⏎bread⏎` two captures. Ink reports ESC then a key within 20 ms and Alt+key alike: outside a text line that is `esc` then the key; in a line Alt with an arrow, `b`, `f`, `d` or backspace moves or deletes by word, and other Alt+named keys do nothing, so they never throw the line away. There are **no counts and no timeouts**: digits switch views, and `d`, `g`, `p` are prefixes (no binding is both complete and a prefix; a test enforces it). An unbound continuation (`d j`, `p 9`) is dropped with a hint, and the status bar shows a pending prefix with its continuations. A bracketed paste never runs as keys: in normal mode it is ignored with a hint.
 
-**`/` and `:search`**: `/` narrows the current view **on the server** as you type (debounced, ~100 ms): `ListItems(view_id = current, filter = {any_of: [title, labels, remote_link.key MATCHES q]})`. `enter` keeps the narrowed list, `esc` clears it, and the tab count stays un-narrowed. A narrowed list holds only matches, so `n`/`N` are not match jumps (M4 may make them row moves). `:search q` searches everything: no view, `any_of` the same targets plus description, with `include_archived`, `include_done` and `include_deferred` (deleted Items stay hidden). MATCHES takes plain words, each a prefix, ignoring case and accents (4.8).
+**Navigation**: `j`/`k` move · `gg`/`G` top/bottom · `ctrl-d`/`ctrl-u` half-page · `tab` cycle focus list ↔ right pane · `1`–`9`, `[`, `]` views (`[` and `]` wrap) · `/` incremental filter (below) · `esc` clear / close. `esc` steps back one level per press: a pending prefix, then the detail (overlay or focus), then a `V` range, then the `/` narrowing, then the marks; on the `Search:` tab with nothing else to clear, back to the view it was opened from. `n`/`N` stay unbound.
 
-**Item actions** (on the selected Item, or on all marked Items):
+**`/` and `:search`**: `/` narrows the current view **on the server** as you type: `ListItems(view_id = current, filter = {any_of: [title, labels, remote_link.key MATCHES q]})`, one request in flight and the latest text winning (no debounce). `enter` keeps the narrowed list, `esc` clears it (back to the selection and scroll from before `/`), a view switch clears it, and the tab count stays un-narrowed. Blank or token-less text is un-narrowed (MATCHES refuses blank text), and the text is capped at 1024 bytes. The selection stays on its Item while it still matches, else goes to the first row. A narrowed list holds only matches, so `n`/`N` are not match jumps. `:search q` searches everything: no view, `any_of` the same targets plus description, with `include_archived`, `include_done` and `include_deferred` (deleted Items stay hidden), most recently updated first. It opens a transient `Search: q` tab after the views; a new `:search` replaces it, and leaving the tab closes it. MATCHES takes plain words, each a prefix, ignoring case and accents (4.8).
+
+**Item actions** (on the selected Item, or on all marked Items). The list keys act on the Item the detail pane shows; with the detail as an overlay, on the Item it shows until `esc`.
 
 | Key | Action |
 |---|---|
 | `a` / `A` | Quick-add / quick-add as child of selected |
-| `enter` | Open detail (field-by-field editing: `j`/`k` over fields, `enter` edits one) |
-| `i` | Edit title inline |
-| `E` | Edit description in `$EDITOR` |
+| `enter` | Open detail. Read-only in P1, where every field P1 edits has its own key; field-by-field editing (`j`/`k` over fields, `enter` edits one, which reaches the local priority override and private notes) arrives in P2 |
+| `i` | Edit title inline (prefilled; the title is literal, tokens are not parsed) |
+| `E` | Edit description in `$EDITOR` (4.6) |
 | `p` then `1`–`5` / `0` | Set priority (the Core field: pushed to Jira when linked) / clear (`0` is rejected with a message if the tracker requires a priority). The local override is set from the detail pane |
-| `^` | Due date prompt (same date grammar as the `^` capture token) |
-| `D` | Defer until… |
-| `w` / `W` | Set waiting-on (person prompt + optional follow-up date) / clear waiting |
-| `s` | Status picker (`inbox`, `next`, `in_progress`, `someday`, `done`, `cancelled`) |
-| `x` / `X` | Mark done / cancelled |
-| `t` | Edit labels |
+| `^` | Due date prompt (same date grammar as the `^` capture token), prefilled with the ISO date and previewed through `ParseDate` as you type (`→ Fri Oct 30`, or the warning, which keeps the prompt open on `enter`). **Empty + `enter` clears** the field, and the preview says so first; there are no magic words |
+| `D` | Defer until… (as `^`) |
+| `w` / `W` | Set waiting-on / clear waiting. `w` is one line, `<person> [^date]`: a trailing `^date` is the follow-up, the rest the person (free text, spaces allowed); `tab` completes the person from the `waiting.on` texts already in use. The same person writes only `waiting.follow_up_on`, keeping `since` (and the age the Waiting view sorts on); a new person replaces `waiting`, so `since` becomes today. Empty clears |
+| `s` | Status picker: a letter each, `i` inbox · `n` next · `p` in progress · `s` someday · `d` done · `c` cancelled; `j`/`k` + `enter` also work; the current status (with marks, the one they share) is ticked |
+| `x` / `X` | Mark done / cancelled. No toggle: on an Item already done the toast says "already done; s to reopen" |
+| `t` | Edit labels: prefilled `#a #b`, edited as the whole set (`#` optional; one `#` comes off, as in capture, so `##a` is the label `#a`). With marks, `+a -b` adds and removes on each Item's own set |
 | `P` | Promote to Jira (target from config; shows missing required fields on failure, 5.7) |
 | `L` | Link (attach) to an existing Jira issue by key |
 | `o` | Open in browser (Jira URL) |
 | `z` | Archive / unarchive |
-| `dd` | Delete (local only; confirm). `d` is reserved as a prefix, so it is not bound alone |
-| `m` / `V` | Mark / visual range-mark for bulk actions |
-| `u` / `ctrl-r` | Undo / redo (per `op_id`) |
+| `dd` | Delete (local only; confirm `Delete "X" and its 2 subtasks? y/N`, or `Delete 3 items and their 2 subtasks? y/N` with marks, counting direct subtasks not marked themselves; `y` deletes, any other key cancels and is swallowed). `d` is reserved as a prefix, so it is not bound alone |
+| `m` / `V` | Mark / visual range-mark for bulk actions. `m` toggles and moves down; `V` marks the rows between where it started and the selection, by index, until `V` or `esc` |
+| `u` / `ctrl-r` | Undo / redo (per `op_id`), with `expected_op_id` from the status bar's `u:` entry, so `u` never undoes an op you have not seen (an `UNDO_STACK_CHANGED` refusal says what `u` now undoes). The toasts use the CLI's words: `Undid: …`, `Could not undo: …`, `· N changes kept (changed since)`, `Nothing to undo` |
 | `gs` | Sync now |
+
+**In P1 (M4)**: `P`, `L`, `o`, `gs`, `S` and the `space` leader are unbound until their services exist (P2–P4). **Marks** belong to the current view: a view switch, a successful bulk action and `esc` clear them; an Item that leaves the view leaves the marks; `/` keeps them (`3 marked (1 hidden)`). When the view has marks, the mark-aware keys `x X s p ^ D w W t z dd` act on every marked Item through one `BatchMutate`, so one undo entry (`mark done (3 items) · u undo`); `z` on a mixed set archives if any is unarchived. `i`, `E`, `A` and `enter` act on the selected Item only, `u` and `ctrl-r` on the global stack. More than 1000 marks is refused, since splitting the batch would split the undo.
 
 **Claude actions** (`space` leader; hidden if no provider configured): `space r` refine · `space p` prioritize · `space s` split · `space c` draft comment · `space l` find related. All produce Suggestions. `?` opens the **Ask bar** (6.7).
 
-**Command line** (`:`) with fuzzy completion, which doubles as the command palette: `:review`, `:standup`, `:sync`, `:promote`, `:link PLAT-123`, `:export`, `:view new …`, `:help`.
+**Command line** (`:`) with fuzzy completion, which doubles as the command palette: `:review`, `:standup`, `:sync`, `:promote`, `:link PLAT-123`, `:export`, `:view new …`, `:help`. P1 runs `:q`/`:quit`, `:help`/`:h`, `:search <q>` and `:refresh`, with `tab` prefix completion (the fuzzy palette comes later); a planned command says when it arrives (`:view` and `:export` in M6, `:sync`, `:promote`, `:link` and `:w` in P2, `:review` and `:standup` in P4), anything else "Not a command".
+
+**Quitting**: `q`, `:q` and `ctrl-c` in normal mode; in an input mode `ctrl-c` cancels it. Quitting waits up to 1 s for an action in flight. `ctrl-z` stops the TUI as a shell job (`fg` resumes it, redrawn, the change stream catching up); with no job control it says so and carries on.
 
 **Editing safeguards**: Core edits on a linked Item assigned to someone else ask for confirmation first (5.9). Editing a lossy description warns first (5.6).
 
@@ -211,6 +226,14 @@ The single place where you review AI proposals **and** sync fallout:
 - Every mutation gives immediate visual feedback (optimistic, from the local daemon) with a one-line toast for anything non-obvious ("Promoted → PLAT-531", "Undid: mark done (3 items)").
 - Errors never block: failures become `!`-marked Items plus Suggestions (`push_failed`), and auth problems show in the status bar.
 - Background events don't move the selection or scroll position. New rows appear in place, briefly highlighted.
+
+**In P1 (M4)**:
+- **The serial action pipeline.** The TUI is not optimistic: the local daemon settles an action in about 5 ms at 60 rows (50 ms at 2000). Every key queues behind the action in flight, which runs in order: the RPC; the response's Items into the live store; an awaited reload of the current view and the undo state; the toast; then the next key. So `xx` completes two Items, never one twice, and `j` after `x` moves in the list as `x` left it. "saving…" shows once an action has run 250 ms.
+- **Toasts** go on the message line, one at a time, newest wins: info for 4 s, errors for 8 s or until the next key. Toasted: actions that move or remove a row (`x X s z D dd`, and a plain edit that takes the Item out of the view), every bulk action, a capture into a view that will not show it (`capture "x" → Inbox`), undo and redo, errors. Not toasted: plain edits (`p ^ t i w`). An action's text is the `OpSummary.description` of the top undo entry, read with `GetUndoState` in the settle when its `op_id` is the action's, plus ` · u undo` (`mark done (3 items) · u undo`, `delete "P" and 2 subtasks · u undo`); when another op landed on top first, a client-side description without the `u` offer.
+- **Errors** map to one line: `ITEM_DELETED` / `ITEM_NOT_FOUND` "“X” was deleted elsewhere" (in a bulk action that Item is dropped and the batch retried once, with a new `request_id`); `PARENT_DELETED` "Undelete the parent first"; `INVALID_ARGUMENT` with its `BadRequest` field; `UNDO_STACK_CHANGED` "Undo stack changed — u now: …"; anything else its code and message. Keys queued behind a failed action that would act are dropped ("· 2 keys dropped"); the navigation keys queued before them still run; text typed into quick-add is kept as lines to capture next.
+- **The daemon going away**: the status bar shows `◌ reconnecting (n)` with the error and the list dims; navigation keeps working on the rows shown. An action cut by a connection failure waits up to 5 s for the stream to be live, then sends the **same request** again, `request_id` and all, so it applies once (4.3 rule 4); otherwise "Not saved: daemon unavailable", with any typed text kept. The live store respawns the daemon at the start of an outage and every 5 s while it lasts.
+- **Selection**: an Item id, remembered per view. When the Item leaves the list (your action or another client's), the selection falls to the row now at its index, or the last row; when your own action reorders the list (`p 1` in Next), it follows the Item. Background changes never move the selection or the scroll: the scroll is anchored on the top row's id, with a scrolloff of 2. Rows a background change brings into view are highlighted briefly.
+- **Midnight**: a 60 s poll compares the local date with `GetStatusCountsResponse.today` and, once it passes, re-reads the views and counts once per `today` (4.4). A single long timer would stall while a laptop sleeps.
 
 ## 3. Domain Model
 
@@ -490,7 +513,8 @@ Three independent version axes: the **API** is versioned by protobuf package (`t
 3. **Enums** always have an `*_UNSPECIFIED = 0` value. Clients must handle unknown enum values gracefully (render as "unknown", never crash).
 4. **Every mutating call** accepts a client-generated `request_id` (ULID; idempotency: a replay within 24h returns the original result) and returns the resulting `op_id` (for undo) and new `revision`.
    - **Bulk**: `ItemService.BatchMutate(mutations[])` applies a list of mutations (any of the single-item mutation messages) atomically as **one op** — what bulk actions on marked Items (2.5) use, so "Undid: mark done (3 items)" is one undo. Single-item RPCs are equivalent to a batch of one.
-   - **Concurrency**: each mutation may carry `expected_revision` (the Item's `revision`, 3.1). If the Item changed since, the call fails with `ABORTED` and the client refreshes. The TUI always sends it for edits made from a rendered value; MCP and the CLI may omit it (last writer wins).
+   - **Concurrency**: each mutation may carry `expected_revision` (the Item's `revision`, 3.1). If the Item changed since, the call fails with `ABORTED` and the client refreshes. The TUI sends it only for edits made from a rendered value, which in P1 are `i` (title), `E` (description) and `t` (labels). On `ABORTED` it reads the Item again: if the edited field is unchanged on the server (someone changed another field), it retries on the new revision without a word; otherwise it keeps the prompt open with your text and "Changed elsewhere to “…” — enter overwrites · esc discards", and `enter` saves on the new revision. `E` has no prompt to keep, so its text goes to `<state dir>/recovered/<id>-<timestamp>.md` and the toast names the file. Absolute actions (`x X s p ^ D w W z dd`) omit it: they do not depend on the old value, and one background touch of a marked Item would otherwise fail a whole batch. The TUI runs its own mutations one at a time (2.8), so it never conflicts with itself. MCP and the CLI may omit it (last writer wins).
+   - **Retry**: after a connection failure a client sends the same request again with the same `request_id`, which is safe whether or not the first reached the daemon. The TUI does so once the stream is live again, within 5 s (2.8); a capture whose answer was lost is resent with its `request_id` when you press `enter` on the same text.
 5. **Errors** use standard gRPC status codes with structured details (`google.rpc.ErrorInfo`, `BadRequest`). Domain-specific details such as `MissingFields` (5.7) are typed messages, never parsed from strings.
 6. **Queries are server-side**: `ListItems` takes a structured filter (status, flags, dates, text, scope, archived, …), sort and page token. Clients don't filter large lists themselves. Saved views (Section 2) are stored filters.
 7. Google's AIP guidelines (resource-oriented design, standard methods, pagination) are the default style reference where this doc is silent.
@@ -502,7 +526,7 @@ Three independent version axes: the **API** is versioned by protobuf package (`t
   - **`Change { revision, topic, id, deleted: bool, resource: oneof { Item, Suggestion, View, Person, RecurrenceSeries, ReviewSession, ConfigSnapshot } }`** — durable, replayable. `topic` ∈ `item` (covers the Item aggregate incl. its comments, relations and pending-push state), `suggestion`, `view`, `person`, `series`, `review`, `config`. The full resource is included unless `deleted`. Views are hard-deleted, so a replayed `view` row whose view is gone is sent as `deleted`.
   - **`Notice { kind, … }`** — ephemeral, **no revision**, not replayed: `sync_status` (5.11), `import_progress` (5.4), `assistant_job` (queued/running/done), `toast`.
   - **`ResyncRequired {}`** — sent once when `since_revision` is older than the replay window (7.2); the stream then continues from the current revision and the client must reload.
-- Clients load data, remember its revision, subscribe from it, and resume from the last seen revision on reconnect. Because filtering is server-side, a client re-runs the current view's `ListItems` and the counts (debounced) when `item` changes arrive, or applies the change locally if it can evaluate membership cheaply; a `view` change re-runs the views that name it. **No change marks a new day**: Today, `is_overdue`, deferrals and ⏰ move at midnight without a revision, so a client re-reads its views and counts once its date passes `GetStatusCountsResponse.today` (LiveStore `refresh()`, on an M4 timer).
+- Clients load data, remember its revision, subscribe from it, and resume from the last seen revision on reconnect. Because filtering is server-side, a client re-runs the current view's `ListItems` and the counts (debounced) when `item` changes arrive, or applies the change locally if it can evaluate membership cheaply; a `view` change re-runs the views that name it. **No change marks a new day**: Today, `is_overdue`, deferrals and ⏰ move at midnight without a revision, so a client re-reads its views and counts once its date passes `GetStatusCountsResponse.today` (LiveStore `refresh()`, from the TUI's 60 s poll, 2.8).
 - This one mechanism keeps the TUI live while sync and Claude work in the background, and it gives future clients the same live behavior for free.
 
 ### 4.5 Daemon internals (Rust)
@@ -535,6 +559,12 @@ pnpm workspace:
 | `mcp` | The MCP server |
 
 **TUI**: Ink (React for terminals, current major version), function components and hooks. State is kept light. Server data lives in the `packages/client` live store; UI-only state (focus, selection, open panes, checkbox selections in the Suggestions pane) is plain React state/context. No Redux-style global store. Keybindings live in a declarative keymap table, listed in the help overlay and overridable from config in v1 (8.2).
+
+As built in M4 (this amends the paragraph above):
+- **UI state** lives in a small `UiStore`: a plain object with `setState(fn)` and `subscribe`, read in components through `useSyncExternalStore`. It is not React state, because a burst of keys and the async action pipeline must read the latest state synchronously, between renders. Server data stays in the live store, which gained `applyItems(items, revision)` (a mutation's response, applied before the next key), `fetchItem(id)` and `useItem(id, {fetch})` (the parent and relation ends), and a `LiveUndoState` (`useUndoState()`, the `u:` hint), all additive. The RPC clients reach components through `ClientsProvider` / `useClients()`.
+- **A controller** with no Ink in it owns the keys: the tokenizer (2.5), the modes (one input mode at a time, plus the narrow layout's detail overlay, orthogonal to it), the keymap compiled to a trie per mode, the input queue and the action pipeline (2.8). Tests drive it directly over FakeDaemon, and render tests run the whole app in a virtual terminal of a set size.
+- **Quick-add and the prompts** edit through a line editor of our own (a pure reducer: cursor, backspace, `ctrl-w`, `ctrl-u`, `ctrl-k`, home/end, word motions, paste), scrolled by display cells. FakeDaemon ports the capture parser, and one capture conformance suite runs against both daemons.
+- **`$EDITOR` (`E`)**: Ink's `suspendTerminal()` hands the terminal over around a **`spawnSync`** of `$VISUAL`, else `$EDITOR`, else `vi`, run through `sh -c` as git runs it (so `code --wait` works), on a temp `.md` file removed afterwards. `spawnSync` leaves no typed key for the TUI to read, unlike an async spawn; the change stream catches up on resume. While it runs, the TUI ignores `SIGINT` and `SIGQUIT`, as git does, so a `ctrl-c` meant for a waiting editor does not end it. A non-zero exit saves nothing (a missing editor is named); one trailing newline is not a change; unchanged text sends nothing; otherwise `UpdateItem(description)` with `expected_revision` and the rebase of 4.3 rule 4. The runner is injectable for tests. `ctrl-z` uses the same hand-over to stop the TUI as a job.
 
 **MCP server**: a thin stdio MCP server (official TypeScript MCP SDK) that maps a curated set of tools 1:1 onto gRPC calls. Tools: capture an item, search/list items, get an item, update fields, set status, list pending suggestions (P2+). It contains no logic of its own. Launched as `todo mcp` and registered with Claude Code as a local stdio server (8.4).
 
@@ -1013,6 +1043,20 @@ Each phase ends usable. Later phases must not require reworking earlier contract
 | **P3 — Claude core** | Providers (`api`, `claude_code`), job queue, context builder, `refine` (incl. merge), `relate`, `prioritize`, `fill_required`, learning from decisions, NL inference, usage tracking. **Services**: `AssistantService` (request jobs, usage) | Captures arrive refined; duplicates are caught |
 | **P4 — Review & Claude workflows** | Stale rules + `stale_review` (rules and Claude), weekly review mode, standup, Ask bar, `split`, `comment_draft`, derived `is_blocked` (4.8). **Services**: `ReviewService` | Monday review is the routine |
 | **P5 — Open source** | Packaging (Homebrew), docs, fixture scrubbing, a **second adapter** (GitHub Issues) to prove the adapter abstraction | Public release |
+
+**P1 progress.** P1 is built in milestones:
+
+| Milestone | Scope | Status |
+|---|---|---|
+| M1 | Write path, capture, `todo add` and the spool | done |
+| M2 | Undo/redo, relations, parent rules | done |
+| M3 | Filters, sort and paging, seeded views, counts, `todo status`, `ParseDate` | done |
+| M4 | The TUI daily driver: views as tabs, the list and detail pane, one-key triage, quick-add with a live preview, prompts, undo, marks and bulk, `/` and `:search`, `$EDITOR` | done: P1's exit criterion, "daily-drivable", is met |
+| M5 | Recurrence and the scheduler (incl. the `auto_done` archive, 3.7) | next |
+| M6 | Config (incl. keymap overrides), export/import, backups, view CRUD (`:view`) | |
+| M7 | The MCP server | |
+
+M4 left these for later: keymap overrides and `:view` to M6 (config and view CRUD); the relation and reparent UI to P3, where `relate` and `split` first create relations (nothing in P1 does); the detail pane's field editor, and with it editing the local priority override and private notes, to P2, where they matter (every field P1 edits has a key); `✦`, sync state and the outbox count to P2; the Ask bar to P4. The contract did not change in M4 (`api_minor` is still 5).
 
 ### 9.2 Open questions
 

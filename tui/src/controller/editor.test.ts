@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { Priority, deleteItem, updateItem } from "@todo-tui/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fakeDaemon, item } from "../fake.test-util.js";
-import { type EditorOutcome, type EditorRunner, systemEditor } from "./editor.js";
+import { type EditorOutcome, type EditorRunner, homeShort, systemEditor } from "./editor.js";
 import { setup, stopControllers } from "./setup.test-util.js";
 
 const dirs: string[] = [];
@@ -147,11 +147,27 @@ describe("the system editor", () => {
     expect(await visual("hi")).toEqual({ ok: true, text: "hi!" });
   });
 
-  it("says a non-zero exit, or a missing editor, saved nothing", async () => {
+  it("says a non-zero exit, or a missing editor, saved nothing, naming the editor it could not run", async () => {
     expect(await systemEditor(() => undefined, { EDITOR: "false" })("x")).toEqual({ ok: false, reason: "Editor exited 1, not saved" });
     // (sh's "not found" kept out of the test output.)
     const missing = systemEditor(() => undefined, { EDITOR: "/nonexistent/editor 2>/dev/null" });
-    expect(await missing("x")).toEqual({ ok: false, reason: "Editor exited 127, not saved" });
+    expect(await missing("x")).toEqual({
+      ok: false,
+      reason: "Could not run the editor /nonexistent/editor 2>/dev/null (not found; set $VISUAL or $EDITOR), not saved",
+    });
+    const dir = scratch();
+    const notExecutable = join(dir, "editor.sh");
+    writeFileSync(notExecutable, "#!/bin/sh\n", { mode: 0o644 });
+    expect(await systemEditor(() => undefined, { EDITOR: `${notExecutable} 2>/dev/null` })("x")).toEqual({
+      ok: false,
+      reason: `Could not run the editor ${notExecutable} 2>/dev/null (not executable), not saved`,
+    });
+  });
+
+  it("shortens a path under the home directory to ~ for the toast", () => {
+    expect(homeShort("/home/u/.local/state/todo-tui/recovered/x.md", "/home/u")).toBe("~/.local/state/todo-tui/recovered/x.md");
+    expect(homeShort("/home/u2/x.md", "/home/u")).toBe("/home/u2/x.md");
+    expect(homeShort("/tmp/x.md", "/")).toBe("/tmp/x.md");
   });
 
   it("hands the terminal over around the editor when the shell lends it", async () => {
@@ -166,6 +182,35 @@ describe("the system editor", () => {
     expect(await systemEditor(() => suspend, { EDITOR: editor })("x")).toEqual({ ok: true, text: "x" });
     expect(order).toEqual(["suspend", "resume"]);
     expect(readFileSync(join(dir, "files"), "utf8")).toMatch(/description\.md/);
+  });
+});
+
+describe("ctrl-c while the editor runs", () => {
+  // The editor has the terminal in cooked mode, so a ctrl-c meant for it
+  // (`code --wait`) goes to the whole process group: the TUI must live on.
+  // Ink's signal-exit re-raises a signal no other listener handles, which
+  // the child copies, so ignoring it only until spawnSync returns is not enough.
+  it("ignores SIGINT and SIGQUIT around the editor, in the process group that gets them", async () => {
+    const job = join(dirname(fileURLToPath(import.meta.url)), "job.ts");
+    const script = `
+      const { withoutInterrupts } = await import(${JSON.stringify(job)});
+      const { spawnSync } = await import("node:child_process");
+      for (const sig of ["SIGINT", "SIGQUIT"]) {
+        process.on(sig, function exitLike() {
+          if (process.listeners(sig).length === 1) { process.off(sig, exitLike); process.kill(process.pid, sig); }
+        });
+      }
+      const r = await withoutInterrupts(() => spawnSync("sh", ["-c", "kill -INT 0; kill -QUIT 0; exit 3"], { stdio: "ignore" }));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      process.stdout.write("alive " + (r.signal ?? r.status));
+    `;
+    const child = spawn(process.execPath, ["--input-type=module", "-e", script], { detached: true, stdio: ["ignore", "pipe", "inherit"] });
+    const kill = setTimeout(() => child.kill("SIGKILL"), 5_000);
+    let out = "";
+    child.stdout.on("data", (d: Buffer) => (out += d));
+    const [code, signal] = await new Promise<[number | null, NodeJS.Signals | null]>((resolve) => child.on("exit", (c, s) => resolve([c, s])));
+    clearTimeout(kill);
+    expect({ code, signal, out }).toEqual({ code: 0, signal: null, out: "alive SIGINT" });
   });
 });
 

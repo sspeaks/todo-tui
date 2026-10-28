@@ -3,7 +3,8 @@
 // enter captures and stays open, enter on blank text closes, esc
 // discards. A paste of several lines captures each non-blank line in
 // order, as `todo add` reads stdin; text over 64 KiB is refused here and
-// kept. `A` captures as a child of the selected Item.
+// kept. `A` captures as a child of the selected Item; when that Item is
+// deleted meanwhile, the text stays in the line, now for the top level.
 
 import {
   BadRequestSchema,
@@ -19,7 +20,7 @@ import {
   ulid,
 } from "@todo-tui/client";
 import { singleLine, truncate } from "../format/text.js";
-import { editLine, emptyLine, insert, type LineState, lineOf } from "../keys/line-editor.js";
+import { altInLine, editLine, emptyLine, insert, type LineState, lineOf } from "../keys/line-editor.js";
 import { isChar, type KeyToken } from "../keys/tokenize.js";
 import { type Mode, normalMode } from "../state/types.js";
 import type { Controller } from "./controller.js";
@@ -61,7 +62,7 @@ export function typedLines(inputs: readonly Input[]): { lines: string[]; dropped
       }
       continue;
     }
-    if (input === "esc" || input === "ctrl+c") break;
+    if (input === "esc" || input === "ctrl+c" || altInLine(input) === "esc") break;
     if (input === "enter") {
       out.push(line.text);
       line = emptyLine;
@@ -89,7 +90,9 @@ export class QuickAdd {
   /**
    * The last capture whose outcome is unknown: enter on the same text (and
    * parent) sends its request_id again, which the daemon answers with the
-   * Item it made, if it made one, so a capture never lands twice.
+   * Item it made, if it made one, so a capture never lands twice. It goes
+   * once the line is emptied or quick-add closes: the same text typed
+   * after that is a new capture, not that one replayed.
    */
   private unknown: { text: string; parentId: string | undefined; requestId: string } | undefined;
 
@@ -107,6 +110,7 @@ export class QuickAdd {
   }
 
   open(): void {
+    this.unknown = undefined;
     this.c.setMode({ kind: "quickAdd", line: emptyLine });
   }
 
@@ -114,6 +118,7 @@ export class QuickAdd {
   openChild(): void {
     const parent = this.c.selectedItem();
     if (!parent) return this.c.toast("info", "Select an Item to add a subtask to");
+    this.unknown = undefined;
     this.c.setMode({ kind: "quickAdd", parentId: parent.id, parentTitle: parent.title, line: emptyLine });
   }
 
@@ -126,6 +131,7 @@ export class QuickAdd {
     switch (key) {
       case "esc":
       case "ctrl+c":
+        this.unknown = undefined;
         return this.c.setMode(normalMode);
       case "enter":
         return this.submit(mode);
@@ -143,6 +149,7 @@ export class QuickAdd {
   }
 
   private edit(mode: QuickAddMode, line: LineState): void {
+    if (line.text === "") this.unknown = undefined;
     this.c.setMode({ ...mode, line });
     this.previews.request(line.text);
   }
@@ -216,8 +223,17 @@ export class QuickAdd {
     });
     this.unknown = !out.ok && outcomeUnknown(out.err) ? { text, parentId, requestId } : undefined;
     if (!out.ok) {
-      const parentGone = parentId !== undefined && parentRefused(out.err);
-      this.c.failed(parentGone ? "The parent was deleted — esc, then a, to add at the top level" : errorText(out.err));
+      if (parentId !== undefined && parentRefused(out.err)) {
+        // The text stays, now for the top level: enter adds it there, esc discards it.
+        const { mode: now } = this.c.state;
+        if (now.kind === "quickAdd") {
+          const { parentId: _, parentTitle: __, ...topLevel } = now;
+          this.c.setMode(topLevel);
+        }
+        this.c.failed("The parent was deleted: enter adds this at the top level · esc discards");
+      } else {
+        this.c.failed(errorText(out.err));
+      }
       return false;
     }
     const { item, result } = out.res;

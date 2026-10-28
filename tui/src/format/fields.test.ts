@@ -4,8 +4,12 @@ import { applyLabelEdits, commonPrefix, formatLabels, parseLabelEdits, parseLabe
 describe("the t and w texts", () => {
   it("reads labels as a set of words, # optional", () => {
     expect(formatLabels(["a", "b"])).toBe("#a #b");
-    expect(parseLabels(" #a b ##c #a  ")).toEqual(["a", "b", "c"]);
+    expect(parseLabels(" #a b #c #a  ")).toEqual(["a", "b", "c"]);
     expect(parseLabels("# ")).toEqual([]);
+    // One # comes off, as capture reads it: a label that starts with # (from `x ##a#b`) survives the round trip.
+    expect(parseLabels("##c")).toEqual(["#c"]);
+    for (const labels of [["#urgent", "home"], ["#a#b"], ["#"], ["##x"]]) expect(parseLabels(formatLabels(labels))).toEqual(labels);
+    expect(parseLabelEdits("+##a -##b")).toEqual({ add: ["#a"], remove: ["#b"] });
     expect(sameLabels(["a", "b"], ["b", "a"])).toBe(true);
     expect(sameLabels(["a"], ["a", "b"])).toBe(false);
   });

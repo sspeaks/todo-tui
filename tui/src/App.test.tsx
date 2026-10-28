@@ -64,6 +64,29 @@ describe("the shell", () => {
     expect(t.lines()[10]).toMatch(/^NORMAL · ● live .*\? help · : command · q quit$/);
   });
 
+  it("keeps the Waiting view's waiting column when one name is long: the name is cut, the age kept", async () => {
+    const on = (name: string) => ({ on: { ref: { case: "freeText" as const, value: name } }, since: date(23) });
+    const fd = fakeDaemon(
+      [
+        item("vendor contract", { waiting: on("the vendor") }),
+        item("passport", { waiting: on("jane doe") }),
+        item("check invoice", { waiting: on("the account manager at Acme Corporation"), dueDate: date(30) }),
+      ],
+      { now: clock, timeZone: "UTC" },
+    );
+    const t = renderTui({ daemon: fd, columns: 120, rows: 12, now: clock });
+    await t.live();
+    await t.press("4");
+    expect(t.ui.getState().tab).toBe(fd.viewId("waiting"));
+    await t.waitFrame((f) => expect(f).toMatch(/^› ○\s+vendor contract/m));
+    const line = (title: string) => t.lines().find((l) => l.includes(title)) ?? "";
+    expect(line("vendor contract")).toMatch(/⧗the vendor 3d/);
+    expect(line("passport")).toMatch(/⧗jane doe 3d/);
+    expect(line("check invoice")).toMatch(/\^Fri\s+⧗the account manager.*… 3d/);
+    // The column lines up across rows.
+    expect(line("passport").indexOf("⧗")).toBe(line("check invoice").indexOf("⧗"));
+  });
+
   it("dims archived rows and marks deferred ones (Archive)", async () => {
     const fd = fakeDaemon(
       [

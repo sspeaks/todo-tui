@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MIN_TITLE, ROW_PREFIX, layout, rowColumns, tabLabels } from "./layout.js";
+import { MIN_TITLE, MIN_WAITING, ROW_PREFIX, layout, rowColumns, tabLabels } from "./layout.js";
 
 describe("layout", () => {
   it("splits at 110 columns, sizes the body, and is too small below 40×8", () => {
@@ -23,6 +23,18 @@ describe("layout", () => {
     expect(rowColumns(30, natural)).toEqual({ markers: 0, waiting: 0, key: 0, due: 0, title: 30 - ROW_PREFIX });
     expect(rowColumns(60, natural).title).toBeGreaterThanOrEqual(MIN_TITLE);
     expect(rowColumns(80, { key: 0, due: 0, waiting: 0, markers: 0 }).title).toBe(80 - ROW_PREFIX);
+  });
+
+  it("narrows a long waiting column before it drops it, so one long name does not hide it on every row", () => {
+    // The split list at 120 columns, a 43-cell name among the waiting rows.
+    const cols = rowColumns(70, { key: 0, due: 4, waiting: 43, markers: 0 });
+    expect(cols.waiting).toBeGreaterThan(0);
+    expect(cols.title).toBe(MIN_TITLE);
+    expect(cols).toEqual({ key: 0, due: 4, waiting: 70 - ROW_PREFIX - MIN_TITLE - 4 - 2 * 2, markers: 0, title: MIN_TITLE });
+    // Narrowed only as far as it must, and never below MIN_WAITING: then it goes.
+    expect(rowColumns(60, { key: 0, due: 4, waiting: 43, markers: 0 })).toMatchObject({ waiting: 24, title: MIN_TITLE });
+    expect(rowColumns(48, { key: 0, due: 4, waiting: 43, markers: 0 })).toMatchObject({ waiting: MIN_WAITING, title: MIN_TITLE });
+    expect(rowColumns(46, { key: 0, due: 4, waiting: 43, markers: 0 })).toMatchObject({ waiting: 0, due: 4, title: 46 - ROW_PREFIX - 6 });
   });
 
   it("labels tabs with non-zero counts, and shortens the others when they do not fit", () => {

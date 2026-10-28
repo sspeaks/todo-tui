@@ -122,14 +122,16 @@ describe("x X and the pipeline", () => {
     });
     t.c.input("xjx", {});
     await t.c.idle();
-    expect(t.toast()).toBe("The daemon did not answer; the change may not be saved · 2 keys dropped");
+    // The j before the second x only moved: it ran. The x did not.
+    expect(t.toast()).toBe("The daemon did not answer; the change may not be saved · 1 key dropped");
     expect(t.state().toast?.level).toBe("error");
-    expect(t.selected()).toBe("row 0");
+    expect(t.selected()).toBe("row 1");
+    expect(t.titles()).toEqual(["row 0", "row 1", "row 2", "row 3", "row 4"]);
     fail = false;
     // The error stays until the next key, which runs.
     await t.c.press("j");
     expect(t.state().toast).toBeUndefined();
-    expect(t.selected()).toBe("row 1");
+    expect(t.selected()).toBe("row 2");
   });
 
   it("says “X” was deleted elsewhere when the Item went while the action was in flight", async () => {
@@ -155,6 +157,18 @@ describe("x X and the pipeline", () => {
     expect(t.userOps()).toEqual([]);
     await t.c.press("j");
     expect(t.selected()).toBe("row 1");
+  });
+
+  it("runs the navigation keys typed while an action waits out an outage, and drops only from the first that acts (Decision 6)", async () => {
+    const t = await setup(fakeDaemon(rows(5)), { timing: { retryMs: 300 } });
+    t.daemon.down = true;
+    // j, then gg G (a prefix and a move), then dd and the j after it.
+    t.c.input("xjggGkddj", {});
+    await t.c.idle();
+    expect(t.toast()).toBe("Not saved: daemon unavailable · 3 keys dropped");
+    expect(t.selected()).toBe("row 3");
+    expect(t.state().mode).toEqual({ kind: "normal", pending: [] });
+    expect(t.userOps()).toEqual([]);
   });
 
   it("retries a call cut by a daemon restart with the same request_id, once live again, and it applies once (hard case 38)", async () => {

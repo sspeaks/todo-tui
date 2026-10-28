@@ -63,7 +63,7 @@ export function MessageLine({ width }: { width: number }) {
     );
   } else if (toast) {
     content = (
-      <Text wrap="truncate-end" color={toast.level === "error" ? "red" : undefined}>
+      <Text wrap={toast.keepEnd ? "truncate-middle" : "truncate-end"} color={toast.level === "error" ? "red" : undefined}>
         {singleLine(toast.text)}
       </Text>
     );

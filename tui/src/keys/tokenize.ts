@@ -50,12 +50,25 @@ function charToken(ch: string): KeyToken | undefined {
   return ch;
 }
 
-/** The keys one useInput call stands for. Pastes never come here: usePaste owns them. */
+/**
+ * The keys one useInput call stands for. Pastes never come here: usePaste
+ * owns them. Ink reports both ESC then X typed within 20 ms and Alt+X (or
+ * a modified key such as Alt+Left, CSI 1;3D) as meta+X, so a meta+X key is
+ * "alt+X": the dispatcher reads it as esc then X (hard case 3), except
+ * where a text mode takes it as a word edit (line-editor.ts).
+ */
 export function tokenize(input: string, key: Partial<Key>): KeyToken[] {
-  // Nothing binds alt, so meta+X is ESC then X typed within Ink's 20 ms.
   const esc: KeyToken[] = key.meta ? ["esc"] : [];
   if (key.tab) return [...esc, key.shift ? "shift+tab" : "tab"];
-  for (const [flag, name] of NAMED) if (key[flag]) return [...esc, key.ctrl ? `ctrl+${name}` : name];
+  for (const [flag, name] of NAMED) {
+    if (!key[flag]) continue;
+    if (key.meta && !key.ctrl && name !== "esc") return [`alt+${name}`];
+    return [...esc, key.ctrl ? `ctrl+${name}` : name];
+  }
+  if (key.meta && !key.ctrl && [...input].length === 1) {
+    const t = charToken(input);
+    if (t !== undefined && isChar(t)) return [`alt+${t}`];
+  }
   if (key.ctrl) return input ? [...esc, `ctrl+${input === " " ? "space" : input.toLowerCase()}`] : esc;
   // Ink blanks the function keys and gives them no flag.
   if (input === "") return esc.length ? esc : ["fkey"];
@@ -90,6 +103,9 @@ export function parseKeys(spec: string): KeyToken[] {
 /** Whether a token is a character typed into text, rather than a named key. */
 export const isChar = (t: KeyToken): boolean => t === "space" || [...t].length === 1;
 
+/** The key of an "alt+X" token (X), else undefined. */
+export const altKey = (t: KeyToken): KeyToken | undefined => (t.startsWith("alt+") && t.length > 4 ? t.slice(4) : undefined);
+
 /** How help and hints show a token: "ctrl-d", "↓", "F1". */
 export function keyLabel(t: KeyToken): string {
   switch (t) {
@@ -108,7 +124,7 @@ export function keyLabel(t: KeyToken): string {
     case "pagedown":
       return "pgdn";
   }
-  return t.replace(/^ctrl\+/, "ctrl-").replace(/^shift\+/, "shift-");
+  return t.replace(/^ctrl\+/, "ctrl-").replace(/^shift\+/, "shift-").replace(/^alt\+/, "alt-");
 }
 
 /** A key sequence as help shows it: "gg", "p 1", "ctrl-d". */

@@ -102,6 +102,8 @@ export interface Toast {
   readonly id: number;
   readonly level: "info" | "error";
   readonly text: string;
+  /** Cut in the middle, not at the end, when it does not fit: its end (a file's name) is what it is for. */
+  readonly keepEnd?: boolean;
 }
 
 export interface UiState {

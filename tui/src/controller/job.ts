@@ -4,6 +4,8 @@
 // or `xterm -e todo`: a session of its own, so the group is orphaned) has
 // its SIGTSTP discarded by the kernel, and no SIGCONT ever comes: waiting
 // for one would leave the TUI with the terminal handed back for good.
+// E's editor runs with the terminal in cooked mode, so a ctrl-c meant for
+// an editor that leaves it so (`code --wait`) reaches this process too.
 // No imports, so that a test can run it in a session of its own.
 
 /**
@@ -27,4 +29,24 @@ export function stopSelf(graceMs = STOP_GRACE_MS): Promise<boolean> {
       resolve(false);
     }, graceMs);
   });
+}
+
+/**
+ * Runs `run` (E's spawnSync of the editor) with SIGINT and SIGQUIT ignored
+ * here, as git does while its editor runs: the editor gets them, and the
+ * TUI carries on and takes the terminal back. Resolves once a signal that
+ * came meanwhile has been handled, by the no-op: a loop turn after `run`
+ * returns, as the loop reads signals in its poll phase.
+ */
+export async function withoutInterrupts<T>(run: () => T): Promise<T> {
+  const ignore = () => {};
+  const signals = ["SIGINT", "SIGQUIT"] as const;
+  for (const sig of signals) process.on(sig, ignore);
+  try {
+    return run();
+  } finally {
+    // This turn's check phase, then the next turn's poll (the signal) and check.
+    for (let turn = 0; turn < 2; turn++) await new Promise((resolve) => setImmediate(resolve));
+    for (const sig of signals) process.off(sig, ignore);
+  }
 }

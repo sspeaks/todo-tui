@@ -4,13 +4,17 @@ A keyboard-driven, local-first todo manager for the terminal. A Rust daemon owns
 state in SQLite and serves a gRPC API (`todo.v1`) over a Unix socket; an Ink TUI, the
 `todo` CLI and an MCP server are clients. See [docs/design.md](docs/design.md).
 
-Status: P1 in progress. Milestone M1 (capture) is done: `todo add` with inline
-tokens, batch capture from stdin, and an offline spool. Milestone M2 (undo) is done:
-`todo undo` and `todo redo`, relations between items in the API, and deleting an
-item together with its subtasks. Milestone M3 (views) is done: filters, sorting and
-paging, the six default views and their counts in the API, and `todo status`. The
-TUI is still the minimal P0 inbox list; the full TUI, with the views as tabs, is
-milestone M4. There are no CLI commands yet to list, edit, complete or delete items.
+Status: P1 in progress, and its daily-driver TUI is done. Milestone M1 (capture) is
+done: `todo add` with inline tokens, batch capture from stdin, and an offline spool.
+Milestone M2 (undo) is done: `todo undo` and `todo redo`, relations between items in
+the API, and deleting an item together with its subtasks. Milestone M3 (views) is
+done: filters, sorting and paging, the six default views and their counts in the
+API, and `todo status`. Milestone M4 (the TUI) is done: the views as tabs, a detail
+pane, one-key triage, quick-add with a live preview, undo, bulk actions on marked
+items, search and `$EDITOR` for descriptions; see [Using the TUI](#using-the-tui).
+Next come M5 (recurring items), M6 (config, export/import, backups, editing views)
+and M7 (the MCP server). The CLI captures, undoes and counts; listing, editing and
+completing items happen in the TUI.
 
 ## Quick start
 
@@ -46,12 +50,13 @@ Capture a todo, then open the TUI with `todo` and no arguments:
 $ todo add "call dentist ^fri +2 #home"
 MTTVN5Y1  call dentist  +2 ^2026-10-30 #home
 $ todo
-Inbox 1
-› ○ +2  call dentist
-● live · rev 1 · 1 items                                   j/k move · q quit
+1 Inbox 1 │ 2 Today │ 3 Next │ 4 Waiting │ 5 Someday │ 6 Archive
+› ○ +2  call dentist                                                       ^Fri
+
+NORMAL · ● live · u: capture "call dentist"          ? help · : command · q quit
 ```
 
-`q` quits the TUI. `todo` runs the bundle that `pnpm -C tui build` made in this
+`q` quits the TUI, and `?` lists its keys. `todo` runs the bundle that `pnpm -C tui build` made in this
 checkout, so keep the checkout where it is. The first `todo add` (or the TUI)
 starts the daemon in the background, and it keeps running after they exit.
 `todo daemon stop` stops it.
@@ -221,8 +226,7 @@ redo. When there is nothing left, `todo` prints `Nothing to undo` (or
 in the history, so undo stops at the first change made after the upgrade.
 
 There is one history per data directory, shared by the CLI and the TUI: `todo undo`
-also undoes a change made in the TUI, and the TUI's undo (M4) also undoes a
-`todo add`. Deleting an item also deletes its subtasks, as one change, so one undo
+also undoes a change made in the TUI, and the TUI's `u` also undoes a `todo add`. Deleting an item also deletes its subtasks, as one change, so one undo
 restores them all.
 
 Changes the daemon makes on its own are not in the history. If one of them has
@@ -279,16 +283,82 @@ exits 0. In bash (in zsh, `setopt prompt_subst` first):
 PS1='$(todo status --short) '"$PS1"
 ```
 
-### Seeing your todos: the TUI
+### Using the TUI
 
-There is no `todo list` yet; the TUI is how you see items. `todo` with no
-arguments opens it: it runs a single-file bundle of the TUI with `node`, which
-must be on `PATH`. Build the bundle once, and again after the TUI changes:
+`todo` with no arguments opens the TUI, the way to see, edit and complete items. It
+runs a single-file bundle of the TUI with `node`, which must be on `PATH`. Build the
+bundle once, and again after the TUI changes:
 
 ```sh
 pnpm -C tui build                      # writes tui/dist/tui.js
 todo
 ```
+
+The top line holds the views as tabs, with their counts; below it is the list of
+the current view, with the selected item's details beside it in a terminal 110
+columns or wider (narrower, `enter` opens them full screen and `esc` closes them).
+The last two lines are a status bar (mode, connection, marks, what `u` would undo,
+key hints) and a message line for prompts and results.
+
+| Keys | What they do |
+|---|---|
+| **Navigation** | |
+| `j` `k`, `↓` `↑` | Next / previous row (in the focused detail: scroll) |
+| `gg` `G`, `home` `end` | First / last row |
+| `ctrl-d` `ctrl-u`, `pgdn` `pgup` | Half a page down / up |
+| `1`–`9`, `[` `]` | Go to view N; previous / next view |
+| `enter`, `tab` | Open the detail; switch focus between the list and the detail |
+| `esc` | Back one step: close the detail, end `V`, clear `/`, clear the marks |
+| **Items** | |
+| `a`, `A` | Quick-add; quick-add a subtask of the selected item |
+| `i` | Edit the title |
+| `E` | Edit the description in `$EDITOR` |
+| `p` then `1`–`5`, `p0` | Set the priority; clear it |
+| `^`, `D` | Set the due date; defer until a date |
+| `w`, `W` | Set who you are waiting on (and when to follow up); clear it |
+| `s` | Set the status: `i` inbox, `n` next, `p` in progress, `s` someday, `d` done, `c` cancelled |
+| `x`, `X` | Mark done; mark cancelled |
+| `t` | Edit the labels |
+| `z` | Archive / unarchive |
+| `dd` | Delete, with its subtasks (asks first: `y` deletes) |
+| **Marks and bulk** | |
+| `m` | Mark or unmark the item, and move down |
+| `V` | Mark the rows you move over; `V` or `esc` ends it |
+| `x X s p ^ D w W t z dd` | With marks: act on every marked item at once, as one undo step (`t` then takes `+a -b` to add and remove labels) |
+| **Search** | |
+| `/` | Narrow this view as you type; `enter` keeps it, `esc` clears it |
+| `:search <words>` | Search everything, done, archived and deferred items too, in a `Search:` tab |
+| **Undo** | |
+| `u`, `ctrl-r` | Undo, redo: the same history as `todo undo` |
+| **Commands** | |
+| `:` | Command line: `:q`, `:help`, `:search <words>`, `:refresh`; `tab` completes |
+| `?`, F1, `:help` | Help: every key, the capture syntax and the dates |
+| `ctrl-z` | Suspend to the shell; `fg` comes back |
+| `q`, `ctrl-c` | Quit |
+
+**Quick-add** (`a`) takes the same tokens as `todo add` ([Capture](#capture)), and
+the line under it shows what `enter` will capture, with a token it cannot apply in
+red and the reason. `enter` adds and leaves the line open for the next one; `enter`
+on an empty line or `esc` closes it. Pasting several lines adds one item per line.
+Changes made elsewhere, by `todo add` or another TUI, show up live.
+
+**Prompts.** `^` and `D` start from the current date (`2026-10-30`) and take the
+same dates as `^` in a capture, with a preview; an empty date clears it. `w` takes
+`person ^date`, the date being when to follow up and optional; `tab` completes a
+name you have used before, and an empty line stops waiting. `t` edits the labels as
+`#a #b`. `i` edits the title as plain text, so its tokens are not parsed. In every
+prompt `enter` saves and `esc` cancels.
+
+**`E`** opens the description in `$VISUAL`, else `$EDITOR`, else `vi`; save and quit
+to store it. Quitting without saving, or an editor that exits with an error (`:cq`
+in vim), changes nothing. A graphical editor needs its wait flag:
+`EDITOR="code --wait"`. If someone changed the description while you were editing,
+your text is not lost: it is saved in `recovered/` next to `daemon.log` (see
+[Where data lives](#where-data-lives)), and the message line names the file.
+
+**Quitting**: `q`, `:q` or `ctrl-c`. In quick-add or a prompt, `ctrl-c` cancels it
+instead. The TUI uses the terminal's alternate screen, so your shell is as you left
+it.
 
 `todo` uses the first bundle that exists of:
 
@@ -307,15 +377,11 @@ To run the TUI from source instead, without building, from the repo:
 pnpm -C tui dev
 ```
 
-Keys: `j`/`k` or the arrow keys move, `q` or Ctrl-C quits. Captures made elsewhere
-appear live at the bottom, briefly highlighted. For now the TUI shows only the Inbox
-(items with status `inbox`, oldest first) with status, priority and title. Items
-captured with `>next` or `>someday` are stored but not shown anywhere yet, and due
-dates, labels and waiting-on are not displayed. Views, quick-add, the detail pane
-and editing come with M4.
-
 If no daemon is running, the TUI starts one with `todo daemon --detach`, using
-`$TODO_BIN` if it is set and `todo` on `PATH` otherwise. `todo` sets `TODO_BIN` to
+`$TODO_BIN` if it is set and `todo` on `PATH` otherwise. If the daemon goes away,
+the status bar says `◌ reconnecting`, the list dims and the TUI starts it again;
+a change you make meanwhile is sent once it is back, or the message line says
+`Not saved: daemon unavailable` and your typed text stays. `todo` sets `TODO_BIN` to
 itself unless it is already set, so the TUI starts that `todo`'s daemon. Under
 `pnpm -C tui dev` with neither, it stops with
 `todo-tui: cannot run todo: spawn todo ENOENT`. Give `TODO_BIN` as an absolute path:

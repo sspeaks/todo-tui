@@ -11,8 +11,8 @@ import { singleLine } from "../format/text.js";
 import { completeCommand, resolveCommand } from "../keys/commands.js";
 import { helpLines } from "../keys/help.js";
 import { type Action, BINDINGS, type Binding, isAvailable, type KeymapMode } from "../keys/keymap.js";
-import { editLine, emptyLine, insert, type LineState, lineOf } from "../keys/line-editor.js";
-import { isChar, type KeyToken, keyLabel, parseKeys, tokenize } from "../keys/tokenize.js";
+import { altInLine, editLine, emptyLine, insert, type LineState, lineOf } from "../keys/line-editor.js";
+import { altKey, isChar, type KeyToken, keyLabel, parseKeys, tokenize } from "../keys/tokenize.js";
 import { buildTrie, continuations, step, type TrieNode } from "../keys/trie.js";
 import { layout } from "../state/layout.js";
 import { anchorIndex, markedInOrder, pruneMarks, rangeMarks, toggleMark } from "../state/marks.js";
@@ -51,6 +51,17 @@ export interface ControllerOptions {
   /** ctrl-z: stops the process as a shell job, resolving once it continues; false when nothing stopped it (default: job.ts). */
   stopProcess?: () => Promise<boolean>;
 }
+
+/** How a toast is cut when it does not fit (Toast.keepEnd). */
+export interface ToastOptions {
+  readonly keepEnd?: boolean;
+}
+
+/** The actions a key queued behind a failed action still runs: they only move the selection or the tab. */
+const NAVIGATION: ReadonlySet<Action["type"]> = new Set(["move", "top", "bottom", "half_page", "view", "view_step"]);
+
+/** The modes that edit a line of text, where alt+X can be a word edit. */
+const TEXT_MODES: ReadonlySet<Mode["kind"]> = new Set(["quickAdd", "prompt", "command", "search"]);
 
 const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n));
 
@@ -318,12 +329,14 @@ export class Controller {
   }
 
   /**
-   * After an action failed: the keys queued behind it are dropped, since
-   * they were meant for the state a success would have left; the error
-   * toast says how many. In quick-add, text typed behind a failed capture
-   * is kept as lines to capture next (Decision 6: typed text is never lost).
+   * After an action failed: the keys queued behind it that would act are
+   * dropped, since they were meant for the state a success would have
+   * left; the error toast says how many. Navigation keys queued first
+   * (j, G, 2, …) still run: navigation keeps working through an outage
+   * (Decision 6). In quick-add, text typed behind a failed capture is kept
+   * as lines to capture next (typed text is never lost).
    */
-  failed(text: string): void {
+  failed(text: string, opts: ToastOptions = {}): void {
     const queued = this.queue.take();
     let dropped = queued.length;
     const { mode } = this.state;
@@ -331,8 +344,31 @@ export class Controller {
       const typed = typedLines(queued);
       dropped = typed.dropped;
       if (typed.lines.length) this.setMode({ ...mode, rest: [...(mode.rest ?? []), ...typed.lines] });
+    } else if (mode.kind === "normal" && !mode.pending.length) {
+      // They run now, before the toast, which the next key clears.
+      const moves = this.leadingMoves(queued);
+      for (const key of moves) void this.handle(key);
+      dropped -= moves.length;
     }
-    this.toast("error", dropped ? `${text} · ${dropped} key${dropped === 1 ? "" : "s"} dropped` : text);
+    this.toast("error", dropped ? `${text} · ${dropped} key${dropped === 1 ? "" : "s"} dropped` : text, opts);
+  }
+
+  /** The keys at the start of `inputs` that only navigate, up to the first that would do anything else. */
+  private leadingMoves(inputs: readonly Input[]): Input[] {
+    let pending: KeyToken[] = [];
+    let kept = 0;
+    for (const [i, input] of inputs.entries()) {
+      if (typeof input !== "string") break;
+      const r = step(this.tries.normal, pending, input);
+      if (r.kind === "pending") {
+        pending = r.pending;
+        continue;
+      }
+      if (r.kind !== "run" || !NAVIGATION.has(r.binding.action.type)) break;
+      pending = [];
+      kept = i + 1;
+    }
+    return inputs.slice(0, kept);
   }
 
   /**
@@ -368,9 +404,9 @@ export class Controller {
   }
 
   /** Shows a toast on the message line: info for 4 s, an error for 8 s or until the next key. */
-  toast(level: "info" | "error", text: string): void {
+  toast(level: "info" | "error", text: string, opts: ToastOptions = {}): void {
     const id = ++this.toastSeq;
-    this.ui.setState((s) => ({ ...s, toast: { id, level, text } }));
+    this.ui.setState((s) => ({ ...s, toast: { id, level, text, ...(opts.keepEnd && { keepEnd: true }) } }));
     if (this.toastTimer) clearTimeout(this.toastTimer);
     this.toastTimer = setTimeout(
       () => {
@@ -494,6 +530,18 @@ export class Controller {
     if (this.state.toast?.level === "error") this.clearToast();
     const { mode } = this.state;
     if (typeof input !== "string") return this.onPaste(mode, input.paste);
+    const alt = altKey(input);
+    if (alt !== undefined) {
+      // alt+X (Ink's meta): a word edit in a line being typed, never an esc
+      // that would throw the line away (Alt+Left, Alt+Backspace); ESC then X
+      // typed within Ink's 20 ms elsewhere, and for a character (hard case 3).
+      const inLine = TEXT_MODES.has(mode.kind) ? altInLine(input) : "esc";
+      if (inLine === "ignore") return;
+      if (inLine === "esc") {
+        this.queue.unshift([alt]);
+        return this.handle("esc");
+      }
+    }
     switch (mode.kind) {
       case "normal":
         return this.normalKey(mode.pending, input);

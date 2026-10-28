@@ -10,10 +10,11 @@
 
 import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Item, errorReason, updateItem } from "@todo-tui/client";
 import type { Controller } from "./controller.js";
+import { withoutInterrupts } from "./job.js";
 import { errorText, opText, quoted } from "./messages.js";
 import { single } from "./pipeline.js";
 
@@ -46,20 +47,30 @@ export function systemEditor(suspend: () => Suspend | undefined, env: NodeJS.Pro
       await writeFile(file, text);
       const editor = env.VISUAL || env.EDITOR || "vi";
       let result: ReturnType<typeof spawnSync> | undefined;
-      const run = () => {
-        result = spawnSync("sh", ["-c", `${editor} "$@"`, editor, file], { stdio: "inherit" });
-      };
+      // A ctrl-c given to the editor must not end the TUI (job.ts).
+      const run = () =>
+        withoutInterrupts(() => {
+          result = spawnSync("sh", ["-c", `${editor} "$@"`, editor, file], { stdio: "inherit" });
+        });
       const handOver = suspend();
       if (handOver) await handOver(run);
-      else run();
+      else await run();
       if (!result || result.error) return { ok: false, reason: `Could not run ${editor}, not saved` };
       if (result.signal) return { ok: false, reason: `Editor stopped by ${result.signal}, not saved` };
+      // sh's own statuses: the command was not found, or not executable.
+      if (result.status === 127) return { ok: false, reason: `Could not run the editor ${editor} (not found; set $VISUAL or $EDITOR), not saved` };
+      if (result.status === 126) return { ok: false, reason: `Could not run the editor ${editor} (not executable), not saved` };
       if (result.status !== 0) return { ok: false, reason: `Editor exited ${result.status}, not saved` };
       return { ok: true, text: await readFile(file, "utf8") };
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
   };
+}
+
+/** A path under the home directory as ~/…, shorter in a toast. */
+export function homeShort(path: string, home: string = homedir()): string {
+  return home && home !== "/" && path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path;
 }
 
 /** Writes `text` to <stateDir>/recovered/<id>-<timestamp>.md and returns the path. */
@@ -120,7 +131,11 @@ export class DescriptionEditor {
     }
   }
 
-  /** A save that did not happen: the text goes to the recovered dir, and the toast says where. */
+  /**
+   * A save that did not happen: the text goes to the recovered dir, and the
+   * toast says where, cut in the middle when it does not fit, so that the
+   * file's name always shows.
+   */
   private async keep(item: Item, text: string, why: string): Promise<void> {
     let path: string;
     try {
@@ -128,6 +143,6 @@ export class DescriptionEditor {
     } catch (err) {
       return this.c.failed(`${why}; your text could not be kept either: ${err instanceof Error ? err.message : String(err)}`);
     }
-    this.c.failed(`${why}; your text is in ${path}`);
+    this.c.failed(`${why}; your text is in ${homeShort(path)}`, { keepEnd: true });
   }
 }

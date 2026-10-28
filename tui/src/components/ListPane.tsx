@@ -1,6 +1,6 @@
 import { type Item, errorReason, useConnection, useViews } from "@todo-tui/client";
 import { Box, Text } from "ink";
-import { type RowCells, priorityLabel, rowCells, statusGlyph } from "../format/item.js";
+import { type RowCells, fitWaiting, priorityLabel, rowCells, statusGlyph } from "../format/item.js";
 import { displayWidth, fit, singleLine } from "../format/text.js";
 import { GAP, type RowColumns, rowColumns } from "../state/layout.js";
 import { reconcile } from "../state/selection.js";
@@ -118,7 +118,7 @@ function Row({ item, cells, cols, selected, marked, active, fresh, dim }: RowPro
       {cell(cells.key, cols.key)}
       <Text color={cells.overdue ? "red" : undefined}>{cell(cells.due, cols.due)}</Text>
       <Text color={cells.followUpDue ? "yellow" : undefined} bold={cells.followUpDue}>
-        {cell(cells.waiting, cols.waiting)}
+        {cols.waiting ? " ".repeat(GAP) + fitWaiting(cells, cols.waiting) : ""}
       </Text>
       {cell(cells.markers, cols.markers)}
     </Text>

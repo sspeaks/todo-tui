@@ -2,7 +2,7 @@
 
 import { CreatedVia, type Item, type PersonRef, Priority, Status } from "@todo-tui/client";
 import { dayOf, shortDay } from "./dates.js";
-import { singleLine } from "./text.js";
+import { displayWidth, fit, singleLine, truncate } from "./text.js";
 
 const glyphs: Partial<Record<Status, string>> = {
   [Status.INBOX]: "○",
@@ -83,6 +83,8 @@ export interface RowCells {
   overdue: boolean;
   /** "⧗dana 3d"; highlighted once the follow-up is due. */
   waiting: string;
+  /** The age at the end of `waiting` (" 3d"), kept when the name is cut. */
+  waitingAge: string;
   followUpDue: boolean;
   /** ⏸date when deferred, ↑ pending push, ! conflict or push failure, 🔁 recurring. */
   markers: string;
@@ -91,8 +93,9 @@ export interface RowCells {
 export function rowCells(item: Item, today: number): RowCells {
   const waiting = item.waiting;
   let waitingText = "";
+  let age = "";
   if (waiting) {
-    const age = waiting.since ? ` ${Math.max(0, today - dayOf(waiting.since))}d` : "";
+    age = waiting.since ? ` ${Math.max(0, today - dayOf(waiting.since))}d` : "";
     waitingText = `⧗${personName(waiting.on)}${age}`;
   }
   const markers: string[] = [];
@@ -105,7 +108,15 @@ export function rowCells(item: Item, today: number): RowCells {
     due: item.dueDate ? `^${shortDay(dayOf(item.dueDate), today)}` : "",
     overdue: item.isOverdue,
     waiting: waitingText,
+    waitingAge: age,
     followUpDue: waiting?.followUpOn !== undefined && dayOf(waiting.followUpOn) <= today,
     markers: markers.join(" "),
   };
+}
+
+/** The waiting cell in exactly `width` cells: a long name cut, the age kept ("⧗the acco… 3d"). */
+export function fitWaiting(cells: Pick<RowCells, "waiting" | "waitingAge">, width: number): string {
+  const { waiting, waitingAge: age } = cells;
+  if (!age || displayWidth(waiting) <= width) return fit(waiting, width);
+  return fit(`${truncate(waiting.slice(0, -age.length), width - displayWidth(age))}${age}`, width);
 }

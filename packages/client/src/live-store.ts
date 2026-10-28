@@ -78,8 +78,14 @@ export interface LiveStoreOptions {
   backoff?: { initialMs?: number; maxMs?: number };
   /** ListItems page size (default MAX_PAGE_SIZE), so that a view is almost always one page. */
   pageSize?: number;
-  /** Called once per outage when the daemon is unreachable (e.g. respawn it). */
+  /**
+   * Called when the daemon is unreachable (e.g. respawn it): at the start
+   * of an outage, then again every `respawnMs` while it lasts, in case a
+   * spawn failed (the old daemon's lock still held, say).
+   */
   ensureDaemon?: () => Promise<void>;
+  /** How often ensureDaemon is called again while an outage lasts (default 5000). */
+  respawnMs?: number;
   /** How long an unobserved view is kept before it is dropped (default 5000). */
   viewGraceMs?: number;
 }
@@ -391,7 +397,9 @@ export class LiveStore {
 
   private async run(signal: AbortSignal): Promise<void> {
     let attempt = 0;
-    let spawnedThisOutage = false;
+    /** When this outage last asked for the daemon. */
+    let spawnedAt: number | undefined;
+    const respawnMs = this.opts.respawnMs ?? 5_000;
     while (!signal.aborted) {
       try {
         if (this.revision === undefined) await this.loadBaseline();
@@ -400,12 +408,14 @@ export class LiveStore {
         // then respawns the daemon again and backs off from the start.
         await this.consume(signal, () => {
           attempt = 0;
-          spawnedThisOutage = false;
+          spawnedAt = undefined;
         });
       } catch (err) {
         if (signal.aborted) break;
-        if (isConnectionFailure(err) && this.opts.ensureDaemon && !spawnedThisOutage) {
-          spawnedThisOutage = true;
+        // Once at the start of an outage, and again while it lasts: a spawn
+        // that failed is not the last word.
+        if (isConnectionFailure(err) && this.opts.ensureDaemon && (spawnedAt === undefined || Date.now() - spawnedAt >= respawnMs)) {
+          spawnedAt = Date.now();
           await this.opts.ensureDaemon().catch(() => {});
         }
         this.conn = { ...this.conn, error: err };

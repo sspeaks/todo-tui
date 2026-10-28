@@ -68,17 +68,28 @@ export interface RowColumns {
 type Column = "key" | "due" | "waiting" | "markers";
 /** Dropped first to last when the title would get narrower than MIN_TITLE. */
 const DROP_ORDER: readonly Column[] = ["markers", "waiting", "key", "due"];
+/**
+ * The narrowest the waiting column gets, its names cut ("⧗the acco… 3d"),
+ * before it is dropped: one long name must not take the column from every
+ * row (the Waiting view lives on it).
+ */
+export const MIN_WAITING = 12;
 
 /**
  * Fits a row into `width` cells: each column as wide as its widest visible
  * cell, and the title gets the rest, at least MIN_TITLE while columns can
- * be dropped to make room.
+ * be narrowed (waiting) or dropped to make room.
  */
 export function rowColumns(width: number, natural: Readonly<Record<Column, number>>): RowColumns {
   const shown: Record<Column, number> = { ...natural };
   const used = () => (Object.values(shown) as number[]).reduce((sum, w) => sum + (w ? w + GAP : 0), 0);
+  const short = () => MIN_TITLE - (width - ROW_PREFIX - used());
   for (const col of DROP_ORDER) {
-    if (width - ROW_PREFIX - used() >= MIN_TITLE) break;
+    if (short() <= 0) break;
+    if (col === "waiting" && shown.waiting > MIN_WAITING) {
+      shown.waiting = Math.max(MIN_WAITING, shown.waiting - short());
+      if (short() <= 0) break;
+    }
     shown[col] = 0;
   }
   return { ...shown, title: Math.max(0, width - ROW_PREFIX - used()) };

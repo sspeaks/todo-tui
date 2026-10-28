@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isChar, parseKeys, sequenceLabel, tokenize } from "./tokenize.js";
+import { altKey, isChar, parseKeys, sequenceLabel, tokenize } from "./tokenize.js";
 
 describe("tokenize", () => {
   it("splits a burst into one token per key (hard case 1)", () => {
@@ -15,10 +15,17 @@ describe("tokenize", () => {
     expect(tokenize("\r\r", {})).toEqual(["enter"]);
   });
 
-  it("reads meta+key as esc then the key (hard case 3)", () => {
-    expect(tokenize("j", { meta: true })).toEqual(["esc", "j"]);
+  it("reads meta+key as alt+key, which the dispatcher takes as esc then the key outside a line (hard case 3)", () => {
+    expect(tokenize("j", { meta: true })).toEqual(["alt+j"]);
     expect(tokenize("", { escape: true, meta: true })).toEqual(["esc", "esc"]);
-    expect(tokenize("", { upArrow: true, meta: true })).toEqual(["esc", "up"]);
+    expect(tokenize("", { upArrow: true, meta: true })).toEqual(["alt+up"]);
+    expect(tokenize("", { backspace: true, meta: true })).toEqual(["alt+backspace"]);
+    expect(tokenize(" ", { meta: true })).toEqual(["alt+space"]);
+    // ctrl with it, or a burst: esc, then the keys.
+    expect(tokenize("", { leftArrow: true, ctrl: true, meta: true })).toEqual(["esc", "ctrl+left"]);
+    expect(tokenize("jk", { meta: true })).toEqual(["esc", "j", "k"]);
+    expect(altKey("alt+b")).toBe("b");
+    expect(altKey("b")).toBeUndefined();
   });
 
   it("names flagged keys", () => {

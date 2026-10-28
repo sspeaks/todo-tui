@@ -50,13 +50,17 @@ export function sharedStatus(target: Target, getItem: (id: string) => Item | und
 
 const statusWord = (status: Status): string => STATUS_CHOICES.find((c) => c.status === status)?.name.toLowerCase() ?? "in that status";
 
-/** Direct children, in any status: what dd's confirm counts. */
-export const childrenFilter = (id: string) => ({
+/** Direct children of `ids`, in any status: what dd's confirm counts. */
+export const childrenFilter = (...ids: string[]) => ({
   allOf: [
     {
       kind: {
         case: "predicate" as const,
-        value: { target: ItemField.PARENT_ID, op: Operator.EQ, operands: [{ kind: { case: "value" as const, value: { kind: { case: "itemId" as const, value: id } } } }] },
+        value: {
+          target: ItemField.PARENT_ID,
+          op: ids.length === 1 ? Operator.EQ : Operator.IN,
+          operands: ids.map((id) => ({ kind: { case: "value" as const, value: { kind: { case: "itemId" as const, value: id } } } })),
+        },
       },
     },
   ],
@@ -208,27 +212,31 @@ export class ItemActions {
 
   // --- dd ---
 
-  /** dd: counts the direct children for the confirm, then asks; with marks, asks about them all. */
+  /**
+   * dd: counts the direct children for the confirm, then asks; with marks,
+   * asks about them all, with the subtasks that go with them that are not
+   * marked themselves.
+   */
   async confirmDelete(): Promise<void> {
     const target = this.c.target(true);
-    if (target?.bulk) {
-      const n = target.ids.length;
-      return this.c.setMode({ kind: "confirm", action: "delete", target, text: `Delete ${n} item${n === 1 ? "" : "s"}? y/N` });
-    }
-    const item = this.itemOf(target);
-    if (!target || !item) return;
+    const item = target?.bulk ? undefined : this.itemOf(target);
+    if (!target || (!target.bulk && !item)) return;
     let children: number;
     try {
       const res = await this.c.pipeline.call(({ timeoutMs }) =>
-        this.c.items.listItems({ filter: childrenFilter(item.id), pageSize: 1000 }, { ...(timeoutMs !== undefined && { timeoutMs }) }),
+        this.c.items.listItems({ filter: childrenFilter(...target.ids), pageSize: 1000 }, { ...(timeoutMs !== undefined && { timeoutMs }) }),
       );
-      children = res.items.length;
+      children = res.items.filter((child) => !target.ids.includes(child.id)).length;
     } catch (err) {
-      return this.c.failed(errorText(err, item.title));
+      return this.c.failed(errorText(err, item?.title));
     }
-    const title = truncate(singleLine(item.title), 40);
-    const subtasks = children ? ` and its ${children} subtask${children === 1 ? "" : "s"}` : "";
-    this.c.setMode({ kind: "confirm", action: "delete", target, text: `Delete "${title}"${subtasks}? y/N` });
+    const subtasks = (whose: string) => (children ? ` and ${whose} ${children} subtask${children === 1 ? "" : "s"}` : "");
+    if (target.bulk) {
+      const n = target.ids.length;
+      return this.c.setMode({ kind: "confirm", action: "delete", target, text: `Delete ${n} item${n === 1 ? "" : "s"}${subtasks("their")}? y/N` });
+    }
+    const title = truncate(singleLine(item?.title ?? ""), 40);
+    this.c.setMode({ kind: "confirm", action: "delete", target, text: `Delete "${title}"${subtasks("its")}? y/N` });
   }
 
   /** y deletes; any other key cancels, and goes no further. */

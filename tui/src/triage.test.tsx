@@ -1,3 +1,6 @@
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { MAX_CAPTURE_BYTES, Status, updateItem } from "@todo-tui/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { holding } from "./controller/setup.test-util.js";
@@ -143,5 +146,61 @@ describe("prompts on screen", () => {
     h.release();
     await t.waitFrame((f) => expect(f).toContain('mark done "row 0" · u undo'));
     expect(t.frame()).not.toContain("saving…");
+  });
+});
+
+describe("wide text in a line", () => {
+  it("keeps the cursor and the end of a long CJK line in view, in quick-add and a prompt", async () => {
+    const t = renderTui({ daemon: dated(), columns: 70, rows: 12, now: clock });
+    await t.live();
+    const cjk = `${"日本語のタイトルをとても長く入力してみるテストです".repeat(2)} END`;
+    await t.press(`a${cjk.replaceAll(" ", "<space>")}`);
+    await t.waitFrame((f) => expect(f.split("\n")[1]).toMatch(/^Add: .* END\s*$/));
+    await t.press("<esc>i<ctrl+u>");
+    await t.press(cjk.replaceAll(" ", "<space>"));
+    await t.waitFrame((f) => expect(f.split("\n").at(-1)).toMatch(/ END\s*$/));
+  });
+});
+
+describe("alt keys through Ink's parser", () => {
+  it("keeps quick-add's text on Alt+Left (CSI 1;3D), Option+Left (ESC b) and Alt+Backspace; a typed esc still closes", async () => {
+    const t = renderTui({ daemon: dated(), columns: 100, rows: 12, now: clock });
+    await t.live();
+    await t.press("abuy milk tomorrow");
+    t.type("\x1b[1;3D");
+    await vi.waitFor(() => expect(t.ui.getState().mode).toMatchObject({ kind: "quickAdd", line: { cursor: 9 } }));
+    t.type("\x1bb");
+    await vi.waitFor(() => expect(t.ui.getState().mode).toMatchObject({ kind: "quickAdd", line: { cursor: 4 } }));
+    t.type("\x1b[1;3C");
+    t.type("\x1b\x7f");
+    await vi.waitFor(() => expect(t.ui.getState().mode).toMatchObject({ kind: "quickAdd", line: { text: "buy  tomorrow", cursor: 4 } }));
+    await t.waitFrame((f) => expect(f.split("\n")[1]).toMatch(/^Add: buy {2}tomorrow/));
+    t.type("\x1b");
+    await vi.waitFor(() => expect(t.ui.getState().mode.kind).toBe("normal"));
+  });
+});
+
+describe("E on screen", () => {
+  it("shows the whole name of the file a kept description went to, however narrow (Decision 6)", async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "todo-tui-test-"));
+    try {
+      const fd = fakeDaemon([item("pay rent", { description: "on the 1st" })]);
+      const id = [...fd.daemon.items.keys()][0] ?? "";
+      const editor = async () => {
+        // Meanwhile another client changes the description.
+        await updateItem(fd.clients().items, { id, description: "theirs" }, ["description"]);
+        return { ok: true as const, text: "mine\n" };
+      };
+      const t = renderTui({ daemon: fd, columns: 100, rows: 10, controller: { editor, stateDir } });
+      await t.live();
+      await t.press("E");
+      const [file = ""] = readdirSync(join(stateDir, "recovered"));
+      expect(file).toMatch(new RegExp(`^${id}-\\d{8}T\\d{6}Z\\.md$`));
+      // Longer than the line: cut in the middle, the reason and the file's name both shown.
+      expect(t.ui.getState().toast?.text.length).toBeGreaterThan(100);
+      await t.waitFrame((f) => expect(f.split("\n").at(-1)).toMatch(new RegExp(`^Description changed elsewhere; .*….*${file}$`)));
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
   });
 });
