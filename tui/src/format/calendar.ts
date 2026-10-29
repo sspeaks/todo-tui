@@ -1,5 +1,5 @@
-// The two-month calendar's grid: months as weeks of day numbers, Monday
-// first (ISO weeks, as ANCHOR_START_OF_WEEK and the review day).
+// The two-month calendar's grid: months as weeks of day numbers, Sunday
+// first.
 
 import { civil, dayNumber } from "./dates.js";
 
@@ -42,12 +42,12 @@ export const lastDay = (m: Month): number => firstDay(nextMonth(m)) - 1;
 /** "October 2026" */
 export const monthTitle = ({ year, month }: Month): string => `${MONTH_NAMES[month - 1]} ${year}`;
 
-/** WEEK_ROWS weeks of seven day numbers, Monday first; undefined outside the month. */
+/** WEEK_ROWS weeks of seven day numbers, Sunday first; undefined outside the month. */
 export function monthWeeks(m: Month): (number | undefined)[][] {
   const first = firstDay(m);
   const last = lastDay(m);
-  // Days since the Monday on or before the 1st.
-  const lead = (civil(first).weekday + 6) % 7;
+  // Days since the Sunday on or before the 1st.
+  const lead = civil(first).weekday;
   return Array.from({ length: WEEK_ROWS }, (_, w) =>
     Array.from({ length: 7 }, (_, d) => {
       const n = first - lead + w * 7 + d;

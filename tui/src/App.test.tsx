@@ -458,7 +458,7 @@ describe("the detail pane", () => {
     const t = renderTui({ daemon: fakeDaemon([item("long one", { description })]), columns: 120, rows: 30 });
     await t.live();
     await t.waitFrame((f) => expect(f).toMatch(/│ long one/));
-    expect(t.frame()).toMatch(/│ Mo Tu We Th Fr Sa Su {2}Mo Tu/);
+    expect(t.frame()).toMatch(/│ Su Mo Tu We Th Fr Sa {2}Su Mo/);
     t.type("\t");
     await t.waitFrame((f) => expect(f).toMatch(/^DETAIL/m));
     t.type("G");
@@ -486,12 +486,13 @@ describe("the calendar", () => {
     await t.waitFrame((f) => expect(f).toMatch(/│ October 2026 {10}November 2026/));
     const lines = t.lines();
     const title = lines.findIndex((l) => l.includes("October 2026"));
-    // Monday first; Oct 1 2026 is a Thursday, Nov 1 a Sunday.
-    expect(lines[title + 1]).toMatch(/│ Mo Tu We Th Fr Sa Su {2}Mo Tu We Th Fr Sa Su\s*$/);
+    // Sunday first; Oct 1 2026 is a Thursday, Nov 1 a Sunday.
+    expect(lines[title + 1]).toMatch(/│ Su Mo Tu We Th Fr Sa {2}Su Mo Tu We Th Fr Sa\s*$/);
     const calendarHalf = (i: number) => (lines[i] ?? "").slice((lines[i] ?? "").lastIndexOf("│") + 1).trimEnd();
-    expect(calendarHalf(title + 2)).toBe(` ${"   ".repeat(3)} 1  2  3  4  ${"   ".repeat(6)} 1`);
-    expect(calendarHalf(title + 6)).toBe(" 26 27 28 29 30 31     23 24 25 26 27 28 29");
-    expect(calendarHalf(title + 7)).toBe(`${" ".repeat(23)}30`);
+    expect(calendarHalf(title + 2)).toBe(` ${"   ".repeat(4)} 1  2  3   1  2  3  4  5  6  7`);
+    expect(calendarHalf(title + 6)).toBe(" 25 26 27 28 29 30 31  29 30");
+    // Neither month needs a sixth week.
+    expect(calendarHalf(title + 7)).toBe("");
     // The calendar fills the bottom of the body, just above the status bar.
     expect(lines[title + 8]).toMatch(/^NORMAL/);
 
@@ -512,9 +513,9 @@ describe("the calendar", () => {
     expect(cell(4, 30)).not.toContain(RED);
     // Done Items do not count.
     expect(cell(4, 28)).not.toContain(BOLD);
-    // Nov 2 is in the second month's second week.
-    const nov = (raw[title + 3] ?? "").slice((raw[title + 3] ?? "").lastIndexOf("│"));
-    expect(nov).toMatch(/\x1b\[1m {1}2/);
+    // Nov 2 is in the second month's first week (Oct 2, on the same line, is not due).
+    const nov = (raw[title + 2] ?? "").slice((raw[title + 2] ?? "").lastIndexOf("│"));
+    expect(nov).toMatch(/\x1b\[1m 2/);
   });
 
   it("is left out when the terminal is narrow or short", async () => {

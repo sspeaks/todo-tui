@@ -7,7 +7,7 @@ import { fit } from "../format/text.js";
 import { CALENDAR_ROWS } from "../state/layout.js";
 import { useToday } from "./hooks.js";
 
-const WEEKDAYS = "Mo Tu We Th Fr Sa Su";
+const WEEKDAYS = "Su Mo Tu We Th Fr Sa";
 /** Seven two-cell days and the spaces between them. */
 const MONTH_WIDTH = WEEKDAYS.length;
 const GAP = "  ";
