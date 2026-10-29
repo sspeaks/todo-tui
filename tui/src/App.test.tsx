@@ -452,4 +452,79 @@ describe("the detail pane", () => {
     await t.press("<esc>");
     await t.waitFrame((f) => expect(f).toMatch(/^NORMAL/m));
   });
+
+  it("scrolls to the end of a detail shortened by the calendar", async () => {
+    const description = Array.from({ length: 40 }, (_, i) => `para ${i}`).join("\n");
+    const t = renderTui({ daemon: fakeDaemon([item("long one", { description })]), columns: 120, rows: 30 });
+    await t.live();
+    await t.waitFrame((f) => expect(f).toMatch(/│ long one/));
+    expect(t.frame()).toMatch(/│ Mo Tu We Th Fr Sa Su {2}Mo Tu/);
+    t.type("\t");
+    await t.waitFrame((f) => expect(f).toMatch(/^DETAIL/m));
+    t.type("G");
+    await t.waitFrame((f) => expect(f).toContain("para 39"));
+    // The last line sits just above the calendar, not under it.
+    const lines = t.lines();
+    const last = lines.findIndex((l) => l.includes("para 39"));
+    expect(lines[last + 2]).toMatch(/│ [A-Z][a-z]+ \d{4}/);
+  });
+});
+
+describe("the calendar", () => {
+  it("shows this month and the next under the detail: today inverse, open due days bold, overdue ones red", async () => {
+    const fd = fakeDaemon(
+      [
+        item("late one", { dueDate: date(20) }),
+        item("friday", { dueDate: date(30) }),
+        item("next month", { dueDate: date(2, 11) }),
+        item("finished", { status: Status.DONE, dueDate: date(28) }),
+      ],
+      { now: clock, timeZone: "UTC" },
+    );
+    const t = renderTui({ daemon: fd, columns: 120, rows: 30, now: clock });
+    await t.live();
+    await t.waitFrame((f) => expect(f).toMatch(/│ October 2026 {10}November 2026/));
+    const lines = t.lines();
+    const title = lines.findIndex((l) => l.includes("October 2026"));
+    // Monday first; Oct 1 2026 is a Thursday, Nov 1 a Sunday.
+    expect(lines[title + 1]).toMatch(/│ Mo Tu We Th Fr Sa Su {2}Mo Tu We Th Fr Sa Su\s*$/);
+    const calendarHalf = (i: number) => (lines[i] ?? "").slice((lines[i] ?? "").lastIndexOf("│") + 1).trimEnd();
+    expect(calendarHalf(title + 2)).toBe(` ${"   ".repeat(3)} 1  2  3  4  ${"   ".repeat(6)} 1`);
+    expect(calendarHalf(title + 6)).toBe(" 26 27 28 29 30 31     23 24 25 26 27 28 29");
+    expect(calendarHalf(title + 7)).toBe(`${" ".repeat(23)}30`);
+    // The calendar fills the bottom of the body, just above the status bar.
+    expect(lines[title + 8]).toMatch(/^NORMAL/);
+
+    const BOLD = "\x1b[1m";
+    const raw = t.raw().split("\n");
+    const cell = (week: number, day: number) => {
+      const line = raw[title + 2 + week] ?? "";
+      const at = line.lastIndexOf("│");
+      // The calendar's half of the line, from the separator on, and the escapes right before the day.
+      const half = line.slice(at);
+      const m = half.match(new RegExp(`((?:\\x1b\\[[0-9;]*m)*)${String(day).padStart(2)}(?!\\d)`));
+      return m?.[1] ?? "";
+    };
+    await t.waitFrame(() => expect(cell(4, 30)).toContain(BOLD));
+    expect(cell(4, 26)).toContain(INVERSE);
+    expect(cell(3, 20)).toContain(RED);
+    expect(cell(3, 20)).toContain(BOLD);
+    expect(cell(4, 30)).not.toContain(RED);
+    // Done Items do not count.
+    expect(cell(4, 28)).not.toContain(BOLD);
+    // Nov 2 is in the second month's second week.
+    const nov = (raw[title + 3] ?? "").slice((raw[title + 3] ?? "").lastIndexOf("│"));
+    expect(nov).toMatch(/\x1b\[1m {1}2/);
+  });
+
+  it("is left out when the terminal is narrow or short", async () => {
+    const t = renderTui({ daemon: fakeDaemon([item("one")]), columns: 120, rows: 21 });
+    await t.live();
+    await t.waitFrame((f) => expect(f).toMatch(/│ one/));
+    expect(t.frame()).not.toContain("Mo Tu We");
+    t.resize(100, 40);
+    await t.waitFrame((f) => expect(f.split("\n")).toHaveLength(40));
+    expect(t.frame()).not.toMatch(/│ one/);
+    expect(t.frame()).not.toContain("Mo Tu We");
+  });
 });

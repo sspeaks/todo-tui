@@ -15,7 +15,8 @@ export const dayOf = (d: Pick<ProtoDate, "year" | "month" | "day">): number => d
 /** The local date of `at`, as a day number. */
 export const localDay = (at: Date): number => dayNumber(at.getFullYear(), at.getMonth() + 1, at.getDate());
 
-const parts = (n: number) => {
+/** Day `n`'s year, month (1–12), day and weekday (0 = Sunday). */
+export const civil = (n: number) => {
   const d = new Date(n * DAY_MS);
   return { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1, day: d.getUTCDate(), weekday: d.getUTCDay() };
 };
@@ -24,7 +25,7 @@ const pad = (n: number) => String(n).padStart(2, "0");
 
 /** 2026-10-30 */
 export function isoDay(n: number): string {
-  const { year, month, day } = parts(n);
+  const { year, month, day } = civil(n);
   return `${year}-${pad(month)}-${pad(day)}`;
 }
 
@@ -36,22 +37,22 @@ export function shortDay(n: number, today: number): string {
   const diff = n - today;
   if (diff === 0) return "Today";
   if (diff === 1) return "Tom";
-  const p = parts(n);
+  const p = civil(n);
   if (diff > 1 && diff < 7) return WEEKDAYS[p.weekday] ?? "";
-  if (p.year === parts(today).year) return `${MONTHS[p.month - 1]} ${p.day}`;
+  if (p.year === civil(today).year) return `${MONTHS[p.month - 1]} ${p.day}`;
   return isoDay(n);
 }
 
 /** "Fri Oct 30", with the year when it is not `today`'s: the date previews. */
 export function dayLabel(n: number, today: number): string {
-  const p = parts(n);
-  const year = p.year === parts(today).year ? "" : ` ${p.year}`;
+  const p = civil(n);
+  const year = p.year === civil(today).year ? "" : ` ${p.year}`;
   return `${WEEKDAYS[p.weekday]} ${MONTHS[p.month - 1]} ${p.day}${year}`;
 }
 
 /** Fri Oct 30 2026 */
 export function longDay(n: number): string {
-  const p = parts(n);
+  const p = civil(n);
   return `${WEEKDAYS[p.weekday]} ${MONTHS[p.month - 1]} ${p.day} ${p.year}`;
 }
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MIN_TITLE, MIN_WAITING, ROW_PREFIX, layout, rowColumns, tabLabels } from "./layout.js";
+import { CALENDAR_ROWS, MIN_TITLE, MIN_WAITING, ROW_PREFIX, layout, rowColumns, tabLabels } from "./layout.js";
 
 describe("layout", () => {
   it("splits at 110 columns, sizes the body, and is too small below 40×8", () => {
@@ -12,6 +12,17 @@ describe("layout", () => {
     expect(layout(120, 30, "quickAdd").bodyHeight).toBe(25);
     expect(layout(120, 30, "prompt").bodyHeight).toBe(26);
     expect(layout(120, 30, "picker").bodyHeight).toBe(27);
+  });
+
+  it("puts the calendar under the detail when wide with room for both, else leaves it out", () => {
+    expect(layout(120, 30)).toMatchObject({ calendarHeight: CALENDAR_ROWS, detailHeight: 27 - CALENDAR_ROWS });
+    expect(layout(110, 22)).toMatchObject({ calendarHeight: CALENDAR_ROWS, detailHeight: 10 });
+    // Fewer than ten rows would be left to the detail.
+    expect(layout(120, 21)).toMatchObject({ calendarHeight: 0, detailHeight: 18 });
+    // Quick-add's rows count: 22 rows with quick-add open leave the body 17.
+    expect(layout(120, 22, "quickAdd").calendarHeight).toBe(0);
+    // Narrow: the detail is an overlay, and there is no calendar.
+    expect(layout(109, 40)).toMatchObject({ calendarHeight: 0, detailHeight: 37 });
   });
 
   it("drops row columns in order (markers, waiting, key, due) to keep the title at least 20", () => {

@@ -54,3 +54,20 @@ jobs:
         run: TODO_BIN=$PWD/target/debug/todo pnpm test
       - name: TUI bundle smoke
         run: pnpm -C tui build && node tui/dist/tui.js --smoke
+
+  # What `nix profile add github:sspeaks/todo-tui` installs, on each system
+  # the flake supports: a stale per-system pnpmDepsHash fails here, with the
+  # `got:` hash to paste into flake.nix.
+  nix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: nix build
+        run: nix build .#default -L
+      - name: todo runs
+        run: ./result/bin/todo --help

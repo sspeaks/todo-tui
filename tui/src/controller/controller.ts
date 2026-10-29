@@ -451,6 +451,12 @@ export class Controller {
     return layout(size.columns, size.rows, mode.kind).bodyHeight;
   }
 
+  /** The detail pane's height: the list's, less the calendar's when it is shown under the detail. */
+  private get detailHeight(): number {
+    const { size, mode } = this.state;
+    return layout(size.columns, size.rows, mode.kind).detailHeight;
+  }
+
   /** A tab's selection and scroll. */
   listState(tab: TabId): ListState {
     return this.state.lists.get(tab) ?? initialList;
@@ -739,7 +745,7 @@ export class Controller {
     if (this.state.focus === "detail") {
       const id = this.selectedId();
       return this.ui.setState((s) => {
-        const max = Math.max(0, s.detail.lines - this.height);
+        const max = Math.max(0, s.detail.lines - this.detailHeight);
         const from = s.detail.id === id ? s.detail.scroll : 0;
         return { ...s, detail: { ...s.detail, id, scroll: clamp(scroll(from, max), 0, max) } };
       });

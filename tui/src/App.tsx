@@ -1,6 +1,7 @@
 import { ClientsProvider, type LiveStore, LiveStoreProvider, type TodoClients } from "@todo-tui/client";
 import { Box, Text, useApp, useInput, usePaste, useWindowSize } from "ink";
 import { useEffect, useSyncExternalStore } from "react";
+import { Calendar } from "./components/Calendar.js";
 import { DetailPane } from "./components/DetailPane.js";
 import { HelpOverlay } from "./components/HelpOverlay.js";
 import { ControllerContext, useRows, useUi } from "./components/hooks.js";
@@ -85,17 +86,20 @@ function Body({ shape }: { shape: Layout }) {
         <Box width={1} height={height} flexShrink={0}>
           <Text color={focused ? "cyan" : "gray"}>{Array.from({ length: height }, () => "│").join("\n")}</Text>
         </Box>
-        <SelectedDetail tab={tab} width={shape.detailWidth} height={height} focused={focused} />
+        <Box flexDirection="column" width={shape.detailWidth} height={height}>
+          <SelectedDetail tab={tab} width={shape.detailWidth} height={shape.detailHeight} listHeight={height} focused={focused} />
+          {shape.calendarHeight ? <Calendar width={shape.detailWidth} /> : null}
+        </Box>
       </Box>
     );
   }
-  if (overlay) return <SelectedDetail tab={tab} width={shape.columns} height={height} focused />;
+  if (overlay) return <SelectedDetail tab={tab} width={shape.columns} height={height} listHeight={height} focused />;
   return <ListPane key={key} tab={tab} width={shape.listWidth} height={height} />;
 }
 
-/** The detail of the tab's selected Item. */
-function SelectedDetail({ tab, width, height, focused }: { tab: TabId; width: number; height: number; focused: boolean }) {
+/** The detail of the tab's selected Item; `listHeight` is the list's, which the selection is reconciled against. */
+function SelectedDetail({ tab, width, height, listHeight, focused }: { tab: TabId; width: number; height: number; listHeight: number; focused: boolean }) {
   const { snap, ids, list } = useRows(tab);
-  const id = snap.status === "ready" ? reconcile(list, ids, height).selectedId : list.selectedId;
+  const id = snap.status === "ready" ? reconcile(list, ids, listHeight).selectedId : list.selectedId;
   return <DetailPane id={id} width={width} height={height} focused={focused} />;
 }

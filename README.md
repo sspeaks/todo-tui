@@ -297,6 +297,9 @@ todo
 The top line holds the views as tabs, with their counts; below it is the list of
 the current view, with the selected item's details beside it in a terminal 110
 columns or wider (narrower, `enter` opens them full screen and `esc` closes them).
+Under the details, when the terminal is at least 22 rows tall, a calendar shows this
+month and the next: today highlighted, and the days that have open items due in bold
+(red when overdue).
 The last two lines are a status bar (mode, connection, marks, what `u` would undo,
 key hints) and a message line for prompts and results.
 

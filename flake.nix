@@ -3,10 +3,12 @@
 # bundle at share/todo-tui/tui.js and Node 24 on its PATH.
 #
 # Maintenance:
-#   - pnpm-lock.yaml changed: update `pnpmDepsHash` below. Set it to "" and run
-#       nix build .#todo-tui-js
-#     which fails with `got: sha256-...`; paste that value in. (A stale hash
-#     can show up as ERR_PNPM_NO_OFFLINE_TARBALL instead of a hash mismatch.)
+#   - pnpm-lock.yaml changed: update every entry of `pnpmDepsHash` below. The
+#     fetched store differs by platform (Linux and macOS get different hashes),
+#     so each system has its own. The `nix` CI job builds each one and fails
+#     with `got: sha256-...` for a stale entry; paste that value in. Locally,
+#     set this system's entry to "" and run `nix build .#todo-tui-js`. (A stale
+#     hash can show up as ERR_PNPM_NO_OFFLINE_TARBALL instead of a mismatch.)
 #   - Cargo.lock changed: nothing, unless a git dependency appears; then add
 #     its hash under `cargoLock.outputHashes`.
 #   - rust-toolchain.toml raised past nixpkgs' rustc: `nix flake update`.
@@ -14,7 +16,6 @@
 #     or `jsSrc`. Nix also sees only git-tracked files, so `git add` first.
 #   - Something new to install (say the MCP server): add a package for it and
 #     copy it into `default`.
-# aarch64-darwin evaluates but has not been built or run.
 {
   description = "todo-tui: a local-first todo list with a daemon, a CLI and an Ink TUI";
 
@@ -32,7 +33,12 @@
       forAllSystems = f: lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
 
       version = (lib.importTOML ./Cargo.toml).workspace.package.version;
-      pnpmDepsHash = "sha256-UQCNT9d14RUBXuWQ1/wT2zJnQER+uWKAedS0yi2KLGk=";
+      # Per system: see the maintenance notes above.
+      pnpmDepsHash = {
+        x86_64-linux = "sha256-UQCNT9d14RUBXuWQ1/wT2zJnQER+uWKAedS0yi2KLGk=";
+        aarch64-linux = "sha256-UQCNT9d14RUBXuWQ1/wT2zJnQER+uWKAedS0yi2KLGk=";
+        aarch64-darwin = "sha256-4E7O7FHIRoeI9Tij3wu3kcjB+oJbVVm71PMXNpS9jV8=";
+      };
 
       # Each part sees only the files it builds from, so a README edit
       # rebuilds nothing and a TUI edit does not rebuild the Rust binary.
@@ -94,7 +100,7 @@
               inherit (finalAttrs) pname version src;
               inherit pnpm;
               fetcherVersion = 4;
-              hash = pnpmDepsHash;
+              hash = pnpmDepsHash.${pkgs.stdenv.hostPlatform.system};
             };
             buildPhase = ''
               runHook preBuild

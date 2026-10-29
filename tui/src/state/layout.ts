@@ -15,6 +15,12 @@ export const CHROME_ROWS = 3;
 export const QUICK_ADD_ROWS = 2;
 /** A prompt's preview (or conflict) line, above the status bar. */
 export const PROMPT_ROWS = 1;
+/** The calendar under the detail: a blank line, the month titles, the weekdays, six weeks. */
+export const CALENDAR_ROWS = 9;
+/** A margin cell, two 20-cell months and the gap between them. */
+export const CALENDAR_WIDTH = 43;
+/** The fewest rows the detail keeps above the calendar; with fewer the calendar is left out. */
+export const MIN_DETAIL_ROWS = 10;
 
 /** The rows a mode takes from the body. */
 export const modeRows = (mode: ModeKind | undefined): number =>
@@ -31,21 +37,29 @@ export interface Layout {
   readonly listWidth: number;
   /** The detail pane's width: about 40% beside the list, or the whole width as an overlay. */
   readonly detailWidth: number;
+  /** The detail pane's rows: the body's, less the calendar's. */
+  readonly detailHeight: number;
+  /** CALENDAR_ROWS under the detail when wide and there is room for it, else 0. */
+  readonly calendarHeight: number;
 }
 
 /** The screen for a terminal size, with the rows `mode` takes left out of the body. */
 export function layout(columns: number, rows: number, mode?: ModeKind): Layout {
   const wide = columns >= SPLIT_COLUMNS;
   const detailWidth = wide ? Math.floor(columns * 0.4) : columns;
+  const bodyHeight = Math.max(1, rows - CHROME_ROWS - modeRows(mode));
+  const calendarHeight = wide && detailWidth >= CALENDAR_WIDTH && bodyHeight >= CALENDAR_ROWS + MIN_DETAIL_ROWS ? CALENDAR_ROWS : 0;
   return {
     columns,
     rows,
     tooSmall: columns < MIN_COLUMNS || rows < MIN_ROWS,
     wide,
-    bodyHeight: Math.max(1, rows - CHROME_ROWS - modeRows(mode)),
+    bodyHeight,
     // One column for the separator.
     listWidth: wide ? columns - detailWidth - 1 : columns,
     detailWidth,
+    detailHeight: bodyHeight - calendarHeight,
+    calendarHeight,
   };
 }
 
