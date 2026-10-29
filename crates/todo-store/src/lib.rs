@@ -5,6 +5,7 @@
 //! call; reads run on a small pool of read-only connections (WAL mode).
 
 mod codec;
+mod hierarchy;
 mod query;
 mod relation;
 mod schema;
@@ -961,14 +962,21 @@ fn recorded_op(
     Ok(Some((op_id, rev_from_sql(revision)?, item_id)))
 }
 
-/// The Items `ids`, in their current state with their relations.
+/// The Items `ids`, in their current state with their relations and hierarchy.
 fn load_items(conn: &Connection, ids: &[ItemId], today: Date) -> Result<Vec<Item>> {
     let mut items = ids
         .iter()
         .map(|&id| load_item(conn, &id.to_string(), Some(today))?.ok_or(StoreError::NotFound(id)))
         .collect::<Result<Vec<_>>>()?;
-    relation::attach(conn, &mut items)?;
+    attach(conn, &mut items)?;
     Ok(items)
+}
+
+/// Attaches what an Item shows from other rows: its relations, subtask
+/// counts and parent title.
+pub(crate) fn attach(conn: &Connection, items: &mut [Item]) -> Result<()> {
+    relation::attach(conn, items)?;
+    hierarchy::attach(conn, items)
 }
 
 /// The original result of an idempotent capture, if any.
@@ -1043,7 +1051,9 @@ fn capture_tx(tx: &mut WriteTx<'_>, input: CaptureInput) -> Result<(Item, Mutati
         }));
     }
 
-    let revision = tx.next_revision();
+    // A subtask re-emits its parent first (its counts change), so the
+    // capture's own revision is still the op's last.
+    let revision = tx.next_revision() + Revision::from(input.parent_id.is_some());
     let now = input.now;
     let mut item = Item::new_capture(new_ulid(), draft.title, input.created_via, now);
     item.revision = revision;
@@ -1087,6 +1097,16 @@ fn capture_tx(tx: &mut WriteTx<'_>, input: CaptureInput) -> Result<(Item, Mutati
             item_id,
             op.at
         ])?;
+    }
+    if let Some(parent_id) = input.parent_id {
+        let mut parent = load_item(conn, &parent_id.to_string(), Some(input.today))?
+            .ok_or(StoreError::NotFound(parent_id))?;
+        parent.revision = tx.next_revision();
+        codec::update_item(tx.conn(), &parent)?;
+        attach(tx.conn(), std::slice::from_mut(&mut parent))?;
+        item.derived.parent_title = Some(parent.core.title.clone());
+        let resource = Resource::Item(Arc::new(parent));
+        tx.record_change(Topic::Item, &parent_id.to_string(), false, Some(resource))?;
     }
     let recorded = tx.record_change(
         Topic::Item,
@@ -1133,8 +1153,11 @@ struct Batch {
     loaded: Vec<Item>,
     slots: HashMap<ItemId, usize>,
     /// Slots that get a revision even if their Item compares equal: the
-    /// ones with events, and relation ends.
+    /// ones with events, relation ends, and the fan-out.
     dirty: HashSet<usize>,
+    /// Slots re-emitted only because a parent's counts or a subtask's
+    /// parent title changed: not part of the op's answer.
+    fanout: HashSet<usize>,
     events: Vec<NewEvent>,
     /// Items this op soft-deleted and has not undeleted since.
     deleted_here: HashSet<ItemId>,
@@ -1175,6 +1198,42 @@ impl Batch {
                 .map(|change| NewEvent::Set { item_id, change }),
         );
         self.items[slot] = applied.item;
+    }
+
+    /// Loads and marks dirty the Items whose derived hierarchy fields this
+    /// op changes without changing them itself: the old and new parent of
+    /// each Item whose contribution to their counts changed, and the
+    /// subtasks of each Item whose title changed. One level, since a
+    /// relative loaded here does not change. `updated_at` stays, so a
+    /// parent does not move in the views sorted by it.
+    fn fan_out(&mut self, conn: &Connection, today: Date) -> Result<()> {
+        let mut parents = Vec::new();
+        let mut retitled = Vec::new();
+        for (item, loaded) in self.items.iter().zip(&self.loaded) {
+            let (now, was) = (
+                hierarchy::contribution(item),
+                hierarchy::contribution(loaded),
+            );
+            if now != was {
+                parents.extend([now.0, was.0].into_iter().flatten());
+            }
+            if item.core.title != loaded.core.title {
+                retitled.push(item.id);
+            }
+        }
+        // parent_id is a foreign key, so every parent exists.
+        let mut relatives = parents;
+        for id in retitled {
+            relatives.extend(self.children(conn, id)?.into_iter().map(|(child, _)| child));
+        }
+        for id in relatives {
+            let slot = self.load(conn, id, today)?;
+            if !self.dirty.contains(&slot) && self.items[slot] == self.loaded[slot] {
+                self.fanout.insert(slot);
+            }
+            self.dirty.insert(slot);
+        }
+        Ok(())
     }
 
     /// The touched slots, in first-touch order: changed, or with events.
@@ -1429,33 +1488,42 @@ impl Batch {
 /// is an entry, see [`OpRow::insert`]); one revision, `items` row and
 /// `changes` row per touched Item, in first-touch order; the events in op
 /// order; and one `derived` event per touched Item whose staleness signals
-/// changed. Attaches every working copy's relations. Returns the op's last
-/// revision (the current one if it allocates none) and the touched slots in
-/// the order their events first name them.
+/// changed. The fan-out ([`Batch::fan_out`]) is touched too, without
+/// events. Attaches every working copy's relations and hierarchy. Returns
+/// the op's last revision (the current one if it allocates none) and the
+/// touched slots but the fan-out, in the order their events first name them.
 fn write_op(
     tx: &mut WriteTx<'_>,
     op: &OpRow<'_>,
     batch: &mut Batch,
     today: Date,
 ) -> Result<(Revision, Vec<usize>)> {
+    batch.fan_out(tx.conn(), today)?;
     let touched = batch.touched();
     let derived: Vec<usize> = touched
         .iter()
         .copied()
         .filter(|&slot| batch.items[slot].derived.staleness != batch.loaded[slot].derived.staleness)
         .collect();
-    let revision = tx.next_revision() + touched.len() as Revision - 1;
+    let first = tx.next_revision();
+    let revision = first + touched.len() as Revision - 1;
     op.insert(tx.conn(), revision, batch.events.len() + derived.len())?;
     for item in &mut batch.items {
         item.derived.is_overdue = is_overdue(item, Some(today));
     }
-    relation::attach(tx.conn(), &mut batch.items)?;
-    for &slot in &touched {
+    for (&slot, rev) in touched.iter().zip(first..) {
         let item = &mut batch.items[slot];
-        item.revision = tx.next_revision();
+        item.revision = rev;
         codec::update_item(tx.conn(), item)?;
+    }
+    // After every row is written, so the counts are the op's.
+    attach(tx.conn(), &mut batch.items)?;
+    for &slot in &touched {
+        let item = &batch.items[slot];
         let resource = Resource::Item(Arc::new(item.clone()));
-        tx.record_change(Topic::Item, &item.id.to_string(), false, Some(resource))?;
+        let recorded =
+            tx.record_change(Topic::Item, &item.id.to_string(), false, Some(resource))?;
+        debug_assert_eq!(recorded, item.revision);
     }
     debug_assert_eq!(tx.next_revision() - 1, revision);
 
@@ -1521,9 +1589,10 @@ fn write_op(
         ord += 1;
     }
     let mut slots: Vec<usize> = order.iter().map(|id| batch.slots[id]).collect();
-    // Every touched Item has an event; this only keeps the list complete.
+    // Every touched Item but the fan-out has an event; this only keeps the
+    // list complete. The fan-out reaches clients through the change stream.
     for slot in touched {
-        if !slots.contains(&slot) {
+        if !slots.contains(&slot) && !batch.fanout.contains(&slot) {
             slots.push(slot);
         }
     }
@@ -1682,7 +1751,7 @@ fn get_item_tx(conn: &Connection, id: ItemId, today: Date) -> Result<GetItemOutp
             StoreError::Corrupt(format!("{} is merged into missing item {target}", item.id))
         })?;
     }
-    relation::attach(&tx, std::slice::from_mut(&mut item))?;
+    attach(&tx, std::slice::from_mut(&mut item))?;
     Ok(GetItemOutput {
         resolved_from: (item.id != id).then_some(id),
         item,
@@ -1774,7 +1843,7 @@ fn changes_since_tx(
         };
         changes.push((revision, topic, id, deleted, replayed));
     }
-    relation::attach(&tx, &mut items)?;
+    attach(&tx, &mut items)?;
     let items: Vec<Arc<Item>> = items.into_iter().map(Arc::new).collect();
     Ok(changes
         .into_iter()

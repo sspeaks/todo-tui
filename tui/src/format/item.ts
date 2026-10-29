@@ -76,6 +76,10 @@ export const shortId = (id: string): string => id.slice(-8);
 
 /** The cells of a list row after the title; empty when unset. */
 export interface RowCells {
+  /** The parent's title, shown dim after the title in the room it leaves. */
+  parent: string;
+  /** "2/5": done of the subtasks not deleted or cancelled, on a parent. */
+  progress: string;
   /** The remote key (P2). */
   key: string;
   /** "^Fri"; red when overdue. */
@@ -104,6 +108,8 @@ export function rowCells(item: Item, today: number): RowCells {
   if (item.hasConflict || item.hasPushFailure) markers.push("!");
   if (item.recurrence) markers.push("🔁");
   return {
+    parent: singleLine(item.parentTitle ?? ""),
+    progress: item.subtasksTotal ? `${item.subtasksDone}/${item.subtasksTotal}` : "",
     key: singleLine(item.remoteLink?.key ?? ""),
     due: item.dueDate ? `^${shortDay(dayOf(item.dueDate), today)}` : "",
     overdue: item.isOverdue,
@@ -112,6 +118,22 @@ export function rowCells(item: Item, today: number): RowCells {
     followUpDue: waiting?.followUpOn !== undefined && dayOf(waiting.followUpOn) <= today,
     markers: markers.join(" "),
   };
+}
+
+/** Between a title and its parent. */
+const PARENT_MARK = "  ↳ ";
+/** The fewest cells of a parent's title worth showing; with less room it is left out. */
+export const MIN_PARENT = 4;
+
+/**
+ * The title cell in exactly `width` cells: the title, then the parent
+ * ("  ↳ Ship auth…") in the room the title leaves, the title never cut for
+ * it. `parent` is that suffix, to render dim; empty when it does not fit.
+ */
+export function titleCell(title: string, parent: string, width: number): { title: string; parent: string } {
+  const room = width - displayWidth(title) - displayWidth(PARENT_MARK);
+  if (!parent || room < MIN_PARENT) return { title: fit(title, width), parent: "" };
+  return { title, parent: fit(PARENT_MARK + truncate(parent, room), width - displayWidth(title)) };
 }
 
 /** The waiting cell in exactly `width` cells: a long name cut, the age kept ("⧗the acco… 3d"). */

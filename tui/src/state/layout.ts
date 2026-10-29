@@ -73,15 +73,17 @@ export const GAP = 2;
 /** Widths of a row's columns after the title; 0 for a column not shown. */
 export interface RowColumns {
   readonly title: number;
+  /** "2/5" on a parent. */
+  readonly progress: number;
   readonly key: number;
   readonly due: number;
   readonly waiting: number;
   readonly markers: number;
 }
 
-type Column = "key" | "due" | "waiting" | "markers";
+type Column = "progress" | "key" | "due" | "waiting" | "markers";
 /** Dropped first to last when the title would get narrower than MIN_TITLE. */
-const DROP_ORDER: readonly Column[] = ["markers", "waiting", "key", "due"];
+const DROP_ORDER: readonly Column[] = ["markers", "progress", "waiting", "key", "due"];
 /**
  * The narrowest the waiting column gets, its names cut ("⧗the acco… 3d"),
  * before it is dropped: one long name must not take the column from every

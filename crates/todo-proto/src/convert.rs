@@ -646,6 +646,9 @@ impl From<&core::Item> for v1::Item {
             deleted_at: d.deleted_at.map(timestamp_to_proto),
             merged_into: d.merged_into.map(|id| id.to_string()),
             is_overdue: d.is_overdue,
+            subtasks_total: d.subtasks_total,
+            subtasks_done: d.subtasks_done,
+            parent_title: d.parent_title.clone(),
 
             relations: item.relations.iter().map(Into::into).collect(),
         }
@@ -757,6 +760,9 @@ impl TryFrom<&v1::Item> for core::Item {
                 deleted_at: ts("deleted_at", &p.deleted_at)?,
                 merged_into: id("merged_into", &p.merged_into)?,
                 is_overdue: p.is_overdue,
+                subtasks_total: p.subtasks_total,
+                subtasks_done: p.subtasks_done,
+                parent_title: p.parent_title.clone(),
             },
             relations: p
                 .relations

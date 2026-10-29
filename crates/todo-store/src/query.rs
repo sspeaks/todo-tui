@@ -29,7 +29,7 @@ use todo_core::{
 use crate::codec::{ITEM_COLUMNS, SqlEnum, date_to_sql, item_from_row};
 use crate::{
     DEFAULT_PAGE_SIZE, ItemPage, ListInput, MAX_PAGE_SIZE, Result, StatusCounts, StoreError,
-    current_revision_in, fnv1a, relation, today_local, view,
+    attach, current_revision_in, fnv1a, today_local, view,
 };
 
 // ---- SQL text --------------------------------------------------------------
@@ -1195,7 +1195,7 @@ pub(crate) fn list_items_tx(conn: &Connection, input: ListInput) -> Result<ItemP
         // The same today as the filter, so is_overdue agrees with it.
         items.push(item_from_row(row, Some(today))?);
     }
-    relation::attach(&tx, &mut items)?;
+    attach(&tx, &mut items)?;
     let next_page_token = match items.last() {
         Some(last) if has_more => Some(PageToken::after(last, fingerprint, today, &keys)?.encode()),
         _ => None,

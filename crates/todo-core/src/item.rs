@@ -198,6 +198,12 @@ pub struct DerivedFields {
     pub deleted_at: Option<Timestamp>,
     pub merged_into: Option<ItemId>,
     pub is_overdue: bool,
+    /// Direct subtasks that are not deleted or cancelled.
+    pub subtasks_total: u32,
+    /// Of those, the done ones.
+    pub subtasks_done: u32,
+    /// The parent's title, whenever `parent_id` is set.
+    pub parent_title: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

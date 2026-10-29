@@ -2984,6 +2984,184 @@ async fn delete_cascades_to_live_descendants_and_undelete_brings_them_back() {
     assert_no_live_orphans(&db).await;
 }
 
+/// `(subtasks_done, subtasks_total)` of an Item as read.
+async fn progress(db: &Db, id: ItemId) -> (u32, u32) {
+    let d = get(db, id).await.derived;
+    (d.subtasks_done, d.subtasks_total)
+}
+
+/// The ids of the `changes` rows after `since`, sorted.
+async fn changed_ids(db: &Db, since: Revision) -> Vec<String> {
+    let mut ids: Vec<String> = change_rows(db, since as i64)
+        .await
+        .into_iter()
+        .map(|(_, id, _)| id)
+        .collect();
+    ids.sort();
+    ids
+}
+
+fn sorted_ids(items: &[&Item]) -> Vec<String> {
+    let mut ids: Vec<String> = items.iter().map(|i| i.id.to_string()).collect();
+    ids.sort();
+    ids
+}
+
+#[tokio::test]
+async fn subtask_counts_and_parent_titles_are_read_and_re_emitted() {
+    let db = open();
+    let p = capture(&db, "p").await;
+    assert_eq!(
+        (p.derived.subtasks_total, p.derived.parent_title.as_deref()),
+        (0, None)
+    );
+
+    // A capture re-emits its parent first, so its own revision is the op's.
+    let before = db.store.current_revision();
+    let mut rx = db.store.subscribe();
+    let mut req = input("a", 1);
+    req.parent_id = Some(p.id);
+    let (a, result) = db.store.capture(req).await.unwrap();
+    assert_eq!((a.revision, result.revision), (before + 2, before + 2));
+    assert_eq!(a.derived.parent_title.as_deref(), Some("p"));
+    assert_eq!(
+        change_rows(&db, before as i64).await,
+        [
+            (before as i64 + 1, p.id.to_string(), false),
+            (before as i64 + 2, a.id.to_string(), false)
+        ]
+    );
+    let Some(Resource::Item(emitted)) = rx.try_recv().unwrap().resource else {
+        panic!("missing resource");
+    };
+    assert_eq!((emitted.id, emitted.derived.subtasks_total), (p.id, 1));
+    assert_eq!(emitted.updated_at, p.updated_at);
+
+    let b = capture_under(&db, "b", p.id).await;
+    let c = capture_under(&db, "c", p.id).await;
+    let other = capture(&db, "other").await;
+    assert_eq!(progress(&db, p.id).await, (0, 3));
+
+    // Done counts; cancelled and deleted leave the total. Each re-emits the
+    // parent, whose updated_at stays, and only the child is the answer.
+    let at = get(&db, p.id).await.updated_at;
+    let since = db.store.current_revision();
+    let out = run(
+        &db,
+        Actor::User,
+        2_000,
+        OpKind::SetStatus,
+        vec![status(a.id, Status::Done)],
+    )
+    .await;
+    assert_eq!(out.items.iter().map(|i| i.id).collect::<Vec<_>>(), [a.id]);
+    assert_eq!(changed_ids(&db, since).await, sorted_ids(&[&p, &a]));
+    assert_eq!(progress(&db, p.id).await, (1, 3));
+    run(
+        &db,
+        Actor::User,
+        2_001,
+        OpKind::SetStatus,
+        vec![status(b.id, Status::Cancelled)],
+    )
+    .await;
+    assert_eq!(progress(&db, p.id).await, (1, 2));
+    run(
+        &db,
+        Actor::User,
+        2_002,
+        OpKind::Delete,
+        vec![mutation(c.id, MutationOp::Delete)],
+    )
+    .await;
+    assert_eq!(progress(&db, p.id).await, (1, 1));
+    assert_eq!(get(&db, p.id).await.updated_at, at);
+
+    // Undo goes through the same writes.
+    let since = db.store.current_revision();
+    let out = undo(&db).await;
+    assert_eq!(out.items.iter().map(|i| i.id).collect::<Vec<_>>(), [c.id]);
+    assert_eq!(changed_ids(&db, since).await, sorted_ids(&[&p, &c]));
+    assert_eq!(progress(&db, p.id).await, (1, 2));
+
+    // Archive and defer still count; a change the counts do not see
+    // re-emits nothing else.
+    let since = db.store.current_revision();
+    run(
+        &db,
+        Actor::User,
+        2_003,
+        OpKind::Update,
+        vec![title(c.id, "c2")],
+    )
+    .await;
+    assert_eq!(changed_ids(&db, since).await, sorted_ids(&[&c]));
+    run(
+        &db,
+        Actor::User,
+        2_004,
+        OpKind::Archive,
+        vec![mutation(a.id, MutationOp::Archive)],
+    )
+    .await;
+    assert_eq!(progress(&db, p.id).await, (1, 2));
+
+    // A retitled parent re-emits every direct subtask, deleted ones too.
+    let since = db.store.current_revision();
+    run(
+        &db,
+        Actor::User,
+        2_005,
+        OpKind::Update,
+        vec![title(p.id, "parent")],
+    )
+    .await;
+    assert_eq!(changed_ids(&db, since).await, sorted_ids(&[&p, &a, &b, &c]));
+    assert_eq!(
+        get(&db, b.id).await.derived.parent_title.as_deref(),
+        Some("parent")
+    );
+
+    // Reparenting re-emits both parents, and the moved Item names its new one.
+    let since = db.store.current_revision();
+    run(
+        &db,
+        Actor::User,
+        2_006,
+        OpKind::Update,
+        vec![parent(c.id, other.id)],
+    )
+    .await;
+    assert_eq!(changed_ids(&db, since).await, sorted_ids(&[&p, &c, &other]));
+    assert_eq!(progress(&db, p.id).await, (1, 1));
+    assert_eq!(progress(&db, other.id).await, (0, 1));
+    assert_eq!(
+        get(&db, c.id).await.derived.parent_title.as_deref(),
+        Some("other")
+    );
+
+    // Lists and replays read the same.
+    let all = ListInput {
+        filter: everything(),
+        today: Some(today()),
+        ..ListInput::default()
+    };
+    let listed = db.store.list_items(all).await.unwrap().items;
+    let listed_p = listed.iter().find(|i| i.id == p.id).unwrap();
+    assert_eq!(
+        (
+            listed_p.derived.subtasks_done,
+            listed_p.derived.subtasks_total
+        ),
+        (1, 1)
+    );
+    let replayed = db.store.changes_since(since).await.unwrap();
+    assert!(replayed.iter().any(|c| matches!(
+        &c.resource,
+        Some(Resource::Item(i)) if i.id == other.id && i.derived.subtasks_total == 1
+    )));
+}
+
 #[tokio::test]
 async fn the_cascade_follows_the_batch_working_copies() {
     let db = open();

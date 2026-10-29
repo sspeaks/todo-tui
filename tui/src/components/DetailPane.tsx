@@ -165,7 +165,11 @@ export function DetailPane({ id, width, height, focused }: { id: string | undefi
         </Field>
         {item.parentId !== undefined ? (
           <Field label="Parent" dim={parent?.deletedAt !== undefined}>
-            {parent ? `${statusGlyph(parent.status)} ${singleLine(parent.title)}${parent.deletedAt ? " (deleted)" : ""}` : shortId(item.parentId)}
+            {parent
+              ? `${statusGlyph(parent.status)} ${singleLine(parent.title)}${parent.deletedAt ? " (deleted)" : ""}`
+              : item.parentTitle !== undefined
+                ? singleLine(item.parentTitle)
+                : shortId(item.parentId)}
           </Field>
         ) : null}
         {item.itemType && item.itemType !== "task" ? <Field label="Type">{singleLine(item.itemType)}</Field> : null}

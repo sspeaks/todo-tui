@@ -1,6 +1,6 @@
 import { type Item, errorReason, useConnection, useViews } from "@todo-tui/client";
 import { Box, Text } from "ink";
-import { type RowCells, fitWaiting, priorityLabel, rowCells, statusGlyph } from "../format/item.js";
+import { type RowCells, fitWaiting, priorityLabel, rowCells, statusGlyph, titleCell } from "../format/item.js";
 import { displayWidth, fit, singleLine } from "../format/text.js";
 import { GAP, type RowColumns, rowColumns } from "../state/layout.js";
 import { reconcile } from "../state/selection.js";
@@ -58,7 +58,9 @@ export function ListPane({ tab, width, height }: { tab: TabId; width: number; he
     const cells = rows.map((item) => rowCells(item, today));
     const widest = (pick: (c: RowCells) => string) => Math.max(0, ...cells.map((c) => displayWidth(pick(c))));
     // A cell of margin on the right, before the detail's separator.
+    // The parent fills what the title leaves: it never widens a column.
     const cols = rowColumns(width - 1, {
+      progress: widest((c) => c.progress),
       key: widest((c) => c.key),
       due: widest((c) => c.due),
       waiting: widest((c) => c.waiting),
@@ -101,9 +103,10 @@ interface RowProps {
   dim: boolean;
 }
 
-/** One row: "› ○ +3  title  ^Fri  ⧗dana 3d  ⏸Nov 3" ("›•○" when marked), archived rows dimmed. */
+/** One row: "› ○ +3  title  ↳ parent  2/5  ^Fri  ⧗dana 3d  ⏸Nov 3" ("›•○" when marked), archived rows dimmed. */
 function Row({ item, cells, cols, selected, marked, active, fresh, dim }: RowProps) {
   const archived = item.archived !== undefined;
+  const title = titleCell(singleLine(item.title), cells.parent, cols.title);
   return (
     <Text
       wrap="truncate-end"
@@ -114,7 +117,9 @@ function Row({ item, cells, cols, selected, marked, active, fresh, dim }: RowPro
     >
       {selected ? "›" : " "}
       {marked ? "•" : " "}
-      {statusGlyph(item.status)} {fit(priorityLabel(item), 3)} {fit(singleLine(item.title), cols.title)}
+      {statusGlyph(item.status)} {fit(priorityLabel(item), 3)} {title.title}
+      {title.parent ? <Text dimColor>{title.parent}</Text> : null}
+      {cell(cells.progress, cols.progress)}
       {cell(cells.key, cols.key)}
       <Text color={cells.overdue ? "red" : undefined}>{cell(cells.due, cols.due)}</Text>
       <Text color={cells.followUpDue ? "yellow" : undefined} bold={cells.followUpDue}>

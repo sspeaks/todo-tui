@@ -411,6 +411,9 @@ pub(crate) fn item_from_row(row: &Row<'_>, today: Option<Date>) -> Result<Item> 
             deleted_at,
             merged_into,
             is_overdue: false,
+            subtasks_total: 0,
+            subtasks_done: 0,
+            parent_title: None,
         },
         relations: Vec::new(),
     };

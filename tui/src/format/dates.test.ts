@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { dayLabel, dayNumber, isoDay, localDay, longDay, relativeDays, shortDay } from "./dates.js";
-import { fitWaiting, rowCells } from "./item.js";
+import { fitWaiting, rowCells, titleCell } from "./item.js";
 import { create, ItemSchema, Status } from "@todo-tui/client";
 
 const today = dayNumber(2026, 10, 26); // a Monday
@@ -39,8 +39,13 @@ describe("date labels", () => {
       hasConflict: true,
       recurrence: {},
       remoteLink: { key: "PLAT-1" },
+      subtasksTotal: 5,
+      subtasksDone: 2,
+      parentTitle: "Ship\nauth",
     });
     expect(rowCells(item, today)).toEqual({
+      parent: "Ship auth",
+      progress: "2/5",
       key: "PLAT-1",
       due: "^Oct 25",
       overdue: true,
@@ -49,7 +54,22 @@ describe("date labels", () => {
       followUpDue: true,
       markers: "⏸Nov 3 ↑ ! 🔁",
     });
-    expect(rowCells(create(ItemSchema, { deferUntil: { year: 2026, month: 10, day: 26 } }), today)).toMatchObject({ due: "", waiting: "", markers: "" });
+    expect(rowCells(create(ItemSchema, { deferUntil: { year: 2026, month: 10, day: 26 } }), today)).toMatchObject({
+      parent: "",
+      progress: "",
+      due: "",
+      waiting: "",
+      markers: "",
+    });
+  });
+
+  it("puts the parent in the room the title leaves, never cutting the title for it", () => {
+    expect(titleCell("write migration", "Ship auth migration", 40)).toEqual({ title: "write migration", parent: "  ↳ Ship auth migration  " });
+    expect(titleCell("write migration", "Ship auth migration", 30)).toEqual({ title: "write migration", parent: "  ↳ Ship auth …" });
+    // Fewer than MIN_PARENT cells of it would fit: the title alone, padded.
+    expect(titleCell("write migration", "Ship auth", 22)).toEqual({ title: "write migration       ", parent: "" });
+    expect(titleCell("a very long title that is cut", "p", 20)).toEqual({ title: "a very long title t…", parent: "" });
+    expect(titleCell("no parent", "", 20)).toEqual({ title: "no parent           ", parent: "" });
   });
 
   it("fits the waiting cell by cutting the name and keeping the age", () => {

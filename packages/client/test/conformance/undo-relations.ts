@@ -715,4 +715,63 @@ export function undoRelationsConformance(open: () => Promise<UndoTarget>): void 
       }
     });
   });
+
+  describe("subtask counts and parent titles", () => {
+    it("counts direct subtasks, done of not deleted or cancelled, and re-emits the parent on each change", async () => {
+      const { items, capture, get, live } = await setup();
+      const p = await capture("p");
+      const { store } = await live();
+      const progress = (item: Item | undefined) => [item?.subtasksDone, item?.subtasksTotal];
+
+      // A capture under p re-emits p first: the capture's revision is the op's.
+      const a = await capture("a", p.item.id);
+      expect(a.item.revision).toBe(a.revision);
+      expect(a.item.parentTitle).toBe("p");
+      expect((await get(p.item.id)).revision).toBe(a.revision - 1n);
+      const b = await capture("b", p.item.id);
+      const c = await capture("c", p.item.id);
+      const g = await capture("g", c.item.id);
+      expect(progress(await get(p.item.id))).toEqual([0, 3]);
+      expect(progress(await get(c.item.id))).toEqual([0, 1]);
+      await waitFor(() => store.getItem(p.item.id)?.subtasksTotal === 3);
+
+      // Only the child is the answer; the parent comes on the stream, its updated_at kept.
+      const updatedAt = (await get(p.item.id)).updatedAt;
+      const done = await setStatus(items, a.item.id, Status.DONE);
+      expect(done.item?.id).toBe(a.item.id);
+      await waitFor(() => store.getItem(p.item.id)?.subtasksDone === 1);
+      await setStatus(items, b.item.id, Status.CANCELLED);
+      expect(progress(await get(p.item.id))).toEqual([1, 2]);
+      await deleteItem(items, c.item.id);
+      expect(progress(await get(p.item.id))).toEqual([1, 1]);
+      expect((await get(g.item.id)).deletedAt).toBeDefined();
+      await waitFor(() => store.getItem(p.item.id)?.subtasksTotal === 1);
+      expect((await get(p.item.id)).updatedAt).toEqual(updatedAt);
+
+      // Undo goes through the same writes.
+      await undo(items);
+      expect(progress(await get(p.item.id))).toEqual([1, 2]);
+      await waitFor(() => store.getItem(p.item.id)?.subtasksTotal === 2);
+    });
+
+    it("re-emits subtasks when their parent is retitled, and both parents when one moves", async () => {
+      const { items, capture, get, live } = await setup();
+      const p = await capture("p");
+      const q = await capture("q");
+      const a = await capture("a", p.item.id);
+      const b = await capture("b", p.item.id);
+      const { store } = await live();
+
+      await updateItem(items, { id: p.item.id, title: "parent" }, ["title"]);
+      expect((await get(a.item.id)).parentTitle).toBe("parent");
+      await waitFor(() => store.getItem(b.item.id)?.parentTitle === "parent");
+
+      const moved = await updateItem(items, { id: a.item.id, parentId: q.item.id }, ["parent_id"]);
+      expect(moved.item?.parentTitle).toBe("q");
+      expect((await get(p.item.id)).subtasksTotal).toBe(1);
+      expect((await get(q.item.id)).subtasksTotal).toBe(1);
+      await waitFor(() => store.getItem(p.item.id)?.subtasksTotal === 1 && store.getItem(q.item.id)?.subtasksTotal === 1);
+      expect((await get(q.item.id)).parentTitle).toBeUndefined();
+    });
+  });
 }

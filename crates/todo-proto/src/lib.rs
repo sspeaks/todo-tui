@@ -27,5 +27,6 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
 
 /// The `api_minor` this build serves (design 4.2). 2 added the M2 RPCs as
 /// stubs; 3 is the first that implements them. 4 added the M3 RPCs as
-/// stubs; 5 is the first that implements them.
-pub const API_MINOR: u32 = 5;
+/// stubs; 5 is the first that implements them. 6 added the Item's
+/// subtask counts and parent title.
+pub const API_MINOR: u32 = 6;

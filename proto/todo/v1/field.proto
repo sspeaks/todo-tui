@@ -72,6 +72,8 @@ enum ItemField {
   ITEM_FIELD_MERGED_INTO = 81;
   ITEM_FIELD_IS_OVERDUE = 82;
   // Allocated (P4): ITEM_FIELD_IS_BLOCKED = 83;
+  // Allocated: ITEM_FIELD_SUBTASKS_TOTAL = 84, ITEM_FIELD_SUBTASKS_DONE = 85,
+  // ITEM_FIELD_PARENT_TITLE = 86, once a view filters or sorts on them.
 
   // Nested: waiting.*
   ITEM_FIELD_WAITING_ON = 41001;

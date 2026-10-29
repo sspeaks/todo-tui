@@ -102,7 +102,14 @@ message Item {
   // cancelled. Archive, defer and delete do not affect it.
   bool is_overdue = 82;
   // Allocated (P4): bool is_blocked = 83; see design 4.8.
-  // 84-99 reserved for future derived fields.
+  // Direct subtasks that are not deleted or cancelled (archived and
+  // deferred ones count), and how many of them are done.
+  uint32 subtasks_total = 84;
+  uint32 subtasks_done = 85;
+  // The parent's title, whenever parent_id is set (the parent may be
+  // deleted).
+  optional string parent_title = 86;
+  // 87-99 reserved for future derived fields.
 
   // Aggregate members.
   // Every relation with this Item at either end, including those whose

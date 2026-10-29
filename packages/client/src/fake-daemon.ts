@@ -187,7 +187,14 @@ const INBOX_TRIPLE: Triple = { statusCategory: StatusCategory.TODO, resolutionKi
 const FIELDS = new Map(ItemSchema.fields.map((f) => [f.localName, f]));
 
 /** Item fields that put's system op does not record events for. */
-const UNTRACKED = new Set(["revision", "updatedAt", "status", "relations"]);
+const UNTRACKED = new Set(["revision", "updatedAt", "status", "relations", "subtasksTotal", "subtasksDone", "parentTitle"]);
+
+/** What an Item adds to its parent's counts (hierarchy.rs `contribution`): a change re-emits the old and new parent. */
+function contribution(item: Item | undefined): string {
+  if (!item) return "";
+  const counted = item.deletedAt === undefined && item.status !== Status.CANCELLED;
+  return `${item.parentId ?? ""}:${counted}:${counted && item.status === Status.DONE}`;
+}
 
 /** Summaries cut titles to this many characters, ellipsis included (summary.rs). */
 const MAX_TITLE_CHARS = 40;
@@ -231,7 +238,9 @@ export interface FakeDaemonOptions {
  *   Items take only DeleteItem (a no-op) and UndeleteItem; a mutation that
  *   changes nothing allocates no revision.
  * - Items carry status, effective_priority and is_overdue as derived when
- *   read, for the request's today (in {@link FakeDaemonOptions.timeZone}).
+ *   read, for the request's today (in {@link FakeDaemonOptions.timeZone}),
+ *   and the subtask counts and parent title, with the store's fan-out: a
+ *   change to them re-emits the Item without touching its updated_at.
  * - ListItems with the whole filter language (filter-eval.ts, ported from
  *   todo_core::filter): the implicit rules, the checks with the daemon's
  *   error paths and its INVALID / UNIMPLEMENTED split, relative dates,
@@ -311,7 +320,7 @@ export class FakeDaemon {
   maxPageSize = MAX_PAGE_SIZE;
   /** Runs before every ListItems; throw from it to fail that call. */
   onListItems: ((req: ListItemsRequest) => void) | undefined;
-  apiMinor = 5;
+  apiMinor = 6;
   readonly calls = { listItems: 0, listViews: 0, getStatusCounts: 0, subscribe: [] as (bigint | undefined)[] };
   readonly transport: Transport;
   readonly now: () => Date;
@@ -332,6 +341,8 @@ export class FakeDaemon {
     this.timeZone = options.timeZone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
     this.seedViews();
     for (const init of initial) this.put(init);
+    // A parent seeded after its subtasks counts them too.
+    for (const item of this.items.values()) this.hierarchy(item);
     this.transport = createRouterTransport(({ service }) => {
       service(SystemService, {
         getServerInfo: () => {
@@ -462,8 +473,11 @@ export class FakeDaemon {
     item.revision = this.revision;
     this.settle(item);
     this.items.set(id, item);
+    this.hierarchy(item);
+    this.publish({ revision: item.revision, topic: Topic.ITEM, id, resource: { case: "item", value: item } });
+    // Then its relatives, so the op's revision is its last.
+    for (const relative of this.relatives([prev], [item])) if (relative !== id) this.reemit(relative);
     this.log({ kind: OpKind.UNSPECIFIED, actor: "system", summary: "", events: prev ? diff(prev, item) : [{ kind: "create", itemId: id }] });
-    this.publish({ revision: this.revision, topic: Topic.ITEM, id, resource: { case: "item", value: item } });
     return item;
   }
 
@@ -474,9 +488,11 @@ export class FakeDaemon {
 
   /** Removes an Item outright (not a soft delete) and publishes a deleted Change. */
   remove(id: string): void {
+    const prev = this.items.get(id);
     this.revision++;
     this.items.delete(id);
     this.publish({ revision: this.revision, topic: Topic.ITEM, id, deleted: true });
+    if (prev?.parentId !== undefined && this.items.has(prev.parentId)) this.reemit(prev.parentId);
   }
 
   /** Changes a saved view and publishes its Change, as an edit will (views are read-only over the API until M6). */
@@ -521,6 +537,7 @@ export class FakeDaemon {
       this.items.set(item.id, this.settle(item));
       for (const r of item.relations) this.relations.set(relationKey(r), clone(RelationSchema, r));
     }
+    for (const item of this.items.values()) this.hierarchy(item);
     this.truncateChanges();
   }
 
@@ -581,6 +598,56 @@ export class FakeDaemon {
     item.effectivePriority = effectivePriority(item);
     item.isOverdue = isOverdue(item, this.today());
     return item;
+  }
+
+  /**
+   * Derives a stored Item's subtask counts (direct subtasks, not deleted or
+   * cancelled) and parent title from the stored Items, as hierarchy.rs
+   * attaches them.
+   */
+  private hierarchy(item: Item): Item {
+    let total = 0;
+    let done = 0;
+    for (const child of this.items.values()) {
+      if (child.parentId !== item.id || child.deletedAt !== undefined || child.status === Status.CANCELLED) continue;
+      total++;
+      if (child.status === Status.DONE) done++;
+    }
+    item.subtasksTotal = total;
+    item.subtasksDone = done;
+    const parent = item.parentId === undefined ? undefined : this.items.get(item.parentId);
+    if (parent) item.parentTitle = parent.title;
+    else delete item.parentTitle;
+    return item;
+  }
+
+  /**
+   * The ids whose derived hierarchy fields change when Items go from
+   * `before` to `after` (pairwise; undefined for a new Item), without
+   * changing them: the old and new parent of each whose contribution
+   * changed, and the subtasks of each retitled one (Batch::fan_out).
+   */
+  private relatives(before: readonly (Item | undefined)[], after: readonly Item[]): string[] {
+    const out = new Set<string>();
+    after.forEach((item, i) => {
+      const prev = before[i];
+      if (contribution(prev) !== contribution(item)) {
+        for (const p of [prev?.parentId, item.parentId]) if (p !== undefined) out.add(p);
+      }
+      if (prev && prev.title !== item.title) {
+        for (const child of this.items.values()) if (child.parentId === item.id) out.add(child.id);
+      }
+    });
+    return [...out];
+  }
+
+  /** Gives a stored Item a revision and publishes it with its hierarchy fields fresh, its updated_at kept. */
+  private reemit(id: string): void {
+    const item = this.items.get(id);
+    if (!item) return;
+    const next = this.hierarchy({ ...item, revision: ++this.revision });
+    this.items.set(id, next);
+    this.publish({ revision: next.revision, topic: Topic.ITEM, id, resource: { case: "item", value: next } });
   }
 
   /** `item` as read on day `today`: is_overdue is for that day. */
@@ -729,8 +796,11 @@ export class FakeDaemon {
       ...(draft.waitingOn !== undefined && { waiting: { on: draft.waitingOn, reason: "", since: protoDate(day) } }),
       ...(parentId !== undefined && { parentId }),
     });
-    item.revision = ++this.revision;
+    // A subtask re-emits its parent first, so the capture's revision is the op's last.
     this.items.set(item.id, this.settle(item));
+    if (parentId !== undefined) this.reemit(parentId);
+    item.revision = ++this.revision;
+    this.hierarchy(item);
     const op = this.log({ kind: OpKind.CAPTURE, actor: "user", summary: `capture ${quoted(item.title)}`, events: [{ kind: "create", itemId: item.id }] });
     this.publish({ revision: item.revision, topic: Topic.ITEM, id: item.id, resource: { case: "item", value: item } });
     const result = this.record("CaptureItem", requestId, item.id, op);
@@ -1053,11 +1123,23 @@ export class FakeDaemon {
    * `updated_at` and Change per touched Item, then the op itself.
    */
   private commit(batch: Working, kind: OpKind, summary: string, now: Timestamp, extra: Pick<FakeOp, "entryOp" | "skipped"> = {}): FakeOp {
-    for (const slot of batch.touched()) {
+    // The fan-out (relatives whose counts or parent title change) is
+    // touched without updated_at, as Batch::fan_out does it.
+    const loaded = batch.items.map((item) => this.items.get(item.id));
+    for (const id of this.relatives(loaded, batch.items)) {
+      const slot = batch.find(id);
+      if (slot !== undefined && !batch.isTouched(slot)) batch.touch(slot, { ...batch.items[slot]! }, { fanout: true });
+    }
+    const touched = batch.touched();
+    for (const slot of touched) {
       const item = batch.items[slot]!;
-      item.updatedAt = now;
+      if (!batch.isFanout(slot)) item.updatedAt = now;
       item.revision = ++this.revision;
       this.items.set(item.id, this.settle(item));
+    }
+    // Once every touched Item is stored, so the counts are the op's.
+    for (const slot of touched) {
+      const item = this.hierarchy(batch.items[slot]!);
       this.publish({ revision: item.revision, topic: Topic.ITEM, id: item.id, resource: { case: "item", value: item } });
     }
     return this.log({ kind, actor: "user", summary, events: batch.events, ...extra });
@@ -1159,8 +1241,10 @@ class Working {
   readonly items: Item[] = [];
   readonly slots = new Map<string, number>();
   readonly events: FakeEvent[] = [];
-  /** Slots that get a revision: the ones with events, and relation ends. */
+  /** Slots that get a revision: the ones with events, relation ends, and the fan-out. */
   private readonly dirty = new Set<number>();
+  /** Slots re-emitted only for their hierarchy fields: no updated_at, not part of the op's answer. */
+  private readonly fanout = new Set<number>();
   /** Items this op soft-deleted and has not undeleted since. */
   private readonly deletedHere = new Set<string>();
 
@@ -1198,10 +1282,19 @@ class Working {
     this.items[slot] = next;
   }
 
-  /** Takes `next` as the slot's Item without an event of its own (a relation end). */
-  touch(slot: number, next: Item): void {
+  /** Takes `next` as the slot's Item without an event of its own (a relation end, or with `fanout` a relative). */
+  touch(slot: number, next: Item, opts: { fanout?: boolean } = {}): void {
     this.items[slot] = next;
     this.dirty.add(slot);
+    if (opts.fanout) this.fanout.add(slot);
+  }
+
+  isTouched(slot: number): boolean {
+    return this.dirty.has(slot);
+  }
+
+  isFanout(slot: number): boolean {
+    return this.fanout.has(slot);
   }
 
   /** The touched slots, in first-touch order. */

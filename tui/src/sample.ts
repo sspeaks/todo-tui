@@ -9,10 +9,16 @@ function after(now: Date, days: number) {
   return { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1, day: d.getUTCDate() };
 }
 
+/** The parent in --smoke's sample: an id of its own, for its subtasks' parent_id. */
+const SHIP = "01JSAMP1E000000000000SH1P0";
+
 /** Items for --smoke: every list column in use, dates relative to `now`. */
 export function sampleItems(now: Date): ItemInit[] {
   const at = (minutes: number) => timestampFromDate(new Date(now.getTime() - minutes * 60_000));
   return [
+    { id: SHIP, title: "Ship auth migration", status: Status.NEXT, priority: Priority.HIGH, createdAt: at(60) },
+    { title: "write migration", status: Status.DONE, parentId: SHIP, createdAt: at(58) },
+    { title: "backfill users", parentId: SHIP, dueDate: after(now, 4), createdAt: at(56) },
     { title: "Call dentist", priority: Priority.MEDIUM, dueDate: after(now, 3), labels: ["health"], createdAt: at(50) },
     {
       title: "Fix flaky login integration test that times out on CI under load",

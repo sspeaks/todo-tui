@@ -292,7 +292,7 @@ async fn handshake_reports_version_and_api_minor() {
         .into_inner();
     assert_eq!(info.daemon_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(info.api_minor, todo_proto::API_MINOR);
-    assert_eq!(info.api_minor, 5);
+    assert_eq!(info.api_minor, 6);
     d.stop().await;
 }
 
@@ -3445,5 +3445,51 @@ async fn subscribe_sees_undo_relations_and_cascades() {
     redo(&mut items).await;
     let seen = changed_items(&mut stream, 2).await;
     assert!(seen.iter().all(|i| i.relations == [blocks.clone()]));
+    d.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn subscribe_re_emits_parents_and_subtasks() {
+    let d = start().await;
+    let mut items = d.items().await;
+    let p = capture(&mut items, "p").await;
+    let mut stream = d
+        .subscribe(SubscribeRequest {
+            since_revision: Some(p.revision),
+            topics: vec![],
+        })
+        .await;
+    assert!(matches!(next(&mut stream).await, Message::CaughtUp(_)));
+
+    // A capture under p re-emits p, then arrives itself.
+    let a = capture_under(&mut items, "a", &p).await;
+    assert_eq!(a.parent_title.as_deref(), Some("p"));
+    let seen = changed_items(&mut stream, 2).await;
+    assert_eq!(
+        (seen[0].id.as_str(), seen[0].subtasks_total),
+        (p.id.as_str(), 1)
+    );
+    assert_eq!(seen[1].id, a.id);
+
+    // Ticking it re-emits p with its count; p's updated_at stays.
+    let res = items
+        .set_status(status_req(&a.id, Status::Done))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(res.item.unwrap().id, a.id);
+    let seen = changed_items(&mut stream, 2).await;
+    let parent = seen.iter().find(|i| i.id == p.id).unwrap();
+    assert_eq!((parent.subtasks_done, parent.subtasks_total), (1, 1));
+    assert_eq!(parent.updated_at, p.updated_at);
+
+    // Retitling p re-emits a with the new title.
+    items
+        .update_item(update_req(&p.id, titled("parent"), &["title"]))
+        .await
+        .unwrap();
+    let seen = changed_items(&mut stream, 2).await;
+    let child = seen.iter().find(|i| i.id == a.id).unwrap();
+    assert_eq!(child.parent_title.as_deref(), Some("parent"));
     d.stop().await;
 }

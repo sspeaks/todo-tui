@@ -64,6 +64,47 @@ describe("the shell", () => {
     expect(t.lines()[10]).toMatch(/^NORMAL · ● live .*\? help · : command · q quit$/);
   });
 
+  it("shows a parent's progress and a subtask's parent dim; ticking a subtask moves the count, not the parent", async () => {
+    const ship = item("Ship auth migration", { status: Status.SOMEDAY });
+    const fd = fakeDaemon(
+      [
+        ship,
+        item("write migration", { status: Status.SOMEDAY, parentId: ship.id }),
+        item("backfill users", { status: Status.SOMEDAY, parentId: ship.id, dueDate: date(30) }),
+        item("dropped idea", { status: Status.CANCELLED, parentId: ship.id }),
+        item("Old idea", { status: Status.SOMEDAY }),
+      ],
+      { now: clock, timeZone: "UTC" },
+    );
+    const t = renderTui({ daemon: fd, columns: 100, rows: 12, now: clock });
+    await t.live();
+    // Someday sorts by updated_at, so a parent re-emitted for its count must stay put.
+    await t.press("5");
+    await t.waitFrame((f) => expect(f).toMatch(/Ship auth migration\s+0\/2/));
+    const line = (title: string) => t.lines().find((l) => l.includes(title)) ?? "";
+    const order = () =>
+      t
+        .lines()
+        .slice(1, 5)
+        .map((l) => l.slice(8, 28).trim())
+        .filter((title) => title !== "" && !title.startsWith("write migration"));
+    const before = order();
+    expect(line("write migration")).toMatch(/write migration {2}↳ Ship auth migration/);
+    expect(line("backfill users")).toMatch(/backfill users {2}↳ Ship auth migration\s+\^Fri/);
+    const rawLine = (title: string) => t.raw().split("\n").find((l) => l.includes(title)) ?? "";
+    expect(rawLine("write migration")).toContain(`${DIM}  ↳ Ship auth migration`);
+    // The progress column lines up with the due column's left neighbours: it never shifts the due.
+    expect(line("Ship auth migration").indexOf("0/2")).toBeLessThan(line("backfill users").indexOf("^Fri"));
+
+    const child = [...fd.daemon.items.values()].find((i) => i.title === "write migration")!;
+    // Done, it leaves Someday; the parent keeps its place among the rest.
+    await setStatus(fd.clients().items, child.id, Status.DONE);
+    await t.waitFrame((f) => expect(f).toMatch(/Ship auth migration\s+1\/2/));
+    await t.waitFrame(() => expect(t.lines().slice(1, 5).join("\n")).not.toContain("write migration"));
+    // Re-emitted with its updated_at kept, it does not jump to the top.
+    expect(order()).toEqual(before);
+  });
+
   it("keeps the Waiting view's waiting column when one name is long: the name is cut, the age kept", async () => {
     const on = (name: string) => ({ on: { ref: { case: "freeText" as const, value: name } }, since: date(23) });
     const fd = fakeDaemon(
