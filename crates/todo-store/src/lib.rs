@@ -4,6 +4,7 @@
 //! one dedicated writer thread, in one SQLite transaction per [`Store::write`]
 //! call; reads run on a small pool of read-only connections (WAL mode).
 
+mod archive;
 mod codec;
 mod hierarchy;
 mod query;
@@ -20,15 +21,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
-use jiff::Timestamp;
 use jiff::civil::Date;
+use jiff::{SignedDuration, Timestamp};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use todo_core::filter::SortKey;
 use todo_core::view::{View, ViewId};
 use todo_core::{
     Actor, Applied, ApplyCtx, CaptureDraft, CreatedVia, FieldChange, FieldValue, Filter,
-    FilterError, Item, ItemField, ItemId, Mutation, MutationError, MutationOp, MutationResult,
-    PersonRef, Relation, Revision, SkipReason, StatusFields, Topic, apply, new_ulid,
+    FilterError, Item, ItemField, ItemId, ItemRecurrence, Mutation, MutationError, MutationOp,
+    MutationResult, PersonRef, Relation, Revision, SkipReason, StatusFields, Topic, apply,
+    new_ulid, next_instance,
 };
 use tokio::sync::{Semaphore, broadcast, oneshot};
 use ulid::Ulid;
@@ -207,9 +209,10 @@ pub enum OpKind {
     Redo,
     AddRelation,
     RemoveRelation,
-    /// `SetRecurrence`; not recorded yet (M5 phase 2).
+    /// `SetRecurrence`: sets, replaces or clears an Item's repeat rule.
     SetRecurrence,
-    /// The scheduler's archive of done Items; not recorded yet (M5 phase 2).
+    /// [`Store::auto_archive`]: the scheduler's archive of done Items and
+    /// its healing (design 3.7). Actor system, so never an undo stack entry.
     AutoArchive,
 }
 
@@ -224,6 +227,7 @@ impl OpKind {
                 | OpKind::Unarchive
                 | OpKind::Delete
                 | OpKind::Undelete
+                | OpKind::SetRecurrence
                 | OpKind::Batch
         )
     }
@@ -250,7 +254,36 @@ pub struct MutateOutput {
     /// whole batch. Descendants a delete or undelete cascaded to are not
     /// listed; their changes arrive on the change stream.
     pub items: Vec<Item>,
+    /// The Items the op created, in creation order: the next instance of
+    /// each series an instance the batch completed repeats (design 3.8).
+    pub generated: Vec<Item>,
     pub result: MutationResult,
+}
+
+/// Input for [`Store::auto_archive`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutoArchiveInput {
+    /// The scheduler's clock: an Item closed at or before `now - after` is
+    /// archived, at `now`.
+    pub now: Timestamp,
+    /// How long a done or cancelled Item stays out of Archive
+    /// (`archive_done_after_days` × 24 h).
+    pub after: SignedDuration,
+    /// "Today" in the user's zone, for `is_overdue` on the written Items.
+    pub today: Date,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoArchiveOutput {
+    /// The Items archived `auto_done`, oldest close first.
+    pub archived: Vec<ItemId>,
+    /// The Items archived `auto_done` that were open again and are
+    /// unarchived, in archive order.
+    pub healed: Vec<ItemId>,
+    /// Whether more Items were due than one op takes: call again.
+    pub more: bool,
+    /// The op; `None` when nothing was due, which records nothing.
+    pub result: Option<MutationResult>,
 }
 
 /// Input for [`Store::undo`] and [`Store::redo`].
@@ -645,6 +678,12 @@ impl Store {
     /// parent at the end of the batch, so the order of a batch's undeletes
     /// does not matter. No live Item ever has a deleted parent.
     ///
+    /// Recurrence (design 3.8): after the mutations, the same op creates the
+    /// next instance of each series an instance the batch closed repeats,
+    /// as [`MutateOutput::generated`]. It runs on the batch's final state,
+    /// so `[x A, dd A]` generates nothing, and it never creates an instance
+    /// while another instance of the series is live and open.
+    ///
     /// An op by the user or a suggestion that writes an event becomes the
     /// top undo stack entry and discards the redo stack (design 3.10).
     /// [`MutationOp::Restore`] and the kinds of other calls fail with
@@ -670,6 +709,30 @@ impl Store {
     /// stack. Otherwise as [`Store::undo`].
     pub async fn redo(&self, input: UndoInput) -> Result<UndoOutput> {
         self.write(move |tx| undo::undo_tx(tx, input, true)).await
+    }
+
+    /// The scheduler's sweep (design 3.7), as at most one op of kind
+    /// [`OpKind::AutoArchive`] by [`Actor::System`], so it is never an undo
+    /// stack entry and leaves the redo stack alone. It selects and writes in
+    /// one transaction, and changes at most 1000 Items; with
+    /// [`AutoArchiveOutput::more`] set the caller calls again.
+    ///
+    /// - **Healing** first: every live Item archived `auto_done` that is
+    ///   open again (an undo of its completion reopens it without the
+    ///   `SetStatus` that would unarchive it) is unarchived.
+    /// - **Archive:** every live, unarchived done or cancelled Item whose
+    ///   `status_entered_at` (else `updated_at`) is at least `after` before
+    ///   `now` is archived `auto_done`, which bumps its `updated_at`.
+    ///   An Item whose archive a user or sync op set either way since it
+    ///   closed is skipped, so a `z` after closing sticks until the Item
+    ///   closes again (which includes done → cancelled). Only a decision
+    ///   still in effect counts: not an undone `z`, nor the restores an
+    ///   undo or redo writes.
+    ///
+    /// When nothing is due, nothing is recorded: no op, no revision.
+    pub async fn auto_archive(&self, input: AutoArchiveInput) -> Result<AutoArchiveOutput> {
+        self.write(move |tx| archive::auto_archive_tx(tx, input))
+            .await
     }
 
     /// The entries [`Store::undo`] and [`Store::redo`] would act on next.
@@ -1066,6 +1129,18 @@ fn capture_tx(tx: &mut WriteTx<'_>, input: CaptureInput) -> Result<(Item, Mutati
     item.core.due_date = draft.due_date;
     item.core.labels = draft.labels;
     item.set_status_fields(StatusFields::from_status(draft.status));
+    if let Some(rule) = draft.recurrence {
+        // A rule on an Item without recurrence (design 3.8): a new series,
+        // scheduled on the draft's first date, which also becomes the due
+        // date when no `^` token set one. The instance is never deferred:
+        // the capture is the user's answer to "this exists now".
+        item.core.due_date = item.core.due_date.or(draft.recurrence_first);
+        item.overlay.recurrence = Some(ItemRecurrence {
+            series_id: new_ulid(),
+            occurrence_date: draft.recurrence_first,
+            rule: Some(rule),
+        });
+    }
     let staleness = &mut item.derived.staleness;
     staleness.status_entered_at = Some(now);
     staleness.waiting_since = draft.waiting.is_some().then_some(now);
@@ -1137,6 +1212,12 @@ enum NewEvent {
         item_id: ItemId,
         change: FieldChange,
     },
+    /// The Item was created by this op ([`Batch::create`]). The payload is
+    /// the bare title, as a capture's `create` event records it.
+    Create {
+        item_id: ItemId,
+        title: String,
+    },
     RelationAdd(Relation),
     RelationRemove(Relation),
 }
@@ -1162,6 +1243,9 @@ struct Batch {
     /// Slots re-emitted only because a parent's counts or a subtask's
     /// parent title changed: not part of the op's answer.
     fanout: HashSet<usize>,
+    /// Slots the op creates ([`Batch::create`]), in creation order: their
+    /// rows are inserted, not updated.
+    created: Vec<usize>,
     events: Vec<NewEvent>,
     /// Items this op soft-deleted and has not undeleted since.
     deleted_here: HashSet<ItemId>,
@@ -1179,6 +1263,30 @@ impl Batch {
         self.items.push(item);
         self.slots.insert(id, self.items.len() - 1);
         Ok(self.items.len() - 1)
+    }
+
+    /// Adds `item` as a new Item of this op, with a `create` event, and
+    /// returns its slot. [`write_op`] inserts its row.
+    ///
+    /// Its "loaded" twin is the same Item soft-deleted at `now`, with
+    /// identical staleness: a created slot therefore always compares
+    /// unequal (so it is touched), contributes nothing to its parent's
+    /// counts as loaded (so [`Batch::fan_out`] re-emits the parent) and
+    /// writes no `derived` event (its signals did not change).
+    fn create(&mut self, item: Item, now: Timestamp) -> usize {
+        let mut twin = item.clone();
+        twin.derived.deleted_at = Some(now);
+        let slot = self.items.len();
+        self.events.push(NewEvent::Create {
+            item_id: item.id,
+            title: item.core.title.clone(),
+        });
+        self.slots.insert(item.id, slot);
+        self.loaded.push(twin);
+        self.items.push(item);
+        self.created.push(slot);
+        self.dirty.insert(slot);
+        slot
     }
 
     /// Takes `applied` as the slot's Item, with an event per change.
@@ -1238,6 +1346,56 @@ impl Batch {
             self.dirty.insert(slot);
         }
         Ok(())
+    }
+
+    /// The Item in `slot` when this op completed it and it still repeats:
+    /// it was open before the op, is done or cancelled now (so done →
+    /// cancelled is no completion), is live, and kept a rule. It is the
+    /// template of the next instance (design 3.8).
+    fn completed_instance(&self, slot: usize) -> Option<&Item> {
+        let item = &self.items[slot];
+        let closed_here = !self.loaded[slot].status().is_closed() && item.status().is_closed();
+        let repeats = item
+            .overlay
+            .recurrence
+            .as_ref()
+            .is_some_and(|r| r.rule.is_some());
+        (closed_here && !item.is_deleted() && repeats).then_some(item)
+    }
+
+    /// Whether an instance of `series_id` other than `but` is still live and
+    /// open, as of this point in the batch: a working copy (which includes
+    /// the instances this op has created), or a stored row the batch has
+    /// not loaded.
+    fn series_is_open(&self, conn: &Connection, series_id: Ulid, but: ItemId) -> Result<bool> {
+        let open = |item: &Item| {
+            item.id != but
+                && !item.is_deleted()
+                && !item.status().is_closed()
+                && item
+                    .overlay
+                    .recurrence
+                    .as_ref()
+                    .is_some_and(|r| r.series_id == series_id)
+        };
+        if self.items.iter().any(open) {
+            return Ok(true);
+        }
+        let mut stmt = conn.prepare_cached(
+            "SELECT id FROM items
+             WHERE recurrence_series_id = ?1 AND deleted_at IS NULL
+                   AND status_category <> 'done'",
+        )?;
+        let mut rows = stmt.query([series_id.to_string()])?;
+        while let Some(row) = rows.next()? {
+            let id = codec::item_id_from_str(&row.get::<_, String>(0)?)?;
+            // The working copies above are this op's truth for the rows it
+            // loaded, whatever the stored ones still say.
+            if id != but && !self.slots.contains_key(&id) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// The touched slots, in first-touch order: changed, or with events.
@@ -1518,7 +1676,12 @@ fn write_op(
     for (&slot, rev) in touched.iter().zip(first..) {
         let item = &mut batch.items[slot];
         item.revision = rev;
-        codec::update_item(tx.conn(), item)?;
+        if batch.created.contains(&slot) {
+            // A created row has nothing to update; the FTS triggers index it.
+            codec::insert_item(tx.conn(), item)?;
+        } else {
+            codec::update_item(tx.conn(), item)?;
+        }
     }
     // After every row is written, so the counts are the op's.
     attach(tx.conn(), &mut batch.items)?;
@@ -1551,6 +1714,18 @@ fn write_op(
                     Some(change.field),
                     Some(codec::value_to_sql(&change.old)?),
                     Some(codec::value_to_sql(&change.new)?),
+                )?;
+            }
+            NewEvent::Create { item_id, title } => {
+                named(*item_id);
+                op.insert_event(
+                    conn,
+                    ord,
+                    &item_id.to_string(),
+                    "create",
+                    None,
+                    None,
+                    Some(serde_json::Value::from(title.as_str()).to_string()),
                 )?;
             }
             NewEvent::RelationAdd(relation) | NewEvent::RelationRemove(relation) => {
@@ -1635,6 +1810,7 @@ fn mutate_tx(tx: &mut WriteTx<'_>, input: MutateInput) -> Result<MutateOutput> {
         let ids: Vec<ItemId> = input.mutations.iter().map(|m| m.id).collect();
         return Ok(MutateOutput {
             items: load_items(conn, &ids, today)?,
+            generated: load_items(conn, &created_by(conn, op_id)?, today)?,
             result: MutationResult { op_id, revision },
         });
     }
@@ -1707,28 +1883,30 @@ fn mutate_tx(tx: &mut WriteTx<'_>, input: MutateInput) -> Result<MutateOutput> {
     if let Some(error) = batch.orphan(conn, &undeleted)? {
         return Err(error);
     }
+    let generated = generate_tx(conn, &mut batch, &slots, &input)?;
 
     let actions: Vec<(Action, ItemId, &str)> = input
         .mutations
         .iter()
         .zip(&slots)
         .map(|(m, &slot)| {
-            let action = match m.op {
-                MutationOp::SetStatus(status) => Action::SetStatus(status),
+            let action = match &m.op {
+                MutationOp::SetStatus(status) => Action::SetStatus(*status),
                 MutationOp::Archive(_) => Action::Archive,
                 MutationOp::Unarchive => Action::Unarchive,
                 MutationOp::Delete => Action::Delete,
                 MutationOp::Undelete => Action::Undelete,
-                // SetRecurrence gets its own wording with its RPC (M5 phase
-                // 2); the daemon does not send it yet.
-                MutationOp::Update(_)
-                | MutationOp::SetRecurrence { .. }
-                | MutationOp::Restore(_) => Action::Edit,
+                MutationOp::SetRecurrence { rule, .. } => Action::SetRecurrence(rule.is_some()),
+                MutationOp::Update(_) | MutationOp::Restore(_) => Action::Edit,
             };
             (action, m.id, batch.items[slot].core.title.as_str())
         })
         .collect();
-    op.summary = summary::mutation(&actions, subtasks.len());
+    let dates: Vec<Date> = generated
+        .iter()
+        .filter_map(|&slot| batch.items[slot].core.due_date)
+        .collect();
+    op.summary = summary::mutation(&actions, subtasks.len(), &dates, today);
     let (revision, _) = write_op(tx, &op, &mut batch, today)?;
     let first = input.mutations.first().map(|m| m.id.to_string());
     op.insert_request_id(tx.conn(), revision, first.as_deref())?;
@@ -1737,11 +1915,75 @@ fn mutate_tx(tx: &mut WriteTx<'_>, input: MutateInput) -> Result<MutateOutput> {
             .into_iter()
             .map(|slot| batch.items[slot].clone())
             .collect(),
+        generated: generated
+            .into_iter()
+            .map(|slot| batch.items[slot].clone())
+            .collect(),
         result: MutationResult {
             op_id: op.id,
             revision,
         },
     })
+}
+
+/// The recurrence post-pass (design 3.8): for each Item the batch
+/// completed, in mutation order, the next instance of its series, created in
+/// the same op. Returns their slots.
+///
+/// It runs on the batch's final state, after every mutation and the parent
+/// rule, so `[x A, s A→next]`, `[x A, dd A]` and `[x A, @clear A]` generate
+/// nothing. It never creates an instance while another instance of the
+/// series is live and open (reopening a completed one can still leave two,
+/// and then neither generates until both are closed): the guard sees
+/// the batch's working copies, the instances this pass has made, and the
+/// stored rows it has not loaded.
+fn generate_tx(
+    conn: &Connection,
+    batch: &mut Batch,
+    slots: &[usize],
+    input: &MutateInput,
+) -> Result<Vec<usize>> {
+    let mut generated = Vec::new();
+    let mut seen = HashSet::new();
+    for &slot in slots {
+        if !seen.insert(slot) {
+            continue;
+        }
+        let mut next = {
+            let Some(completed) = batch.completed_instance(slot) else {
+                continue;
+            };
+            // `completed_instance` found a rule, hence a series.
+            let recurrence = completed.overlay.recurrence.as_ref().expect("it recurs");
+            if batch.series_is_open(conn, recurrence.series_id, completed.id)? {
+                continue;
+            }
+            next_instance(completed, new_ulid(), input.today, input.now)
+                .expect("a completed instance has a rule")
+        };
+        // An instance live under a deleted parent is an M1 database's
+        // legacy orphan, which ops tolerate. The next instance is a new
+        // Item and keeps the parent rule (design 3.7): it starts at the
+        // top level instead.
+        if let Some(parent) = next.core.parent_id
+            && batch.unusable_parent(conn, parent)?.is_some()
+        {
+            next.core.parent_id = None;
+        }
+        generated.push(batch.create(next, input.now));
+    }
+    Ok(generated)
+}
+
+/// The Items op `op_id` created, in the order of its `create` events: what
+/// a replayed request answers as [`MutateOutput::generated`].
+fn created_by(conn: &Connection, op_id: Ulid) -> Result<Vec<ItemId>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT item_id FROM events WHERE op_id = ?1 AND kind = 'create' ORDER BY ord, rowid",
+    )?;
+    let rows = stmt.query_map([op_id.to_string()], |r| r.get::<_, String>(0))?;
+    rows.map(|id| codec::item_id_from_str(&id?))
+        .collect::<Result<Vec<_>>>()
 }
 
 fn get_item_tx(conn: &Connection, id: ItemId, today: Date) -> Result<GetItemOutput> {

@@ -3,18 +3,18 @@ use std::path::PathBuf;
 
 use jiff::civil::{Date, date};
 use jiff::{SignedDuration, Timestamp};
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use todo_core::filter::{Operand, Operator, Predicate};
 use todo_core::{
     Actor, ArchiveReason, Archived, CaptureDraft, CreatedVia, FieldChange, FieldUpdate, FieldValue,
     Filter, Item, ItemField, ItemId, Mutation, MutationError, MutationOp, PersonRef, Priority,
-    Relation, RelationKind, ResolutionKind, Revision, SkipReason, StalenessSignals, Status,
-    StatusCategory, StatusFields, TodoRefinement, Topic, Waiting, new_ulid,
+    Relation, RelationKind, ResolutionKind, Revision, Rule, SkipReason, StalenessSignals, Status,
+    StatusCategory, StatusFields, TodoRefinement, Topic, Waiting, Weekday, new_ulid,
 };
 use todo_store::{
-    CaptureInput, ChangesSinceError, EndProblem, Expired, ListInput, MutateInput, MutateOutput,
-    OpKind, RelationInput, RelationOutput, Resource, SCHEMA_VERSION, Store, StoreError, UndoInput,
-    UndoOutput, UndoSkipRow, UndoState,
+    AutoArchiveInput, AutoArchiveOutput, CaptureInput, ChangesSinceError, EndProblem, Expired,
+    ListInput, MutateInput, MutateOutput, OpKind, RelationInput, RelationOutput, Resource,
+    SCHEMA_VERSION, Store, StoreError, UndoInput, UndoOutput, UndoSkipRow, UndoState,
 };
 use tokio::sync::broadcast::error::TryRecvError;
 use ulid::Ulid;
@@ -90,6 +90,9 @@ async fn migrates_an_empty_database() {
         "relations",
         "views",
         "view_seeds",
+        "items_series",
+        "items_auto_archive",
+        "items_auto_done_reopened",
     ] {
         let n: i64 = conn
             .query_row(
@@ -1016,7 +1019,8 @@ async fn an_update_rewrites_every_other_column_unchanged() {
          defer_until = '2026-02-15', private_notes = 'n', focus_week = '2026-W09',
          local_priority_override = 'low', archived_at = 9, archived_reason = 'left_scope',
          recurrence_series_id = '01JB8X4Z5Q6R7S8T9V0W1X2Y3Z',
-         recurrence_occurrence_date = '2026-02-02', remote_extras = '{\"cf\":[1]}',
+         recurrence_occurrence_date = '2026-02-02',
+         recurrence_rule = '{\"monthly\":{\"day\":15}}', remote_extras = '{\"cf\":[1]}',
          is_mine = 1, pending_fields = '[16,41001]', has_conflict = 1, has_push_failure = 1,
          description_lossy = 1, description_dirty = 1, last_user_touch_at = 9,
          last_remote_change_at = 10, status_entered_at = 11, staleness_waiting_since = 12,
@@ -1042,6 +1046,14 @@ async fn an_update_rewrites_every_other_column_unchanged() {
     let before = find(snapshot(&db).await.2);
     assert!(before.is_linked() && before.overlay.waiting.is_some());
     assert_eq!(before.derived.merged_into, Some(other.id));
+    assert_eq!(
+        before
+            .overlay
+            .recurrence
+            .as_ref()
+            .and_then(|r| r.rule.clone()),
+        Some(Rule::monthly(15).unwrap())
+    );
 
     // A sync update leaves the user-touch signal alone, so only the title,
     // updated_at and revision move.
@@ -4112,6 +4124,1216 @@ async fn a_summary_counts_only_the_subtasks_the_op_does_not_name() {
             "parent first: {parent_first}"
         );
     }
+}
+
+// ---- M5: recurrence ---------------------------------------------------------
+
+/// Every event of an op, in op order: `(kind, item_id, new)`. Unlike
+/// [`events`] this keeps the `create` events, whose payload is a bare title.
+async fn all_events(db: &Db, op_id: Ulid) -> Vec<(String, String, Option<String>)> {
+    db.store
+        .read(move |c| {
+            let mut stmt =
+                c.prepare("SELECT kind, item_id, new FROM events WHERE op_id = ?1 ORDER BY ord")?;
+            let rows = stmt.query_map([op_id.to_string()], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .await
+        .unwrap()
+}
+
+/// Every Item's title, whatever the implicit rules would hide: a generation
+/// that should not have happened shows up here.
+async fn all_titles(db: &Db) -> Vec<String> {
+    let query = ListInput {
+        filter: everything(),
+        today: Some(today()),
+        ..ListInput::default()
+    };
+    let page = db.store.list_items(query).await.unwrap();
+    page.items.into_iter().map(|i| i.core.title).collect()
+}
+
+/// A `SetRecurrence` mutation; `None` clears the rule. Each one names a
+/// fresh series, as `request.rs` fills it in, so an Item that does not
+/// recur yet starts its own.
+fn repeat(id: ItemId, rule: Option<Rule>) -> Mutation {
+    mutation(
+        id,
+        MutationOp::SetRecurrence {
+            rule,
+            series_id: new_ulid(),
+            today: today(),
+        },
+    )
+}
+
+async fn set_rule(db: &Db, id: ItemId, rule: Option<Rule>) -> MutateOutput {
+    run(
+        db,
+        Actor::User,
+        500,
+        OpKind::SetRecurrence,
+        vec![repeat(id, rule)],
+    )
+    .await
+}
+
+/// Captures `title` and sets `rule` on it through its own op, as the repeat
+/// prompt does: the rule places the occurrence date and the due date.
+async fn recurring(db: &Db, title: &str, rule: Rule) -> Item {
+    let item = capture(db, title).await;
+    set_rule(db, item.id, Some(rule)).await;
+    get(db, item.id).await
+}
+
+/// [`recurring`] under `parent`.
+async fn recurring_under(db: &Db, title: &str, parent: ItemId, rule: Rule) -> Item {
+    let item = capture_under(db, title, parent).await;
+    set_rule(db, item.id, Some(rule)).await;
+    get(db, item.id).await
+}
+
+/// Closes `ids` as `to` in one op, which also generates the next instance
+/// of every series it closes.
+async fn close(db: &Db, ids: &[ItemId], to: Status) -> MutateOutput {
+    let kind = if ids.len() == 1 {
+        OpKind::SetStatus
+    } else {
+        OpKind::Batch
+    };
+    let mutations = ids.iter().map(|&id| status(id, to)).collect();
+    run(db, Actor::User, 1_000, kind, mutations).await
+}
+
+/// `(due_date, occurrence_date, defer_until)` of a generated instance.
+fn dates(item: &Item) -> (Option<Date>, Option<Date>, Option<Date>) {
+    (
+        item.core.due_date,
+        item.overlay
+            .recurrence
+            .as_ref()
+            .and_then(|r| r.occurrence_date),
+        item.overlay.defer_until,
+    )
+}
+
+#[tokio::test]
+async fn setting_a_rule_schedules_the_item_and_starts_a_series() {
+    let db = open();
+    let x = capture(&db, "water plants").await;
+    assert_eq!(x.core.due_date, None);
+
+    // A fixed rule on an Item without a due date is scheduled on its first
+    // date, which becomes the due date too.
+    let out = set_rule(&db, x.id, Some(Rule::Daily)).await;
+    let set = out.items[0].clone();
+    assert_eq!(dates(&set), (Some(today()), Some(today()), None));
+    let series = set.overlay.recurrence.as_ref().unwrap().series_id;
+    assert_eq!(
+        op_stack(&db, out.result.op_id).await.1.as_deref(),
+        Some("set repeat \"water plants\"")
+    );
+    assert_eq!(op_row(&db, out.result.op_id).await.0, "set_recurrence");
+
+    // Replacing the rule keeps the series and the due date a rule already
+    // placed, and reschedules the occurrence.
+    let monday = Rule::weekly([Weekday::Monday]).unwrap();
+    let out = set_rule(&db, x.id, Some(monday.clone())).await;
+    let changed = out.items[0].clone();
+    assert_eq!(
+        dates(&changed),
+        (Some(today()), Some(date(2026, 3, 2)), None)
+    );
+    let recurrence = changed.overlay.recurrence.as_ref().unwrap();
+    assert_eq!(
+        (recurrence.series_id, &recurrence.rule),
+        (series, &Some(monday))
+    );
+
+    // Clearing it leaves the Item and its due date, and ends the series.
+    let out = set_rule(&db, x.id, None).await;
+    assert_eq!(out.items[0].overlay.recurrence, None);
+    assert_eq!(out.items[0].core.due_date, Some(today()));
+    assert_eq!(
+        op_stack(&db, out.result.op_id).await.1.as_deref(),
+        Some("stop repeating \"water plants\"")
+    );
+    assert_eq!(get(&db, x.id).await, out.items[0]);
+}
+
+#[tokio::test]
+async fn setting_a_rule_undoes_the_occurrence_and_the_due_date_apart() {
+    let db = open();
+    let x = capture(&db, "x").await;
+    let out = set_rule(&db, x.id, Some(Rule::Daily)).await;
+    let scheduled = out.items[0].clone();
+
+    // Two fields, two events, so two restore units: the due date comes back
+    // on its own even though the rule placed it.
+    let fields: Vec<ItemField> = events(&db, out.result.op_id)
+        .await
+        .into_iter()
+        .filter(|e| e.kind == "set")
+        .map(|e| e.change.field)
+        .collect();
+    assert_eq!(fields, [ItemField::Recurrence, ItemField::DueDate]);
+    let undone = undo(&db).await;
+    assert_eq!(undone.skipped, []);
+    let back = get(&db, x.id).await;
+    assert_eq!((back.overlay.recurrence, back.core.due_date), (None, None));
+
+    let redone = redo(&db).await;
+    assert_eq!(redone.skipped, []);
+    assert_eq!(content(&get(&db, x.id).await), content(&scheduled));
+
+    // A due date the user set is kept, and only the rule is undone.
+    let y = capture(&db, "y").await;
+    let due = date(2026, 3, 10);
+    run(
+        &db,
+        Actor::User,
+        600,
+        OpKind::Update,
+        vec![set(y.id, ItemField::DueDate, FieldValue::Date(due))],
+    )
+    .await;
+    let out = set_rule(&db, y.id, Some(Rule::Daily)).await;
+    assert_eq!(dates(&out.items[0]), (Some(due), Some(due), None));
+    undo(&db).await;
+    let back = get(&db, y.id).await;
+    assert_eq!(
+        (back.overlay.recurrence, back.core.due_date),
+        (None, Some(due))
+    );
+}
+
+#[tokio::test]
+async fn a_rule_on_a_closed_item_is_refused_but_clearing_one_is_not() {
+    let db = open();
+    let x = recurring(&db, "x", Rule::Daily).await;
+    close(&db, &[x.id], Status::Done).await;
+    let before = snapshot(&db).await;
+    match db
+        .store
+        .mutate(mutate(
+            OpKind::SetRecurrence,
+            vec![repeat(x.id, Some(Rule::Daily))],
+        ))
+        .await
+    {
+        Err(StoreError::Mutation {
+            index: 0,
+            error: MutationError::Closed,
+        }) => {}
+        other => panic!("expected Closed, got {other:?}"),
+    }
+    assert_eq!(snapshot(&db).await, before);
+
+    // The series can still be ended on the Item that closed it.
+    let out = set_rule(&db, x.id, None).await;
+    assert_eq!(out.items[0].overlay.recurrence, None);
+}
+
+#[tokio::test]
+async fn a_bulk_rule_gives_each_item_its_own_series() {
+    let db = open();
+    let mut ids: Vec<ItemId> = Vec::new();
+    for title in ["a", "b", "c"] {
+        ids.push(capture(&db, title).await.id);
+    }
+    let mutations = ids
+        .iter()
+        .map(|&id| repeat(id, Some(Rule::Daily)))
+        .collect();
+    let out = run(&db, Actor::User, 500, OpKind::Batch, mutations).await;
+    let series: BTreeSet<Ulid> = out
+        .items
+        .iter()
+        .map(|i| i.overlay.recurrence.as_ref().unwrap().series_id)
+        .collect();
+    assert_eq!(series.len(), 3);
+    assert_eq!(
+        op_stack(&db, out.result.op_id).await.1.as_deref(),
+        Some("set repeat (3 items)")
+    );
+    let cleared = run(
+        &db,
+        Actor::User,
+        600,
+        OpKind::Batch,
+        ids.iter().map(|&id| repeat(id, None)).collect(),
+    )
+    .await;
+    assert!(cleared.items.iter().all(|i| i.overlay.recurrence.is_none()));
+    assert_eq!(
+        op_stack(&db, cleared.result.op_id).await.1.as_deref(),
+        Some("stop repeating (3 items)")
+    );
+}
+
+#[tokio::test]
+async fn completing_an_instance_generates_the_next_one() {
+    let db = open();
+    let p = capture(&db, "p").await;
+    let a = recurring_under(&db, "water plants", p.id, Rule::Daily).await;
+    let since = db.store.current_revision();
+    let out = close(&db, &[a.id], Status::Done).await;
+
+    // The completed Item answers the mutation; the instance is `generated`.
+    assert_eq!(out.items.iter().map(|i| i.id).collect::<Vec<_>>(), [a.id]);
+    let [made] = out.generated.as_slice() else {
+        panic!("expected one generated item, got {:?}", out.generated)
+    };
+    assert_eq!(made.core.title, "water plants");
+    assert_eq!(made.created_via, CreatedVia::Recurrence);
+    assert_eq!(made.status(), Status::Next);
+    assert_eq!(
+        dates(made),
+        (
+            Some(date(2026, 3, 2)),
+            Some(date(2026, 3, 2)),
+            Some(date(2026, 3, 2))
+        )
+    );
+    assert_eq!(made.core.parent_id, Some(p.id));
+    assert_eq!(made.derived.subtasks_total, 0);
+
+    // It belongs to the series and carries its rule.
+    let stored = get(&db, made.id).await;
+    assert_eq!(&stored, made);
+    let recurrence = stored.overlay.recurrence.unwrap();
+    assert_eq!(recurrence.rule, Some(Rule::Daily));
+    assert_eq!(
+        recurrence.series_id,
+        a.overlay.recurrence.unwrap().series_id
+    );
+
+    // The completed Item comes first, then the instance, then the parent the
+    // fan-out re-emits for its counts.
+    assert_eq!(
+        (out.items[0].revision, made.revision),
+        (since + 1, since + 2)
+    );
+    assert_eq!(out.result.revision, since + 3);
+    assert_eq!(
+        change_rows(&db, since as i64).await,
+        [
+            (since as i64 + 1, a.id.to_string(), false),
+            (since as i64 + 2, made.id.to_string(), false),
+            (since as i64 + 3, p.id.to_string(), false),
+        ]
+    );
+    assert_eq!(progress(&db, p.id).await, (1, 2));
+
+    // The create event follows the completed Item's own, and names the
+    // instance in the op.
+    let kinds: Vec<(String, String)> = all_events(&db, out.result.op_id)
+        .await
+        .into_iter()
+        .map(|(kind, item_id, _)| (kind, item_id))
+        .collect();
+    let (a_id, made_id) = (a.id.to_string(), made.id.to_string());
+    assert_eq!(
+        kinds,
+        [
+            ("set".to_owned(), a_id.clone()),
+            ("set".to_owned(), a_id.clone()),
+            ("create".to_owned(), made_id.clone()),
+            ("derived".to_owned(), a_id.clone()),
+        ]
+    );
+    let create = all_events(&db, out.result.op_id).await.remove(2);
+    assert_eq!(create.2.as_deref(), Some("\"water plants\""));
+    let entry = db.store.undo_state().await.unwrap().undo.unwrap();
+    assert_eq!(entry.item_ids, [a.id, made.id]);
+    assert_eq!(
+        entry.description,
+        "mark done \"water plants\" · next Mon Mar 2"
+    );
+
+    // The FTS triggers index the inserted row.
+    let hits: Vec<String> = db
+        .store
+        .read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT i.id FROM items i JOIN items_fts f ON f.rowid = i.seq
+                 WHERE items_fts MATCH 'plants' ORDER BY i.created_at, i.id",
+            )?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(hits, [a_id, made_id]);
+}
+
+#[tokio::test]
+async fn each_rule_kind_schedules_its_next_instance() {
+    let db = open();
+    // today() is Sunday 2026-03-01.
+    let rows = [
+        (Rule::Daily, date(2026, 3, 1), date(2026, 3, 2)),
+        (
+            Rule::weekly([Weekday::Monday, Weekday::Wednesday]).unwrap(),
+            date(2026, 3, 2),
+            date(2026, 3, 4),
+        ),
+        (
+            Rule::monthly(15).unwrap(),
+            date(2026, 3, 15),
+            date(2026, 4, 15),
+        ),
+    ];
+    for (rule, first, next) in rows {
+        let a = recurring(&db, "x", rule.clone()).await;
+        assert_eq!(dates(&a), (Some(first), Some(first), None), "{rule:?}");
+        let out = close(&db, &[a.id], Status::Done).await;
+        assert_eq!(
+            dates(&out.generated[0]),
+            (Some(next), Some(next), Some(next)),
+            "{rule:?}"
+        );
+    }
+
+    // An after-completion rule on an Item without a due date has no slot;
+    // the next instance is its days from today.
+    let b = recurring(&db, "y", Rule::after_completion(3).unwrap()).await;
+    assert_eq!(dates(&b), (None, None, None));
+    let out = close(&db, &[b.id], Status::Done).await;
+    let next = date(2026, 3, 4);
+    assert_eq!(
+        dates(&out.generated[0]),
+        (Some(next), Some(next), Some(next))
+    );
+}
+
+#[tokio::test]
+async fn a_late_completion_skips_the_missed_dates_and_is_not_deferred() {
+    let db = open();
+    // Three Mondays late: the next instance is the coming Monday, not the
+    // one after the slot.
+    let a = recurring(&db, "weekly", Rule::weekly([Weekday::Monday]).unwrap()).await;
+    set_columns(
+        &db,
+        &a,
+        "due_date = '2026-02-09', recurrence_occurrence_date = '2026-02-09'",
+    )
+    .await;
+    let out = close(&db, &[a.id], Status::Done).await;
+    let next = date(2026, 3, 2);
+    assert_eq!(
+        dates(&out.generated[0]),
+        (Some(next), Some(next), Some(next))
+    );
+
+    // A next date of today is due now, not deferred.
+    let b = recurring(&db, "daily", Rule::Daily).await;
+    set_columns(
+        &db,
+        &b,
+        "due_date = '2026-02-20', recurrence_occurrence_date = '2026-02-20'",
+    )
+    .await;
+    let out = close(&db, &[b.id], Status::Done).await;
+    assert_eq!(
+        dates(&out.generated[0]),
+        (Some(today()), Some(today()), None)
+    );
+}
+
+#[tokio::test]
+async fn cancelling_generates_but_closing_an_already_closed_item_does_not() {
+    let db = open();
+    let a = recurring(&db, "x", Rule::Daily).await;
+    let out = close(&db, &[a.id], Status::Cancelled).await;
+    assert_eq!(out.generated.len(), 1);
+    assert_eq!(
+        op_stack(&db, out.result.op_id).await.1.as_deref(),
+        Some("cancel \"x\" · next Mon Mar 2")
+    );
+
+    // Done then cancelled is no completion: the Item was already closed.
+    let b = recurring(&db, "y", Rule::Daily).await;
+    close(&db, &[b.id], Status::Done).await;
+    let before = all_titles(&db).await;
+    let out = close(&db, &[b.id], Status::Cancelled).await;
+    assert_eq!(out.generated, []);
+    assert_eq!(all_titles(&db).await, before);
+    assert_eq!(
+        op_stack(&db, out.result.op_id).await.1.as_deref(),
+        Some("cancel \"y\"")
+    );
+}
+
+#[tokio::test]
+async fn a_legacy_instance_without_a_rule_never_generates() {
+    let db = open();
+    let a = capture(&db, "x").await;
+    set_columns(
+        &db,
+        &a,
+        "recurrence_series_id = '01JB8X4Z5Q6R7S8T9V0W1X2Y3Z',
+         recurrence_occurrence_date = '2026-03-01'",
+    )
+    .await;
+    assert_eq!(get(&db, a.id).await.overlay.recurrence.unwrap().rule, None);
+    let out = close(&db, &[a.id], Status::Done).await;
+    assert_eq!(out.generated, []);
+    assert_eq!(all_titles(&db).await, ["x"]);
+}
+
+#[tokio::test]
+async fn the_batchs_final_state_decides_what_it_generates() {
+    let db = open();
+    // Reopened, deleted, or no longer repeating by the end of the batch: the
+    // post-pass runs once, on the state the batch leaves.
+    type Second = fn(ItemId) -> Mutation;
+    let rows: [(&str, Second); 3] = [
+        ("reopened", |id| status(id, Status::Next)),
+        ("deleted", |id| mutation(id, MutationOp::Delete)),
+        ("stopped", |id| repeat(id, None)),
+    ];
+    for (name, second) in rows {
+        let a = recurring(&db, name, Rule::Daily).await;
+        let out = run(
+            &db,
+            Actor::User,
+            1_000,
+            OpKind::Batch,
+            vec![status(a.id, Status::Done), second(a.id)],
+        )
+        .await;
+        assert_eq!(out.generated, [], "{name}");
+        assert_eq!(
+            all_titles(&db).await.iter().filter(|t| *t == name).count(),
+            1,
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn two_open_instances_of_one_series_generate_one_between_them() {
+    let db = open();
+    let a = recurring(&db, "a", Rule::Daily).await;
+    // A second open instance of A's series, as a generation interrupted
+    // before M5's guard existed would leave.
+    let b = recurring(&db, "b", Rule::Daily).await;
+    let series = a.overlay.recurrence.as_ref().unwrap().series_id;
+    let b_id = b.id;
+    db.store
+        .write(move |tx| {
+            tx.conn().execute(
+                "UPDATE items SET recurrence_series_id = ?1 WHERE id = ?2",
+                params![series.to_string(), b_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    // The post-pass walks the mutations in order, so the first completion is
+    // the template; by the time B's turn comes, that instance is the
+    // series' open one.
+    let out = close(&db, &[a.id, b.id], Status::Done).await;
+    let [made] = out.generated.as_slice() else {
+        panic!("expected one generated item, got {:?}", out.generated)
+    };
+    assert_eq!(made.core.title, "a");
+    assert_eq!(
+        op_stack(&db, out.result.op_id).await.1.as_deref(),
+        Some("mark done (2 items) · 1 next")
+    );
+}
+
+#[tokio::test]
+async fn a_stored_open_instance_of_the_series_blocks_generation() {
+    let db = open();
+    let a = recurring(&db, "a", Rule::Daily).await;
+    let out = close(&db, &[a.id], Status::Done).await;
+    let made = out.generated[0].clone();
+
+    // The instance the first completion made is still open, so completing
+    // A again (it is already closed, but the undo of the completion reopens
+    // it) generates nothing.
+    undo(&db).await;
+    assert!(get(&db, made.id).await.is_deleted());
+    run(
+        &db,
+        Actor::System,
+        1_500,
+        OpKind::Undelete,
+        vec![mutation(made.id, MutationOp::Undelete)],
+    )
+    .await;
+    let out = close(&db, &[a.id], Status::Done).await;
+    assert_eq!(out.generated, []);
+}
+
+#[tokio::test]
+async fn deleting_the_open_instance_ends_the_series_and_undelete_resumes_it() {
+    let db = open();
+    let a = recurring(&db, "x", Rule::Daily).await;
+    let b = close(&db, &[a.id], Status::Done).await.generated[0].clone();
+
+    // `dd` on the open instance leaves the series with none, and generates
+    // nothing of its own.
+    let out = run(
+        &db,
+        Actor::User,
+        1_100,
+        OpKind::Delete,
+        vec![mutation(b.id, MutationOp::Delete)],
+    )
+    .await;
+    assert_eq!(out.generated, []);
+    assert_eq!(titles(&db, false).await, [] as [String; 0]);
+
+    // `u` brings it back, and completing it generates again.
+    let out = run(
+        &db,
+        Actor::User,
+        1_200,
+        OpKind::Undelete,
+        vec![mutation(b.id, MutationOp::Undelete)],
+    )
+    .await;
+    assert_eq!(out.generated, []);
+    let out = close(&db, &[b.id], Status::Done).await;
+    let [made] = out.generated.as_slice() else {
+        panic!("expected one generated item, got {:?}", out.generated)
+    };
+    assert_eq!(
+        made.overlay.recurrence.as_ref().unwrap().series_id,
+        a.overlay.recurrence.unwrap().series_id
+    );
+    assert_eq!(
+        dates(made),
+        (
+            Some(date(2026, 3, 3)),
+            Some(date(2026, 3, 3)),
+            Some(date(2026, 3, 3))
+        )
+    );
+}
+
+#[tokio::test]
+async fn generated_items_follow_the_mutations_that_completed_them() {
+    let db = open();
+    let p = capture(&db, "p").await;
+    let a = recurring_under(&db, "a", p.id, Rule::Daily).await;
+    let b = recurring_under(&db, "b", p.id, Rule::Daily).await;
+    // A third Item that does not repeat, so the bulk summary counts two.
+    let c = capture_under(&db, "c", p.id).await;
+    let out = close(&db, &[b.id, a.id, c.id], Status::Done).await;
+    let titles: Vec<&str> = out
+        .generated
+        .iter()
+        .map(|i| i.core.title.as_str())
+        .collect();
+    assert_eq!(titles, ["b", "a"]);
+    let creates: Vec<String> = all_events(&db, out.result.op_id)
+        .await
+        .into_iter()
+        .filter(|(kind, ..)| kind == "create")
+        .map(|(_, item_id, _)| item_id)
+        .collect();
+    assert_eq!(
+        creates,
+        out.generated
+            .iter()
+            .map(|i| i.id.to_string())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        op_stack(&db, out.result.op_id).await.1.as_deref(),
+        Some("mark done (3 items) · 2 next")
+    );
+    assert_eq!(progress(&db, p.id).await, (3, 5));
+    assert!(get(&db, c.id).await.overlay.recurrence.is_none());
+}
+
+#[tokio::test]
+async fn a_generated_instance_names_next_year_when_it_differs() {
+    let db = open();
+    let a = recurring(&db, "x", Rule::monthly(2).unwrap()).await;
+    set_columns(
+        &db,
+        &a,
+        "due_date = '2026-12-02', recurrence_occurrence_date = '2026-12-02'",
+    )
+    .await;
+    let out = close(&db, &[a.id], Status::Done).await;
+    assert_eq!(out.generated[0].core.due_date, Some(date(2027, 1, 2)));
+    assert_eq!(
+        op_stack(&db, out.result.op_id).await.1.as_deref(),
+        Some("mark done \"x\" · next Sat Jan 2 2027")
+    );
+}
+
+#[tokio::test]
+async fn undo_deletes_the_generated_instance_and_redo_restores_it() {
+    let db = open();
+    let p = capture(&db, "p").await;
+    let a = recurring_under(&db, "water plants", p.id, Rule::Daily).await;
+    let out = close(&db, &[a.id], Status::Done).await;
+    let made = out.generated[0].clone();
+
+    // One op, so one entry: the undo reopens the Item and deletes the
+    // instance the completion created.
+    let undone = undo(&db).await;
+    assert_eq!(undone.skipped, []);
+    assert_eq!(undone.entry.unwrap().op_id, out.result.op_id);
+    assert_eq!(get(&db, a.id).await.status(), a.status());
+    let back = get(&db, made.id).await;
+    assert!(back.is_deleted());
+    assert_eq!(back.derived.deleted_at, Some(ts(2_000)));
+    assert_eq!(progress(&db, p.id).await, (0, 1));
+    assert_eq!(titles(&db, false).await, ["p", "water plants"]);
+
+    // Redo closes the Item again and undeletes the instance, which keeps
+    // everything it was created with.
+    let redone = redo(&db).await;
+    assert_eq!(redone.skipped, []);
+    assert_eq!(get(&db, a.id).await.status(), Status::Done);
+    let again = get(&db, made.id).await;
+    assert!(!again.is_deleted());
+    assert_eq!(again.overlay.recurrence, made.overlay.recurrence);
+    assert_eq!(again.core.due_date, made.core.due_date);
+    assert_eq!(progress(&db, p.id).await, (1, 2));
+}
+
+#[tokio::test]
+async fn redo_skips_an_instance_whose_parent_has_gone_since() {
+    let db = open();
+    let p = capture(&db, "p").await;
+    let a = recurring_under(&db, "x", p.id, Rule::Daily).await;
+    let made = close(&db, &[a.id], Status::Done).await.generated[0].clone();
+    undo(&db).await;
+
+    // Move the Item out from under p and delete p, as system ops so the redo
+    // stack survives: the deleted instance's parent is now gone.
+    run(
+        &db,
+        Actor::System,
+        1_500,
+        OpKind::Update,
+        vec![set(a.id, ItemField::ParentId, FieldValue::Cleared)],
+    )
+    .await;
+    run(
+        &db,
+        Actor::System,
+        1_600,
+        OpKind::Delete,
+        vec![mutation(p.id, MutationOp::Delete)],
+    )
+    .await;
+
+    // The redo closes the Item again but leaves the instance deleted, so no
+    // live Item ends up under a deleted parent.
+    let redone = redo(&db).await;
+    assert_eq!(
+        redone.skipped,
+        [skip(
+            made.id,
+            &[ItemField::DeletedAt],
+            SkipReason::Invalid("the parent is deleted".into())
+        )]
+    );
+    assert_eq!(get(&db, a.id).await.status(), Status::Done);
+    assert!(get(&db, made.id).await.is_deleted());
+    assert_no_live_orphans(&db).await;
+}
+
+#[tokio::test]
+async fn an_instance_under_a_deleted_parent_generates_one_at_the_top_level() {
+    let db = open();
+    let p = capture(&db, "p").await;
+    let a = recurring_under(&db, "x", p.id, Rule::Daily).await;
+    // An M1 database, from before deletes cascaded, left A live under a
+    // deleted parent. Closing A does not fail on it.
+    set_columns(&db, &p, "deleted_at = 5").await;
+    let out = close(&db, &[a.id], Status::Done).await;
+
+    // The next instance is a new Item, so it keeps the parent rule: no
+    // parent rather than a deleted one.
+    let [made] = out.generated.as_slice() else {
+        panic!("expected one generated item, got {:?}", out.generated)
+    };
+    assert_eq!(made.core.parent_id, None);
+    assert_eq!(made.derived.parent_title, None);
+    assert_eq!(get(&db, made.id).await.core.parent_id, None);
+    assert_eq!(get(&db, a.id).await.core.parent_id, Some(p.id));
+
+    // So undo and redo of the completion restore all of it.
+    assert_eq!(undo(&db).await.skipped, []);
+    assert!(get(&db, made.id).await.is_deleted());
+    assert_eq!(redo(&db).await.skipped, []);
+    assert!(!get(&db, made.id).await.is_deleted());
+    assert_eq!(get(&db, a.id).await.status(), Status::Done);
+}
+
+#[tokio::test]
+async fn a_replayed_completion_returns_the_same_instance_and_creates_none() {
+    let db = open();
+    let p = capture(&db, "p").await;
+    let a = recurring_under(&db, "water plants", p.id, Rule::Daily).await;
+    let req = mutate(OpKind::SetStatus, vec![status(a.id, Status::Done)]);
+    let out = db.store.mutate(req.clone()).await.unwrap();
+    assert_eq!(out.generated.len(), 1);
+    let after = snapshot(&db).await;
+
+    // The replay answers with the same instance and writes nothing, so a
+    // retried completion never generates a second one.
+    let replay = db.store.mutate(req).await.unwrap();
+    assert_eq!(replay.result, out.result);
+    assert_eq!(replay.generated, out.generated);
+    assert_eq!(replay.items, out.items);
+    assert_eq!(snapshot(&db).await, after);
+}
+
+#[tokio::test]
+async fn a_capture_with_a_rule_starts_a_series_in_one_op() {
+    let db = open();
+    let mut req = input("", 100);
+    req.draft = todo_core::parse_capture("water plants ^fri @mon,wed", today());
+    let (item, result) = db.store.capture(req).await.unwrap();
+
+    // The `^` date stays the due date; the rule is scheduled on its own
+    // first date after it. A capture is the user saying "this exists now",
+    // so the Item is never deferred.
+    assert_eq!(item.core.title, "water plants");
+    assert_eq!(
+        dates(&item),
+        (Some(date(2026, 3, 6)), Some(date(2026, 3, 9)), None)
+    );
+    let recurrence = item.overlay.recurrence.as_ref().unwrap();
+    assert_eq!(
+        recurrence.rule,
+        Some(Rule::weekly([Weekday::Monday, Weekday::Wednesday]).unwrap())
+    );
+    assert_eq!(get(&db, item.id).await, item);
+
+    // Still one capture op with one create event.
+    assert_eq!(op_row(&db, result.op_id).await.0, "capture");
+    assert_eq!(
+        all_events(&db, result.op_id).await,
+        [(
+            "create".to_owned(),
+            item.id.to_string(),
+            Some("\"water plants\"".to_owned())
+        )]
+    );
+
+    // Without a `^` the rule's first date becomes the due date; an
+    // after-completion rule leaves both unset.
+    let mut req = input("", 100);
+    req.draft = todo_core::parse_capture("feed cat @daily", today());
+    let (daily, _) = db.store.capture(req).await.unwrap();
+    assert_eq!(dates(&daily), (Some(today()), Some(today()), None));
+    let mut req = input("", 100);
+    req.draft = todo_core::parse_capture("water the tree @3w", today());
+    let (after, _) = db.store.capture(req).await.unwrap();
+    assert_eq!(dates(&after), (None, None, None));
+    assert_eq!(
+        after.overlay.recurrence.unwrap().rule,
+        Some(Rule::after_completion(21).unwrap())
+    );
+
+    // Completing the capture generates from the series it started.
+    let out = close(&db, &[item.id], Status::Done).await;
+    assert_eq!(
+        out.generated[0]
+            .overlay
+            .recurrence
+            .as_ref()
+            .unwrap()
+            .series_id,
+        item.overlay.recurrence.unwrap().series_id
+    );
+    assert_eq!(out.generated[0].core.due_date, Some(date(2026, 3, 11)));
+}
+
+/// `archive_done_after_days` = 7.
+const WEEK: SignedDuration = SignedDuration::from_hours(7 * 24);
+
+const NS: SignedDuration = SignedDuration::from_nanos(1);
+
+/// The scheduler's sweep at `now`.
+async fn sweep(db: &Db, now: Timestamp) -> AutoArchiveOutput {
+    let input = AutoArchiveInput {
+        now,
+        after: WEEK,
+        today: today(),
+    };
+    db.store.auto_archive(input).await.unwrap()
+}
+
+/// Mutates as the user at the wall clock, as the daemon does, and returns
+/// that time. Stickiness compares the time of an `archived` event, which
+/// is always the wall clock, with `status_entered_at`, which is the op's
+/// `now`: the two only agree when `now` is the wall clock too.
+async fn user_now(db: &Db, kind: OpKind, mutations: Vec<Mutation>) -> Timestamp {
+    let mut req = mutate(kind, mutations);
+    req.now = Timestamp::now();
+    db.store.mutate(req.clone()).await.unwrap();
+    req.now
+}
+
+/// Moves `id` to `to` now; for a close, the time its clock starts.
+async fn status_now(db: &Db, id: ItemId, to: Status) -> Timestamp {
+    user_now(db, OpKind::SetStatus, vec![status(id, to)]).await
+}
+
+/// A user `z` on `id`: archive, or unarchive.
+async fn z(db: &Db, id: ItemId, archive: bool) {
+    let (kind, op) = if archive {
+        (OpKind::Archive, MutationOp::Archive(ArchiveReason::User))
+    } else {
+        (OpKind::Unarchive, MutationOp::Unarchive)
+    };
+    user_now(db, kind, vec![mutation(id, op)]).await;
+}
+
+async fn archived(db: &Db, id: ItemId) -> Option<Archived> {
+    get(db, id).await.overlay.archived
+}
+
+fn auto_done(at: Timestamp) -> Option<Archived> {
+    Some(Archived {
+        at,
+        reason: ArchiveReason::AutoDone,
+    })
+}
+
+#[tokio::test]
+async fn the_sweep_archives_what_closed_at_least_a_week_ago() {
+    let db = open();
+    let a = capture(&db, "a").await;
+    let b = capture(&db, "b").await;
+    let open_one = capture(&db, "open").await;
+    let legacy = capture(&db, "legacy").await;
+    let closed = user_now(
+        &db,
+        OpKind::Batch,
+        vec![
+            status(a.id, Status::Done),
+            status(b.id, Status::Cancelled),
+            status(open_one.id, Status::Next),
+            status(legacy.id, Status::Done),
+        ],
+    )
+    .await;
+    // A row written before `status_entered_at` was recorded falls back to
+    // `updated_at`.
+    set_columns(
+        &db,
+        &legacy,
+        "status_entered_at = NULL, updated_at = 1000000000000",
+    )
+    .await;
+
+    // A nanosecond short of the week only the legacy row is due, oldest
+    // close first.
+    let out = sweep(&db, closed + WEEK - NS).await;
+    assert_eq!(
+        (out.archived, out.healed, out.more),
+        (vec![legacy.id], vec![], false)
+    );
+    let result = out.result.unwrap();
+    assert_eq!(
+        op_row(&db, result.op_id).await,
+        ("auto_archive".to_owned(), "system".to_owned(), None, rev(9))
+    );
+    assert_eq!(
+        op_stack(&db, result.op_id).await,
+        (None, Some("auto-archive 1 done item".to_owned()))
+    );
+    let written = events(&db, result.op_id).await;
+    assert_eq!(
+        written,
+        [EventRow {
+            item_id: legacy.id.to_string(),
+            actor: "system".to_owned(),
+            kind: "set".to_owned(),
+            change: FieldChange {
+                field: ItemField::Archived,
+                old: FieldValue::Cleared,
+                new: FieldValue::Archived(auto_done(closed + WEEK - NS).unwrap()),
+            },
+        }]
+    );
+
+    // Nothing more is due: no op, no revision, nothing written.
+    let before = snapshot(&db).await;
+    let out = sweep(&db, closed + WEEK - NS).await;
+    assert_eq!(
+        (out.archived, out.healed, out.more, out.result),
+        (vec![], vec![], false, None)
+    );
+    assert_eq!(snapshot(&db).await, before);
+
+    // At the week, done and cancelled alike; the open Item stays. Archiving
+    // bumps `updated_at`, so they sort to the top of Archive.
+    let at = closed + WEEK;
+    let out = sweep(&db, at).await;
+    assert_eq!(out.archived, [a.id, b.id]);
+    assert_eq!(
+        op_stack(&db, out.result.unwrap().op_id).await.1.as_deref(),
+        Some("auto-archive 2 done items")
+    );
+    for id in [a.id, b.id] {
+        let item = get(&db, id).await;
+        assert_eq!(
+            (item.overlay.archived, item.updated_at),
+            (auto_done(at), at)
+        );
+    }
+    assert_eq!(archived(&db, open_one.id).await, None);
+    assert_eq!(db.store.current_revision(), rev(11) as Revision);
+}
+
+#[tokio::test]
+async fn an_unarchive_after_closing_sticks_until_the_item_closes_again() {
+    let db = open();
+    let x = capture(&db, "x").await;
+    let closed = status_now(&db, x.id, Status::Done).await;
+    assert_eq!(sweep(&db, closed + WEEK).await.archived, [x.id]);
+
+    // `z` brings it back out of Archive for good: day 8, day 30.
+    z(&db, x.id, false).await;
+    for days in [8, 30] {
+        let out = sweep(&db, closed + SignedDuration::from_hours(days * 24)).await;
+        assert_eq!(out.result, None, "day {days}");
+    }
+    assert_eq!(archived(&db, x.id).await, None);
+
+    // Closing it again restarts the clock, and the old `z` no longer counts.
+    status_now(&db, x.id, Status::Next).await;
+    let again = status_now(&db, x.id, Status::Done).await;
+    assert_eq!(sweep(&db, again + WEEK - NS).await.result, None);
+    assert_eq!(sweep(&db, again + WEEK).await.archived, [x.id]);
+    assert_eq!(archived(&db, x.id).await, auto_done(again + WEEK));
+}
+
+#[tokio::test]
+async fn an_archive_and_unarchive_after_closing_sticks_too() {
+    let db = open();
+    let x = capture(&db, "x").await;
+    let closed = status_now(&db, x.id, Status::Done).await;
+    // Archived by hand before the scheduler got to it, then unarchived.
+    z(&db, x.id, true).await;
+    z(&db, x.id, false).await;
+    assert_eq!(sweep(&db, closed + WEEK * 2).await.result, None);
+    assert_eq!(archived(&db, x.id).await, None);
+}
+
+#[tokio::test]
+async fn an_undone_archive_leaves_the_item_to_the_sweep() {
+    let db = open();
+    let x = capture(&db, "x").await;
+    let closed = status_now(&db, x.id, Status::Done).await;
+    // A `z` by mistake, undone at once: no decision is left in effect.
+    z(&db, x.id, true).await;
+    undo(&db).await;
+    assert_eq!(archived(&db, x.id).await, None);
+    assert_eq!(sweep(&db, closed + WEEK - NS).await.result, None);
+    assert_eq!(sweep(&db, closed + WEEK).await.archived, [x.id]);
+    assert_eq!(archived(&db, x.id).await, auto_done(closed + WEEK));
+}
+
+#[tokio::test]
+async fn a_redone_archive_and_unarchive_stick_again() {
+    let db = open();
+    let x = capture(&db, "x").await;
+    let closed = status_now(&db, x.id, Status::Done).await;
+    z(&db, x.id, true).await;
+    z(&db, x.id, false).await;
+    // Both undone, then both redone: the user's decision is back in effect.
+    undo(&db).await;
+    undo(&db).await;
+    redo(&db).await;
+    redo(&db).await;
+    assert_eq!(archived(&db, x.id).await, None);
+    assert_eq!(sweep(&db, closed + WEEK * 2).await.result, None);
+    assert_eq!(archived(&db, x.id).await, None);
+}
+
+#[tokio::test]
+async fn the_restores_of_undo_and_redo_do_not_stick() {
+    let db = open();
+    let x = capture(&db, "x").await;
+    let first = status_now(&db, x.id, Status::Done).await;
+    assert_eq!(sweep(&db, first + WEEK).await.archived, [x.id]);
+    // Reopening clears the auto_done archive; X closes again at `closed`.
+    status_now(&db, x.id, Status::Next).await;
+    let closed = status_now(&db, x.id, Status::Done).await;
+
+    // Undoing the reopen restores the archive, and redoing it clears it
+    // again: `archived` events of the user's undo and redo ops, after the
+    // close, which are no decision of the user's.
+    undo(&db).await;
+    undo(&db).await;
+    assert_eq!(archived(&db, x.id).await, auto_done(first + WEEK));
+    redo(&db).await;
+    redo(&db).await;
+    let item = get(&db, x.id).await;
+    assert_eq!((item.status(), item.overlay.archived), (Status::Done, None));
+    assert_eq!(item.derived.staleness.status_entered_at, Some(closed));
+    assert_eq!(sweep(&db, closed + WEEK - NS).await.result, None);
+    assert_eq!(sweep(&db, closed + WEEK).await.archived, [x.id]);
+}
+
+#[tokio::test]
+async fn cancelling_a_done_item_restarts_its_clock() {
+    let db = open();
+    let x = capture(&db, "x").await;
+    let y = capture(&db, "y").await;
+    status_now(&db, x.id, Status::Done).await;
+    let closed = status_now(&db, y.id, Status::Done).await;
+    z(&db, y.id, true).await;
+    z(&db, y.id, false).await;
+
+    // done → cancelled is a new close: the clock starts over, and an
+    // unarchive from before it no longer sticks.
+    let x_cancelled = status_now(&db, x.id, Status::Cancelled).await;
+    let y_cancelled = status_now(&db, y.id, Status::Cancelled).await;
+    // A week after the first closes both would be due; neither is.
+    assert!(closed < x_cancelled);
+    assert_eq!(sweep(&db, closed + WEEK).await.result, None);
+    assert_eq!(sweep(&db, x_cancelled + WEEK - NS).await.result, None);
+    assert_eq!(sweep(&db, x_cancelled + WEEK).await.archived, [x.id]);
+    assert_eq!(sweep(&db, y_cancelled + WEEK).await.archived, [y.id]);
+}
+
+#[tokio::test]
+async fn healing_unarchives_an_item_an_undo_reopened() {
+    let db = open();
+    let (x, captured) = capture_op(&db, "x").await;
+    let mut req = mutate(OpKind::SetStatus, vec![status(x.id, Status::Done)]);
+    req.now = Timestamp::now();
+    let closed = req.now;
+    let completion = db.store.mutate(req).await.unwrap().result.op_id;
+    assert_eq!(sweep(&db, closed + WEEK).await.archived, [x.id]);
+
+    // The sweep is no undo entry, so undo reverts the completion. That
+    // reopens X but keeps the archive, which only a `SetStatus` clears.
+    assert_eq!(tops(&db).await, (Some(completion), None));
+    undo(&db).await;
+    assert_eq!(get(&db, x.id).await.status(), Status::Inbox);
+    assert_eq!(archived(&db, x.id).await, auto_done(closed + WEEK));
+
+    // The next sweep heals it, whatever the threshold, and keeps the redo
+    // stack: a system op is never an entry and discards nothing.
+    let out = sweep(&db, closed).await;
+    assert_eq!((out.healed, out.archived), (vec![x.id], vec![]));
+    let op_id = out.result.unwrap().op_id;
+    assert_eq!(
+        op_stack(&db, op_id).await,
+        (None, Some("unarchive 1 reopened item".to_owned()))
+    );
+    assert_eq!(op_row(&db, op_id).await.1, "system");
+    assert_eq!(archived(&db, x.id).await, None);
+    assert_eq!(tops(&db).await, (Some(captured), Some(completion)));
+
+    // Redo closes X again at its old close time. The scheduler's own archive
+    // events do not make an archive stick, so it is archived again.
+    redo(&db).await;
+    assert_eq!(
+        get(&db, x.id).await.derived.staleness.status_entered_at,
+        Some(closed)
+    );
+    let later = closed + WEEK * 2;
+    assert_eq!(sweep(&db, later).await.archived, [x.id]);
+    assert_eq!(archived(&db, x.id).await, auto_done(later));
+    assert_eq!(tops(&db).await, (Some(completion), None));
+}
+
+#[tokio::test]
+async fn the_sweep_skips_deleted_items() {
+    let db = open();
+    let done = capture(&db, "done").await;
+    let reopened = capture(&db, "reopened").await;
+    let closed = user_now(
+        &db,
+        OpKind::Batch,
+        vec![
+            status(done.id, Status::Done),
+            mutation(done.id, MutationOp::Delete),
+            mutation(reopened.id, MutationOp::Delete),
+        ],
+    )
+    .await;
+    // A deleted Item archived auto_done and open is left alone too: undelete
+    // brings it back as it was.
+    set_columns(
+        &db,
+        &reopened,
+        "archived_at = 500000000000, archived_reason = 'auto_done'",
+    )
+    .await;
+    assert_eq!(sweep(&db, closed + WEEK).await.result, None);
+    assert_eq!(archived(&db, done.id).await, None);
+}
+
+/// Adds `n` Items closed at second `closed_at` in one write, faster than
+/// `n` captures.
+async fn closed_items(db: &Db, n: usize, closed_at: i64) {
+    db.store
+        .write(move |tx| {
+            let mut stmt = tx.conn().prepare(
+                "INSERT INTO items (id, created_via, created_at, updated_at, revision, title,
+                                    status_category, resolution_kind, status_entered_at)
+                 VALUES (?1, 'cli', ?2, ?2, 1, 'old', 'done', 'done', ?2)",
+            )?;
+            for _ in 0..n {
+                stmt.execute(params![new_ulid().to_string(), closed_at * 1_000_000_000])?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn one_sweep_changes_at_most_1000_items_and_says_when_more_remain() {
+    let db = open();
+    closed_items(&db, 1001, 1).await;
+    let out = sweep(&db, ts(1) + WEEK).await;
+    assert_eq!((out.archived.len(), out.more), (1000, true));
+    assert_eq!(
+        op_stack(&db, out.result.unwrap().op_id).await.1.as_deref(),
+        Some("auto-archive 1000 done items")
+    );
+    let out = sweep(&db, ts(1) + WEEK).await;
+    assert_eq!((out.archived.len(), out.more), (1, false));
+    assert_eq!(sweep(&db, ts(1) + WEEK).await.result, None);
+
+    // Healing comes first and counts towards the cap. Exactly 1000 is not
+    // "more".
+    let db = open();
+    let x = capture(&db, "x").await;
+    set_columns(
+        &db,
+        &x,
+        "archived_at = 500000000000, archived_reason = 'auto_done'",
+    )
+    .await;
+    closed_items(&db, 1000, 1).await;
+    let out = sweep(&db, ts(1) + WEEK).await;
+    assert_eq!(
+        (out.healed.as_slice(), out.archived.len(), out.more),
+        ([x.id].as_slice(), 999, true)
+    );
+    let out = sweep(&db, ts(1) + WEEK).await;
+    assert_eq!(
+        (out.healed.len(), out.archived.len(), out.more),
+        (0, 1, false)
+    );
 }
 
 #[tokio::test]

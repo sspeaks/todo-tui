@@ -195,8 +195,8 @@ impl ItemService for Items {
                 request::set_status_from_proto(&req)
             })
             .await?;
-        // Completing never generates yet: recurrence is stored in M5
-        // phase 2.
+        // The store generates the next instance of a series this completed
+        // (design 3.8); reporting it waits for M5 phase 3.
         Ok(Response::new(SetStatusResponse {
             item,
             result,
@@ -282,15 +282,6 @@ impl ItemService for Items {
                 format!("must hold 1 to {MAX_BATCH} mutations"),
             ));
         }
-        // The store cannot keep a rule until M5 phase 2, so SetRecurrence
-        // never reaches it yet.
-        if req
-            .mutations
-            .iter()
-            .any(|m| matches!(m.kind, Some(v1::mutation::Kind::SetRecurrence(_))))
-        {
-            return Err(not_implemented("SetRecurrence"));
-        }
         let now = Zoned::now();
         let mutations = req
             .mutations
@@ -306,6 +297,7 @@ impl ItemService for Items {
         let out = self
             .mutate(&request_id, OpKind::Batch, mutations, &now, &shape)
             .await?;
+        // As in `set_status`: the store generates, phase 3 reports it.
         Ok(Response::new(BatchMutateResponse {
             items: out.items.into_iter().map(v1::Item::from).collect(),
             result: Some(out.result.into()),

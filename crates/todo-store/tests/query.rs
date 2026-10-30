@@ -1558,7 +1558,8 @@ async fn migrates_an_m2_database() {
     let (a, b) = ("01JB8X4Z5Q6R7S8T9V0W1X2Y3Z", "01JB8X4Z5Q6R7S8T9V0W1X2Y40");
     {
         // The M2 schema with M2 rows: two Items (one title composed, one
-        // decomposed) and a relation.
+        // decomposed, and in a series recorded before M5 stored its rule)
+        // and a relation.
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(include_str!("../migrations/0001_init.sql"))
             .unwrap();
@@ -1567,9 +1568,11 @@ async fn migrates_an_m2_database() {
         conn.pragma_update(None, "user_version", 2).unwrap();
         conn.execute_batch(&format!(
             "INSERT INTO items (id, created_via, created_at, updated_at, revision, title,
-                                status_category, labels)
-             VALUES ('{a}', 'cli', 1000, 1000, 1, 'Ti\u{1EBF}ng Vi\u{1EC7}t', 'todo', '[\"x\"]'),
-                    ('{b}', 'cli', 2000, 2000, 3, 'Tie\u{0302}\u{0301}ng NFD', 'todo', '[]');
+                                status_category, labels, recurrence_series_id)
+             VALUES ('{a}', 'cli', 1000, 1000, 1, 'Ti\u{1EBF}ng Vi\u{1EC7}t', 'todo', '[\"x\"]',
+                     NULL),
+                    ('{b}', 'cli', 2000, 2000, 3, 'Tie\u{0302}\u{0301}ng NFD', 'todo', '[]',
+                     '{a}');
              INSERT INTO relations (from_id, to_id, kind, created_at)
              VALUES ('{a}', '{b}', 'blocks', 3000);
              INSERT INTO changes (revision, topic, resource_id, deleted, at)
@@ -1620,6 +1623,13 @@ async fn migrates_an_m2_database() {
     let ids: Vec<String> = found.items.iter().map(|i| i.id.to_string()).collect();
     assert_eq!(ids, [a, b]);
     assert_eq!(found.items[0].relations.len(), 1);
+    // A series recorded before M5 reads back with no rule, so it never
+    // generates another instance.
+    let legacy = found.items[1].overlay.recurrence.as_ref().unwrap();
+    assert_eq!(
+        (legacy.series_id.to_string().as_str(), &legacy.rule),
+        (a, &None)
+    );
     let found = db.store.list_items(search(F::Labels, "x")).await.unwrap();
     assert_eq!(found.items.len(), 1);
     // The triggers keep the new index current, for new Items and edits to

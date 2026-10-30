@@ -298,10 +298,10 @@ async fn handshake_reports_version_and_api_minor() {
     d.stop().await;
 }
 
-/// M5 phase 1 serves the recurrence contract as stubs: the store cannot
-/// keep a rule yet.
+/// M5 phase 2 stores rules, through a batch and through a capture; the two
+/// recurrence RPCs are wired in phase 3 and answer UNIMPLEMENTED until then.
 #[tokio::test(flavor = "multi_thread")]
-async fn recurrence_rpcs_are_unimplemented_for_now() {
+async fn recurrence_is_stored_but_its_own_rpcs_are_not_wired_yet() {
     let d = start().await;
     let mut items = d.items().await;
     let x = capture(&mut items, "water plants").await;
@@ -313,7 +313,7 @@ async fn recurrence_rpcs_are_unimplemented_for_now() {
     let set = SetRecurrenceRequest {
         request_id: rid(),
         id: x.id.clone(),
-        rule: Some(daily),
+        rule: Some(daily.clone()),
         expected_revision: None,
     };
     let status = items.set_recurrence(set.clone()).await.unwrap_err();
@@ -330,21 +330,26 @@ async fn recurrence_rpcs_are_unimplemented_for_now() {
     error_info(&status, Code::Unimplemented, "NOT_IMPLEMENTED");
     assert_eq!(status.message(), "ParseRecurrence is not implemented yet");
 
-    // Nor in a batch, which then applies nothing.
-    let batch = batch_req(vec![
-        batched(mutation::Kind::SetStatus(SetStatusRequest {
-            request_id: String::new(),
-            id: x.id.clone(),
-            status: Status::Done.into(),
-            expected_revision: None,
-        })),
-        batched(mutation::Kind::SetRecurrence(set)),
-    ]);
-    let status = items.batch_mutate(batch).await.unwrap_err();
-    error_info(&status, Code::Unimplemented, "NOT_IMPLEMENTED");
-    assert_eq!(get(&mut items, &x.id).await.status, Status::Inbox as i32);
+    // A batch does set the rule, and completing the Item in a later batch
+    // generates the next instance.
+    let batch = batch_req(vec![batched(mutation::Kind::SetRecurrence(set))]);
+    let out = items.batch_mutate(batch).await.unwrap().into_inner();
+    let rule = out.items[0].recurrence.as_ref().unwrap();
+    assert_eq!(rule.rule, Some(daily));
+    assert!(!rule.series_id.is_empty());
+    let batch = batch_req(vec![batched(mutation::Kind::SetStatus(SetStatusRequest {
+        request_id: String::new(),
+        id: x.id.clone(),
+        status: Status::Done.into(),
+        expected_revision: None,
+    }))]);
+    items.batch_mutate(batch).await.unwrap();
+    assert_eq!(get(&mut items, &x.id).await.status, Status::Done as i32);
+    // The instance is deferred to tomorrow, so only its series names it.
+    let instance = titles(&mut items).await;
+    assert_eq!(instance, [] as [String; 0]);
 
-    // An @ token parses, but the capture does not store the rule yet.
+    // An @ token parses and the capture stores its rule.
     let draft = items
         .parse_capture(ParseCaptureRequest {
             text: "water plants @daily".into(),
@@ -360,7 +365,7 @@ async fn recurrence_rpcs_are_unimplemented_for_now() {
     assert_eq!(draft.tokens[0].kind, CaptureTokenKind::Recurrence as i32);
     let y = capture(&mut items, "feed cat @daily").await;
     assert_eq!(y.title, "feed cat");
-    assert_eq!(y.recurrence, None);
+    assert_eq!(y.recurrence.unwrap().rule, draft.recurrence);
     d.stop().await;
 }
 
