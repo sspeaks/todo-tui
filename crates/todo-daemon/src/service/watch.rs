@@ -157,6 +157,7 @@ mod tests {
     use super::*;
     use crate::ShutdownHandle;
     use crate::conn::Clients;
+    use crate::scheduler::Wake;
 
     async fn capture(store: &Store, n: usize) {
         for i in 0..n {
@@ -190,6 +191,7 @@ mod tests {
             store: store.clone(),
             clients: Clients::default(),
             shutdown: ShutdownHandle::new(),
+            wake: Wake::default(),
         });
         let mut stream = watch
             .subscribe(Request::new(SubscribeRequest::default()))
@@ -221,6 +223,7 @@ mod tests {
             store: store.clone(),
             clients: Clients::default(),
             shutdown: ShutdownHandle::new(),
+            wake: Wake::default(),
         });
         let subscribe = async |since_revision| {
             let req = SubscribeRequest {

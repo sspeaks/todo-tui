@@ -8,6 +8,7 @@ use anyhow::Context as _;
 use todo_core::{MAX_CAPTURE_BYTES, new_ulid};
 use todo_daemon::paths::Paths;
 use todo_daemon::spool::{self, SpoolEntry};
+use todo_proto::convert::rule_from_proto;
 use todo_proto::v1::item_service_client::ItemServiceClient;
 use todo_proto::v1::{
     CaptureDraft, CaptureItemRequest, CaptureItemResponse, CreatedVia, Priority,
@@ -264,8 +265,8 @@ fn captured_line(id: &str, title: &str, draft: &CaptureDraft) -> String {
     }
 }
 
-/// The fields `draft` sets, as tokens: priority, due date, labels, waiting
-/// and a status other than inbox.
+/// The fields `draft` sets, as tokens: priority, due date, labels, waiting,
+/// a status other than inbox and the repeat rule.
 fn parsed_fields(draft: &CaptureDraft) -> Vec<String> {
     let mut fields = Vec::new();
     let priority = match draft.priority() {
@@ -279,7 +280,10 @@ fn parsed_fields(draft: &CaptureDraft) -> Vec<String> {
     if let Some(n) = priority {
         fields.push(format!("+{n}"));
     }
-    if let Some(d) = &draft.due_date {
+    // A repeat rule without a ^ date stores its first occurrence as the due
+    // date, so print that.
+    let due = draft.due_date.as_ref().or(draft.recurrence_first.as_ref());
+    if let Some(d) = due {
         fields.push(format!("^{:04}-{:02}-{:02}", d.year, d.month, d.day));
     }
     fields.extend(draft.labels.iter().map(|label| format!("#{label}")));
@@ -296,6 +300,12 @@ fn parsed_fields(draft: &CaptureDraft) -> Vec<String> {
         ItemStatus::Next => fields.push(">next".to_owned()),
         ItemStatus::Someday => fields.push(">someday".to_owned()),
         _ => {}
+    }
+    // A rule this build cannot read is left out rather than misprinted.
+    if let Some(rule) = &draft.recurrence
+        && let Ok(rule) = rule_from_proto("recurrence", rule)
+    {
+        fields.push(rule.token());
     }
     fields
 }

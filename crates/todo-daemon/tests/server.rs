@@ -4,13 +4,14 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::time::Duration;
 
+use jiff::SignedDuration;
 use jiff::tz::TimeZone;
 use prost_types::FieldMask;
 use tempfile::TempDir;
 use todo_core::{MAX_CAPTURE_BYTES, new_ulid};
 use todo_daemon::paths::{Env, Os, Paths};
 use todo_daemon::spool::{self, SpoolEntry};
-use todo_daemon::{Daemon, ShutdownHandle, Started};
+use todo_daemon::{Daemon, DaemonOptions, ShutdownHandle, Started};
 use todo_proto::convert::{date_to_proto, timestamp_to_proto};
 use todo_proto::v1::item_service_client::ItemServiceClient;
 use todo_proto::v1::system_service_client::SystemServiceClient;
@@ -25,8 +26,8 @@ use todo_proto::v1::{
     Priority, RecurrenceRule, RedoRequest, RedoResponse, Relation, RelationKind,
     RemoveRelationRequest, SetRecurrenceRequest, SetStatusRequest, ShutdownRequest, SortKey,
     Status, SubscribeRequest, SubscribeResponse, Topic, UnarchiveItemRequest, UndeleteItemRequest,
-    UndoRequest, UndoResponse, UndoSkip, UndoSkipReason, UpdateItemRequest, View, clause,
-    field_value, mutation, operand, person_ref, subscribe_response::Message,
+    UndoRequest, UndoResponse, UndoSkip, UndoSkipReason, UpdateItemRequest, View, Weekday, clause,
+    field_value, mutation, operand, person_ref, recurrence_rule, subscribe_response::Message,
 };
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -294,65 +295,343 @@ async fn handshake_reports_version_and_api_minor() {
         .into_inner();
     assert_eq!(info.daemon_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(info.api_minor, todo_proto::API_MINOR);
-    assert_eq!(info.api_minor, 7);
+    assert_eq!(info.api_minor, 8);
     d.stop().await;
 }
 
-/// M5 phase 2 stores rules, through a batch and through a capture; the two
-/// recurrence RPCs are wired in phase 3 and answer UNIMPLEMENTED until then.
+fn daily() -> RecurrenceRule {
+    RecurrenceRule {
+        kind: Some(recurrence_rule::Kind::Daily(recurrence_rule::Daily {})),
+    }
+}
+
+fn weekly(days: &[Weekday]) -> RecurrenceRule {
+    let days = days.iter().map(|&d| d as i32).collect();
+    RecurrenceRule {
+        kind: Some(recurrence_rule::Kind::Weekly(recurrence_rule::Weekly {
+            days,
+        })),
+    }
+}
+
+fn monthly(day: u32) -> RecurrenceRule {
+    RecurrenceRule {
+        kind: Some(recurrence_rule::Kind::Monthly(recurrence_rule::Monthly {
+            day,
+        })),
+    }
+}
+
+fn after_completion(days: u32) -> RecurrenceRule {
+    RecurrenceRule {
+        kind: Some(recurrence_rule::Kind::AfterCompletion(
+            recurrence_rule::AfterCompletion { days },
+        )),
+    }
+}
+
+fn recurrence_req(id: &str, rule: Option<RecurrenceRule>) -> SetRecurrenceRequest {
+    SetRecurrenceRequest {
+        request_id: rid(),
+        id: id.to_owned(),
+        rule,
+        expected_revision: None,
+    }
+}
+
+fn today() -> jiff::civil::Date {
+    jiff::Zoned::now().date()
+}
+
+fn day_after(date: jiff::civil::Date, days: i64) -> jiff::civil::Date {
+    date.checked_add(jiff::Span::new().days(days)).unwrap()
+}
+
+/// `Mon Nov 2` as an op summary names the next instance's date.
+fn summary_day(date: jiff::civil::Date) -> String {
+    if date.year() == today().year() {
+        date.strftime("%a %b %-d").to_string()
+    } else {
+        date.strftime("%a %b %-d %Y").to_string()
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn recurrence_is_stored_but_its_own_rpcs_are_not_wired_yet() {
+async fn set_recurrence_sets_replaces_and_clears_a_rule() {
     let d = start().await;
     let mut items = d.items().await;
     let x = capture(&mut items, "water plants").await;
-    let daily = RecurrenceRule {
-        kind: Some(todo_proto::v1::recurrence_rule::Kind::Daily(
-            Default::default(),
-        )),
-    };
     let set = SetRecurrenceRequest {
-        request_id: rid(),
-        id: x.id.clone(),
-        rule: Some(daily.clone()),
-        expected_revision: None,
+        expected_revision: Some(x.revision),
+        ..recurrence_req(&x.id, Some(daily()))
     };
-    let status = items.set_recurrence(set.clone()).await.unwrap_err();
-    error_info(&status, Code::Unimplemented, "NOT_IMPLEMENTED");
-    assert_eq!(status.message(), "SetRecurrence is not implemented yet");
+    let res = items
+        .set_recurrence(set.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    let item = res.item.unwrap();
+    let result = res.result.unwrap();
+    assert_eq!(item.revision, result.revision);
+    let recurrence = item.recurrence.clone().unwrap();
+    assert_eq!(recurrence.rule, Some(daily()));
+    assert!(!recurrence.series_id.is_empty());
+    // Without a due date the first occurrence is today, which becomes it.
+    let on_today = Some(date_to_proto(today()));
+    assert_eq!(recurrence.occurrence_date, on_today);
+    assert_eq!(item.due_date, on_today);
+    let (undo_top, _) = undo_state(&mut items).await;
+    assert_eq!(undo_top, Some(result.op_id.clone()));
 
-    let status = items
-        .parse_recurrence(ParseRecurrenceRequest {
-            text: "@daily".into(),
-            ..Default::default()
+    // A replay returns the original op and writes nothing, though its
+    // expected_revision is stale by now.
+    let replay = items
+        .set_recurrence(set.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(replay.result, Some(result.clone()));
+    assert_eq!(replay.item, Some(item.clone()));
+    let other = capture(&mut items, "other").await;
+    let reused = SetRecurrenceRequest {
+        id: other.id.clone(),
+        ..set.clone()
+    };
+    let status = items.set_recurrence(reused).await.unwrap_err();
+    assert_eq!(violation(&status).0, "request_id");
+
+    // A new rule keeps the series and the due date, and moves the slot.
+    use Weekday::{Monday, Thursday};
+    let res = items
+        .set_recurrence(recurrence_req(&x.id, Some(weekly(&[Thursday, Monday]))))
+        .await
+        .unwrap()
+        .into_inner();
+    let item = res.item.unwrap();
+    let changed = item.recurrence.clone().unwrap();
+    assert_eq!(changed.rule, Some(weekly(&[Monday, Thursday])));
+    assert_eq!(changed.series_id, recurrence.series_id);
+    let slot = (0..7)
+        .map(|n| day_after(today(), n))
+        .find(|d| {
+            use jiff::civil::Weekday as W;
+            matches!(d.weekday(), W::Monday | W::Thursday)
         })
+        .unwrap();
+    assert_eq!(changed.occurrence_date, Some(date_to_proto(slot)));
+    assert_eq!(item.due_date, on_today);
+
+    // A stale expected_revision is refused.
+    let stale = SetRecurrenceRequest {
+        expected_revision: Some(x.revision),
+        ..recurrence_req(&x.id, None)
+    };
+    let status = items.set_recurrence(stale).await.unwrap_err();
+    error_info(&status, Code::Aborted, "REVISION_MISMATCH");
+
+    // No rule clears it; the Item stays, due as it was.
+    let res = items
+        .set_recurrence(recurrence_req(&x.id, None))
+        .await
+        .unwrap()
+        .into_inner();
+    let item = res.item.unwrap();
+    assert_eq!(item.recurrence, None);
+    assert_eq!(item.due_date, on_today);
+    // And an undo brings the rule back.
+    let undone = undo(&mut items).await;
+    assert_eq!(undone.items[0].recurrence, Some(changed));
+    d.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_recurrence_errors_name_the_request_field() {
+    let d = start().await;
+    let mut items = d.items().await;
+    let x = capture(&mut items, "x").await;
+    let bad = |rule: RecurrenceRule| recurrence_req(&x.id, Some(rule));
+    let rows = [
+        (bad(RecurrenceRule { kind: None }), "rule.kind"),
+        (bad(weekly(&[])), "rule.weekly.days"),
+        (bad(weekly(&[Weekday::Unspecified])), "rule.weekly.days"),
+        (
+            bad(RecurrenceRule {
+                kind: Some(recurrence_rule::Kind::Weekly(recurrence_rule::Weekly {
+                    days: vec![99],
+                })),
+            }),
+            "rule.weekly.days",
+        ),
+        (bad(monthly(0)), "rule.monthly.day"),
+        (bad(monthly(32)), "rule.monthly.day"),
+        (bad(after_completion(0)), "rule.after_completion.days"),
+        (bad(after_completion(3651)), "rule.after_completion.days"),
+        (recurrence_req("nope", Some(daily())), "id"),
+        (
+            SetRecurrenceRequest {
+                request_id: "nope".into(),
+                ..recurrence_req(&x.id, Some(daily()))
+            },
+            "request_id",
+        ),
+    ];
+    for (req, field) in rows {
+        let status = items.set_recurrence(req.clone()).await.unwrap_err();
+        assert_eq!(violation(&status).0, field, "{req:?}");
+    }
+    let status = items.set_recurrence(bad(monthly(32))).await.unwrap_err();
+    assert_eq!(violation(&status).1, "the day of the month must be 1 to 31");
+    // In a batch, under the mutation's oneof case.
+    let batch = batch_req(vec![batched(mutation::Kind::SetRecurrence(bad(weekly(
+        &[],
+    ))))]);
+    let status = items.batch_mutate(batch).await.unwrap_err();
+    assert_eq!(
+        violation(&status).0,
+        "mutations[0].set_recurrence.rule.weekly.days"
+    );
+
+    let missing = new_ulid().to_string();
+    let status = items
+        .set_recurrence(recurrence_req(&missing, Some(daily())))
         .await
         .unwrap_err();
-    error_info(&status, Code::Unimplemented, "NOT_IMPLEMENTED");
-    assert_eq!(status.message(), "ParseRecurrence is not implemented yet");
+    assert_eq!(
+        error_info(&status, Code::NotFound, "ITEM_NOT_FOUND")["item_id"],
+        missing
+    );
+    let gone = capture(&mut items, "gone").await;
+    items.delete_item(delete_req(&gone.id)).await.unwrap();
+    let status = items
+        .set_recurrence(recurrence_req(&gone.id, Some(daily())))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error_info(&status, Code::FailedPrecondition, "ITEM_DELETED")["item_id"],
+        gone.id
+    );
 
-    // A batch does set the rule, and completing the Item in a later batch
-    // generates the next instance.
-    let batch = batch_req(vec![batched(mutation::Kind::SetRecurrence(set))]);
-    let out = items.batch_mutate(batch).await.unwrap().into_inner();
-    let rule = out.items[0].recurrence.as_ref().unwrap();
-    assert_eq!(rule.rule, Some(daily));
-    assert!(!rule.series_id.is_empty());
-    let batch = batch_req(vec![batched(mutation::Kind::SetStatus(SetStatusRequest {
-        request_id: String::new(),
-        id: x.id.clone(),
-        status: Status::Done.into(),
-        expected_revision: None,
-    }))]);
-    items.batch_mutate(batch).await.unwrap();
-    assert_eq!(get(&mut items, &x.id).await.status, Status::Done as i32);
-    // The instance is deferred to tomorrow, so only its series names it.
-    let instance = titles(&mut items).await;
-    assert_eq!(instance, [] as [String; 0]);
+    // A done or cancelled Item takes no new rule, but may lose its rule.
+    for closed in [Status::Done, Status::Cancelled] {
+        let y = capture(&mut items, "y").await;
+        items.set_status(status_req(&y.id, closed)).await.unwrap();
+        let status = items
+            .set_recurrence(recurrence_req(&y.id, Some(daily())))
+            .await
+            .unwrap_err();
+        let meta = error_info(&status, Code::FailedPrecondition, "ITEM_CLOSED");
+        assert_eq!(meta["item_id"], y.id);
+        assert_eq!(
+            status.message(),
+            format!("item {} is done or cancelled: reopen it first", y.id)
+        );
+        let batch = batch_req(vec![batched(mutation::Kind::SetRecurrence(
+            recurrence_req(&y.id, Some(daily())),
+        ))]);
+        let status = items.batch_mutate(batch).await.unwrap_err();
+        error_info(&status, Code::FailedPrecondition, "ITEM_CLOSED");
+        assert_eq!(
+            status.message(),
+            format!(
+                "mutations[0].set_recurrence.id: item {} is done or cancelled: reopen it first",
+                y.id
+            )
+        );
+    }
+    let z = capture(&mut items, "z @daily").await;
+    let done = items
+        .set_status(status_req(&z.id, Status::Done))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(done.generated.is_some());
+    let cleared = items
+        .set_recurrence(recurrence_req(&z.id, None))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(cleared.item.unwrap().recurrence, None);
+    d.stop().await;
+}
 
-    // An @ token parses and the capture stores its rule.
+#[tokio::test(flavor = "multi_thread")]
+async fn parse_recurrence_resolves_the_rule_grammar() {
+    let d = start().await;
+    let mut items = d.items().await;
+    // A Monday.
+    let day = jiff::civil::date(2030, 6, 3);
+    let noon = day.at(12, 0, 0, 0).to_zoned(TimeZone::system()).unwrap();
+    let parse = async |items: &mut ItemServiceClient<Channel>,
+                       text: &str,
+                       anchor: Option<jiff::civil::Date>| {
+        let req = ParseRecurrenceRequest {
+            text: text.to_owned(),
+            reference_time: Some(timestamp_to_proto(noon.timestamp())),
+            anchor: anchor.map(date_to_proto),
+        };
+        let res = items.parse_recurrence(req).await.unwrap().into_inner();
+        (res.rule, res.first, res.warning)
+    };
+    let on = |rule: RecurrenceRule, first: Option<jiff::civil::Date>| {
+        (Some(rule), first.map(date_to_proto), String::new())
+    };
+    let not = |warning: &str| (None, None, warning.to_owned());
+    use Weekday::{Friday, Monday, Thursday};
+    let wednesday = jiff::civil::date(2030, 6, 5);
+    let friday = jiff::civil::date(2030, 6, 7);
+    let rows = [
+        ("daily", None, on(daily(), Some(day))),
+        ("@daily", Some(friday), on(daily(), Some(friday))),
+        ("  @DAILY ", None, on(daily(), Some(day))),
+        // The first slot on or after the anchor, else today.
+        (
+            "@mon,thu",
+            Some(wednesday),
+            on(weekly(&[Monday, Thursday]), Some(day_after(wednesday, 1))),
+        ),
+        ("thu,mon", None, on(weekly(&[Monday, Thursday]), Some(day))),
+        // weekly and monthly take the anchor's weekday and day.
+        ("weekly", Some(friday), on(weekly(&[Friday]), Some(friday))),
+        ("weekly", None, on(weekly(&[Monday]), Some(day))),
+        (
+            "monthly",
+            Some(jiff::civil::date(2030, 1, 31)),
+            on(monthly(31), Some(jiff::civil::date(2030, 1, 31))),
+        ),
+        ("monthly", None, on(monthly(3), Some(day))),
+        (
+            "15th",
+            None,
+            on(monthly(15), Some(jiff::civil::date(2030, 6, 15))),
+        ),
+        (
+            "1st",
+            None,
+            on(monthly(1), Some(jiff::civil::date(2030, 7, 1))),
+        ),
+        // After completion: the first is the anchor if any.
+        ("3d", None, on(after_completion(3), None)),
+        ("@2w", Some(friday), on(after_completion(14), Some(friday))),
+        // Warnings, worded as ParseCapture words an @ token.
+        ("home", None, not("home: not a repeat rule")),
+        ("@home", Some(friday), not("@home: not a repeat rule")),
+        ("22th", None, not("22th: write 22nd")),
+        (
+            "0d",
+            None,
+            not("0d: after completion must be 1 to 3650 days"),
+        ),
+        ("mon,xyz", None, not("mon,xyz: xyz is not a weekday")),
+        ("", None, not("empty repeat rule")),
+        ("@", None, not("@: empty repeat rule")),
+    ];
+    for (text, anchor, want) in rows {
+        assert_eq!(parse(&mut items, text, anchor).await, want, "{text:?}");
+    }
+    // The capture grammar says the same of the token.
     let draft = items
         .parse_capture(ParseCaptureRequest {
-            text: "water plants @daily".into(),
+            text: "x @home".into(),
             reference_time: None,
         })
         .await
@@ -360,12 +639,348 @@ async fn recurrence_is_stored_but_its_own_rpcs_are_not_wired_yet() {
         .into_inner()
         .draft
         .unwrap();
-    assert_eq!(draft.title, "water plants");
-    assert!(draft.recurrence.is_some());
+    assert_eq!(draft.warnings, ["@home: not a repeat rule"]);
+
+    let bad_anchor = ParseRecurrenceRequest {
+        text: "daily".into(),
+        reference_time: None,
+        anchor: Some(todo_proto::google::r#type::Date {
+            year: 2030,
+            month: 2,
+            day: 30,
+        }),
+    };
+    let status = items.parse_recurrence(bad_anchor).await.unwrap_err();
+    assert_eq!(violation(&status).0, "anchor");
+    let bad_time = ParseRecurrenceRequest {
+        text: "daily".into(),
+        reference_time: Some(prost_types::Timestamp {
+            seconds: i64::MAX / 2,
+            nanos: 0,
+        }),
+        anchor: None,
+    };
+    let status = items.parse_recurrence(bad_time).await.unwrap_err();
+    assert_eq!(violation(&status).0, "reference_time");
+    let long = ParseRecurrenceRequest {
+        text: "x".repeat(MAX_CAPTURE_BYTES + 1),
+        ..Default::default()
+    };
+    let status = items.parse_recurrence(long).await.unwrap_err();
+    assert_eq!(violation(&status).0, "text");
+    d.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_capture_with_a_repeat_rule_starts_a_series() {
+    let d = start().await;
+    let mut items = d.items().await;
+    let res = items
+        .capture_item(capture_req("feed cat @daily"))
+        .await
+        .unwrap()
+        .into_inner();
+    let item = res.item.unwrap();
+    let draft = res.draft.unwrap();
+    assert_eq!(item.title, "feed cat");
+    assert_eq!(draft.recurrence, Some(daily()));
+    let on_today = Some(date_to_proto(today()));
+    assert_eq!(draft.recurrence_first, on_today);
     assert_eq!(draft.tokens[0].kind, CaptureTokenKind::Recurrence as i32);
-    let y = capture(&mut items, "feed cat @daily").await;
-    assert_eq!(y.title, "feed cat");
-    assert_eq!(y.recurrence.unwrap().rule, draft.recurrence);
+    let recurrence = item.recurrence.unwrap();
+    assert_eq!(recurrence.rule, Some(daily()));
+    assert!(!recurrence.series_id.is_empty());
+    assert_eq!(recurrence.occurrence_date, on_today);
+    assert_eq!(item.due_date, on_today);
+
+    // A ^ date is kept and anchors the rule, in either order.
+    let friday = jiff::civil::date(2031, 1, 3);
+    for text in ["pay @weekly ^2031-01-03", "pay ^2031-01-03 @weekly"] {
+        let item = capture(&mut items, text).await;
+        let recurrence = item.recurrence.unwrap();
+        assert_eq!(recurrence.rule, Some(weekly(&[Weekday::Friday])), "{text}");
+        assert_eq!(recurrence.occurrence_date, Some(date_to_proto(friday)));
+        assert_eq!(item.due_date, Some(date_to_proto(friday)));
+    }
+    d.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn completing_an_instance_returns_and_streams_the_next() {
+    let d = start().await;
+    let mut items = d.items().await;
+    let x = capture(&mut items, "water plants @daily").await;
+    let mut stream = d
+        .subscribe(SubscribeRequest {
+            since_revision: Some(x.revision),
+            topics: vec![],
+        })
+        .await;
+    assert!(matches!(next(&mut stream).await, Message::CaughtUp(_)));
+
+    let req = status_req(&x.id, Status::Done);
+    let res = items.set_status(req.clone()).await.unwrap().into_inner();
+    let done = res.item.unwrap();
+    let result = res.result.unwrap();
+    let generated = res.generated.unwrap();
+    let tomorrow = Some(date_to_proto(day_after(today(), 1)));
+    assert_eq!(done.status, Status::Done as i32);
+    assert_ne!(generated.id, x.id);
+    assert_eq!(generated.title, "water plants");
+    assert_eq!(generated.created_via, CreatedVia::Recurrence as i32);
+    assert_eq!(generated.status, Status::Next as i32);
+    assert_eq!(generated.due_date, tomorrow);
+    assert_eq!(generated.defer_until, tomorrow);
+    let recurrence = generated.recurrence.clone().unwrap();
+    let series = x.recurrence.as_ref().unwrap();
+    assert_eq!(recurrence.series_id, series.series_id);
+    assert_eq!(recurrence.rule, Some(daily()));
+    assert_eq!(recurrence.occurrence_date, tomorrow);
+    // One op: the completed Item, then the new one.
+    assert_eq!(done.revision + 1, generated.revision);
+    assert_eq!(result.revision, generated.revision);
+    let changed = changed_items(&mut stream, 2).await;
+    assert_eq!(changed, [done.clone(), generated.clone()]);
+
+    let state = items
+        .get_undo_state(GetUndoStateRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let entry = state.undo.unwrap();
+    assert_eq!(entry.op_id, result.op_id);
+    assert_eq!(entry.kind, OpKind::SetStatus as i32);
+    assert_eq!(entry.item_ids, [x.id.clone(), generated.id.clone()]);
+    assert_eq!(
+        entry.description,
+        format!(
+            "mark done \"water plants\" · next {}",
+            summary_day(day_after(today(), 1))
+        )
+    );
+
+    // A replay names the same instance and creates no other.
+    let replay = items.set_status(req).await.unwrap().into_inner();
+    assert_eq!(replay.result, Some(result));
+    assert_eq!(replay.generated, Some(generated.clone()));
+    // Completing an Item that does not recur generates nothing.
+    let plain = capture(&mut items, "plain").await;
+    let res = items
+        .set_status(status_req(&plain.id, Status::Done))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(res.generated, None);
+    d.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn batch_mutate_reports_the_generated_instances_in_order() {
+    use mutation::Kind;
+    let d = start().await;
+    let mut items = d.items().await;
+    let a = capture(&mut items, "a @daily").await;
+    let b = capture(&mut items, "b @3d").await;
+    let c = capture(&mut items, "c").await;
+    let req = batch_req(vec![
+        batched(Kind::SetStatus(status_req(&b.id, Status::Done))),
+        batched(Kind::SetStatus(status_req(&c.id, Status::Done))),
+        batched(Kind::SetStatus(status_req(&a.id, Status::Cancelled))),
+    ]);
+    let res = items.batch_mutate(req.clone()).await.unwrap().into_inner();
+    let series = |item: &Item| item.recurrence.as_ref().unwrap().series_id.clone();
+    let generated: Vec<(String, String)> = res
+        .generated
+        .iter()
+        .map(|g| (g.title.clone(), series(g)))
+        .collect();
+    assert_eq!(
+        generated,
+        [("b".to_owned(), series(&b)), ("a".to_owned(), series(&a))]
+    );
+    assert_eq!(
+        res.generated[0].due_date,
+        Some(date_to_proto(day_after(today(), 3)))
+    );
+    let state = items
+        .get_undo_state(GetUndoStateRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    // Done and cancelled are two statuses, so the batch reads as a change.
+    assert_eq!(state.undo.unwrap().description, "change 3 items · 2 next");
+    let replay = items.batch_mutate(req).await.unwrap().into_inner();
+    assert_eq!(replay.generated, res.generated);
+
+    // A bulk SetRecurrence gives each Item its own series.
+    let e = capture(&mut items, "e").await;
+    let f = capture(&mut items, "f").await;
+    let req = batch_req(vec![
+        batched(Kind::SetRecurrence(recurrence_req(&e.id, Some(daily())))),
+        batched(Kind::SetRecurrence(recurrence_req(&f.id, Some(daily())))),
+    ]);
+    let res = items.batch_mutate(req).await.unwrap().into_inner();
+    assert!(res.generated.is_empty());
+    assert_ne!(series(&res.items[0]), series(&res.items[1]));
+    d.stop().await;
+}
+
+async fn start_with(options: DaemonOptions) -> TestDaemon {
+    let home = TempDir::new().unwrap();
+    let paths = paths_for(&home);
+    let Started::Running(daemon) = Daemon::start_with(paths.clone(), options).await.unwrap() else {
+        panic!("lock unexpectedly held");
+    };
+    let shutdown = daemon.shutdown_handle();
+    let task = tokio::spawn(daemon.serve());
+    TestDaemon {
+        home,
+        paths,
+        shutdown,
+        task,
+    }
+}
+
+/// The next change on `stream` to the Item `id`, skipping others.
+async fn next_change_to(stream: &mut Streaming<SubscribeResponse>, id: &str) -> Item {
+    loop {
+        let [item] = &changed_items(stream, 1).await[..] else {
+            unreachable!();
+        };
+        if item.id == id {
+            return item.clone();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_scheduler_archives_done_items_and_a_user_unarchive_sticks() {
+    let d = start_with(DaemonOptions {
+        scheduler_interval: Duration::from_millis(20),
+        archive_done_after: SignedDuration::ZERO,
+        ..DaemonOptions::default()
+    })
+    .await;
+    let mut items = d.items().await;
+    let a = capture(&mut items, "a").await;
+    let open = capture(&mut items, "open").await;
+    let mut stream = d
+        .subscribe(SubscribeRequest {
+            since_revision: Some(open.revision),
+            topics: vec![],
+        })
+        .await;
+    assert!(matches!(next(&mut stream).await, Message::CaughtUp(_)));
+    let done = items
+        .set_status(status_req(&a.id, Status::Done))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(next_change_to(&mut stream, &a.id).await.archived, None);
+    let archived = next_change_to(&mut stream, &a.id).await;
+    let reason = archived.archived.as_ref().unwrap().reason;
+    assert_eq!(reason, ArchiveReason::AutoDone as i32);
+    assert_eq!(archived.status, Status::Done as i32);
+    // A system op: the user's completion is still the top undo entry.
+    let (undo_top, _) = undo_state(&mut items).await;
+    assert_eq!(undo_top, Some(done.result.unwrap().op_id));
+
+    // A z after the close sticks, through many sweeps.
+    let res = items
+        .unarchive_item(unarchive_req(&a.id))
+        .await
+        .unwrap()
+        .into_inner();
+    let unarchived = res.item.unwrap();
+    assert_eq!(unarchived.archived, None);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(get(&mut items, &a.id).await, unarchived);
+    // An open Item is never archived.
+    assert_eq!(get(&mut items, &open.id).await.archived, None);
+
+    // Closing it again restarts the clock.
+    items
+        .set_status(status_req(&a.id, Status::Cancelled))
+        .await
+        .unwrap();
+    loop {
+        let item = next_change_to(&mut stream, &a.id).await;
+        if let Some(archived) = item.archived {
+            assert_eq!(archived.reason, ArchiveReason::AutoDone as i32);
+            assert_eq!(item.status, Status::Cancelled as i32);
+            break;
+        }
+    }
+    d.stop().await;
+}
+
+/// serve() runs the scheduler under its supervisor: it panics twice at
+/// start, and the restarts still archive.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_panicked_scheduler_is_restarted() {
+    let d = start_with(DaemonOptions {
+        scheduler_interval: Duration::from_millis(20),
+        archive_done_after: SignedDuration::ZERO,
+        restart_after: Duration::from_millis(10),
+        scheduler_panics: 2,
+        ..DaemonOptions::default()
+    })
+    .await;
+    let mut items = d.items().await;
+    let a = capture(&mut items, "a").await;
+    let mut stream = d
+        .subscribe(SubscribeRequest {
+            since_revision: Some(a.revision),
+            topics: vec![],
+        })
+        .await;
+    assert!(matches!(next(&mut stream).await, Message::CaughtUp(_)));
+    items
+        .set_status(status_req(&a.id, Status::Done))
+        .await
+        .unwrap();
+    assert_eq!(next_change_to(&mut stream, &a.id).await.archived, None);
+    let archived = next_change_to(&mut stream, &a.id).await;
+    let reason = archived.archived.as_ref().unwrap().reason;
+    assert_eq!(reason, ArchiveReason::AutoDone as i32);
+    d.stop().await;
+}
+
+/// The scheduler is woken by the undo itself: its interval is an hour.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_undone_completion_is_unarchived_at_once() {
+    let d = start_with(DaemonOptions {
+        scheduler_interval: Duration::from_secs(3600),
+        archive_done_after: SignedDuration::ZERO,
+        ..DaemonOptions::default()
+    })
+    .await;
+    let mut items = d.items().await;
+    let a = capture(&mut items, "a").await;
+    let mut stream = d
+        .subscribe(SubscribeRequest {
+            since_revision: Some(a.revision),
+            topics: vec![],
+        })
+        .await;
+    assert!(matches!(next(&mut stream).await, Message::CaughtUp(_)));
+    items
+        .set_status(status_req(&a.id, Status::Done))
+        .await
+        .unwrap();
+    next_change_to(&mut stream, &a.id).await;
+    let archived = next_change_to(&mut stream, &a.id).await;
+    let reason = archived.archived.as_ref().unwrap().reason;
+    assert_eq!(reason, ArchiveReason::AutoDone as i32);
+
+    // The undo reopens it, still archived; the sweep it wakes heals it.
+    let undone = undo(&mut items).await;
+    assert_eq!(undone.items[0].status, Status::Inbox as i32);
+    assert!(undone.items[0].archived.is_some());
+    assert!(next_change_to(&mut stream, &a.id).await.archived.is_some());
+    let healed = next_change_to(&mut stream, &a.id).await;
+    assert_eq!(healed.archived, None);
+    assert_eq!(healed.status, Status::Inbox as i32);
     d.stop().await;
 }
 

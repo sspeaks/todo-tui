@@ -29,5 +29,6 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
 /// stubs; 3 is the first that implements them. 4 added the M3 RPCs as
 /// stubs; 5 is the first that implements them. 6 added the Item's
 /// subtask counts and parent title. 7 added recurrence rules and the M5
-/// RPCs (SetRecurrence, ParseRecurrence) as stubs.
-pub const API_MINOR: u32 = 7;
+/// RPCs (SetRecurrence, ParseRecurrence) as stubs; 8 is the first that
+/// implements them, reports generated instances and runs the scheduler.
+pub const API_MINOR: u32 = 8;

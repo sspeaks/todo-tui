@@ -357,6 +357,44 @@ fn add_prints_the_parsed_fields_and_warnings() {
 }
 
 #[test]
+fn add_prints_the_repeat_rule() {
+    use todo_proto::v1::recurrence_rule::{Kind, Weekly};
+    use todo_proto::v1::{RecurrenceRule, Weekday};
+    let h = Home::new();
+    let out = h.ok(&["add", "water plants @mon,thu"]);
+    // Without a ^ date the first occurrence is printed as the due date.
+    let [line] = captured(&out).try_into().unwrap();
+    let (rest, due) = line.split_once(" ^").unwrap();
+    assert_eq!(rest, "water plants ");
+    let due: jiff::civil::Date = due.strip_suffix(" @mon,thu").unwrap().parse().unwrap();
+    assert!(matches!(
+        due.weekday(),
+        jiff::civil::Weekday::Monday | jiff::civil::Weekday::Thursday
+    ));
+    // The anchor forms print the day they resolved to.
+    let out = h.ok(&["add", "pay rent @monthly ^2026-11-01 +2"]);
+    assert_eq!(captured(&out), ["pay rent  +2 ^2026-11-01 @1st"]);
+    let out = h.ok(&["add", "stretch", "@2w"]);
+    assert_eq!(captured(&out), ["stretch  @2w"]);
+
+    let items = h.items();
+    assert_eq!(titles(&items), ["water plants", "pay rent", "stretch"]);
+    let recurrence = items[0].recurrence.as_ref().unwrap();
+    let days = [Weekday::Monday, Weekday::Thursday].map(i32::from).to_vec();
+    let want = RecurrenceRule {
+        kind: Some(Kind::Weekly(Weekly { days })),
+    };
+    assert_eq!(recurrence.rule, Some(want));
+    // Without a ^ date the first occurrence becomes the due date.
+    assert_eq!(items[0].due_date, recurrence.occurrence_date);
+    let stored = items[0].due_date.unwrap();
+    assert_eq!(
+        (stored.year, stored.month, stored.day),
+        (due.year().into(), due.month().into(), due.day().into())
+    );
+}
+
+#[test]
 fn a_capture_sends_its_id_as_request_and_spool_id() {
     let h = Home::new();
     h.ok(&["add", "once"]);

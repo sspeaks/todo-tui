@@ -21,7 +21,7 @@ let dir: string;
 let socket: string;
 let server: http2.Http2Server;
 /** What GetServerInfo answers with. */
-let serverApiMinor = 7;
+let serverApiMinor = 8;
 /** The client_kind of every GetServerInfo call. */
 const helloKinds: ClientKind[] = [];
 
@@ -34,9 +34,9 @@ beforeAll(async () => {
         service(SystemService, {
           getServerInfo: (req) => {
             helloKinds.push(req.clientKind);
-            if (req.requiredApiMinor > 7) {
+            if (req.requiredApiMinor > 8) {
               throw new ConnectError("too new", Code.FailedPrecondition, undefined, [
-                { desc: ErrorInfoSchema, value: { reason: "API_MINOR", domain: "todo.v1", metadata: { have: "7" } } },
+                { desc: ErrorInfoSchema, value: { reason: "API_MINOR", domain: "todo.v1", metadata: { have: "8" } } },
               ]);
             }
             return { daemonVersion: "node-test", apiMinor: serverApiMinor };
@@ -88,7 +88,7 @@ describe("createTodoTransport over a Unix socket", () => {
     expect((err as ConnectError).code).toBe(Code.FailedPrecondition);
     const [info] = (err as ConnectError).findDetails(ErrorInfoSchema);
     expect(info?.reason).toBe("API_MINOR");
-    expect(info?.metadata.have).toBe("7");
+    expect(info?.metadata.have).toBe("8");
     t.close();
   });
 
@@ -138,7 +138,7 @@ describe("createTodoTransport over a Unix socket", () => {
 
   it("connect() handshakes without spawning when the daemon answers", async () => {
     const conn = await connect({ socketPath: socket, autoSpawn: false });
-    expect(conn.serverInfo.apiMinor).toBe(7);
+    expect(conn.serverInfo.apiMinor).toBe(8);
     conn.close();
   });
 
@@ -181,7 +181,7 @@ describe("createTodoTransport over a Unix socket", () => {
       expect(calls[2]).toEqual(["GetServerInfo"]);
       conn.close();
     } finally {
-      serverApiMinor = 7;
+      serverApiMinor = 8;
       server.off("stream", onStream);
     }
   });

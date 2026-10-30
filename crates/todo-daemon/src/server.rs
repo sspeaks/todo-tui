@@ -7,6 +7,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Context as _;
+use jiff::SignedDuration;
 use todo_proto::v1::item_service_server::ItemServiceServer;
 use todo_proto::v1::system_service_server::SystemServiceServer;
 use todo_proto::v1::view_service_server::ViewServiceServer;
@@ -20,8 +21,10 @@ use crate::ShutdownHandle;
 use crate::client;
 use crate::conn::Clients;
 use crate::paths::Paths;
+use crate::scheduler::{self, Wake};
 use crate::service::{Ctx, item::Items, system::System, view::Views, watch::Watch};
 use crate::spool;
+use crate::supervise::{Backoff, spawn_supervised};
 
 /// How long in-flight work may take once shutdown starts (design 4.2).
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
@@ -32,19 +35,57 @@ pub enum Started {
     AlreadyRunning,
 }
 
+/// How a [`Daemon`] runs its background tasks. Tests shorten them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaemonOptions {
+    /// How often the scheduler sweeps when no user op wakes it (60 s).
+    pub scheduler_interval: Duration,
+    /// How long a done or cancelled Item stays out of Archive before the
+    /// scheduler archives it `auto_done`
+    /// ([`ARCHIVE_DONE_AFTER_DAYS`](crate::ARCHIVE_DONE_AFTER_DAYS) days).
+    pub archive_done_after: SignedDuration,
+    /// How often a running daemon looks at the capture spool (30 s).
+    pub spool_interval: Duration,
+    /// How long a background task that panicked waits before its first
+    /// restart (1 s). The wait doubles after each panic that follows, up
+    /// to 60 s or this, whichever is longer.
+    pub restart_after: Duration,
+    /// Test hook: the scheduler's first this many runs panic at once.
+    #[doc(hidden)]
+    pub scheduler_panics: u32,
+}
+
+impl Default for DaemonOptions {
+    fn default() -> Self {
+        DaemonOptions {
+            scheduler_interval: scheduler::INTERVAL,
+            archive_done_after: scheduler::archive_done_after(),
+            spool_interval: spool::INTERVAL,
+            restart_after: Backoff::default().first,
+            scheduler_panics: 0,
+        }
+    }
+}
+
 /// A daemon that holds the lock and is bound to its socket, ready to serve.
 pub struct Daemon {
     paths: Paths,
     store: Store,
     listener: UnixListener,
     shutdown: ShutdownHandle,
+    options: DaemonOptions,
     _lock: File,
 }
 
 impl Daemon {
+    /// [`Daemon::start_with`] the default options.
+    pub async fn start(paths: Paths) -> anyhow::Result<Started> {
+        Daemon::start_with(paths, DaemonOptions::default()).await
+    }
+
     /// Takes the single-daemon lock (D6/D7), records the pid in it, opens the
     /// store and binds the socket (mode 0600). Must run inside a tokio runtime.
-    pub async fn start(paths: Paths) -> anyhow::Result<Started> {
+    pub async fn start_with(paths: Paths, options: DaemonOptions) -> anyhow::Result<Started> {
         create_dir(&paths.data)?;
         create_dir(&paths.logs)?;
         create_runtime_dir(&paths.runtime)?;
@@ -87,6 +128,7 @@ impl Daemon {
             store,
             listener,
             shutdown: ShutdownHandle::new(),
+            options,
             _lock: lock,
         })))
     }
@@ -106,29 +148,62 @@ impl Daemon {
     /// Imports the capture spool (design 2.1), then serves until shutdown is
     /// triggered (by a handle or the `Shutdown` RPC), then drains for up to
     /// 10s, removes the socket and releases the lock. Meanwhile imports the
-    /// spool again whenever it fills. The spooled captures are undo stack
-    /// entries, so they are imported before any call is served: the first
-    /// Undo finds them on the stack, and none lands on top of a later op.
+    /// spool again whenever it fills, and runs the scheduler. The spooled
+    /// captures are undo stack entries, so they are imported before any call
+    /// is served: the first Undo finds them on the stack, and none lands on
+    /// top of a later op. Both background tasks are restarted if they panic.
     pub async fn serve(self) -> anyhow::Result<()> {
         let Daemon {
             paths,
             store,
             listener,
             shutdown,
+            options,
             _lock,
         } = self;
         let clients = Clients::default();
         spool::import_logged(&paths, &store).await;
-        let spool = tokio::spawn(spool::run(
-            paths.clone(),
-            store.clone(),
-            shutdown.signal(),
-            spool::INTERVAL,
-        ));
+        let backoff = Backoff {
+            first: options.restart_after,
+            max: options.restart_after.max(Backoff::default().max),
+            ..Backoff::default()
+        };
+        let spool = {
+            let (paths, store, stop) = (paths.clone(), store.clone(), shutdown.signal());
+            spawn_supervised("spool", shutdown.signal(), backoff, move || {
+                spool::run(
+                    paths.clone(),
+                    store.clone(),
+                    stop.clone(),
+                    options.spool_interval,
+                )
+            })
+        };
+        let wake = Wake::default();
+        let scheduler = {
+            let (store, wake, stop) = (store.clone(), wake.clone(), shutdown.signal());
+            let mut panics = options.scheduler_panics;
+            spawn_supervised("scheduler", shutdown.signal(), backoff, move || {
+                let panic = panics > 0;
+                panics = panics.saturating_sub(1);
+                let run = scheduler::run(
+                    store.clone(),
+                    wake.clone(),
+                    stop.clone(),
+                    options.scheduler_interval,
+                    options.archive_done_after,
+                );
+                async move {
+                    assert!(!panic, "scheduler_panics test hook");
+                    run.await;
+                }
+            })
+        };
         let ctx = Ctx {
             store,
             clients: clients.clone(),
             shutdown: shutdown.clone(),
+            wake,
         };
 
         let incoming = async_stream::stream! {
@@ -162,10 +237,17 @@ impl Daemon {
                 Ok(())
             }
         };
+        // Both tasks have seen the shutdown and end at their next pause.
         // An interrupted import is safe: what it captured is recorded by
-        // spool id, and the spool is only truncated once it completes.
-        spool.abort();
-        let _ = spool.await;
+        // spool id, and the spool is only truncated once it completes. An
+        // interrupted sweep is too: each of its ops commits or not at all.
+        // Each abort returns once its task, and the Store clone it holds,
+        // has been dropped, so the last clone (dropped here) joins the
+        // writer thread before the lock is released: a daemon that takes
+        // the lock next sees every commit.
+        for task in [spool, scheduler] {
+            task.abort().await;
+        }
         let _ = fs::remove_file(&paths.socket);
         tracing::info!("daemon stopped");
         result

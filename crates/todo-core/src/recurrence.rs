@@ -159,6 +159,26 @@ impl Rule {
     pub fn is_fixed(&self) -> bool {
         !matches!(self, Rule::AfterCompletion { .. })
     }
+
+    /// The rule as an `@` token that [`parse_rule`] reads back as this rule,
+    /// for `todo add` and the repeat prompt's prefill: `@daily`, `@weekdays`
+    /// (Monday to Friday exactly), `@mon,thu` (three-letter names, Monday
+    /// first), `@15th`, and `@2w` for a whole number of weeks after
+    /// completion, else `@3d`. A resolved `@weekly` or `@monthly` shows its
+    /// day, since the rule no longer knows it came from the anchor.
+    pub fn token(&self) -> String {
+        match self {
+            Rule::Daily => "@daily".to_owned(),
+            Rule::Weekly { days } if days[..] == WEEKDAYS => "@weekdays".to_owned(),
+            Rule::Weekly { days } => {
+                let names: Vec<&str> = days.iter().map(|d| &d.name()[..MIN_PREFIX]).collect();
+                format!("@{}", names.join(","))
+            }
+            Rule::Monthly { day } => format!("@{day}{}", ordinal_suffix((*day).into())),
+            Rule::AfterCompletion { days } if days % 7 == 0 => format!("@{}w", days / 7),
+            Rule::AfterCompletion { days } => format!("@{days}d"),
+        }
+    }
 }
 
 /// A parsed rule before its anchor is known: `@weekly` and `@monthly` take
@@ -654,6 +674,62 @@ mod tests {
             all,
             r#"["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]"#
         );
+    }
+
+    #[test]
+    fn token_reads_back_as_the_rule() {
+        let rows: &[(Rule, &str)] = &[
+            (Rule::Daily, "@daily"),
+            (
+                weekly(&[Monday, Tuesday, Wednesday, Thursday, Friday]),
+                "@weekdays",
+            ),
+            (weekly(&[Monday, Thursday]), "@mon,thu"),
+            (weekly(&[Thursday]), "@thu"),
+            (weekly(&[Friday, Saturday, Sunday]), "@fri,sat,sun"),
+            (
+                weekly(&[Monday, Tuesday, Wednesday, Thursday, Friday, Saturday]),
+                "@mon,tue,wed,thu,fri,sat",
+            ),
+            (weekly(&Weekday::ALL), "@mon,tue,wed,thu,fri,sat,sun"),
+            (Rule::Monthly { day: 1 }, "@1st"),
+            (Rule::Monthly { day: 2 }, "@2nd"),
+            (Rule::Monthly { day: 3 }, "@3rd"),
+            (Rule::Monthly { day: 11 }, "@11th"),
+            (Rule::Monthly { day: 15 }, "@15th"),
+            (Rule::Monthly { day: 22 }, "@22nd"),
+            (Rule::Monthly { day: 31 }, "@31st"),
+            (Rule::AfterCompletion { days: 1 }, "@1d"),
+            (Rule::AfterCompletion { days: 3 }, "@3d"),
+            (Rule::AfterCompletion { days: 7 }, "@1w"),
+            (Rule::AfterCompletion { days: 14 }, "@2w"),
+            (Rule::AfterCompletion { days: 15 }, "@15d"),
+            (Rule::AfterCompletion { days: 3647 }, "@521w"),
+            (Rule::AfterCompletion { days: 3650 }, "@3650d"),
+        ];
+        for (want, token) in rows {
+            assert_eq!(want.token(), *token, "{want:?}");
+            assert_eq!(&rule(token), want, "{token}");
+        }
+        // Every rule of every kind reads back.
+        let mut every = vec![Rule::Daily];
+        every.extend((1..=31).map(|day| Rule::Monthly { day }));
+        every.extend((1..=MAX_AFTER_DAYS).map(|days| Rule::AfterCompletion { days }));
+        every.extend((1..128u8).map(|mask| {
+            let days = Weekday::ALL
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, d)| d);
+            Rule::weekly(days).unwrap()
+        }));
+        for want in every {
+            assert_eq!(rule(&want.token()), want, "{}", want.token());
+        }
+        // The anchor forms show what they resolved to.
+        let friday = date(2026, 10, 23);
+        assert_eq!(resolve(&ok("@weekly"), friday).token(), "@fri");
+        assert_eq!(resolve(&ok("@monthly"), friday).token(), "@23rd");
     }
 
     #[test]

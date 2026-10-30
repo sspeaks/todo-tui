@@ -27,4 +27,9 @@ impl ShutdownSignal {
         // An Err means every handle is gone, which also means shutdown.
         let _ = self.0.wait_for(|&stop| stop).await;
     }
+
+    /// Whether shutdown has been triggered, without waiting.
+    pub(crate) fn is_triggered(&self) -> bool {
+        *self.0.borrow() || self.0.has_changed().is_err()
+    }
 }

@@ -5,8 +5,9 @@ use todo_core::{
     Actor, CreatedVia, ItemId, MAX_CAPTURE_BYTES, Mutation, parse_capture, parse_date,
 };
 use todo_proto::convert::{
-    ConvertError, EnumField, date_to_proto, filter_from_proto, sort_from_proto,
-    timestamp_from_proto, timestamp_to_proto, undo_skip_to_proto,
+    ConvertError, EnumField, date_from_proto, date_to_proto, filter_from_proto,
+    parse_recurrence_response, sort_from_proto, timestamp_from_proto, timestamp_to_proto,
+    undo_skip_to_proto,
 };
 use todo_proto::request;
 use todo_proto::v1::item_service_server::ItemService;
@@ -29,7 +30,7 @@ use todo_store::{
 use tonic::{Request, Response, Status};
 use ulid::Ulid;
 
-use super::{Ctx, not_implemented};
+use super::Ctx;
 use crate::error::{self, Shape};
 
 /// The most mutations one `BatchMutate` may carry.
@@ -95,6 +96,7 @@ impl ItemService for Items {
             .capture(input)
             .await
             .map_err(|e| error::mutation(e, &Shape::Capture, &[]))?;
+        self.0.wake.poke();
         // A replay returns the Item the original request created at its
         // reference time, so the draft is the text as parsed then.
         let created = item.created_at.to_zoned(now.time_zone().clone()).date();
@@ -177,7 +179,7 @@ impl ItemService for Items {
         request: Request<UpdateItemRequest>,
     ) -> Result<Response<UpdateItemResponse>, Status> {
         let req = request.into_inner();
-        let (item, result) = self
+        let (item, result, _) = self
             .single(&req.request_id, OpKind::Update, Shape::Update, |today| {
                 request::update_item_from_proto(&req, today)
             })
@@ -190,32 +192,51 @@ impl ItemService for Items {
         request: Request<SetStatusRequest>,
     ) -> Result<Response<SetStatusResponse>, Status> {
         let req = request.into_inner();
-        let (item, result) = self
+        let (item, result, generated) = self
             .single(&req.request_id, OpKind::SetStatus, Shape::SetStatus, |_| {
                 request::set_status_from_proto(&req)
             })
             .await?;
-        // The store generates the next instance of a series this completed
-        // (design 3.8); reporting it waits for M5 phase 3.
+        // Closing an instance creates at most one next instance (design 3.8).
         Ok(Response::new(SetStatusResponse {
             item,
             result,
-            generated: None,
+            generated: generated.into_iter().next(),
         }))
     }
 
     async fn set_recurrence(
         &self,
-        _request: Request<SetRecurrenceRequest>,
+        request: Request<SetRecurrenceRequest>,
     ) -> Result<Response<SetRecurrenceResponse>, Status> {
-        Err(not_implemented("SetRecurrence"))
+        let req = request.into_inner();
+        let (item, result, _) = self
+            .single(
+                &req.request_id,
+                OpKind::SetRecurrence,
+                Shape::SetRecurrence,
+                |today| request::set_recurrence_from_proto(&req, today),
+            )
+            .await?;
+        Ok(Response::new(SetRecurrenceResponse { item, result }))
     }
 
     async fn parse_recurrence(
         &self,
-        _request: Request<ParseRecurrenceRequest>,
+        request: Request<ParseRecurrenceRequest>,
     ) -> Result<Response<ParseRecurrenceResponse>, Status> {
-        Err(not_implemented("ParseRecurrence"))
+        let req = request.into_inner();
+        check_capture_length(&req.text)?;
+        let today = reference_time(req.reference_time.as_ref(), &Zoned::now())?.date();
+        let anchor = req
+            .anchor
+            .as_ref()
+            .map(|d| date_from_proto("anchor", d))
+            .transpose()
+            .map_err(error::convert)?;
+        Ok(Response::new(parse_recurrence_response(
+            &req.text, anchor, today,
+        )))
     }
 
     async fn archive_item(
@@ -223,7 +244,7 @@ impl ItemService for Items {
         request: Request<ArchiveItemRequest>,
     ) -> Result<Response<ArchiveItemResponse>, Status> {
         let req = request.into_inner();
-        let (item, result) = self
+        let (item, result, _) = self
             .single(&req.request_id, OpKind::Archive, Shape::ItemOp, |_| {
                 request::archive_item_from_proto(&req)
             })
@@ -236,7 +257,7 @@ impl ItemService for Items {
         request: Request<UnarchiveItemRequest>,
     ) -> Result<Response<UnarchiveItemResponse>, Status> {
         let req = request.into_inner();
-        let (item, result) = self
+        let (item, result, _) = self
             .single(&req.request_id, OpKind::Unarchive, Shape::ItemOp, |_| {
                 request::unarchive_item_from_proto(&req)
             })
@@ -249,7 +270,7 @@ impl ItemService for Items {
         request: Request<DeleteItemRequest>,
     ) -> Result<Response<DeleteItemResponse>, Status> {
         let req = request.into_inner();
-        let (item, result) = self
+        let (item, result, _) = self
             .single(&req.request_id, OpKind::Delete, Shape::ItemOp, |_| {
                 request::delete_item_from_proto(&req)
             })
@@ -262,7 +283,7 @@ impl ItemService for Items {
         request: Request<UndeleteItemRequest>,
     ) -> Result<Response<UndeleteItemResponse>, Status> {
         let req = request.into_inner();
-        let (item, result) = self
+        let (item, result, _) = self
             .single(&req.request_id, OpKind::Undelete, Shape::ItemOp, |_| {
                 request::undelete_item_from_proto(&req)
             })
@@ -297,11 +318,10 @@ impl ItemService for Items {
         let out = self
             .mutate(&request_id, OpKind::Batch, mutations, &now, &shape)
             .await?;
-        // As in `set_status`: the store generates, phase 3 reports it.
         Ok(Response::new(BatchMutateResponse {
             items: out.items.into_iter().map(v1::Item::from).collect(),
             result: Some(out.result.into()),
-            generated: Vec::new(),
+            generated: out.generated.into_iter().map(v1::Item::from).collect(),
         }))
     }
 
@@ -450,6 +470,10 @@ impl ItemService for Items {
     }
 }
 
+/// What a single-item RPC answers: the Item, the op, and the Items the op
+/// generated.
+type Single = (Option<v1::Item>, Option<v1::MutationResult>, Vec<v1::Item>);
+
 /// The fields `UndoResponse` and `RedoResponse` share.
 struct Undone {
     result: Option<v1::MutationResult>,
@@ -467,7 +491,7 @@ impl Items {
         kind: OpKind,
         shape: Shape<'static>,
         convert: impl FnOnce(Date) -> Result<Mutation, ConvertError>,
-    ) -> Result<(Option<v1::Item>, Option<v1::MutationResult>), Status> {
+    ) -> Result<Single, Status> {
         let request_id = check_request_id(request_id)?;
         let now = Zoned::now();
         let mutation = convert(now.date()).map_err(error::convert)?;
@@ -475,7 +499,8 @@ impl Items {
             .mutate(&request_id, kind, vec![mutation], &now, &shape)
             .await?;
         let item = out.items.into_iter().next().map(v1::Item::from);
-        Ok((item, Some(out.result.into())))
+        let generated = out.generated.into_iter().map(v1::Item::from).collect();
+        Ok((item, Some(out.result.into()), generated))
     }
 
     /// `Undo`, or `Redo` when `redo`, by the user now.
@@ -506,6 +531,9 @@ impl Items {
             store.undo(input).await
         }
         .map_err(error::store)?;
+        // Undoing a completion reopens an Item the scheduler may have
+        // archived, which it unarchives.
+        self.0.wake.poke();
         Ok(Undone {
             result: Some(out.result.into()),
             entry: out.entry.map(op_summary),
@@ -574,7 +602,9 @@ impl Items {
             }
             other => other,
         };
-        out.map_err(|e| error::mutation(e, &Shape::Relation(asked), &[]))
+        let out = out.map_err(|e| error::mutation(e, &Shape::Relation(asked), &[]))?;
+        self.0.wake.poke();
+        Ok(out)
     }
 
     /// What makes `id` unfit as a relation end, for an add (`add`) or a
@@ -593,8 +623,9 @@ impl Items {
         }
     }
 
-    /// Runs `mutations` as one op by the user at `now`; store errors name
-    /// the request fields laid out by `shape`.
+    /// Runs `mutations` as one op by the user at `now`, then wakes the
+    /// scheduler, which may have Items to archive or unarchive; store errors
+    /// name the request fields laid out by `shape`.
     async fn mutate(
         &self,
         request_id: &str,
@@ -612,11 +643,14 @@ impl Items {
             now: now.timestamp(),
             today: now.date(),
         };
-        self.0
+        let out = self
+            .0
             .store
             .mutate(input)
             .await
-            .map_err(|e| error::mutation(e, shape, &ids))
+            .map_err(|e| error::mutation(e, shape, &ids))?;
+        self.0.wake.poke();
+        Ok(out)
     }
 }
 

@@ -5,10 +5,13 @@ mod conn;
 mod error;
 mod logging;
 pub mod paths;
+mod scheduler;
 mod server;
 mod service;
 mod shutdown;
 pub mod spool;
+mod supervise;
 
-pub use server::{Daemon, Exit, Started, run};
+pub use scheduler::ARCHIVE_DONE_AFTER_DAYS;
+pub use server::{Daemon, DaemonOptions, Exit, Started, run};
 pub use shutdown::ShutdownHandle;
