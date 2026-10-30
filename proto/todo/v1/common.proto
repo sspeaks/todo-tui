@@ -29,6 +29,8 @@ enum Topic {
   TOPIC_SUGGESTION = 2;
   TOPIC_VIEW = 3;
   TOPIC_PERSON = 4;
+  // Unused: recurrence lives on the Item (ADR-0003), so series changes
+  // arrive on TOPIC_ITEM.
   TOPIC_SERIES = 5;
   TOPIC_REVIEW = 6;
   TOPIC_CONFIG = 7;

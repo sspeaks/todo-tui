@@ -13,7 +13,7 @@ use todo_core as core;
 use crate::convert::{
     ConvertError, EnumField, Result, date_from_proto, date_to_proto, duration_from_proto,
     iso_week_from_proto, item_field_from_path, item_field_path, parse_id, person_from_proto,
-    require,
+    require, rule_from_proto,
 };
 use crate::google::r#type as gtype;
 use crate::v1;
@@ -188,8 +188,10 @@ pub fn set_status_from_proto(req: &v1::SetStatusRequest) -> Result<core::Mutatio
     })
 }
 
+/// Archives by the user.
 pub fn archive_item_from_proto(req: &v1::ArchiveItemRequest) -> Result<core::Mutation> {
-    item_op(&req.id, req.expected_revision, core::MutationOp::Archive)
+    let op = core::MutationOp::Archive(core::ArchiveReason::User);
+    item_op(&req.id, req.expected_revision, op)
 }
 
 pub fn unarchive_item_from_proto(req: &v1::UnarchiveItemRequest) -> Result<core::Mutation> {
@@ -202,6 +204,31 @@ pub fn delete_item_from_proto(req: &v1::DeleteItemRequest) -> Result<core::Mutat
 
 pub fn undelete_item_from_proto(req: &v1::UndeleteItemRequest) -> Result<core::Mutation> {
     item_op(&req.id, req.expected_revision, core::MutationOp::Undelete)
+}
+
+/// `today` places a fixed rule's first occurrence on an Item without a due
+/// date. Each call names a fresh series, which the Item takes only if it
+/// does not recur yet, so every Item of a batch gets its own. Errors in the
+/// rule are at `rule.<oneof case>`.
+pub fn set_recurrence_from_proto(
+    req: &v1::SetRecurrenceRequest,
+    today: Date,
+) -> Result<core::Mutation> {
+    let id = parse_id("id", &req.id)?;
+    let rule = req
+        .rule
+        .as_ref()
+        .map(|rule| rule_from_proto("rule", rule))
+        .transpose()?;
+    Ok(core::Mutation {
+        id,
+        expected_revision: req.expected_revision,
+        op: core::MutationOp::SetRecurrence {
+            rule,
+            series_id: core::new_ulid(),
+            today,
+        },
+    })
 }
 
 fn item_op(
@@ -252,6 +279,11 @@ pub fn mutation_from_proto(m: &v1::Mutation, today: Date) -> Result<core::Mutati
         ),
         Kind::DeleteItem(r) => ("delete_item", &r.request_id, delete_item_from_proto(r)),
         Kind::UndeleteItem(r) => ("undelete_item", &r.request_id, undelete_item_from_proto(r)),
+        Kind::SetRecurrence(r) => (
+            "set_recurrence",
+            &r.request_id,
+            set_recurrence_from_proto(r, today),
+        ),
     };
     if !request_id.is_empty() {
         let reason = "must be empty in a batch: the batch's request_id covers it";
@@ -468,6 +500,7 @@ mod tests {
             recurrence: Some(v1::ItemRecurrence {
                 series_id: "nope".into(),
                 occurrence_date: None,
+                rule: Some(v1::RecurrenceRule::default()),
             }),
             staleness: Some(v1::StalenessSignals {
                 waiting_since: Some(prost_types::Timestamp {
@@ -953,7 +986,7 @@ mod tests {
                         expected_revision,
                     })
                 },
-                MutationOp::Archive,
+                MutationOp::Archive(core::ArchiveReason::User),
             ),
             (
                 |id, expected_revision| {
@@ -1039,7 +1072,7 @@ mod tests {
                     id: item_id(),
                     expected_revision: rev,
                 }),
-                MutationOp::Archive,
+                MutationOp::Archive(core::ArchiveReason::User),
             ),
             (
                 "unarchive_item",
@@ -1068,7 +1101,32 @@ mod tests {
                 }),
                 MutationOp::Undelete,
             ),
+            (
+                "set_recurrence",
+                Kind::SetRecurrence(v1::SetRecurrenceRequest {
+                    request_id: String::new(),
+                    id: item_id(),
+                    rule: Some((&core::Rule::Daily).into()),
+                    expected_revision: rev,
+                }),
+                MutationOp::SetRecurrence {
+                    rule: Some(core::Rule::Daily),
+                    series_id: SERIES,
+                    today: TODAY,
+                },
+            ),
         ]
+    }
+
+    /// The series [`batch`] expects: each conversion names a fresh one.
+    const SERIES: Ulid = Ulid::from_parts(0, 7);
+
+    /// `m` with its fresh series replaced by [`SERIES`].
+    fn fixed_series(mut m: core::Mutation) -> core::Mutation {
+        if let MutationOp::SetRecurrence { series_id, .. } = &mut m.op {
+            *series_id = SERIES;
+        }
+        m
     }
 
     /// The nested request_id and Item id of a mutation.
@@ -1080,6 +1138,7 @@ mod tests {
             Kind::UnarchiveItem(r) => (&mut r.request_id, &mut r.id),
             Kind::DeleteItem(r) => (&mut r.request_id, &mut r.id),
             Kind::UndeleteItem(r) => (&mut r.request_id, &mut r.id),
+            Kind::SetRecurrence(r) => (&mut r.request_id, &mut r.id),
         }
     }
 
@@ -1088,7 +1147,7 @@ mod tests {
         let convert = |kind: Kind| mutation_from_proto(&v1::Mutation { kind: Some(kind) }, TODAY);
         for (case, kind, op) in batch() {
             assert_eq!(
-                convert(kind.clone()),
+                convert(kind.clone()).map(fixed_series),
                 Ok(core::Mutation {
                     id: id(1),
                     expected_revision: Some(3),
@@ -1117,6 +1176,66 @@ mod tests {
         assert_eq!(
             mutation_from_proto(&v1::Mutation { kind: None }, TODAY),
             Err(ConvertError::Missing("kind".into()))
+        );
+        // One case of each.
+        let pool = prost_reflect::DescriptorPool::decode(crate::FILE_DESCRIPTOR_SET).unwrap();
+        let desc = pool.get_message_by_name("todo.v1.Mutation").unwrap();
+        let oneof = desc.oneofs().next().unwrap();
+        let cases: Vec<String> = oneof.fields().map(|f| f.name().to_owned()).collect();
+        let named: Vec<&str> = batch().iter().map(|(case, ..)| *case).collect();
+        assert_eq!(cases, named);
+    }
+
+    #[test]
+    fn set_recurrence_requests() {
+        let req = |id: &str, rule: Option<v1::RecurrenceRule>| v1::SetRecurrenceRequest {
+            request_id: String::new(),
+            id: id.to_owned(),
+            rule,
+            expected_revision: Some(4),
+        };
+        let good = id(1).to_string();
+        let monthly = core::Rule::Monthly { day: 15 };
+        for rule in [None, Some(monthly)] {
+            let got = set_recurrence_from_proto(&req(&good, rule.as_ref().map(Into::into)), TODAY);
+            assert_eq!(
+                got.map(fixed_series),
+                Ok(core::Mutation {
+                    id: id(1),
+                    expected_revision: Some(4),
+                    op: MutationOp::SetRecurrence {
+                        rule,
+                        series_id: SERIES,
+                        today: TODAY,
+                    },
+                })
+            );
+        }
+        // Each conversion names its own series, so every Item of a batch
+        // that starts one gets its own.
+        let series = || match set_recurrence_from_proto(&req(&good, None), TODAY)
+            .unwrap()
+            .op
+        {
+            MutationOp::SetRecurrence { series_id, .. } => series_id,
+            other => panic!("{other:?}"),
+        };
+        assert_ne!(series(), series());
+        assert_eq!(
+            set_recurrence_from_proto(&req("nope", None), TODAY),
+            Err(ConvertError::InvalidId("id".into(), "nope".into()))
+        );
+        let empty = v1::RecurrenceRule::default();
+        assert_eq!(
+            set_recurrence_from_proto(&req(&good, Some(empty.clone())), TODAY),
+            Err(ConvertError::Missing("rule.kind".into()))
+        );
+        let m = v1::Mutation {
+            kind: Some(Kind::SetRecurrence(req(&good, Some(empty)))),
+        };
+        assert_eq!(
+            mutation_from_proto(&m, TODAY),
+            Err(ConvertError::Missing("set_recurrence.rule.kind".into()))
         );
     }
 

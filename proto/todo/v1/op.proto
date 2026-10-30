@@ -22,6 +22,10 @@ enum OpKind {
   OP_KIND_REDO = 10;
   OP_KIND_ADD_RELATION = 11;
   OP_KIND_REMOVE_RELATION = 12;
+  OP_KIND_SET_RECURRENCE = 13;
+  // The daemon's scheduler archiving done and cancelled Items (design 3.7).
+  // Never an undo stack entry.
+  OP_KIND_AUTO_ARCHIVE = 14;
 }
 
 // An entry of the undo stack (design 3.10).

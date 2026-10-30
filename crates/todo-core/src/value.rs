@@ -280,6 +280,7 @@ mod tests {
         overlay.recurrence = Some(ItemRecurrence {
             series_id: id(5),
             occurrence_date: Some(date(2026, 10, 21)),
+            rule: Some(crate::recurrence::Rule::Daily),
         });
         item.remote_extras
             .insert("customfield_1".into(), json!({"x": 1}));
@@ -533,6 +534,9 @@ mod tests {
             FieldValue::Recurrence(ItemRecurrence {
                 series_id: id(5),
                 occurrence_date: None,
+                rule: Some(crate::recurrence::Rule::Weekly {
+                    days: vec![crate::recurrence::Weekday::Monday],
+                }),
             }),
             FieldValue::RemoteLink(item.remote_link.clone().unwrap()),
             FieldValue::Staleness(StalenessSignals {

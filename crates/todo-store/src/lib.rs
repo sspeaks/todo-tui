@@ -207,6 +207,10 @@ pub enum OpKind {
     Redo,
     AddRelation,
     RemoveRelation,
+    /// `SetRecurrence`; not recorded yet (M5 phase 2).
+    SetRecurrence,
+    /// The scheduler's archive of done Items; not recorded yet (M5 phase 2).
+    AutoArchive,
 }
 
 impl OpKind {
@@ -1711,11 +1715,15 @@ fn mutate_tx(tx: &mut WriteTx<'_>, input: MutateInput) -> Result<MutateOutput> {
         .map(|(m, &slot)| {
             let action = match m.op {
                 MutationOp::SetStatus(status) => Action::SetStatus(status),
-                MutationOp::Archive => Action::Archive,
+                MutationOp::Archive(_) => Action::Archive,
                 MutationOp::Unarchive => Action::Unarchive,
                 MutationOp::Delete => Action::Delete,
                 MutationOp::Undelete => Action::Undelete,
-                MutationOp::Update(_) | MutationOp::Restore(_) => Action::Edit,
+                // SetRecurrence gets its own wording with its RPC (M5 phase
+                // 2); the daemon does not send it yet.
+                MutationOp::Update(_)
+                | MutationOp::SetRecurrence { .. }
+                | MutationOp::Restore(_) => Action::Edit,
             };
             (action, m.id, batch.items[slot].core.title.as_str())
         })

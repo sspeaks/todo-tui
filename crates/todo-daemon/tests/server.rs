@@ -21,11 +21,12 @@ use todo_proto::v1::{
     CaptureTokenKind, Clause, ClauseGroup, ClientKind, CreatedVia, DeleteItemRequest, FieldValue,
     Filter, GetItemRequest, GetServerInfoRequest, GetStatusCountsRequest, GetUndoStateRequest,
     Item, ItemField, ListItemsRequest, ListViewsRequest, Mutation, MutationResult, OpKind, Operand,
-    Operator, ParseCaptureRequest, ParseDateRequest, PersonRef, Predicate, Priority, RedoRequest,
-    RedoResponse, Relation, RelationKind, RemoveRelationRequest, SetStatusRequest, ShutdownRequest,
-    SortKey, Status, SubscribeRequest, SubscribeResponse, Topic, UnarchiveItemRequest,
-    UndeleteItemRequest, UndoRequest, UndoResponse, UndoSkip, UndoSkipReason, UpdateItemRequest,
-    View, clause, field_value, mutation, operand, person_ref, subscribe_response::Message,
+    Operator, ParseCaptureRequest, ParseDateRequest, ParseRecurrenceRequest, PersonRef, Predicate,
+    Priority, RecurrenceRule, RedoRequest, RedoResponse, Relation, RelationKind,
+    RemoveRelationRequest, SetRecurrenceRequest, SetStatusRequest, ShutdownRequest, SortKey,
+    Status, SubscribeRequest, SubscribeResponse, Topic, UnarchiveItemRequest, UndeleteItemRequest,
+    UndoRequest, UndoResponse, UndoSkip, UndoSkipReason, UpdateItemRequest, View, clause,
+    field_value, mutation, operand, person_ref, subscribe_response::Message,
 };
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -221,6 +222,7 @@ fn batched(mut kind: mutation::Kind) -> Mutation {
         Kind::UnarchiveItem(r) => &mut r.request_id,
         Kind::DeleteItem(r) => &mut r.request_id,
         Kind::UndeleteItem(r) => &mut r.request_id,
+        Kind::SetRecurrence(r) => &mut r.request_id,
     };
     request_id.clear();
     Mutation { kind: Some(kind) }
@@ -292,7 +294,73 @@ async fn handshake_reports_version_and_api_minor() {
         .into_inner();
     assert_eq!(info.daemon_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(info.api_minor, todo_proto::API_MINOR);
-    assert_eq!(info.api_minor, 6);
+    assert_eq!(info.api_minor, 7);
+    d.stop().await;
+}
+
+/// M5 phase 1 serves the recurrence contract as stubs: the store cannot
+/// keep a rule yet.
+#[tokio::test(flavor = "multi_thread")]
+async fn recurrence_rpcs_are_unimplemented_for_now() {
+    let d = start().await;
+    let mut items = d.items().await;
+    let x = capture(&mut items, "water plants").await;
+    let daily = RecurrenceRule {
+        kind: Some(todo_proto::v1::recurrence_rule::Kind::Daily(
+            Default::default(),
+        )),
+    };
+    let set = SetRecurrenceRequest {
+        request_id: rid(),
+        id: x.id.clone(),
+        rule: Some(daily),
+        expected_revision: None,
+    };
+    let status = items.set_recurrence(set.clone()).await.unwrap_err();
+    error_info(&status, Code::Unimplemented, "NOT_IMPLEMENTED");
+    assert_eq!(status.message(), "SetRecurrence is not implemented yet");
+
+    let status = items
+        .parse_recurrence(ParseRecurrenceRequest {
+            text: "@daily".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    error_info(&status, Code::Unimplemented, "NOT_IMPLEMENTED");
+    assert_eq!(status.message(), "ParseRecurrence is not implemented yet");
+
+    // Nor in a batch, which then applies nothing.
+    let batch = batch_req(vec![
+        batched(mutation::Kind::SetStatus(SetStatusRequest {
+            request_id: String::new(),
+            id: x.id.clone(),
+            status: Status::Done.into(),
+            expected_revision: None,
+        })),
+        batched(mutation::Kind::SetRecurrence(set)),
+    ]);
+    let status = items.batch_mutate(batch).await.unwrap_err();
+    error_info(&status, Code::Unimplemented, "NOT_IMPLEMENTED");
+    assert_eq!(get(&mut items, &x.id).await.status, Status::Inbox as i32);
+
+    // An @ token parses, but the capture does not store the rule yet.
+    let draft = items
+        .parse_capture(ParseCaptureRequest {
+            text: "water plants @daily".into(),
+            reference_time: None,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .draft
+        .unwrap();
+    assert_eq!(draft.title, "water plants");
+    assert!(draft.recurrence.is_some());
+    assert_eq!(draft.tokens[0].kind, CaptureTokenKind::Recurrence as i32);
+    let y = capture(&mut items, "feed cat @daily").await;
+    assert_eq!(y.title, "feed cat");
+    assert_eq!(y.recurrence, None);
     d.stop().await;
 }
 

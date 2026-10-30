@@ -147,11 +147,63 @@ message RemoteLink {
   bool pinned = 8;
 }
 
-// Membership in a local recurrence series (3.8).
+// Membership in a local recurrence series (3.8). A series is the Items
+// sharing a series_id; the rule lives on each instance (ADR-0003).
 message ItemRecurrence {
   string series_id = 1;
-  // The date this instance was generated for.
+  // The instance's scheduled slot: the date it was generated for. Unset for
+  // an after-completion rule on an Item without a due date.
   google.type.Date occurrence_date = 2;
+  // How the next instance is scheduled once this one is done or cancelled.
+  // Unset on a legacy instance, which never generates another.
+  RecurrenceRule rule = 3;
+}
+
+// When a recurring Item repeats (design 3.8). Always concrete: the capture
+// and prompt forms that depend on an anchor date (`@weekly`, `@monthly`)
+// are resolved before they reach a rule.
+message RecurrenceRule {
+  oneof kind {
+    Daily daily = 1;
+    Weekly weekly = 2;
+    Monthly monthly = 3;
+    AfterCompletion after_completion = 4;
+  }
+
+  // Every day.
+  message Daily {}
+
+  // On each of the given weekdays.
+  message Weekly {
+    // Non-empty, sorted Monday first, without duplicates; none UNSPECIFIED.
+    repeated Weekday days = 1;
+  }
+
+  // On one day of every month.
+  message Monthly {
+    // 1 to 31. In a month without that day, the month's last day.
+    uint32 day = 1;
+  }
+
+  // A number of days after the previous instance is completed, rather than
+  // on a fixed schedule.
+  message AfterCompletion {
+    // 1 to 3650; `@2w` is 14.
+    uint32 days = 1;
+  }
+}
+
+// ISO weekdays, Monday first. google.type has no DayOfWeek in the vendored
+// protos.
+enum Weekday {
+  WEEKDAY_UNSPECIFIED = 0;
+  WEEKDAY_MONDAY = 1;
+  WEEKDAY_TUESDAY = 2;
+  WEEKDAY_WEDNESDAY = 3;
+  WEEKDAY_THURSDAY = 4;
+  WEEKDAY_FRIDAY = 5;
+  WEEKDAY_SATURDAY = 6;
+  WEEKDAY_SUNDAY = 7;
 }
 
 // Cached staleness signals (3.10).

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::field::ItemField;
 use crate::ids::{ItemId, PersonId, Revision};
+use crate::recurrence::Rule;
 use crate::relation::Relation;
 use crate::status::{ResolutionKind, Status, StatusCategory, StatusFields, TodoRefinement};
 
@@ -92,10 +93,17 @@ pub struct RemoteLink {
     pub pinned: bool,
 }
 
+/// Membership in a recurrence series (design 3.8): the Items sharing a
+/// `series_id`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ItemRecurrence {
     pub series_id: ulid::Ulid,
+    /// The instance's scheduled slot; `None` for an after-completion rule on
+    /// an Item without a due date.
     pub occurrence_date: Option<Date>,
+    /// `None` on a legacy instance, which never generates another.
+    #[serde(default)]
+    pub rule: Option<Rule>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

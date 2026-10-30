@@ -1290,6 +1290,7 @@ mod tests {
             overlay.recurrence = Some(ItemRecurrence {
                 series_id: id(5),
                 occurrence_date: Some(date(2026, 10, 21)),
+                rule: None,
             });
             let derived = &mut item.derived;
             derived.pending_fields = vec![F::Title];

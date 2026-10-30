@@ -16,7 +16,8 @@ use todo_proto::v1::{
     DeleteItemRequest, DeleteItemResponse, GetItemRequest, GetItemResponse, GetStatusCountsRequest,
     GetStatusCountsResponse, GetUndoStateRequest, GetUndoStateResponse, ListItemsRequest,
     ListItemsResponse, ParseCaptureRequest, ParseCaptureResponse, ParseDateRequest,
-    ParseDateResponse, RedoRequest, RedoResponse, RemoveRelationRequest, RemoveRelationResponse,
+    ParseDateResponse, ParseRecurrenceRequest, ParseRecurrenceResponse, RedoRequest, RedoResponse,
+    RemoveRelationRequest, RemoveRelationResponse, SetRecurrenceRequest, SetRecurrenceResponse,
     SetStatusRequest, SetStatusResponse, UnarchiveItemRequest, UnarchiveItemResponse,
     UndeleteItemRequest, UndeleteItemResponse, UndoRequest, UndoResponse, UpdateItemRequest,
     UpdateItemResponse,
@@ -28,7 +29,7 @@ use todo_store::{
 use tonic::{Request, Response, Status};
 use ulid::Ulid;
 
-use super::Ctx;
+use super::{Ctx, not_implemented};
 use crate::error::{self, Shape};
 
 /// The most mutations one `BatchMutate` may carry.
@@ -194,7 +195,27 @@ impl ItemService for Items {
                 request::set_status_from_proto(&req)
             })
             .await?;
-        Ok(Response::new(SetStatusResponse { item, result }))
+        // Completing never generates yet: recurrence is stored in M5
+        // phase 2.
+        Ok(Response::new(SetStatusResponse {
+            item,
+            result,
+            generated: None,
+        }))
+    }
+
+    async fn set_recurrence(
+        &self,
+        _request: Request<SetRecurrenceRequest>,
+    ) -> Result<Response<SetRecurrenceResponse>, Status> {
+        Err(not_implemented("SetRecurrence"))
+    }
+
+    async fn parse_recurrence(
+        &self,
+        _request: Request<ParseRecurrenceRequest>,
+    ) -> Result<Response<ParseRecurrenceResponse>, Status> {
+        Err(not_implemented("ParseRecurrence"))
     }
 
     async fn archive_item(
@@ -261,6 +282,15 @@ impl ItemService for Items {
                 format!("must hold 1 to {MAX_BATCH} mutations"),
             ));
         }
+        // The store cannot keep a rule until M5 phase 2, so SetRecurrence
+        // never reaches it yet.
+        if req
+            .mutations
+            .iter()
+            .any(|m| matches!(m.kind, Some(v1::mutation::Kind::SetRecurrence(_))))
+        {
+            return Err(not_implemented("SetRecurrence"));
+        }
         let now = Zoned::now();
         let mutations = req
             .mutations
@@ -279,6 +309,7 @@ impl ItemService for Items {
         Ok(Response::new(BatchMutateResponse {
             items: out.items.into_iter().map(v1::Item::from).collect(),
             result: Some(out.result.into()),
+            generated: Vec::new(),
         }))
     }
 
@@ -622,6 +653,8 @@ fn op_kind(kind: OpKind) -> v1::OpKind {
         OpKind::Redo => v1::OpKind::Redo,
         OpKind::AddRelation => v1::OpKind::AddRelation,
         OpKind::RemoveRelation => v1::OpKind::RemoveRelation,
+        OpKind::SetRecurrence => v1::OpKind::SetRecurrence,
+        OpKind::AutoArchive => v1::OpKind::AutoArchive,
     }
 }
 
@@ -701,6 +734,8 @@ mod tests {
             OpKind::Redo,
             OpKind::AddRelation,
             OpKind::RemoveRelation,
+            OpKind::SetRecurrence,
+            OpKind::AutoArchive,
         ];
         let proto: HashSet<i32> = kinds.iter().map(|&k| op_kind(k) as i32).collect();
         assert_eq!(proto.len(), kinds.len());
@@ -716,6 +751,10 @@ mod tests {
         assert_eq!(
             op_kind(OpKind::SetStatus).as_str_name(),
             "OP_KIND_SET_STATUS"
+        );
+        assert_eq!(
+            op_kind(OpKind::AutoArchive).as_str_name(),
+            "OP_KIND_AUTO_ARCHIVE"
         );
     }
 }

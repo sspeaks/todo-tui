@@ -1129,7 +1129,7 @@ async fn a_failing_mutation_rolls_back_the_whole_batch() {
     assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
 
     let missing = new_ulid();
-    batch[2] = mutation(missing, MutationOp::Archive);
+    batch[2] = mutation(missing, MutationOp::Archive(ArchiveReason::User));
     match db.store.mutate(mutate(OpKind::Batch, batch)).await {
         Err(StoreError::NotFound(id)) => assert_eq!(id, missing),
         other => panic!("expected NotFound, got {other:?}"),
@@ -1147,7 +1147,7 @@ async fn revision_mismatch_writes_nothing() {
     let stale = Mutation {
         id: b.id,
         expected_revision: Some(SEEDED + 1),
-        op: MutationOp::Archive,
+        op: MutationOp::Archive(ArchiveReason::User),
     };
     let mut req = mutate(OpKind::Batch, vec![title(a.id, "a2"), stale]);
     match db.store.mutate(req.clone()).await {
@@ -1222,7 +1222,7 @@ async fn a_batch_allocates_contiguous_revisions_in_first_touch_order() {
     let req = mutate(
         OpKind::Batch,
         vec![
-            mutation(c.id, MutationOp::Archive),
+            mutation(c.id, MutationOp::Archive(ArchiveReason::User)),
             mutation(a.id, MutationOp::SetStatus(Status::Done)),
             title(c.id, "c2"),
             mutation(b.id, MutationOp::Delete),
@@ -1317,7 +1317,10 @@ async fn a_request_id_replays_only_the_same_kind_of_request() {
 
     let reused = |request_id: &str, kind| MutateInput {
         request_id: request_id.to_owned(),
-        ..mutate(kind, vec![mutation(a.id, MutationOp::Archive)])
+        ..mutate(
+            kind,
+            vec![mutation(a.id, MutationOp::Archive(ArchiveReason::User))],
+        )
     };
     for input in [
         reused(&captured.request_id, OpKind::Archive),
@@ -1435,10 +1438,13 @@ async fn delete_hides_an_item_until_undelete() {
             value: FieldValue::String("a2".into()),
         }]),
         MutationOp::SetStatus(Status::Next),
-        MutationOp::Archive,
+        MutationOp::Archive(ArchiveReason::User),
         MutationOp::Unarchive,
     ] {
-        let batch = vec![mutation(b.id, MutationOp::Archive), mutation(a.id, op)];
+        let batch = vec![
+            mutation(b.id, MutationOp::Archive(ArchiveReason::User)),
+            mutation(a.id, op),
+        ];
         match db.store.mutate(mutate(OpKind::Batch, batch)).await {
             Err(StoreError::Mutation {
                 index: 1,
@@ -2548,7 +2554,7 @@ async fn the_stack_is_lifo_and_undo_and_redo_are_not_entries() {
             Actor::User,
             1_000,
             OpKind::Archive,
-            vec![mutation(x.id, MutationOp::Archive)],
+            vec![mutation(x.id, MutationOp::Archive(ArchiveReason::User))],
         )
         .await,
     ]
@@ -2659,7 +2665,7 @@ async fn undo_and_redo_round_trip() {
                 ItemField::WaitingReason,
                 FieldValue::String("contract".into()),
             ),
-            mutation(x.id, MutationOp::Archive),
+            mutation(x.id, MutationOp::Archive(ArchiveReason::User)),
         ],
     )
     .await;
@@ -3101,7 +3107,7 @@ async fn subtask_counts_and_parent_titles_are_read_and_re_emitted() {
         Actor::User,
         2_004,
         OpKind::Archive,
-        vec![mutation(a.id, MutationOp::Archive)],
+        vec![mutation(a.id, MutationOp::Archive(ArchiveReason::User))],
     )
     .await;
     assert_eq!(progress(&db, p.id).await, (1, 2));
@@ -4034,14 +4040,17 @@ async fn ops_record_their_summary() {
         ),
         (
             OpKind::Batch,
-            vec![title(b.id, "b2"), mutation(c.id, MutationOp::Archive)],
+            vec![
+                title(b.id, "b2"),
+                mutation(c.id, MutationOp::Archive(ArchiveReason::User)),
+            ],
             "change 2 items",
         ),
         (OpKind::Update, vec![title(c.id, "c2")], "edit \"c2\""),
         (
             OpKind::Batch,
             vec![
-                mutation(b.id, MutationOp::Archive),
+                mutation(b.id, MutationOp::Archive(ArchiveReason::User)),
                 mutation(c.id, MutationOp::Unarchive),
             ],
             "change 2 items",

@@ -124,6 +124,8 @@ sql_enum!(OpKind, "op_kind", {
     OpKind::Redo => "redo",
     OpKind::AddRelation => "add_relation",
     OpKind::RemoveRelation => "remove_relation",
+    OpKind::SetRecurrence => "set_recurrence",
+    OpKind::AutoArchive => "auto_archive",
 });
 sql_enum!(RelationKind, "relation_kind", {
     RelationKind::Blocks => "blocks",
@@ -326,9 +328,11 @@ pub(crate) fn item_from_row(row: &Row<'_>, today: Option<Date>) -> Result<Item> 
     };
     let series_id = opt_ulid_from_sql(col!())?;
     let occurrence_date = opt_date_from_sql(col!())?;
+    // The rule column arrives in phase 2; until then no stored Item has one.
     let recurrence = series_id.map(|series_id| ItemRecurrence {
         series_id,
         occurrence_date,
+        rule: None,
     });
 
     let extras: String = col!();

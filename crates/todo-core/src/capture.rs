@@ -6,9 +6,10 @@ use jiff::civil::Date;
 
 use crate::date::parse_date;
 use crate::item::{PersonRef, Priority, Waiting};
+use crate::recurrence::{Rule, RuleSpec, first_on_or_after, parse_rule, resolve};
 use crate::status::Status;
 
-const SIGILS: [char; 5] = ['+', '^', '#', '~', '>'];
+const SIGILS: [char; 6] = ['+', '^', '#', '~', '>', '@'];
 
 /// The most capture text the API takes, in bytes of UTF-8 (design 2.3):
 /// `CaptureItem`, `ParseCapture` and the spool import refuse longer text,
@@ -33,6 +34,13 @@ pub struct CaptureDraft {
     pub tokens: Vec<CaptureToken>,
     /// Human-readable, in text order.
     pub warnings: Vec<String>,
+    /// The `@` token's rule, resolved against `due_date`, else today.
+    pub recurrence: Option<Rule>,
+    /// The first occurrence the capture schedules, stored as its occurrence
+    /// date: for a fixed rule, the first scheduled date on or after
+    /// `due_date` (else today), which also becomes the due date when no `^`
+    /// token set one; for an after-completion rule, `due_date`.
+    pub recurrence_first: Option<Date>,
 }
 
 /// One sigil token of capture text.
@@ -63,6 +71,8 @@ pub enum CaptureTokenKind {
     Waiting,
     /// `>next` / `>someday`
     Status,
+    /// `@daily`, `@mon,thu`, `@15th`, `@3d`, ... (design 2.3)
+    Recurrence,
 }
 
 impl CaptureDraft {
@@ -77,6 +87,8 @@ impl CaptureDraft {
             status: Status::Inbox,
             tokens: Vec::new(),
             warnings: Vec::new(),
+            recurrence: None,
+            recurrence_first: None,
         }
     }
 }
@@ -88,6 +100,8 @@ enum Effect {
     Label(String),
     Waiting(String),
     Status(Status),
+    /// Resolved once the due date is known.
+    Recurrence(RuleSpec),
 }
 
 enum Piece {
@@ -167,7 +181,8 @@ pub fn parse_capture(text: &str, today: Date) -> CaptureDraft {
 
 /// Applies parsed tokens (indexes into `draft.tokens`, with the text of
 /// each token in `typed`). The last token of a single-valued kind wins;
-/// every label applies.
+/// every label applies. The rule is resolved last, against the winning due
+/// date, so `@weekly ^fri` reads as `^fri @weekly`.
 fn apply_effects(
     draft: &mut CaptureDraft,
     parsed: Vec<(usize, Effect)>,
@@ -176,6 +191,7 @@ fn apply_effects(
 ) {
     let mut winners = HashMap::new();
     let mut labels = HashSet::new();
+    let mut recurrence = None;
     for (i, effect) in &parsed {
         if !matches!(effect, Effect::Label(_)) {
             winners.insert(draft.tokens[*i].kind, *i);
@@ -207,7 +223,17 @@ fn apply_effects(
                 });
             }
             Effect::Status(s) => draft.status = s,
+            Effect::Recurrence(spec) => recurrence = Some(spec),
         }
+    }
+    if let Some(spec) = recurrence {
+        let rule = resolve(&spec, draft.due_date.unwrap_or(today));
+        draft.recurrence_first = if rule.is_fixed() {
+            first_on_or_after(&rule, draft.due_date.unwrap_or(today))
+        } else {
+            draft.due_date
+        };
+        draft.recurrence = Some(rule);
     }
 }
 
@@ -267,7 +293,15 @@ fn classify(word: &str, quoted: bool, today: Date) -> Piece {
         ),
         '#' => Piece::Token(CaptureTokenKind::Label, label(rest)),
         '~' => Piece::Token(CaptureTokenKind::Waiting, waiting(rest, quoted)),
-        _ => Piece::Token(CaptureTokenKind::Status, status(rest)),
+        '>' => Piece::Token(CaptureTokenKind::Status, status(rest)),
+        _ => Piece::Token(
+            CaptureTokenKind::Recurrence,
+            // The whole word, so that `@@daily` is not a rule, as `^^fri`
+            // is not a date.
+            parse_rule(word)
+                .map(Effect::Recurrence)
+                .map_err(|e| e.reason),
+        ),
     }
 }
 
@@ -323,6 +357,7 @@ fn collapse_whitespace(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::recurrence::Weekday;
     use jiff::civil::date;
 
     /// A Thursday.
@@ -379,6 +414,8 @@ mod tests {
                     token(21, 26, CaptureTokenKind::Label),
                 ],
                 warnings: vec![],
+                recurrence: None,
+                recurrence_first: None,
             }
         );
     }
@@ -450,6 +487,7 @@ mod tests {
         let rows = [
             (r"\#1 fan", "#1 fan"),
             (r"\+2 \^fri \~dana \>next", "+2 ^fri ~dana >next"),
+            (r"\@daily \@x", "@daily @x"),
             (r"\~dana", "~dana"),
             (r"\foo", r"\foo"),
             (r"\\#x", r"\\#x"),
@@ -469,7 +507,7 @@ mod tests {
 
     #[test]
     fn bare_sigils_are_title_text() {
-        let text = "a + b ^ c # d ~ e > f";
+        let text = "a + b ^ c # d ~ e > f @ g";
         assert_eq!(parse(text), CaptureDraft::from_title(text));
         assert_eq!(parse("+"), CaptureDraft::from_title("+"));
     }
@@ -727,6 +765,168 @@ mod tests {
         );
     }
 
+    fn weekly(days: &[Weekday]) -> Option<Rule> {
+        Some(Rule::Weekly {
+            days: days.to_vec(),
+        })
+    }
+
+    #[test]
+    fn recurrence_tokens() {
+        use crate::recurrence::Weekday::*;
+        let draft = parse("water plants @mon,thu");
+        assert_eq!(draft.title, "water plants");
+        assert_eq!(draft.recurrence, weekly(&[Monday, Thursday]));
+        // Without a due date, the first occurrence on or after today.
+        assert_eq!(draft.recurrence_first, Some(TODAY));
+        assert_eq!(draft.due_date, None);
+        assert_eq!(draft.tokens, [token(13, 21, CaptureTokenKind::Recurrence)]);
+        assert!(draft.warnings.is_empty());
+
+        let rows: &[(&str, Rule, Date)] = &[
+            ("x @daily", Rule::Daily, TODAY),
+            ("x @DAILY", Rule::Daily, TODAY),
+            (
+                "x @weekdays",
+                Rule::Weekly {
+                    days: vec![Monday, Tuesday, Wednesday, Thursday, Friday],
+                },
+                TODAY,
+            ),
+            (
+                "x @weekly",
+                Rule::Weekly {
+                    days: vec![Thursday],
+                },
+                TODAY,
+            ),
+            ("x @monthly", Rule::Monthly { day: 22 }, TODAY),
+            ("x @15th", Rule::Monthly { day: 15 }, date(2026, 11, 15)),
+            (
+                "x @mon",
+                Rule::Weekly { days: vec![Monday] },
+                date(2026, 10, 26),
+            ),
+        ];
+        for (text, rule, first) in rows {
+            let draft = parse(text);
+            assert_eq!(draft.recurrence.as_ref(), Some(rule), "{text}");
+            assert_eq!(draft.recurrence_first, Some(*first), "{text}");
+            assert_eq!(draft.title, "x", "{text}");
+        }
+
+        // After completion: the first occurrence is the due date, if any.
+        let draft = parse("x @3d");
+        assert_eq!(draft.recurrence, Some(Rule::AfterCompletion { days: 3 }));
+        assert_eq!(draft.recurrence_first, None);
+        let draft = parse("x @2w ^fri");
+        assert_eq!(draft.recurrence, Some(Rule::AfterCompletion { days: 14 }));
+        assert_eq!(draft.recurrence_first, Some(date(2026, 10, 23)));
+    }
+
+    #[test]
+    fn recurrence_resolves_against_the_due_date_in_any_order() {
+        use crate::recurrence::Weekday::*;
+        let friday = date(2026, 10, 23);
+        for text in ["x @weekly ^fri", "x ^fri @weekly", "@weekly x ^fri"] {
+            let draft = parse(text);
+            assert_eq!(draft.recurrence, weekly(&[Friday]), "{text}");
+            assert_eq!(draft.recurrence_first, Some(friday), "{text}");
+            assert_eq!(draft.due_date, Some(friday), "{text}");
+        }
+        for text in ["x @monthly ^2026-11-30", "x ^2026-11-30 @monthly"] {
+            let draft = parse(text);
+            assert_eq!(draft.recurrence, Some(Rule::Monthly { day: 30 }), "{text}");
+            assert_eq!(draft.recurrence_first, Some(date(2026, 11, 30)), "{text}");
+        }
+        // The winning due date anchors, not an overridden one.
+        let draft = parse("x ^tom @weekly ^mon");
+        assert_eq!(draft.recurrence, weekly(&[Monday]));
+        // A due date off the schedule: the first scheduled date on or after it.
+        let draft = parse("x ^fri @mon,wed");
+        assert_eq!(draft.due_date, Some(friday));
+        assert_eq!(draft.recurrence_first, Some(date(2026, 10, 26)));
+        // A failed due date anchors nothing.
+        let draft = parse("x ^someday @weekly");
+        assert_eq!(draft.recurrence, weekly(&[Thursday]));
+        assert_eq!(draft.warnings, ["^someday: not a date"]);
+    }
+
+    #[test]
+    fn a_later_recurrence_overrides_an_earlier_one() {
+        let draft = parse("x @daily @3d");
+        assert_eq!(draft.recurrence, Some(Rule::AfterCompletion { days: 3 }));
+        assert_eq!(draft.warnings, ["@daily: overridden by @3d"]);
+        assert_eq!(
+            draft.tokens,
+            [
+                failed(
+                    2,
+                    8,
+                    CaptureTokenKind::Recurrence,
+                    "@daily: overridden by @3d"
+                ),
+                token(9, 12, CaptureTokenKind::Recurrence),
+            ]
+        );
+        // A failed token overrides nothing.
+        let draft = parse("x @daily @home");
+        assert_eq!(draft.recurrence, Some(Rule::Daily));
+        assert_eq!(draft.title, "x @home");
+    }
+
+    #[test]
+    fn recurrence_failures_stay_in_the_title() {
+        let rows = [
+            ("x @home", "@home: not a repeat rule"),
+            ("x @@daily", "@@daily: not a repeat rule"),
+            ("x @mon,fr", "@mon,fr: fr is not a weekday"),
+            ("x @mon,", "@mon,: a day is missing between commas"),
+            ("x @22th", "@22th: write 22nd"),
+            ("x @32nd", "@32nd: the day of the month must be 1st to 31st"),
+            ("x @0d", "@0d: after completion must be 1 to 3650 days"),
+            (
+                "x @15",
+                "@15: a number needs d or w, or a day suffix, e.g. 3d, 2w or 15th",
+            ),
+        ];
+        for (text, warning) in rows {
+            let draft = parse(text);
+            assert_eq!(draft.title, text, "{text}");
+            assert_eq!(draft.warnings, [warning], "{text}");
+            assert_eq!(draft.recurrence, None, "{text}");
+            assert_eq!(draft.recurrence_first, None, "{text}");
+            assert_eq!(draft.tokens[0].kind, CaptureTokenKind::Recurrence);
+            assert!(!draft.tokens[0].applied);
+        }
+    }
+
+    #[test]
+    fn at_signs_that_are_title_text() {
+        for text in ["mail bob@x.com", "meet @", "a @ b", "x@daily"] {
+            assert_eq!(parse(text), CaptureDraft::from_title(text), "{text}");
+        }
+        assert_eq!(
+            parse(r"\@daily standup"),
+            CaptureDraft::from_title("@daily standup")
+        );
+        // Alone, a rule is kept as the title, like any token.
+        let draft = parse("@daily");
+        assert_eq!(draft.title, "@daily");
+        assert_eq!(draft.recurrence, None);
+        assert_eq!(draft.recurrence_first, None);
+        assert_eq!(
+            draft.warnings,
+            [
+                "@daily: kept as title text",
+                "no title words: the text was kept as typed",
+            ]
+        );
+        let draft = parse("@daily ^fri");
+        assert_eq!(draft.title, "@daily ^fri");
+        assert_eq!((draft.recurrence, draft.due_date), (None, None));
+    }
+
     #[test]
     fn hostile_text_parses_in_linear_time() {
         let started = std::time::Instant::now();
@@ -748,7 +948,8 @@ mod tests {
             "call dentist ^fri +2 #home",
             "+1 +2",
             r#"~"a b" ~"c"#,
-            r"\+1 + ++ ^ ^^ # ## ~ ~~ > >>",
+            r"\+1 + ++ ^ ^^ # ## ~ ~~ > >> @ @@",
+            "x @weekly ^fri @3d @nope",
             "  ",
             "x\u{a0}+1\u{2003}#é",
             r#"~"" ~"x"y" z"#,

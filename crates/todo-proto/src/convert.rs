@@ -307,6 +307,11 @@ enum_map!(core::LinkState, v1::LinkState, "link_state", {
 });
 enum_map!(core::CaptureTokenKind, v1::CaptureTokenKind, "capture_token_kind", {
     Priority => Priority, DueDate => DueDate, Label => Label, Waiting => Waiting, Status => Status,
+    Recurrence => Recurrence,
+});
+enum_map!(core::Weekday, v1::Weekday, "weekday", {
+    Monday => Monday, Tuesday => Tuesday, Wednesday => Wednesday, Thursday => Thursday,
+    Friday => Friday, Saturday => Saturday, Sunday => Sunday,
 });
 enum_map!(core::RelationKind, v1::RelationKind, "kind", {
     Blocks => Blocks, Duplicates => Duplicates, RelatesTo => RelatesTo,
@@ -500,11 +505,58 @@ impl TryFrom<&v1::RemoteLink> for core::RemoteLink {
     }
 }
 
+impl From<&core::Rule> for v1::RecurrenceRule {
+    fn from(r: &core::Rule) -> Self {
+        use v1::recurrence_rule::{self as rule, Kind as K};
+        let kind = match r {
+            core::Rule::Daily => K::Daily(rule::Daily {}),
+            core::Rule::Weekly { days } => K::Weekly(rule::Weekly {
+                days: days.iter().map(|d| d.to_i32()).collect(),
+            }),
+            core::Rule::Monthly { day } => K::Monthly(rule::Monthly { day: (*day).into() }),
+            core::Rule::AfterCompletion { days } => K::AfterCompletion(rule::AfterCompletion {
+                days: (*days).into(),
+            }),
+        };
+        Self { kind: Some(kind) }
+    }
+}
+
+/// The rule at `field`. Errors name the oneof case below it
+/// (`rule.weekly.days`, and `rule.kind` when no case is set). Weekly days
+/// may come in any order and repeat; the rule keeps them sorted, once.
+pub fn rule_from_proto(field: &'static str, r: &v1::RecurrenceRule) -> Result<core::Rule> {
+    rule(r).map_err(|e| e.within(field))
+}
+
+fn rule(r: &v1::RecurrenceRule) -> Result<core::Rule> {
+    use v1::recurrence_rule::Kind as K;
+    let invalid = |path: &'static str| {
+        move |e: core::InvalidRule| ConvertError::Invalid(path.into(), e.reason().to_owned())
+    };
+    match require("kind", r.kind.as_ref())? {
+        K::Daily(_) => Ok(core::Rule::Daily),
+        K::Weekly(w) => {
+            let days = w
+                .days
+                .iter()
+                .map(|&d| core::Weekday::from_i32("weekly.days", d))
+                .collect::<Result<Vec<_>>>()?;
+            core::Rule::weekly(days).map_err(invalid("weekly.days"))
+        }
+        K::Monthly(m) => core::Rule::monthly(m.day).map_err(invalid("monthly.day")),
+        K::AfterCompletion(a) => {
+            core::Rule::after_completion(a.days).map_err(invalid("after_completion.days"))
+        }
+    }
+}
+
 impl From<&core::ItemRecurrence> for v1::ItemRecurrence {
     fn from(r: &core::ItemRecurrence) -> Self {
         Self {
             series_id: r.series_id.to_string(),
             occurrence_date: r.occurrence_date.map(date_to_proto),
+            rule: r.rule.as_ref().map(Into::into),
         }
     }
 }
@@ -518,6 +570,11 @@ impl TryFrom<&v1::ItemRecurrence> for core::ItemRecurrence {
                 .occurrence_date
                 .as_ref()
                 .map(|d| date_from_proto("recurrence.occurrence_date", d))
+                .transpose()?,
+            rule: r
+                .rule
+                .as_ref()
+                .map(|rule| rule_from_proto("recurrence.rule", rule))
                 .transpose()?,
         })
     }
@@ -1289,7 +1346,46 @@ impl From<&core::CaptureDraft> for v1::CaptureDraft {
             status: d.status.to_i32(),
             tokens: d.tokens.iter().map(Into::into).collect(),
             warnings: d.warnings.clone(),
+            recurrence: d.recurrence.as_ref().map(Into::into),
+            recurrence_first: d.recurrence_first.map(date_to_proto),
         }
+    }
+}
+
+/// The `ParseRecurrence` answer for `text` (with an optional leading `@`),
+/// resolved against `anchor`, else `today`: the rule and its first
+/// occurrence, or the warning ParseCapture would give an `@` token with
+/// that text.
+pub fn parse_recurrence_response(
+    text: &str,
+    anchor: Option<Date>,
+    today: Date,
+) -> v1::ParseRecurrenceResponse {
+    let typed = text.trim();
+    match core::parse_rule(typed) {
+        Ok(spec) => {
+            let from = anchor.unwrap_or(today);
+            let rule = core::resolve(&spec, from);
+            let first = if rule.is_fixed() {
+                core::first_on_or_after(&rule, from)
+            } else {
+                anchor
+            };
+            v1::ParseRecurrenceResponse {
+                rule: Some((&rule).into()),
+                first: first.map(date_to_proto),
+                warning: String::new(),
+            }
+        }
+        // As ParseCapture words an @ token that is not a rule.
+        Err(e) if typed.is_empty() => v1::ParseRecurrenceResponse {
+            warning: e.reason,
+            ..Default::default()
+        },
+        Err(e) => v1::ParseRecurrenceResponse {
+            warning: format!("{typed}: {}", e.reason),
+            ..Default::default()
+        },
     }
 }
 
@@ -1368,6 +1464,9 @@ mod tests {
         o.recurrence = Some(core::ItemRecurrence {
             series_id: new_ulid(),
             occurrence_date: Some(date(2026, 10, 18)),
+            rule: Some(core::Rule::Weekly {
+                days: vec![core::Weekday::Monday, core::Weekday::Sunday],
+            }),
         });
         item.remote_extras.insert(
             "customfield_10010".into(),
@@ -1403,6 +1502,175 @@ mod tests {
         let decoded = v1::Item::decode(proto.encode_to_vec().as_slice()).unwrap();
         assert_eq!(decoded, proto);
         assert_eq!(core::Item::try_from(&decoded).unwrap(), item);
+    }
+
+    /// One rule of each kind.
+    fn rules() -> Vec<core::Rule> {
+        vec![
+            core::Rule::Daily,
+            core::Rule::Weekly {
+                days: core::Weekday::ALL.to_vec(),
+            },
+            core::Rule::Monthly { day: 31 },
+            core::Rule::AfterCompletion { days: 3650 },
+        ]
+    }
+
+    #[test]
+    fn rules_round_trip_through_proto_and_wire() {
+        let mut cases = HashSet::new();
+        for rule in rules() {
+            let proto = v1::RecurrenceRule::from(&rule);
+            let decoded = v1::RecurrenceRule::decode(proto.encode_to_vec().as_slice()).unwrap();
+            assert_eq!(decoded, proto);
+            assert_eq!(rule_from_proto("rule", &decoded), Ok(rule));
+            cases.insert(std::mem::discriminant(proto.kind.as_ref().unwrap()));
+        }
+        let pool = DescriptorPool::decode(crate::FILE_DESCRIPTOR_SET).unwrap();
+        let desc = pool.get_message_by_name("todo.v1.RecurrenceRule").unwrap();
+        let oneof = desc.oneofs().next().unwrap();
+        assert_eq!(cases.len(), oneof.fields().count());
+
+        // Every weekday maps to its ISO number.
+        for (n, day) in (1..).zip(core::Weekday::ALL) {
+            assert_eq!(day.to_i32(), n, "{day:?}");
+            assert_eq!(core::Weekday::from_i32("day", n), Ok(day));
+        }
+        assert_eq!(v1::Weekday::try_from(8).ok(), None);
+
+        // Days are sorted and collapse on the way in.
+        use v1::Weekday as W;
+        let weekly = |days: Vec<W>| v1::RecurrenceRule {
+            kind: Some(v1::recurrence_rule::Kind::Weekly(
+                v1::recurrence_rule::Weekly {
+                    days: days.into_iter().map(|d| d as i32).collect(),
+                },
+            )),
+        };
+        assert_eq!(
+            rule_from_proto("rule", &weekly(vec![W::Thursday, W::Monday, W::Thursday])),
+            Ok(core::Rule::Weekly {
+                days: vec![core::Weekday::Monday, core::Weekday::Thursday],
+            })
+        );
+    }
+
+    #[test]
+    fn rule_errors_name_the_case() {
+        use v1::recurrence_rule::{self as rule, Kind as K};
+        let fails =
+            |kind: Option<K>| rule_from_proto("rule", &v1::RecurrenceRule { kind }).unwrap_err();
+        let weekly = |days: Vec<i32>| Some(K::Weekly(rule::Weekly { days }));
+        assert_eq!(fails(None), ConvertError::Missing("rule.kind".into()));
+        assert_eq!(
+            fails(weekly(vec![])),
+            ConvertError::Invalid(
+                "rule.weekly.days".into(),
+                "a weekly rule needs at least one day".into()
+            )
+        );
+        assert_eq!(
+            fails(weekly(vec![1, 0])),
+            ConvertError::Unspecified("rule.weekly.days".into())
+        );
+        assert_eq!(
+            fails(weekly(vec![9])),
+            ConvertError::UnknownEnum("rule.weekly.days".into(), 9)
+        );
+        let invalid = [
+            (K::Monthly(rule::Monthly { day: 0 }), "rule.monthly.day"),
+            (K::Monthly(rule::Monthly { day: 32 }), "rule.monthly.day"),
+            (
+                K::Monthly(rule::Monthly {
+                    day: u32::from(u8::MAX) + 2,
+                }),
+                "rule.monthly.day",
+            ),
+            (
+                K::AfterCompletion(rule::AfterCompletion { days: 0 }),
+                "rule.after_completion.days",
+            ),
+            (
+                K::AfterCompletion(rule::AfterCompletion { days: 3651 }),
+                "rule.after_completion.days",
+            ),
+            (
+                K::AfterCompletion(rule::AfterCompletion {
+                    days: u32::from(u16::MAX) + 2,
+                }),
+                "rule.after_completion.days",
+            ),
+        ];
+        for (kind, path) in invalid {
+            let err = fails(Some(kind));
+            assert!(matches!(err, ConvertError::Invalid(..)), "{err}");
+            assert_eq!(err.path(), path);
+        }
+
+        // Within an Item, at recurrence.rule.
+        let mut item = v1::Item::from(&full_item());
+        item.recurrence.as_mut().unwrap().rule = Some(v1::RecurrenceRule {
+            kind: weekly(vec![]),
+        });
+        let err = core::Item::try_from(&item).unwrap_err();
+        assert_eq!(err.path(), "recurrence.rule.weekly.days");
+        // A legacy instance has no rule.
+        item.recurrence.as_mut().unwrap().rule = None;
+        let back = core::Item::try_from(&item).unwrap();
+        assert_eq!(back.overlay.recurrence.unwrap().rule, None);
+    }
+
+    #[test]
+    fn parse_recurrence_answers() {
+        use todo_core::Weekday as D;
+        let today = date(2026, 10, 22);
+        let friday = date(2026, 10, 23);
+        let answer = |text: &str, anchor| parse_recurrence_response(text, anchor, today);
+        let ok = |rule: core::Rule, first: Option<Date>| v1::ParseRecurrenceResponse {
+            rule: Some((&rule).into()),
+            first: first.map(date_to_proto),
+            warning: String::new(),
+        };
+        assert_eq!(answer("@daily", None), ok(core::Rule::Daily, Some(today)));
+        assert_eq!(answer(" daily ", None), ok(core::Rule::Daily, Some(today)));
+        assert_eq!(
+            answer("weekly", Some(friday)),
+            ok(
+                core::Rule::Weekly {
+                    days: vec![D::Friday]
+                },
+                Some(friday)
+            )
+        );
+        assert_eq!(
+            answer("@mon,thu", Some(friday)),
+            ok(
+                core::Rule::Weekly {
+                    days: vec![D::Monday, D::Thursday],
+                },
+                Some(date(2026, 10, 26))
+            )
+        );
+        assert_eq!(
+            answer("monthly", None),
+            ok(core::Rule::Monthly { day: 22 }, Some(today))
+        );
+        assert_eq!(
+            answer("3d", None),
+            ok(core::Rule::AfterCompletion { days: 3 }, None)
+        );
+        assert_eq!(
+            answer("@2w", Some(friday)),
+            ok(core::Rule::AfterCompletion { days: 14 }, Some(friday))
+        );
+        let warning = |text: &str| answer(text, None).warning;
+        assert_eq!(warning("@home"), "@home: not a repeat rule");
+        assert_eq!(warning(" home "), "home: not a repeat rule");
+        assert_eq!(warning(""), "empty repeat rule");
+        assert_eq!(warning("@"), "@: empty repeat rule");
+        let failed = answer("@22th", None);
+        assert_eq!((failed.rule, failed.first), (None, None));
+        assert_eq!(failed.warning, "@22th: write 22nd");
     }
 
     #[test]
@@ -2020,6 +2288,20 @@ mod tests {
                 token(46, 48, K::Priority, warning),
             ]
         );
+
+        let p = v1::CaptureDraft::from(&core::parse_capture(
+            "water plants @mon,thu ^fri",
+            date(2026, 10, 22),
+        ));
+        assert_eq!(
+            p.recurrence,
+            Some(v1::RecurrenceRule::from(&core::Rule::Weekly {
+                days: vec![core::Weekday::Monday, core::Weekday::Thursday],
+            }))
+        );
+        assert_eq!(p.recurrence_first, Some(date_to_proto(date(2026, 10, 26))));
+        assert_eq!(p.due_date, Some(date_to_proto(date(2026, 10, 23))));
+        assert_eq!(p.tokens[0], token(13, 21, K::Recurrence, ""));
 
         let p = v1::CaptureDraft::from(&core::parse_capture("call dentist", date(2026, 10, 22)));
         assert_eq!(

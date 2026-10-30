@@ -9,6 +9,7 @@ pub mod ids;
 pub mod inverse;
 pub mod item;
 pub mod mutation;
+pub mod recurrence;
 pub mod relation;
 pub mod status;
 pub mod value;
@@ -28,6 +29,10 @@ pub use item::{
 pub use mutation::{
     Actor, Applied, ApplyCtx, FieldChange, FieldRestore, FieldUpdate, Mutation, MutationError,
     MutationOp, RestoreSkip, RestoreUnit, SkipReason, apply,
+};
+pub use recurrence::{
+    InvalidRule, Rule, RuleError, RuleSpec, Weekday, first_on_or_after, next_after, next_instance,
+    parse_rule, resolve,
 };
 pub use relation::{Relation, RelationError, RelationKind};
 pub use status::{

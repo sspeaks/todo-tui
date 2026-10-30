@@ -58,7 +58,40 @@ service ItemService {
   // one transaction.
   rpc GetStatusCounts(GetStatusCountsRequest) returns (GetStatusCountsResponse);
   rpc UpdateItem(UpdateItemRequest) returns (UpdateItemResponse);
+  // Completing an instance of a recurring Item (design 3.8), i.e. moving it
+  // from an open status to done or cancelled while it has a rule, creates
+  // the series' next instance in the same op, so one undo removes both. No
+  // instance is created while another live, open instance of the series
+  // exists. This holds for every mutation that closes an Item, in a
+  // BatchMutate too, where it is decided by the state the whole batch leaves
+  // (so completing an instance and deleting it, or clearing its rule, in one
+  // batch creates nothing). A fixed rule skips the dates missed: the next
+  // instance is on the first scheduled date after the completed slot
+  // (occurrence_date, else due_date, else today) that is not before today;
+  // an after-completion rule schedules it that many days after today. The
+  // new Item copies the completed one's title, description, item_type,
+  // priority, local priority override, labels, parent and estimates, has
+  // created_via RECURRENCE, the same series and rule, due_date and
+  // occurrence_date on the next date, and is deferred until that date
+  // unless it is today or earlier. Its status is the completed Item's todo
+  // refinement, with inbox becoming next. Moving an Item to an open status
+  // also unarchives it when it was archived ARCHIVE_REASON_AUTO_DONE.
   rpc SetStatus(SetStatusRequest) returns (SetStatusResponse);
+  // Sets, replaces or clears an Item's recurrence rule (design 3.8). Setting
+  // a rule on an Item without recurrence starts a new series; on one that
+  // already recurs it keeps the series and replaces the rule. For a fixed
+  // rule, occurrence_date becomes the first scheduled date on or after the
+  // due date (else today), and the due date is set to it only if unset; for
+  // an after-completion rule occurrence_date is the due date, which is left
+  // alone. Clearing the rule ends the series: the Item stays, and no
+  // instance follows it. Setting a rule on a done or cancelled Item fails
+  // with FAILED_PRECONDITION (ErrorInfo ITEM_CLOSED): reopen it first;
+  // clearing one is allowed. An absolute action, so bulk-capable through
+  // BatchMutate, where each Item gets its own series.
+  rpc SetRecurrence(SetRecurrenceRequest) returns (SetRecurrenceResponse);
+  // Resolves a repeat rule with the capture rule grammar (design 2.3), for
+  // the repeat prompt.
+  rpc ParseRecurrence(ParseRecurrenceRequest) returns (ParseRecurrenceResponse);
   rpc ArchiveItem(ArchiveItemRequest) returns (ArchiveItemResponse);
   rpc UnarchiveItem(UnarchiveItemRequest) returns (UnarchiveItemResponse);
   // Soft delete (design 3.7): the Item stays as a tombstone with deleted_at
@@ -157,6 +190,29 @@ message ParseDateResponse {
   string warning = 2;
 }
 
+message ParseRecurrenceRequest {
+  // A repeat rule (design 2.3), e.g. "daily", "weekdays", "mon,thu",
+  // "monthly", "15th" or "2w", with an optional leading "@".
+  // Case-insensitive.
+  string text = 1;
+  // "Now", for today; defaults to the daemon's clock.
+  google.protobuf.Timestamp reference_time = 2;
+  // The date "weekly" and "monthly" take their weekday or day from, and
+  // the first occurrence is counted from: the Item's due date, if any.
+  // Defaults to today.
+  google.type.Date anchor = 3;
+}
+
+message ParseRecurrenceResponse {
+  // Unset when text does not parse; warning then says why.
+  RecurrenceRule rule = 1;
+  // The first occurrence SetRecurrence would schedule on an Item due on the
+  // anchor: the first scheduled date on or after it. For an
+  // after-completion rule, the request's anchor if set, else unset.
+  google.type.Date first = 2;
+  string warning = 3;
+}
+
 // The result of parsing capture text (design 2.3). A token that fails to
 // parse stays in the title and adds a warning. When no title words remain,
 // the whole text is kept as the title and no token is applied.
@@ -174,6 +230,14 @@ message CaptureDraft {
   repeated CaptureToken tokens = 7;
   // Human-readable warnings, in text order.
   repeated string warnings = 8;
+  // Unset without an @ token. Resolved against the due date if a ^ token
+  // set one, else today, wherever the tokens are in the text.
+  RecurrenceRule recurrence = 9;
+  // The first occurrence the capture schedules, its occurrence_date: for a
+  // fixed rule the first scheduled date on or after the due date (else
+  // today), which is also the stored due date when no ^ token set one; for
+  // an after-completion rule the due date, if any.
+  google.type.Date recurrence_first = 10;
 }
 
 message CaptureToken {
@@ -201,6 +265,8 @@ enum CaptureTokenKind {
   CAPTURE_TOKEN_KIND_WAITING = 4;
   // >next / >someday
   CAPTURE_TOKEN_KIND_STATUS = 5;
+  // @daily, @weekdays, @weekly, @mon,thu, @monthly, @15th, @3d, @2w
+  CAPTURE_TOKEN_KIND_RECURRENCE = 6;
 }
 
 message GetItemRequest {
@@ -327,6 +393,21 @@ message SetStatusRequest {
 message SetStatusResponse {
   Item item = 1;
   MutationResult result = 2;
+  // The next instance of the series, when this completed a recurring Item.
+  Item generated = 3;
+}
+
+message SetRecurrenceRequest {
+  string request_id = 1;
+  string id = 2;
+  // Unset clears the rule.
+  RecurrenceRule rule = 3;
+  optional uint64 expected_revision = 4;
+}
+
+message SetRecurrenceResponse {
+  Item item = 1;
+  MutationResult result = 2;
 }
 
 // Archives with reason ARCHIVE_REASON_USER.
@@ -396,6 +477,7 @@ message Mutation {
     UnarchiveItemRequest unarchive_item = 4;
     DeleteItemRequest delete_item = 5;
     UndeleteItemRequest undelete_item = 6;
+    SetRecurrenceRequest set_recurrence = 7;
   }
 }
 
@@ -406,6 +488,10 @@ message BatchMutateResponse {
   // the change stream.
   repeated Item items = 1;
   MutationResult result = 2;
+  // The next instances the batch created for the recurring Items it
+  // completed (see SetStatus), in the order of the mutations that completed
+  // them.
+  repeated Item generated = 3;
 }
 
 message UndoRequest {

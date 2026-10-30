@@ -11,13 +11,14 @@
 use std::collections::HashSet;
 
 use jiff::Timestamp;
-use jiff::civil::{ISOWeekDate, Weekday};
+use jiff::civil::{Date, ISOWeekDate, Weekday};
 use ulid::Ulid;
 
 use crate::capture::MAX_CAPTURE_BYTES;
 use crate::field::ItemField;
 use crate::ids::{ItemId, Revision};
-use crate::item::{ArchiveReason, Archived, Item, PersonRef, Priority, Waiting};
+use crate::item::{ArchiveReason, Archived, Item, ItemRecurrence, PersonRef, Priority, Waiting};
+use crate::recurrence::{Rule, first_on_or_after};
 use crate::status::Status;
 use crate::value::{FieldValue, duration_in_range, timestamp_in_range};
 
@@ -58,9 +59,25 @@ pub struct FieldUpdate {
 pub enum MutationOp {
     /// Fields in order; each at most once, and not together with its parent.
     Update(Vec<FieldUpdate>),
+    /// Moving to an open status also unarchives an Item archived
+    /// [`ArchiveReason::AutoDone`] (design 3.7).
     SetStatus(Status),
-    Archive,
+    /// Keeps an existing archive, whatever its reason.
+    Archive(ArchiveReason),
     Unarchive,
+    /// Sets, replaces or clears the recurrence rule (design 3.8). Setting a
+    /// rule on an Item without recurrence starts the series `series_id`; on
+    /// one that recurs it keeps its series. A fixed rule's
+    /// `occurrence_date` is its first date on or after the due date (else
+    /// `today`), which becomes the due date if there is none; an
+    /// after-completion rule's is the due date, which is kept. Setting a
+    /// rule on a done or cancelled Item fails with
+    /// [`MutationError::Closed`]; clearing one does not.
+    SetRecurrence {
+        rule: Option<Rule>,
+        series_id: Ulid,
+        today: Date,
+    },
     /// Soft delete (design 3.7).
     Delete,
     Undelete,
@@ -74,9 +91,10 @@ pub enum MutationOp {
 /// ([`FieldValue::matches`]).
 ///
 /// Besides the fields `Update` sets, a restore writes the status triple,
-/// `archived`, `deleted_at` and the nested `staleness.*` signals. Values are
-/// still validated, as by `Update` (types, the title limit, `focus_week`,
-/// nested waiting fields need `waiting` set).
+/// `archived`, `recurrence` (whole: its nested fields stay read-only),
+/// `deleted_at` and the nested `staleness.*` signals. Values are still
+/// validated, as by `Update` (types, the title limit, `focus_week`, nested
+/// waiting fields need `waiting` set, a recurrence rule's invariants).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FieldRestore {
     pub field: ItemField,
@@ -181,6 +199,9 @@ pub enum MutationError {
     Duplicate(ItemField),
     #[error("the Item is deleted")]
     Deleted,
+    /// A recurrence rule set on a done or cancelled Item.
+    #[error("the Item is done or cancelled: reopen it first")]
+    Closed,
     #[error("{field:?}: {reason}")]
     Unsupported { field: ItemField, reason: String },
 }
@@ -197,7 +218,7 @@ impl MutationError {
             | MutationError::WrongType { field, .. }
             | MutationError::Invalid { field, .. }
             | MutationError::Unsupported { field, .. } => Some(*field),
-            MutationError::Deleted => None,
+            MutationError::Deleted | MutationError::Closed => None,
         }
     }
 }
@@ -236,14 +257,32 @@ pub fn apply(item: &Item, op: &MutationOp, ctx: &ApplyCtx) -> Result<Applied, Mu
             if item.status() != *target {
                 next.set_status_fields(item.status_fields().with_status(*target));
             }
-            STATUS_TRIPLE.to_vec()
+            if !target.is_closed()
+                && item
+                    .overlay
+                    .archived
+                    .is_some_and(|a| a.reason == ArchiveReason::AutoDone)
+            {
+                next.overlay.archived = None;
+            }
+            let mut fields = STATUS_TRIPLE.to_vec();
+            fields.push(ItemField::Archived);
+            fields
         }
-        MutationOp::Archive => {
+        MutationOp::Archive(reason) => {
             next.overlay.archived.get_or_insert(Archived {
                 at: ctx.now,
-                reason: ArchiveReason::User,
+                reason: *reason,
             });
             vec![ItemField::Archived]
+        }
+        MutationOp::SetRecurrence {
+            rule,
+            series_id,
+            today,
+        } => {
+            set_recurrence(&mut next, rule.as_ref(), *series_id, *today)?;
+            vec![ItemField::Recurrence, ItemField::DueDate]
         }
         MutationOp::Unarchive => {
             next.overlay.archived = None;
@@ -280,6 +319,45 @@ pub fn apply(item: &Item, op: &MutationOp, ctx: &ApplyCtx) -> Result<Applied, Mu
         changes,
         skipped: Vec::new(),
     })
+}
+
+/// The `SetRecurrence` op on `item`.
+fn set_recurrence(
+    item: &mut Item,
+    rule: Option<&Rule>,
+    series_id: Ulid,
+    today: Date,
+) -> Result<(), MutationError> {
+    let Some(rule) = rule else {
+        item.overlay.recurrence = None;
+        return Ok(());
+    };
+    if item.status().is_closed() {
+        return Err(MutationError::Closed);
+    }
+    rule.check().map_err(|e| MutationError::Invalid {
+        field: ItemField::Recurrence,
+        reason: e.reason().to_owned(),
+    })?;
+    let due = item.core.due_date;
+    let occurrence_date = if rule.is_fixed() {
+        let first = first_on_or_after(rule, due.unwrap_or(today));
+        item.core.due_date = due.or(first);
+        first
+    } else {
+        due
+    };
+    let series_id = item
+        .overlay
+        .recurrence
+        .as_ref()
+        .map_or(series_id, |r| r.series_id);
+    item.overlay.recurrence = Some(ItemRecurrence {
+        series_id,
+        occurrence_date,
+        rule: Some(rule.clone()),
+    });
+    Ok(())
 }
 
 /// Applies the units of a `Restore` in order. Only `updated_at` is
@@ -389,7 +467,20 @@ fn restore_field(
         }
         (F::Archived, V::Archived(archived)) => item.overlay.archived = Some(*archived),
         (F::Archived, V::Cleared) => item.overlay.archived = None,
-        (F::StatusCategory | F::ResolutionKind | F::TodoRefinement | F::Archived, _) => {
+        (F::Recurrence, V::Recurrence(recurrence)) => {
+            if let Some(rule) = &recurrence.rule {
+                rule.check().map_err(|e| MutationError::Invalid {
+                    field,
+                    reason: e.reason().to_owned(),
+                })?;
+            }
+            item.overlay.recurrence = Some(recurrence.clone());
+        }
+        (F::Recurrence, V::Cleared) => item.overlay.recurrence = None,
+        (
+            F::StatusCategory | F::ResolutionKind | F::TodoRefinement | F::Archived | F::Recurrence,
+            _,
+        ) => {
             return Err(wrong_type());
         }
         (F::DeletedAt, _) => item.derived.deleted_at = timestamp()?,
@@ -909,6 +1000,44 @@ mod tests {
                 assert_eq!(applied.changes, [], "{field:?}");
                 assert_eq!(applied.item, item, "{field:?}");
             }
+        }
+    }
+
+    /// The fields `Update` refuses that a `Restore` writes, whole.
+    const RESTORE_ONLY: &[ItemField] = &[
+        F::StatusCategory,
+        F::ResolutionKind,
+        F::TodoRefinement,
+        F::Archived,
+        F::Recurrence,
+        F::DeletedAt,
+        F::StalenessLastUserTouchAt,
+        F::StalenessLastRemoteChangeAt,
+        F::StalenessStatusEnteredAt,
+        F::StalenessWaitingSince,
+    ];
+
+    #[test]
+    fn restore_also_writes_the_restore_only_fields() {
+        let mut item = linked();
+        item.overlay.waiting = Some(waiting(PersonRef::Person(id(2))));
+        item.overlay.focus_week = Some("2026-W43".into());
+        item.overlay.recurrence = Some(ItemRecurrence {
+            series_id: id(5),
+            occurrence_date: Some(date(2026, 10, 26)),
+            rule: Some(Rule::Daily),
+        });
+        for &field in ItemField::ALL {
+            let Some(value) = FieldValue::of(&item, field) else {
+                continue;
+            };
+            let unit = vec![restore(field, value.clone(), value)];
+            let skipped = restore_units(&item, vec![unit]).skipped;
+            let restorable = WRITABLE.contains(&field) || RESTORE_ONLY.contains(&field);
+            assert_eq!(skipped.is_empty(), restorable, "{field:?}: {skipped:?}");
+        }
+        for &field in RESTORE_ONLY {
+            assert!(!WRITABLE.contains(&field), "{field:?}");
         }
     }
 
@@ -1541,7 +1670,7 @@ mod tests {
 
     #[test]
     fn archive_and_unarchive() {
-        let applied = run(&item(), MutationOp::Archive).unwrap();
+        let applied = run(&item(), MutationOp::Archive(ArchiveReason::User)).unwrap();
         let archived = Archived {
             at: now(),
             reason: ArchiveReason::User,
@@ -1551,7 +1680,7 @@ mod tests {
             applied.changes,
             [change(F::Archived, V::Cleared, V::Archived(archived))]
         );
-        let again = run(&applied.item, MutationOp::Archive).unwrap();
+        let again = run(&applied.item, MutationOp::Archive(ArchiveReason::User)).unwrap();
         assert_eq!(again.changes, []);
         assert_eq!(again.item, applied.item);
 
@@ -1560,7 +1689,12 @@ mod tests {
             at: ts(100),
             reason: ArchiveReason::LeftScope,
         });
-        assert_eq!(run(&left_scope, MutationOp::Archive).unwrap().changes, []);
+        assert_eq!(
+            run(&left_scope, MutationOp::Archive(ArchiveReason::User))
+                .unwrap()
+                .changes,
+            []
+        );
 
         let unarchived = run(&applied.item, MutationOp::Unarchive).unwrap();
         assert_eq!(unarchived.item.overlay.archived, None);
@@ -1573,6 +1707,337 @@ mod tests {
                 .unwrap()
                 .changes,
             []
+        );
+    }
+
+    #[test]
+    fn archive_keeps_its_reason() {
+        for reason in [ArchiveReason::User, ArchiveReason::AutoDone] {
+            let applied = run(&item(), MutationOp::Archive(reason)).unwrap();
+            assert_eq!(
+                applied.item.overlay.archived,
+                Some(Archived { at: now(), reason })
+            );
+            // An archived Item keeps its archive, whatever the reason.
+            let other = match reason {
+                ArchiveReason::User => ArchiveReason::AutoDone,
+                _ => ArchiveReason::User,
+            };
+            let again = run(&applied.item, MutationOp::Archive(other)).unwrap();
+            assert_eq!(again.changes, []);
+        }
+    }
+
+    #[test]
+    fn reopening_clears_only_an_auto_done_archive() {
+        let mut done = item();
+        done.set_status_fields(done.status_fields().with_status(Status::Done));
+        let auto_done = Archived {
+            at: ts(100),
+            reason: ArchiveReason::AutoDone,
+        };
+        done.overlay.archived = Some(auto_done);
+        for open in [
+            Status::Inbox,
+            Status::Next,
+            Status::Someday,
+            Status::InProgress,
+        ] {
+            let applied = run(&done, MutationOp::SetStatus(open)).unwrap();
+            assert_eq!(applied.item.status(), open);
+            assert_eq!(applied.item.overlay.archived, None, "{open:?}");
+            assert_eq!(
+                applied.changes.last(),
+                Some(&change(F::Archived, V::Archived(auto_done), V::Cleared)),
+                "{open:?}"
+            );
+        }
+        // Closing again, or staying closed, keeps it.
+        let cancelled = run(&done, MutationOp::SetStatus(Status::Cancelled)).unwrap();
+        assert_eq!(cancelled.item.overlay.archived, Some(auto_done));
+        let same = run(&done, MutationOp::SetStatus(Status::Done)).unwrap();
+        assert_eq!(same.changes, []);
+        // Another reason is the user's (or the tracker's) choice.
+        for reason in [
+            ArchiveReason::User,
+            ArchiveReason::LeftScope,
+            ArchiveReason::RemoteUnavailable,
+        ] {
+            let mut item = done.clone();
+            item.overlay.archived = Some(Archived {
+                at: ts(100),
+                reason,
+            });
+            let applied = run(&item, MutationOp::SetStatus(Status::Next)).unwrap();
+            assert_eq!(applied.item.overlay.archived, item.overlay.archived);
+            assert_eq!(applied.changes.len(), 3, "{reason:?}");
+        }
+        // An open Item archived auto_done (a stale archive) heals too.
+        let mut open = item();
+        open.overlay.archived = Some(auto_done);
+        let applied = run(&open, MutationOp::SetStatus(Status::Inbox)).unwrap();
+        assert_eq!(applied.item.overlay.archived, None);
+        assert_eq!(
+            applied.changes,
+            [change(F::Archived, V::Archived(auto_done), V::Cleared)]
+        );
+    }
+
+    // ---- SetRecurrence ------------------------------------------------------
+
+    /// A Thursday.
+    const TODAY: Date = date(2026, 10, 22);
+
+    fn set_recurrence(item: &Item, rule: Option<Rule>) -> Result<Applied, MutationError> {
+        run(
+            item,
+            MutationOp::SetRecurrence {
+                rule,
+                series_id: id(50),
+                today: TODAY,
+            },
+        )
+    }
+
+    fn mondays() -> Rule {
+        Rule::Weekly {
+            days: vec![crate::recurrence::Weekday::Monday],
+        }
+    }
+
+    fn recurrence(series: u128, occurrence_date: Option<Date>, rule: Rule) -> ItemRecurrence {
+        ItemRecurrence {
+            series_id: id(series),
+            occurrence_date,
+            rule: Some(rule),
+        }
+    }
+
+    #[test]
+    fn a_fixed_rule_starts_a_series_on_its_first_date() {
+        // No due date: the first Monday on or after today, which becomes
+        // the due date.
+        let monday = date(2026, 10, 26);
+        let applied = set_recurrence(&item(), Some(mondays())).unwrap();
+        let want = recurrence(50, Some(monday), mondays());
+        assert_eq!(applied.item.overlay.recurrence, Some(want.clone()));
+        assert_eq!(applied.item.core.due_date, Some(monday));
+        assert_eq!(
+            applied.changes,
+            [
+                change(F::Recurrence, V::Cleared, V::Recurrence(want)),
+                change(F::DueDate, V::Cleared, V::Date(monday)),
+            ]
+        );
+        assert_eq!(applied.item.updated_at, now());
+        assert_eq!(
+            applied.item.derived.staleness.last_user_touch_at,
+            Some(now())
+        );
+
+        // A due date is kept, and the slot is the first date on or after it.
+        let mut due = item();
+        due.core.due_date = Some(date(2026, 11, 4));
+        let applied = set_recurrence(&due, Some(mondays())).unwrap();
+        assert_eq!(applied.item.core.due_date, Some(date(2026, 11, 4)));
+        let recurrence = applied.item.overlay.recurrence.unwrap();
+        assert_eq!(recurrence.occurrence_date, Some(date(2026, 11, 9)));
+        assert_eq!(applied.changes.len(), 1);
+
+        // A past due date: the slot is on or after it, not today.
+        due.core.due_date = Some(date(2026, 10, 1));
+        let applied = set_recurrence(&due, Some(Rule::Daily)).unwrap();
+        let recurrence = applied.item.overlay.recurrence.unwrap();
+        assert_eq!(recurrence.occurrence_date, Some(date(2026, 10, 1)));
+        assert_eq!(applied.item.core.due_date, Some(date(2026, 10, 1)));
+    }
+
+    #[test]
+    fn an_after_completion_rule_takes_the_due_date_as_its_slot() {
+        let three_days = Rule::AfterCompletion { days: 3 };
+        let applied = set_recurrence(&item(), Some(three_days.clone())).unwrap();
+        assert_eq!(
+            applied.item.overlay.recurrence,
+            Some(recurrence(50, None, three_days.clone()))
+        );
+        assert_eq!(applied.item.core.due_date, None);
+        assert_eq!(applied.changes.len(), 1);
+
+        let mut due = item();
+        due.core.due_date = Some(date(2026, 11, 4));
+        let applied = set_recurrence(&due, Some(three_days.clone())).unwrap();
+        assert_eq!(
+            applied.item.overlay.recurrence,
+            Some(recurrence(50, Some(date(2026, 11, 4)), three_days))
+        );
+        assert_eq!(applied.item.core.due_date, Some(date(2026, 11, 4)));
+    }
+
+    #[test]
+    fn a_new_rule_keeps_the_series() {
+        let mut recurring = item();
+        recurring.core.due_date = Some(date(2026, 10, 26));
+        recurring.overlay.recurrence = Some(recurrence(7, Some(date(2026, 10, 26)), mondays()));
+        let applied = set_recurrence(&recurring, Some(Rule::Monthly { day: 30 })).unwrap();
+        assert_eq!(
+            applied.item.overlay.recurrence,
+            Some(recurrence(
+                7,
+                Some(date(2026, 10, 30)),
+                Rule::Monthly { day: 30 }
+            ))
+        );
+        assert_eq!(applied.item.core.due_date, Some(date(2026, 10, 26)));
+
+        // The same rule again changes nothing.
+        let same = set_recurrence(&recurring, Some(mondays())).unwrap();
+        assert_eq!(same.changes, []);
+        assert_eq!(same.item, recurring);
+
+        // A legacy instance without a rule gets one, in its series.
+        let mut legacy = item();
+        legacy.overlay.recurrence = Some(ItemRecurrence {
+            series_id: id(8),
+            occurrence_date: None,
+            rule: None,
+        });
+        let applied = set_recurrence(&legacy, Some(Rule::Daily)).unwrap();
+        assert_eq!(
+            applied.item.overlay.recurrence,
+            Some(recurrence(8, Some(TODAY), Rule::Daily))
+        );
+    }
+
+    #[test]
+    fn no_rule_ends_the_series() {
+        let mut recurring = item();
+        recurring.core.due_date = Some(date(2026, 10, 26));
+        let was = recurrence(7, Some(date(2026, 10, 26)), mondays());
+        recurring.overlay.recurrence = Some(was.clone());
+        let applied = set_recurrence(&recurring, None).unwrap();
+        assert_eq!(applied.item.overlay.recurrence, None);
+        // The due date stays.
+        assert_eq!(applied.item.core.due_date, Some(date(2026, 10, 26)));
+        assert_eq!(
+            applied.changes,
+            [change(F::Recurrence, V::Recurrence(was), V::Cleared)]
+        );
+        let none = set_recurrence(&item(), None).unwrap();
+        assert_eq!(none.changes, []);
+    }
+
+    #[test]
+    fn a_rule_on_a_closed_item_needs_it_reopened() {
+        for closed in [Status::Done, Status::Cancelled] {
+            let mut item = item();
+            item.set_status_fields(item.status_fields().with_status(closed));
+            assert_eq!(
+                set_recurrence(&item, Some(Rule::Daily)),
+                Err(MutationError::Closed),
+                "{closed:?}"
+            );
+            // Clearing is allowed.
+            item.overlay.recurrence = Some(recurrence(7, None, Rule::Daily));
+            let applied = set_recurrence(&item, None).unwrap();
+            assert_eq!(applied.item.overlay.recurrence, None, "{closed:?}");
+        }
+        let mut deleted = item();
+        deleted.derived.deleted_at = Some(ts(10));
+        assert_eq!(set_recurrence(&deleted, None), Err(MutationError::Deleted));
+        assert_eq!(MutationError::Closed.field(), None);
+        assert_eq!(
+            MutationError::Closed.to_string(),
+            "the Item is done or cancelled: reopen it first"
+        );
+    }
+
+    #[test]
+    fn a_broken_rule_is_invalid() {
+        let rows = [
+            (
+                Rule::Weekly { days: vec![] },
+                "a weekly rule needs at least one day",
+            ),
+            (
+                Rule::Monthly { day: 0 },
+                "the day of the month must be 1 to 31",
+            ),
+            (
+                Rule::AfterCompletion { days: 4000 },
+                "after completion must be 1 to 3650 days",
+            ),
+        ];
+        for (rule, reason) in rows {
+            let want = Err(MutationError::Invalid {
+                field: F::Recurrence,
+                reason: reason.into(),
+            });
+            assert_eq!(set_recurrence(&item(), Some(rule.clone())), want);
+            let unit = vec![restore(
+                F::Recurrence,
+                V::Cleared,
+                V::Recurrence(recurrence(7, None, rule)),
+            )];
+            let skipped = restore_units(&item(), vec![unit]).skipped;
+            assert_eq!(
+                skipped,
+                [skip(
+                    &[F::Recurrence],
+                    SkipReason::Invalid(format!("Recurrence: {reason}"))
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn restore_writes_recurrence_whole() {
+        let was = recurrence(7, Some(date(2026, 10, 26)), mondays());
+        let applied = restore_units(
+            &item(),
+            vec![vec![restore(
+                F::Recurrence,
+                V::Cleared,
+                V::Recurrence(was.clone()),
+            )]],
+        );
+        assert_eq!(applied.skipped, []);
+        assert_eq!(applied.item.overlay.recurrence, Some(was.clone()));
+        let back = restore_units(
+            &applied.item,
+            vec![vec![restore(
+                F::Recurrence,
+                V::Recurrence(was.clone()),
+                V::Cleared,
+            )]],
+        );
+        assert_eq!(back.item.overlay.recurrence, None);
+        // A legacy value without a rule restores too.
+        let legacy = ItemRecurrence { rule: None, ..was };
+        let applied = restore_units(
+            &item(),
+            vec![vec![restore(
+                F::Recurrence,
+                V::Cleared,
+                V::Recurrence(legacy.clone()),
+            )]],
+        );
+        assert_eq!(applied.item.overlay.recurrence, Some(legacy));
+        // Nested fields stay read-only.
+        let unit = vec![restore(F::RecurrenceOccurrenceDate, V::Cleared, V::Cleared)];
+        assert_eq!(
+            restore_units(&item(), vec![unit]).skipped,
+            [skip(
+                &[F::RecurrenceOccurrenceDate],
+                SkipReason::Invalid("RecurrenceOccurrenceDate is read-only".into())
+            )]
+        );
+        let unit = vec![restore(F::Recurrence, V::Cleared, V::Date(TODAY))];
+        assert_eq!(
+            restore_units(&item(), vec![unit]).skipped,
+            [skip(
+                &[F::Recurrence],
+                SkipReason::Invalid("Recurrence does not take a date value".into())
+            )]
         );
     }
 
@@ -1603,7 +2068,7 @@ mod tests {
             }]),
             MutationOp::Update(vec![]),
             MutationOp::SetStatus(Status::Done),
-            MutationOp::Archive,
+            MutationOp::Archive(ArchiveReason::User),
             MutationOp::Unarchive,
         ];
         for op in rejected {
@@ -1651,7 +2116,7 @@ mod tests {
 
             for op in [
                 MutationOp::SetStatus(Status::Next),
-                MutationOp::Archive,
+                MutationOp::Archive(ArchiveReason::User),
                 MutationOp::Delete,
             ] {
                 let after = apply(&before, &op, &ctx(actor)).unwrap().item;
@@ -1673,7 +2138,7 @@ mod tests {
         );
         let mut item = item();
         item.derived.staleness.status_entered_at = Some(ts(10));
-        let archived = run(&item, MutationOp::Archive).unwrap();
+        let archived = run(&item, MutationOp::Archive(ArchiveReason::User)).unwrap();
         assert_eq!(
             archived.item.derived.staleness.status_entered_at,
             Some(ts(10))
@@ -2195,6 +2660,7 @@ mod tests {
             (MutationError::ParentUnset(F::WaitingOn), Some(F::WaitingOn)),
             (MutationError::Duplicate(F::Labels), Some(F::Labels)),
             (MutationError::Deleted, None),
+            (MutationError::Closed, None),
             (
                 MutationError::Unsupported {
                     field: F::Components,

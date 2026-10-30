@@ -696,7 +696,7 @@ mod tests {
                 field: F::WaitingReason,
                 value: title("contract"),
             }]),
-            MutationOp::Archive,
+            MutationOp::Archive(ArchiveReason::User),
         ];
         let (done, events) = run(&original, &ops, user(ts(2_000)));
         assert_eq!(done.status(), Status::Done);
@@ -826,6 +826,113 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// Setting a rule records `recurrence` and `due_date` as two events, so
+    /// undo restores them as separate units: a due date changed since keeps
+    /// its value, and the rule is still removed.
+    #[test]
+    fn undo_and_redo_of_set_recurrence() {
+        use crate::item::ItemRecurrence;
+        use crate::recurrence::Rule;
+
+        let item = start();
+        let op = MutationOp::SetRecurrence {
+            rule: Some(Rule::Daily),
+            series_id: id(50),
+            today: date(2026, 10, 22),
+        };
+        let (recurring, events) = run(&item, &[op], user(ts(2_000)));
+        assert_eq!(
+            recurring.overlay.recurrence,
+            Some(ItemRecurrence {
+                series_id: id(50),
+                occurrence_date: Some(date(2026, 10, 22)),
+                rule: Some(Rule::Daily),
+            })
+        );
+        assert_eq!(recurring.core.due_date, Some(date(2026, 10, 22)));
+        let steps = inverse(&events, ts(3_000));
+        let fields: Vec<Vec<ItemField>> = steps
+            .iter()
+            .map(|step| match step {
+                InverseStep::Restore { unit, .. } => {
+                    unit.restores.iter().map(|r| r.field).collect()
+                }
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                vec![F::StalenessLastUserTouchAt],
+                vec![F::DueDate],
+                vec![F::Recurrence],
+            ]
+        );
+
+        let (undone, skipped, undo_events) = undo(&recurring, &events, ts(3_000));
+        assert_eq!(skipped, []);
+        assert_eq!(content(&undone), content(&item));
+        let (redone, skipped, _) = undo(&undone, &undo_events, ts(4_000));
+        assert_eq!(skipped, []);
+        assert_eq!(content(&redone), content(&recurring));
+
+        // The due date changed since: only the rule is undone.
+        let system = ApplyCtx {
+            now: ts(2_500),
+            actor: Actor::System,
+        };
+        let moved = MutationOp::Update(vec![FieldUpdate {
+            field: F::DueDate,
+            value: V::Date(date(2026, 11, 1)),
+        }]);
+        let (changed, _) = run(&recurring, &[moved], system);
+        let (undone, skipped, _) = undo(&changed, &events, ts(3_000));
+        assert_eq!(
+            skipped,
+            [RestoreSkip {
+                fields: vec![F::DueDate],
+                reason: SkipReason::ChangedSince,
+            }]
+        );
+        assert_eq!(undone.overlay.recurrence, None);
+        assert_eq!(undone.core.due_date, Some(date(2026, 11, 1)));
+
+        // Clearing the rule undoes back to it.
+        let clear = MutationOp::SetRecurrence {
+            rule: None,
+            series_id: id(51),
+            today: date(2026, 10, 22),
+        };
+        let (cleared, events) = run(&recurring, &[clear], user(ts(5_000)));
+        assert_eq!(cleared.overlay.recurrence, None);
+        let (undone, skipped, _) = undo(&cleared, &events, ts(6_000));
+        assert_eq!(skipped, []);
+        assert_eq!(content(&undone), content(&recurring));
+    }
+
+    /// Reopening an Item archived auto_done unarchives it; undo archives it
+    /// again with the recorded archive.
+    #[test]
+    fn undo_of_a_reopen_restores_the_auto_done_archive() {
+        let mut done = start();
+        done.set_status_fields(done.status_fields().with_status(Status::Done));
+        let auto_done = Archived {
+            at: ts(500),
+            reason: ArchiveReason::AutoDone,
+        };
+        done.overlay.archived = Some(auto_done);
+        let (open, events) = run(
+            &done,
+            &[MutationOp::SetStatus(Status::Next)],
+            user(ts(2_000)),
+        );
+        assert_eq!(open.overlay.archived, None);
+        let (undone, skipped, _) = undo(&open, &events, ts(3_000));
+        assert_eq!(skipped, []);
+        assert_eq!(content(&undone), content(&done));
+        assert_eq!(undone.overlay.archived, Some(auto_done));
     }
 
     #[test]

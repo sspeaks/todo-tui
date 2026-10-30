@@ -170,6 +170,8 @@ pub(crate) enum Shape<'a> {
     /// `UpdateItem`: fields under `item`, repeats in `update_mask`.
     Update,
     SetStatus,
+    /// `SetRecurrence`: `id`, and `rule`.
+    SetRecurrence,
     /// Archive, unarchive, delete and undelete: only `id`.
     ItemOp,
     /// `BatchMutate`: mutation `i` under `mutations[i].<oneof case>`.
@@ -192,6 +194,7 @@ impl Shape<'_> {
                 (_, None) => "item".to_owned(),
             },
             Shape::SetStatus => "status".to_owned(),
+            Shape::SetRecurrence => "rule".to_owned(),
             Shape::ItemOp => "id".to_owned(),
             Shape::Batch(mutations) => batched(mutations, index, |inner| inner.path(0, error)),
             // The store makes no MutationError from a relation.
@@ -204,7 +207,7 @@ impl Shape<'_> {
         match self {
             Shape::Capture => "parent_id".to_owned(),
             Shape::Update => "item.id".to_owned(),
-            Shape::SetStatus | Shape::ItemOp => "id".to_owned(),
+            Shape::SetStatus | Shape::SetRecurrence | Shape::ItemOp => "id".to_owned(),
             Shape::Batch(mutations) => batched(mutations, index, |inner| inner.id_path(0)),
             Shape::Relation(_) => "relation.from_id".to_owned(),
         }
@@ -230,6 +233,18 @@ impl Shape<'_> {
                     match id {
                         Some(id) => format!("item {id} is deleted"),
                         None => "the item is deleted".to_owned(),
+                    },
+                ),
+                id.map(|id| ("item_id", id.to_string())),
+            ),
+            MutationError::Closed => error_info(
+                Code::FailedPrecondition,
+                "ITEM_CLOSED",
+                self.in_batch(
+                    index,
+                    match id {
+                        Some(id) => format!("item {id} is done or cancelled: reopen it first"),
+                        None => "the item is done or cancelled: reopen it first".to_owned(),
                     },
                 ),
                 id.map(|id| ("item_id", id.to_string())),
@@ -300,6 +315,7 @@ fn batched(
         Some(Kind::UnarchiveItem(_)) => ("unarchive_item", Shape::ItemOp),
         Some(Kind::DeleteItem(_)) => ("delete_item", Shape::ItemOp),
         Some(Kind::UndeleteItem(_)) => ("undelete_item", Shape::ItemOp),
+        Some(Kind::SetRecurrence(_)) => ("set_recurrence", Shape::SetRecurrence),
         None => return prefix,
     };
     format!("{prefix}.{case}.{}", path(&inner))
@@ -344,6 +360,7 @@ fn describe(error: &MutationError) -> String {
             item_field_path(*field)
         ),
         MutationError::Deleted => "the item is deleted".to_owned(),
+        MutationError::Closed => "the item is done or cancelled: reopen it first".to_owned(),
     }
 }
 
@@ -426,10 +443,64 @@ mod tests {
         assert_eq!(batch.id_path(2), "mutations[2].delete_item.id");
         assert_eq!(batch.id_path(3), "mutations[3]");
         assert_eq!(Shape::Capture.path(0, &invalid), "text");
+        let rule = MutationError::Invalid {
+            field: ItemField::Recurrence,
+            reason: "x".into(),
+        };
+        let recurrence = [v1::Mutation {
+            kind: Some(Kind::SetRecurrence(Default::default())),
+        }];
+        let batch = Shape::Batch(&recurrence);
+        assert_eq!(batch.path(0, &rule), "mutations[0].set_recurrence.rule");
+        assert_eq!(batch.id_path(0), "mutations[0].set_recurrence.id");
         let parent = MutationError::Invalid {
             field: ItemField::ParentId,
             reason: "x".into(),
         };
         assert_eq!(Shape::Capture.path(0, &parent), "parent_id");
+    }
+
+    #[test]
+    fn a_rule_on_a_closed_item_is_item_closed() {
+        use v1::mutation::Kind;
+        let id = ItemId::from(7u128);
+        let status = Shape::SetRecurrence.status(0, &MutationError::Closed, Some(id));
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        assert_eq!(
+            status.message(),
+            format!("item {id} is done or cancelled: reopen it first")
+        );
+        let info = status.get_details_error_info().unwrap();
+        assert_eq!(info.reason, "ITEM_CLOSED");
+        assert_eq!(info.domain, DOMAIN);
+        assert_eq!(info.metadata["item_id"], id.to_string());
+
+        let mutations = [
+            v1::Mutation {
+                kind: Some(Kind::SetStatus(Default::default())),
+            },
+            v1::Mutation {
+                kind: Some(Kind::SetRecurrence(Default::default())),
+            },
+        ];
+        let status = mutation(
+            StoreError::Mutation {
+                index: 1,
+                error: MutationError::Closed,
+            },
+            &Shape::Batch(&mutations),
+            &[ItemId::from(1u128), id],
+        );
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        assert_eq!(
+            status.message(),
+            format!(
+                "mutations[1].set_recurrence.id: item {id} is done or cancelled: reopen it first"
+            )
+        );
+        assert_eq!(
+            status.get_details_error_info().unwrap().reason,
+            "ITEM_CLOSED"
+        );
     }
 }

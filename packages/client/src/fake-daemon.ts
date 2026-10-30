@@ -320,7 +320,7 @@ export class FakeDaemon {
   maxPageSize = MAX_PAGE_SIZE;
   /** Runs before every ListItems; throw from it to fail that call. */
   onListItems: ((req: ListItemsRequest) => void) | undefined;
-  apiMinor = 6;
+  apiMinor = 7;
   readonly calls = { listItems: 0, listViews: 0, getStatusCounts: 0, subscribe: [] as (bigint | undefined)[] };
   readonly transport: Transport;
   readonly now: () => Date;
@@ -378,6 +378,15 @@ export class FakeDaemon {
         },
         updateItem: (req) => this.single("UpdateItem", OpKind.UPDATE, req.requestId, () => planUpdate(req, "", this.today())),
         setStatus: (req) => this.single("SetStatus", OpKind.SET_STATUS, req.requestId, () => planSetStatus(req, "")),
+        // Stubs, as in the daemon until recurrence is stored (M5 phase 2).
+        setRecurrence: () => {
+          this.check();
+          throw notImplemented("SetRecurrence");
+        },
+        parseRecurrence: () => {
+          this.check();
+          throw notImplemented("ParseRecurrence");
+        },
         archiveItem: (req) => this.single("ArchiveItem", OpKind.ARCHIVE, req.requestId, () => planItemOp("archive", req, "")),
         unarchiveItem: (req) => this.single("UnarchiveItem", OpKind.UNARCHIVE, req.requestId, () => planItemOp("unarchive", req, "")),
         deleteItem: (req) => this.single("DeleteItem", OpKind.DELETE, req.requestId, () => planItemOp("delete", req, "")),
@@ -388,6 +397,7 @@ export class FakeDaemon {
           if (req.mutations.length < 1 || req.mutations.length > MAX_BATCH) {
             throw badRequest("mutations", `must hold 1 to ${MAX_BATCH} mutations`);
           }
+          if (req.mutations.some((m) => m.kind.case === "setRecurrence")) throw notImplemented("SetRecurrence");
           const today = this.today();
           const planned = req.mutations.map((m, i) => planMutation(m, `mutations[${i}].`, today));
           return this.mutate("BatchMutate", OpKind.BATCH, requestId, planned);
@@ -1687,6 +1697,11 @@ function inBatch(p: Planned, message: string): string {
   return p.batched ? `${p.idPath}: ${message}` : message;
 }
 
+/** UNIMPLEMENTED for an RPC the daemon does not serve yet. */
+function notImplemented(rpc: string): ConnectError {
+  return errorInfo(Code.Unimplemented, "NOT_IMPLEMENTED", `${rpc} is not implemented yet`, {});
+}
+
 function notFound(id: string): ConnectError {
   return errorInfo(Code.NotFound, "ITEM_NOT_FOUND", `item ${id} not found`, { item_id: id });
 }
@@ -1831,6 +1846,8 @@ function planMutation(m: Mutation, prefix: string, today: number): Planned {
       return planItemOp("delete", k.value, inner);
     case "undeleteItem":
       return planItemOp("undelete", k.value, inner);
+    case "setRecurrence":
+      throw notImplemented("SetRecurrence");
   }
 }
 
