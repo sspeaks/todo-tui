@@ -1,4 +1,4 @@
-import { type ItemsClient, Priority, Status, archiveItem, deleteItem, updateItem } from "@todo-tui/client";
+import { type ItemsClient, Priority, Status, archiveItem, deleteItem, setStatus, updateItem } from "@todo-tui/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fakeDaemon, item, rows } from "../fake.test-util.js";
 import { holding, setup, stopControllers } from "./setup.test-util.js";
@@ -323,6 +323,68 @@ describe("bulk actions", () => {
     expect(t.byTitle("a")?.waiting).toMatchObject({ since: { day: 1 }, followUpOn: { day: 5 } });
     expect(t.byTitle("b")?.waiting).toMatchObject({ on: { ref: { value: "dana" } }, followUpOn: { day: 5 } });
     expect(t.userOps().at(-1)?.summary).toBe("edit 2 items");
+  });
+
+  it("@ with marks: each Item's own weekday for weekly, one op of SetRecurrence, the shared rule prefilled, empty stops them", async () => {
+    const NOON = new Date(Date.UTC(2026, 9, 26, 12));
+    const day = (d: number) => ({ year: 2026, month: 10, day: d });
+    const fd = fakeDaemon([item("a", { dueDate: day(29) }), item("b", { dueDate: day(30) }), item("c")], { now: () => NOON, timeZone: "UTC" });
+    const log: Call[] = [];
+    const t = await setup(fd, { now: () => NOON, items: recording(log) });
+    await t.c.press("mmm@");
+    expect(t.mode()).toMatchObject({ kind: "prompt", prompt: "repeat", line: { text: "" }, target: { bulk: true } });
+    await t.c.press("weekly");
+    await t.c.previewIdle();
+    expect(t.mode()).toMatchObject({ preview: { text: "→ weekly, each on its own due date's weekday (else today's)", warn: false } });
+    await t.c.press("<enter>");
+    expect(t.mode().kind).toBe("normal");
+    expect(batches(log)).toHaveLength(1);
+    expect((batches(log)[0]?.req.mutations as { kind: { case: string } }[]).map((m) => m.kind.case)).toEqual(["setRecurrence", "setRecurrence", "setRecurrence"]);
+    const days = (x: string) => {
+      const k = t.byTitle(x)?.recurrence?.rule?.kind;
+      return k?.case === "weekly" ? k.value.days : undefined;
+    };
+    // Thu, Fri, and c (no due date) today's Monday, now also its due date.
+    expect(["a", "b", "c"].map(days)).toEqual([[4], [5], [1]]);
+    expect(t.byTitle("c")?.dueDate).toMatchObject(day(26));
+    expect(t.userOps().map((o) => o.summary)).toEqual(["set repeat (3 items)"]);
+    expect(t.toast()).toBe("set repeat (3 items) · u undo");
+    expect(t.state().marks.size).toBe(0);
+
+    // The rule they share is prefilled; the same again changes nothing.
+    await t.c.press("ggjmm@");
+    expect(t.mode()).toMatchObject({ line: { text: "" } });
+    await t.c.press("<ctrl+u>daily<enter>");
+    await t.c.press("ggjmm@");
+    expect(t.mode()).toMatchObject({ line: { text: "daily" } });
+    await t.c.press("<enter>");
+    expect(t.toast()).toBe("Repeat rules unchanged");
+    // Nothing sent, so the marks stay: esc clears them.
+    expect(t.state().marks.size).toBe(2);
+    await t.c.press("<esc>ggmmm@<ctrl+u><enter>");
+    expect(t.userOps().at(-1)?.summary).toBe("stop repeating (3 items)");
+    expect(["a", "b", "c"].map((x) => t.byTitle(x)?.recurrence)).toEqual([undefined, undefined, undefined]);
+  });
+
+  it("@ with marks keeps the prompt on a warning, and names a closed Item ITEM_CLOSED refuses", async () => {
+    const t = await setup(fakeDaemon(rows(3)));
+    await t.c.press("mm@nope<enter>");
+    expect(t.mode()).toMatchObject({ kind: "prompt", line: { text: "nope" }, preview: { text: "nope: not a repeat rule", warn: true } });
+    expect(t.userOps()).toEqual([]);
+    await setStatus(t.clients().items, t.byTitle("row 1")!.id, Status.DONE);
+    await t.c.press("<ctrl+u>daily<enter>");
+    expect(t.state().toast).toMatchObject({ level: "error", text: "“row 1” is done or cancelled: reopen it first" });
+    expect(t.byTitle("row 0")?.recurrence).toBeUndefined();
+  });
+
+  it("x with marks on recurring Items puts the next instances in the store, and says how many", async () => {
+    const t = await setup(fakeDaemon(rows(3)));
+    await t.c.press("mm@daily<enter>");
+    await t.c.press("ggmmx");
+    expect(t.toast()).toBe("mark done (2 items) · 2 next · u undo");
+    const next = [...t.daemon.items.values()].filter((i) => i.status === Status.NEXT);
+    expect(next.map((i) => i.title).sort()).toEqual(["row 0", "row 1"]);
+    for (const i of next) expect(t.store.getItem(i.id)).toBeDefined();
   });
 
   it("keeps the marks when the batch fails, with the error", async () => {

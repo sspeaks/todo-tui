@@ -10,6 +10,7 @@ describe("error toasts (m4_arch §3.2)", () => {
     expect(errorText(info(Code.NotFound, "ITEM_NOT_FOUND"), "x".repeat(60))).toBe(`“${"x".repeat(39)}…” was deleted elsewhere`);
     expect(errorText(info(Code.NotFound, "ITEM_NOT_FOUND"))).toBe("The Item was deleted elsewhere");
     expect(errorText(info(Code.FailedPrecondition, "PARENT_DELETED"))).toBe("Undelete the parent first");
+    expect(errorText(info(Code.FailedPrecondition, "ITEM_CLOSED"), "water plants")).toBe("“water plants” is done or cancelled: reopen it first");
     const bad = new ConnectError("bad", Code.InvalidArgument, undefined, [
       { desc: BadRequestSchema, value: { fieldViolations: [{ field: "item.title", description: "must be one line" }] } },
     ]);

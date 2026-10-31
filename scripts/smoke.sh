@@ -2,8 +2,9 @@
 # Smoke test: auto-spawn, a TS watcher over Subscribe, the single-daemon lock
 # under parallel --detach, the long-path socket fallback (P0), parsed capture
 # and the capture spool round trip (P1 M1), undo/redo of a capture (P1 M2),
-# `todo status` and the seeded Today view (P1 M3), and the TUI driven in a
-# private tmux server (P1 M4; skipped without tmux).
+# `todo status` and the seeded Today view (P1 M3), the TUI driven in a
+# private tmux server (P1 M4; skipped without tmux), and x in the TUI on an
+# @daily capture making the next instance (P1 M5).
 # Usage: scripts/smoke.sh   (TODO_BIN overrides the binary; default: cargo build;
 # TODO_TUI_ENTRY the TUI bundle; default: pnpm -C tui build)
 set -euo pipefail
@@ -242,8 +243,9 @@ titles=$(sed -n 's/.*"title":"\([^"]*\)".*/\1/p' "$root/today.items" | paste -sd
 #    back, E edits the description in $EDITOR (a script) with the terminal
 #    resized meanwhile, ctrl-z without job control comes straight back, q
 #    leaves the terminal as it was, and ctrl-z / fg in a job-control shell
-#    stop and resume it. The TS client checks the
-#    daemon. Frames are polled with capture-pane, not fixed sleeps.
+#    stop and resume it, and x on an @daily capture makes the next
+#    instance. The TS client checks the daemon. Frames are polled with
+#    capture-pane, not fixed sleeps.
 step "the TUI in tmux"
 if ! command -v tmux >/dev/null; then
   echo "smoke: tmux not found; skipping the TUI step"
@@ -379,8 +381,50 @@ else
   tmx send-keys -t tui:job q
   # The prompt is back, alone on its line (capture-pane drops its trailing space).
   jsee '^\$$' "the shell after the TUI quit"
+
+  # x on an @daily capture, in a scratch home of its own: the toast says
+  # when the next instance is and the row leaves the Inbox. The instance is
+  # deferred to its day, so ListItems leaves it out (as it does the done
+  # one); :search finds both, and the instance's detail shows where it
+  # came from and its Repeats line.
+  rhome=$root/recur
+  new_home "$rhome"
+  out=$(TODO_TUI_HOME=$rhome "$TODO_BIN" add "smoke daily @daily")
+  re='^[0-9A-Z]{8}  smoke daily  \^[0-9]{4}-[0-9]{2}-[0-9]{2} @daily$'
+  [[ $out =~ $re ]] || fail "unexpected add output: $out"
+  tmx new-window -t tui -n recur -e "TODO_TUI_HOME=$rhome" -e "TODO_BIN=$TODO_BIN" -e "TODO_TUI_ENTRY=$TODO_TUI_ENTRY" \
+    "\"\$TODO_BIN\"; sleep 600"
+  tmx resize-window -t tui:recur -x 110 -y 24
+  rscreen() { tmx capture-pane -p -t tui:recur; }
+  rsee() {
+    for _ in $(seq 1 100); do
+      rscreen | grep -Eq -- "$1" && return 0
+      sleep 0.1
+    done
+    rscreen >&2
+    fail "the TUI never showed $2"
+  }
+  rsee '^NORMAL · ● live' "the TUI live"
+  rsee '^› ○ +smoke daily .*🔁' "the @daily capture in the Inbox"
+  tmx send-keys -t tui:recur x
+  # The year shows only when it is not this year's.
+  rsee '^mark done "smoke daily" · next [A-Z][a-z]{2} [A-Z][a-z]{2} [0-9]{1,2}( [0-9]{4})? · u undo' "the x toast with the next date"
+  rsee 'Inbox zero' "the row leaving the Inbox"
+  TODO_TUI_HOME=$rhome list_items >"$root/recur.items" || fail "listing items failed"
+  grep -qF '"title":"smoke daily"' "$root/recur.items" && { cat "$root/recur.items" >&2; fail "x left an open 'smoke daily' showing"; }
+  tmx send-keys -t tui:recur :
+  tmx send-keys -t tui:recur -l 'search smoke daily'
+  tmx send-keys -t tui:recur Enter
+  rsee '^[› ] ● +smoke daily ' "the done Item in the search"
+  rsee '^[› ] ○ +smoke daily .*⏸.*🔁' "the deferred next instance in the search"
+  rscreen | grep -q '^› ●' && tmx send-keys -t tui:recur j
+  rsee '^› ○ +smoke daily ' "the next instance selected"
+  rsee 'Created +[0-9-]+ [0-9:]+ via recurrence' "the instance created via recurrence"
+  rsee 'Repeats +every day · this one ' "the instance's Repeats line"
+  tmx send-keys -t tui:recur q
   tmx kill-server
   rm -rf "$tmux_dir"
   tmux_dir=
   "$TODO_BIN" daemon stop >/dev/null
+  TODO_TUI_HOME=$rhome "$TODO_BIN" daemon stop >/dev/null
 fi

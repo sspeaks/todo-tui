@@ -6,7 +6,7 @@
 import { Priority, Status } from "@todo-tui/client";
 import type { KeyToken } from "./tokenize.js";
 
-export type PromptKind = "title" | "labels" | "due" | "defer" | "waiting";
+export type PromptKind = "title" | "labels" | "due" | "defer" | "waiting" | "repeat";
 
 export type Action =
   | { type: "move"; by: 1 | -1 }
@@ -108,6 +108,7 @@ export const BINDINGS: readonly Binding[] = [
   ),
   { id: "clear_priority", keys: ["p 0"], action: { type: "set_priority", priority: Priority.NONE }, markAware: true, section: "Items", help: "Clear the priority" },
   { id: "set_due", keys: ["^"], action: { type: "prompt", prompt: "due" }, markAware: true, section: "Items", help: "Set the due date" },
+  { id: "set_repeat", keys: ["@"], action: { type: "prompt", prompt: "repeat" }, markAware: true, section: "Items", help: "Set or stop the repeat rule" },
   { id: "defer", keys: ["D"], action: { type: "prompt", prompt: "defer" }, markAware: true, section: "Items", help: "Defer until…" },
   { id: "set_waiting", keys: ["w"], action: { type: "prompt", prompt: "waiting" }, markAware: true, section: "Items", help: "Waiting on…" },
   { id: "clear_waiting", keys: ["W"], action: { type: "clear_waiting" }, markAware: true, section: "Items", help: "Clear waiting" },

@@ -489,9 +489,11 @@ export class Controller {
    * After any store change: keeps the tab one that exists, observes its
    * view, drops the marks whose Item left it, and pins its selection, so
    * that a later change starts from where this one left it and background
-   * changes never move the selection.
+   * changes never move the selection. An open repeat prompt previews
+   * again when the due date it resolves against moved.
    */
   private sync(): void {
+    this.prompts.sync();
     const { views } = this.store.getViews();
     const { tab } = this.state;
     const first = views[0];

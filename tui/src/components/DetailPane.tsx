@@ -11,6 +11,7 @@ import { type DOMElement, Box, Text, useBoxMetrics } from "ink";
 import { type ReactNode, useEffect, useRef } from "react";
 import { dayOf, localTime, longDay, relativeDays, shortDay } from "../format/dates.js";
 import { createdViaName, personName, priorityName, shortId, statusGlyph, statusName } from "../format/item.js";
+import { repeatsLine } from "../format/recurrence.js";
 import { sanitize, singleLine } from "../format/text.js";
 import { useController, useDebounced, useOptionalView, useToday, useUi } from "./hooks.js";
 
@@ -127,6 +128,7 @@ export function DetailPane({ id, width, height, focused }: { id: string | undefi
     return `${longDay(n)} (${relativeDays(n, today)}${overdue ? ", overdue" : ""})`;
   };
   const waiting = item.waiting;
+  const repeats = repeatsLine(item, today);
   const override = item.localPriorityOverride;
   const kids = subtasks?.items ?? [];
   return (
@@ -148,6 +150,7 @@ export function DetailPane({ id, width, height, focused }: { id: string | undefi
         <Field label="Defer" dim={!item.deferUntil}>
           {day(item.deferUntil)}
         </Field>
+        {repeats !== undefined ? <Field label="Repeats">{repeats}</Field> : null}
         <Field label="Waiting" dim={!waiting}>
           {waiting
             ? [

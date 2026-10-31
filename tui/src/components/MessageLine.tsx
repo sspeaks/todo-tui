@@ -84,18 +84,21 @@ const PROMPT_HINTS: Readonly<Record<Extract<Mode, { kind: "prompt" }>["prompt"],
   due: "a date: fri, +3d, eow, nov2, 2026-11-02 · empty clears",
   defer: "a date: fri, +3d, eow, nov2, 2026-11-02 · empty clears",
   waiting: "<person> [^date] · tab completes the person · empty clears",
+  repeat: "a rule: daily, weekdays, mon,thu, 15th, 3d, 2w · empty stops it",
 };
 
 /** The hints of a prompt acting on marks, where they differ. */
 const BULK_HINTS: Partial<Record<Extract<Mode, { kind: "prompt" }>["prompt"], string>> = {
   labels: "+a adds · -b removes, on each marked Item · enter saves · esc cancels",
   waiting: "<person> [^date] for each marked Item · tab completes the person · empty clears",
+  repeat: "a rule for each marked Item: daily, weekdays, mon,thu, 15th, 3d, 2w · empty stops it",
 };
 
 /**
  * Above the status bar while a prompt is open: why enter did not save, a
- * conflict (the server's value, which enter overwrites), the ParseDate
- * preview, or a hint. A toast while the prompt is open shows here too.
+ * conflict (the server's value, which enter overwrites), the ParseDate or
+ * ParseRecurrence preview, or a hint. A toast while the prompt is open
+ * shows here too.
  */
 export function PromptPreviewLine({ width }: { width: number }) {
   const mode = useUi((s) => (s.mode.kind === "prompt" ? s.mode : undefined));

@@ -9,7 +9,7 @@ const LABEL = "Add: ";
 /** The byte counter shows from here on. */
 const COUNTER_FROM = Math.floor(MAX_CAPTURE_BYTES * 0.9);
 
-const HINT = "+1–5 priority · ^date due · #label · ~person waiting · >next >someday · enter adds · esc closes";
+const HINT = "+1–5 priority · ^date due · @rule repeats · #label · ~person waiting · >next >someday · enter adds · esc closes";
 
 /**
  * Quick-add (Decision 7), at the top of the list: the line being typed,

@@ -7,6 +7,7 @@ import { CaptureTokenKind, type CaptureDraft, type CaptureToken, Priority, Statu
 import { type LineState, lineWindow } from "../keys/line-editor.js";
 import { dayLabel, dayOf } from "./dates.js";
 import { personName } from "./item.js";
+import { describeRule } from "./recurrence.js";
 import { sanitize, singleLine } from "./text.js";
 
 /** A token's place in the text, as JS string indexes (end exclusive). */
@@ -55,6 +56,8 @@ export function tokenColor(span: Pick<Span, "kind" | "applied">): string {
       return "green";
     case CaptureTokenKind.WAITING:
       return "yellow";
+    case CaptureTokenKind.RECURRENCE:
+      return "cyanBright";
     default:
       return "blue";
   }
@@ -68,12 +71,23 @@ const priorities: Partial<Record<Priority, string>> = {
   [Priority.LOWEST]: "+5",
 };
 
-/** `→ title · +2 · ^Fri Oct 30 · #a #b · ⧗dana · >next`: what enter would capture. */
+/**
+ * `→ title · +2 · ^Fri Oct 30 · repeats every Fri · #a #b · ⧗dana · >next`:
+ * what enter would capture. A rule without a ^ date is due on its first
+ * date, as the capture stores it; one whose first date is not the due date
+ * says when it is.
+ */
 export function captureSummary(draft: CaptureDraft, today: number): string {
   const parts = [`→ ${singleLine(draft.title)}`];
   const priority = priorities[draft.priority];
   if (priority) parts.push(priority);
-  if (draft.dueDate) parts.push(`^${dayLabel(dayOf(draft.dueDate), today)}`);
+  const due = draft.dueDate ?? draft.recurrenceFirst;
+  if (due) parts.push(`^${dayLabel(dayOf(due), today)}`);
+  if (draft.recurrence) {
+    const first = draft.recurrenceFirst;
+    parts.push(`repeats ${describeRule(draft.recurrence)}`);
+    if (first && due && dayOf(first) !== dayOf(due)) parts.push(`first ${dayLabel(dayOf(first), today)}`);
+  }
   if (draft.labels.length) parts.push(draft.labels.map((l) => `#${singleLine(l)}`).join(" "));
   const waiting = personName(draft.waitingOn);
   if (waiting) parts.push(`⧗${waiting}`);

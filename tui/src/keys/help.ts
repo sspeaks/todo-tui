@@ -1,6 +1,6 @@
 // The help overlay's text: generated from the keymap (the bindings that run
 // now, each once) and the commands, plus a cheat sheet of the capture
-// syntax and the date grammar (design 2.3).
+// syntax, the repeat rule grammar and the date grammar (design 2.3).
 
 import { COMMANDS } from "./commands.js";
 import { BINDINGS, type Binding, type Section, bindingModes, isAvailable, sequences } from "./keymap.js";
@@ -19,7 +19,7 @@ const row = (keys: string, text: string): HelpLine => ({ text: `  ${keys.padEnd(
 /** Lines after a section's bindings, for what no single binding says. */
 const NOTES: Partial<Record<Section, readonly [string, string][]>> = {
   Marks: [
-    ["x X s p ^ D w W", "with marks: act on every marked Item, one undo"],
+    ["x X s p ^ @ D w W", "with marks: act on every marked Item, one undo"],
     ["t z dd", "the same; t then takes +a -b (labels to add, remove)"],
     ["esc", "clears the marks (after the detail, V and /)"],
   ],
@@ -43,6 +43,7 @@ export function helpBindings(): Binding[][] {
 const CAPTURE: readonly [string, string][] = [
   ["+1 … +5", "priority, +1 highest"],
   ["^<date>", "due date (dates below)"],
+  ["@<rule>", "repeats (rules below)"],
   ["#label", "label"],
   ["~dana ~\"the vendor\"", "waiting on"],
   [">next >someday", "status (default inbox)"],
@@ -57,6 +58,14 @@ const DATES: readonly [string, string][] = [
   ["eow eom", "this Friday, the month's last day"],
   ["2026-11-02", "that date"],
   ["nov2", "the next Nov 2"],
+];
+
+const RULES: readonly [string, string][] = [
+  ["daily weekdays", "every day, Mon–Fri"],
+  ["weekly monthly", "on the ^date's weekday or day, else today's"],
+  ["mon,thu", "on those weekdays"],
+  ["15th", "that day of every month (the last, if shorter)"],
+  ["3d 2w", "days, weeks after done"],
 ];
 
 export function helpLines(): HelpLine[] {
@@ -76,6 +85,8 @@ export function helpLines(): HelpLine[] {
   }
   lines.push(...section("Capture syntax"));
   for (const [k, t] of CAPTURE) lines.push(row(k, t));
+  lines.push(...section("Repeat rules"));
+  for (const [k, t] of RULES) lines.push(row(k, t));
   lines.push(...section("Dates"));
   for (const [k, t] of DATES) lines.push(row(k, t));
   return lines;

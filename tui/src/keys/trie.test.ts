@@ -33,7 +33,7 @@ describe("the keymap", () => {
     expect(available).toEqual(
       expect.arrayContaining(["mark_done", "mark_cancelled", "set_status", "set_priority_1", "clear_priority", "toggle_archive", "delete", "undo", "redo"]),
     );
-    expect(available).toEqual(expect.arrayContaining(["quick_add", "edit_title", "edit_labels", "set_due", "defer", "set_waiting", "clear_waiting"]));
+    expect(available).toEqual(expect.arrayContaining(["quick_add", "edit_title", "edit_labels", "set_due", "set_repeat", "defer", "set_waiting", "clear_waiting"]));
     expect(available).toEqual(expect.arrayContaining(["mark", "visual_mark", "narrow", "quick_add_child", "edit_description", "suspend"]));
     expect(BINDINGS.filter((b) => b.available)).toEqual([]);
   });

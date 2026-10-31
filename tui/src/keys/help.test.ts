@@ -15,17 +15,19 @@ describe("help", () => {
     }
     expect(text.find((t) => t.includes("Mark done"))).toMatch(/^ {2}x /);
     expect(text.find((t) => t.includes("Mark a range"))).toMatch(/^ {2}V /);
-    expect(text.find((t) => t.includes("act on every marked Item"))).toMatch(/^ {2}x X s p \^ D w W /);
+    expect(text.find((t) => t.includes("act on every marked Item"))).toMatch(/^ {2}x X s p \^ @ D w W /);
     expect(text.find((t) => t.includes("Go to view N"))).toMatch(/1–9/);
     expect(text.find((t) => t.includes("First row"))).toMatch(/gg home/);
   });
 
-  it("adds the commands and the capture and date cheat sheets", () => {
+  it("adds the commands and the capture, repeat rule and date cheat sheets", () => {
     const text = helpLines().map((l) => l.text).join("\n");
     expect(text).toMatch(/:quit :q\s+Quit/);
     expect(text).toContain(":refresh");
     expect(text).toMatch(/:search <query>\s+Search everything/);
     expect(text).toMatch(/\^<date>\s+due date/);
+    expect(text).toMatch(/@<rule>\s+repeats/);
+    expect(text).toMatch(/3d 2w\s+days, weeks after done/);
     expect(text).toMatch(/eow eom/);
   });
 });

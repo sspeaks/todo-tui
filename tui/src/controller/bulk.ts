@@ -1,5 +1,5 @@
 // Bulk actions (Decision 8): with marks in the tab, the mark-aware keys
-// x X s p ^ D w W t z dd act on every marked Item through one BatchMutate,
+// x X s p ^ D w W t z dd @ act on every marked Item through one BatchMutate,
 // in list order and without expected_revision (they are absolute): one op,
 // so one undo entry, toasted with its OpSummary. An Item deleted elsewhere
 // meanwhile is dropped and the rest retried once.
@@ -32,11 +32,14 @@ export interface BulkStep {
 export const MAX_BULK = 1000;
 export const TOO_MANY = `Bulk actions take at most ${MAX_BULK} items`;
 
-/** The Item an ITEM_DELETED or ITEM_NOT_FOUND error names (ErrorInfo metadata item_id). */
+/** The Item an error names (ErrorInfo metadata item_id), e.g. the closed one ITEM_CLOSED refuses a rule on. */
+export const errorItemId = (err: unknown): string | undefined =>
+  err instanceof ConnectError ? err.findDetails(ErrorInfoSchema)[0]?.metadata.item_id : undefined;
+
+/** The Item an ITEM_DELETED or ITEM_NOT_FOUND error names. */
 export function deletedItemId(err: unknown): string | undefined {
   const reason = errorReason(err);
-  if (reason !== "ITEM_DELETED" && reason !== "ITEM_NOT_FOUND") return undefined;
-  return err instanceof ConnectError ? err.findDetails(ErrorInfoSchema)[0]?.metadata.item_id : undefined;
+  return reason === "ITEM_DELETED" || reason === "ITEM_NOT_FOUND" ? errorItemId(err) : undefined;
 }
 
 /**
@@ -78,7 +81,8 @@ export class Bulk {
    * deleted elsewhere meanwhile (ITEM_DELETED or ITEM_NOT_FOUND naming it),
    * it is dropped and the rest retried once, with a new request_id, and
    * the toast says so. On success the marks clear and the selection goes
-   * to where the first marked row was. Returns whether it saved.
+   * to where the first marked row was. A failure names the Item its error
+   * names. Returns whether it saved.
    */
   async run(steps: readonly BulkStep[], describe: (done: readonly BulkStep[]) => string): Promise<boolean> {
     const first = this.c.firstMarkedIndex();
@@ -88,7 +92,8 @@ export class Bulk {
       const batch = todo;
       const out = await this.c.pipeline.run<BatchMutateResponse>({
         call: (opts) => batchMutate(this.c.items, batch.map((s) => s.mutation), opts),
-        items: (res) => ({ items: res.items, revision: res.result?.revision ?? 0n }),
+        // The next instances of the series it completed go into the store too.
+        items: (res) => ({ items: [...res.items, ...res.generated], revision: res.result?.revision ?? 0n }),
       });
       if (out.ok) {
         this.c.clearMarks();
@@ -103,7 +108,7 @@ export class Bulk {
         dropped++;
         continue;
       }
-      this.c.failed(errorText(out.err, step?.title));
+      this.c.failed(errorText(out.err, (step ?? batch.find((s) => s.id === errorItemId(out.err)))?.title));
       return false;
     }
   }

@@ -101,6 +101,23 @@ describe("prompts on screen", () => {
     await t.waitFrame((f) => expect(f.split("\n")[10]).toMatch(/^NORMAL/));
   });
 
+  it("@ previews the rule and its first date; x then toasts the next date, and the next instance shows where it is due", async () => {
+    const t = renderTui({ daemon: dated([item("water plants", { dueDate: { year: 2026, month: 10, day: 20 } })]), columns: 100, rows: 12, now: clock });
+    await t.live();
+    await t.press("@");
+    await t.waitFrame((f) => expect(f.split("\n").slice(-3)).toEqual([expect.stringMatching(/^enter stops repeating/), expect.stringMatching(/^EDIT/), "Repeats:  "]));
+    await t.press("daily");
+    await t.waitFrame((f) => expect(f.split("\n").slice(-3)).toEqual(["→ every day · first Tue Oct 20", expect.stringMatching(/^EDIT/), "Repeats: daily "]));
+    await t.press("<enter>");
+    await t.waitFrame((f) => expect(f).toContain("🔁"));
+    // Its slot was missed: the next one is today's, so not deferred.
+    await t.press("x");
+    await t.waitFrame((f) => expect(f.split("\n")[11]).toBe('mark done "water plants" · next Mon Oct 26 · u undo'));
+    await t.press("2");
+    await t.waitFrame((f) => expect(t.selectedLine()).toMatch(/water plants.*🔁/));
+    expect(t.lines()[0]).toMatch(/Today 1/);
+  });
+
   it("shows a conflict: the server's value, and what enter and esc do (hard case 33)", async () => {
     const t = renderTui({ daemon: dated(), columns: 100, rows: 12, now: clock });
     await t.live();

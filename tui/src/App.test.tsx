@@ -6,7 +6,9 @@ import {
   RelationKind,
   Status,
   addRelation,
+  Weekday,
   deleteItem,
+  setRecurrence,
   setStatus,
   timestampFromDate,
 } from "@todo-tui/client";
@@ -438,6 +440,23 @@ describe("the detail pane", () => {
     expect(t.store.getItem(done.id)).toBeUndefined();
     t.type("j");
     await t.waitFrame((x) => expect(x).toMatch(/Parent {4}● parent done/));
+  });
+
+  it("shows a Repeats line after Defer, following SetRecurrence, and none once the rule is cleared", async () => {
+    const fd = fakeDaemon([], { now: clock, timeZone: "UTC" });
+    const rule = { kind: { case: "weekly" as const, value: { days: [Weekday.MONDAY, Weekday.THURSDAY] } } };
+    const plants = fd.put(item("water plants", { dueDate: date(29), recurrence: { seriesId: "s1", rule, occurrenceDate: date(29) } }));
+    const t = renderTui({ daemon: fd, columns: 130, rows: 30, now: clock });
+    await t.live();
+    await t.waitFrame((f) => expect(f).toMatch(/Repeats {3}every Mon, Thu · this one Thu Oct 29/));
+    const lines = t.lines();
+    expect(lines.findIndex((l) => /Repeats /.test(l))).toBe(lines.findIndex((l) => /Defer /.test(l)) + 1);
+    const items = fd.clients().items;
+    await setRecurrence(items, plants.id, { kind: { case: "monthly", value: { day: 15 } } });
+    await t.waitFrame((f) => expect(f).toMatch(/Repeats {3}monthly on the 15th · this one Sun Nov 15/));
+    await setRecurrence(items, plants.id, undefined);
+    await t.waitFrame((f) => expect(f).not.toContain("Repeats"));
+    expect(t.frame()).toMatch(/Defer {5}—/);
   });
 
   it("fetches only once the selection settles", async () => {

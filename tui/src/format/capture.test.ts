@@ -1,8 +1,8 @@
-import { CaptureTokenKind, create, CaptureDraftSchema, CaptureTokenSchema, Priority, Status } from "@todo-tui/client";
+import { CaptureTokenKind, create, CaptureDraftSchema, CaptureTokenSchema, Priority, Status, Weekday } from "@todo-tui/client";
 import { describe, expect, it } from "vitest";
 import { lineOf } from "../keys/line-editor.js";
 import { dayNumber } from "./dates.js";
-import { captureSummary, codePointIndexes, lineSegments, tokenSpans } from "./capture.js";
+import { captureSummary, codePointIndexes, lineSegments, tokenColor, tokenSpans } from "./capture.js";
 
 const token = (start: number, end: number, kind: CaptureTokenKind, applied = true, warning = "") =>
   create(CaptureTokenSchema, { start, end, kind, applied, warning });
@@ -35,6 +35,9 @@ describe("the quick-add preview", () => {
       { text: " " },
       { text: "^nope", color: "red" },
     ]);
+    // A repeat rule has its own colour, red when it is not one.
+    expect(tokenColor({ kind: CaptureTokenKind.RECURRENCE, applied: true })).toBe("cyanBright");
+    expect(tokenColor({ kind: CaptureTokenKind.RECURRENCE, applied: false })).toBe("red");
     // A window around the cursor; control characters left out.
     expect(lineSegments(lineOf("abcdef"), 3, [])).toEqual([{ text: "ef" }, { text: " ", cursor: true }]);
     expect(lineSegments(lineOf("a\x1bb"), 10, [])).toEqual([{ text: "ab" }, { text: " ", cursor: true }]);
@@ -55,5 +58,27 @@ describe("the quick-add preview", () => {
     expect(captureSummary(create(CaptureDraftSchema, { title: "x", status: Status.SOMEDAY, dueDate: { year: 2027, month: 1, day: 5 } }), today)).toBe(
       "→ x · ^Tue Jan 5 2027 · >someday",
     );
+  });
+
+  it("sums up a repeat rule and the due date it gives: `^Mon Nov 2 · repeats every Mon, Thu`", () => {
+    const today = dayNumber(2026, 10, 26);
+    const weekly = { kind: { case: "weekly" as const, value: { days: [Weekday.MONDAY, Weekday.THURSDAY] } } };
+    // No ^ date: due on the first date (on or after today), as the capture stores it.
+    const monday = { year: 2026, month: 10, day: 26 };
+    expect(captureSummary(create(CaptureDraftSchema, { title: "water", recurrence: weekly, recurrenceFirst: monday }), today)).toBe(
+      "→ water · ^Mon Oct 26 · repeats every Mon, Thu",
+    );
+    // A ^ date the rule does not fall on is kept; the first date follows it.
+    const draft = create(CaptureDraftSchema, {
+      title: "water",
+      dueDate: { year: 2026, month: 10, day: 27 },
+      recurrence: weekly,
+      recurrenceFirst: { year: 2026, month: 10, day: 29 },
+      status: Status.NEXT,
+    });
+    expect(captureSummary(draft, today)).toBe("→ water · ^Tue Oct 27 · repeats every Mon, Thu · first Thu Oct 29 · >next");
+    // An after-completion rule without a ^ date has no first date.
+    const after = { kind: { case: "afterCompletion" as const, value: { days: 3 } } };
+    expect(captureSummary(create(CaptureDraftSchema, { title: "x", recurrence: after }), today)).toBe("→ x · repeats 3 days after done");
   });
 });

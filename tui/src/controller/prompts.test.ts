@@ -1,4 +1,4 @@
-import { Status, setStatus, updateItem } from "@todo-tui/client";
+import { Status, Weekday, setRecurrence, setStatus, updateItem } from "@todo-tui/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fakeDaemon, item, rows } from "../fake.test-util.js";
 import { setup, stopControllers } from "./setup.test-util.js";
@@ -72,6 +72,119 @@ describe("^ and D", () => {
     await t.c.press("<enter>");
     expect(t.byTitle("X")?.dueDate).toMatchObject(date(30));
     expect(t.byTitle("Y")?.dueDate).toBeUndefined();
+  });
+});
+
+describe("@", () => {
+  const weekly = (...days: Weekday[]) => ({ kind: { case: "weekly" as const, value: { days } } });
+
+  it("previews the rule and its first date, sets it, keeps the prompt on a warning, and stops it on empty", async () => {
+    const t = await setup(dated(["water plants", "Y"]), { now: clock });
+    await t.c.press("@");
+    expect(await prompt(t)).toMatchObject({ prompt: "repeat", line: { text: "" }, preview: { text: "enter stops repeating", warn: false } });
+    await t.c.press("mon,thu");
+    expect((await prompt(t)).preview).toMatchObject({ for: "mon,thu", text: "→ every Mon, Thu · first Mon Oct 26", warn: false });
+    await t.c.press("<enter>");
+    expect(t.mode().kind).toBe("normal");
+    // No due date: the first date becomes it.
+    expect(t.byTitle("water plants")).toMatchObject({ dueDate: date(26), recurrence: { rule: weekly(Weekday.MONDAY, Weekday.THURSDAY), occurrenceDate: date(26) } });
+    expect(t.userOps().map((o) => o.summary)).toEqual(['set repeat "water plants"']);
+    expect(t.toast()).toBeUndefined();
+
+    // Prefilled with the rule's token; the same rule again sends nothing.
+    await t.c.press("@");
+    expect((await prompt(t)).line).toEqual({ text: "mon,thu", cursor: 7 });
+    await t.c.press("<enter>");
+    expect(t.userOps()).toHaveLength(1);
+
+    await t.c.press("@<ctrl+u>@home");
+    expect((await prompt(t)).preview).toMatchObject({ text: "@home: not a repeat rule", warn: true });
+    await t.c.press("<enter>");
+    expect(await prompt(t)).toMatchObject({ line: { text: "@home" }, preview: { text: "@home: not a repeat rule", warn: true } });
+    await t.c.press("<ctrl+u>3d");
+    expect((await prompt(t)).preview?.text).toBe("→ 3 days after done · first Mon Oct 26");
+    await t.c.press("<enter>");
+    expect(t.byTitle("water plants")?.recurrence?.rule).toEqual(expect.objectContaining({ kind: { case: "afterCompletion", value: expect.objectContaining({ days: 3 }) } }));
+    await t.c.press("@");
+    expect((await prompt(t)).line.text).toBe("3d");
+    await t.c.press("<ctrl+u><enter>");
+    expect(t.byTitle("water plants")?.recurrence).toBeUndefined();
+    expect(t.userOps().at(-1)?.summary).toBe('stop repeating "water plants"');
+    // Empty on an Item that does not repeat sends nothing.
+    await t.c.press("@<enter>");
+    expect(t.userOps()).toHaveLength(3);
+  });
+
+  it("resolves weekly and monthly against the Item's due date, and prefills its day", async () => {
+    const t = await setup(dated([item("X", { dueDate: date(29) })]), { now: clock });
+    await t.c.press("@weekly");
+    expect((await prompt(t)).preview?.text).toBe("→ every Thu · first Thu Oct 29");
+    await t.c.press("<ctrl+u>monthly");
+    expect((await prompt(t)).preview?.text).toBe("→ monthly on the 29th · first Thu Oct 29");
+    await t.c.press("<enter>");
+    expect(t.byTitle("X")?.recurrence?.rule?.kind).toMatchObject({ case: "monthly", value: { day: 29 } });
+    await t.c.press("@");
+    expect((await prompt(t)).line.text).toBe("29th");
+    await t.c.press("<ctrl+u>weekdays<enter>@");
+    expect((await prompt(t)).line.text).toBe("weekdays");
+  });
+
+  it("previews weekly again when the due date it resolves against moves elsewhere, so enter saves what it showed", async () => {
+    const t = await setup(dated(["X"]), { now: clock });
+    const id = t.byTitle("X")!.id;
+    await t.c.press("@weekly");
+    expect((await prompt(t)).preview?.text).toBe("→ every Mon · first Mon Oct 26");
+    await updateItem(t.clients().items, { id, dueDate: date(29) }, ["due_date"]);
+    await vi.waitFor(() => expect(t.store.getItem(id)?.dueDate).toMatchObject(date(29)));
+    expect((await prompt(t)).preview?.text).toBe("→ every Thu · first Thu Oct 29");
+    await t.c.press("<enter>");
+    expect(t.byTitle("X")?.recurrence?.rule?.kind).toMatchObject({ case: "weekly", value: { days: [Weekday.THURSDAY] } });
+  });
+
+  it("keeps the prompt on enter when the Item read back is due on another day than the preview counted from", async () => {
+    const t = await setup(dated(["X", "Y"]), { now: clock });
+    const id = t.byTitle("X")!.id;
+    await t.c.press("@weekly");
+    expect((await prompt(t)).preview?.text).toBe("→ every Mon · first Mon Oct 26");
+    // Due and deferred elsewhere while the stream was down, then a resync: the store no longer holds it.
+    t.daemon.down = true;
+    t.dropStreams();
+    await vi.waitFor(() => expect(t.store.getConnection().state).toBe("reconnecting"));
+    t.daemon.update(id, { dueDate: date(29), deferUntil: date(2, 11) });
+    t.daemon.truncateChanges();
+    t.daemon.down = false;
+    await vi.waitFor(() => expect(t.store.getItem(id)).toBeUndefined());
+    await t.c.press("<enter>");
+    expect(await prompt(t)).toMatchObject({ prompt: "repeat", line: { text: "weekly" }, preview: { text: "→ every Thu · first Thu Oct 29" } });
+    expect(t.daemon.items.get(id)?.recurrence).toBeUndefined();
+    await t.c.press("<enter>");
+    expect(t.mode().kind).toBe("normal");
+    expect(t.daemon.items.get(id)?.recurrence?.rule?.kind).toMatchObject({ case: "weekly", value: { days: [Weekday.THURSDAY] } });
+  });
+
+  it("says a done Item must be reopened first, keeping the rule as it was", async () => {
+    const t = await setup(dated(["X"]), { now: clock });
+    const id = t.byTitle("X")!.id;
+    await t.c.press("@daily");
+    await setStatus(t.clients().items, id, Status.DONE);
+    await t.c.press("<enter>");
+    expect(t.state().toast).toMatchObject({ level: "error", text: "“X” is done or cancelled: reopen it first" });
+    expect(t.byTitle("X")?.recurrence).toBeUndefined();
+  });
+
+  it("x on a recurring Item toasts the next date, and the next instance is in the store", async () => {
+    const t = await setup(dated(["water plants"]), { now: clock });
+    const id = t.byTitle("water plants")!.id;
+    await setRecurrence(t.clients().items, id, weekly(Weekday.MONDAY, Weekday.THURSDAY));
+    await vi.waitFor(() => expect(t.store.getItem(id)?.recurrence).toBeDefined());
+    const applied = vi.spyOn(t.store, "applyItems");
+    await t.c.press("x");
+    expect(t.toast()).toBe('mark done "water plants" · next Thu Oct 29 · u undo');
+    const next = [...t.daemon.items.values()].find((i) => i.title === "water plants" && i.id !== id)!;
+    expect(next).toMatchObject({ dueDate: date(29), deferUntil: date(29), status: Status.NEXT });
+    expect(t.store.getItem(next.id)?.recurrence?.occurrenceDate).toMatchObject(date(29));
+    // With the op's response (SetStatus's generated), not only once the stream delivers it.
+    expect(applied.mock.calls.flatMap(([items]) => items.map((i) => i.id))).toContain(next.id);
   });
 });
 
@@ -273,7 +386,7 @@ describe("prompts", () => {
 
   it("does nothing on an empty list", async () => {
     const t = await setup(fakeDaemon([]));
-    await t.c.press("i^Dwtx");
+    await t.c.press("i^Dwt@x");
     expect(t.mode().kind).toBe("normal");
   });
 });

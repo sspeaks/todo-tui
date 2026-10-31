@@ -50,4 +50,5 @@ export * from "./ulid.js";
 export * from "./mutations.js";
 export * from "./queries.js";
 export * from "./limits.js";
+export { ordinalSuffix, ruleFromProto, ruleToken } from "./recurrence.js";
 export * from "./fake-daemon.js";

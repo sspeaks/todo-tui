@@ -1,12 +1,12 @@
 // The prompts on the message line (Decision 5 and 6): i (title), t (labels),
-// ^ and D (dates, with a ParseDate preview), and w (waiting, with tab
-// completion of the person). The Target is frozen when the prompt opens.
-// Only i and t send expected_revision: their text was made from the
-// rendered value, so a conflict rebases silently when that field is
-// unchanged on the server, and otherwise keeps the text for enter to
-// overwrite. With marks, t ^ D w act on every marked Item in one
-// BatchMutate (Decision 8): t then takes "+a -b", applied to each Item's
-// own labels.
+// ^ and D (dates, with a ParseDate preview), w (waiting, with tab
+// completion of the person) and @ (the repeat rule, with a ParseRecurrence
+// preview). The Target is frozen when the prompt opens. Only i and t send
+// expected_revision: their text was made from the rendered value, so a
+// conflict rebases silently when that field is unchanged on the server,
+// and otherwise keeps the text for enter to overwrite. With marks, t ^ D w @
+// act on every marked Item in one BatchMutate (Decision 8): t then takes
+// "+a -b", applied to each Item's own labels.
 
 import {
   type Item,
@@ -15,9 +15,15 @@ import {
   type MessageInitShape,
   Operator,
   type ParseDateResponse,
+  type ParseRecurrenceResponse,
   type ProtoDate,
+  type RecurrenceRule,
+  RecurrenceRuleSchema,
+  equals,
   errorReason,
   parseDate,
+  parseRecurrence,
+  setRecurrence,
   updateItem,
 } from "@todo-tui/client";
 import { dayLabel, dayOf, isoDay } from "../format/dates.js";
@@ -31,6 +37,7 @@ import {
   sameLabels,
   waitingPrefix,
 } from "../format/fields.js";
+import { repeatPreview, ruleText } from "../format/recurrence.js";
 import { singleLine } from "../format/text.js";
 import type { PromptKind } from "../keys/keymap.js";
 import { editLine, insert, type LineState, lineOf } from "../keys/line-editor.js";
@@ -51,6 +58,7 @@ export const PROMPT_LABELS: Readonly<Record<PromptKind, string>> = {
   due: "Due",
   defer: "Defer until",
   waiting: "Waiting on",
+  repeat: "Repeats",
 };
 
 /** How many times a derived edit rebases silently before it shows the conflict. */
@@ -58,6 +66,27 @@ const MAX_REBASES = 3;
 
 const sameDate = (a: ProtoDate | undefined, b: ProtoDate | undefined) =>
   a === undefined || b === undefined ? a === b : dayOf(a) === dayOf(b);
+
+const sameRule = (a: RecurrenceRule | undefined, b: RecurrenceRule | undefined) =>
+  a === undefined || b === undefined ? a === b : equals(RecurrenceRuleSchema, a, b);
+
+/** What anchors an Item's weekly or monthly: its due date, else (none) today. */
+const anchorKey = (item: Item): string => (item.dueDate ? isoDay(dayOf(item.dueDate)) : "");
+
+/** `weekly` or `monthly`, which take their day from the anchor; else undefined. */
+const onAnchor = (text: string): string | undefined => /^@?\s*(weekly|monthly)$/i.exec(text.trim())?.[1]?.toLowerCase();
+
+/**
+ * What `@` asks ParseRecurrence about: the text, the anchor, and whether
+ * the marked Items' anchors differ; `key` names the anchor ("*" when they
+ * differ), so a preview made for another one is known to be stale.
+ */
+interface RepeatQuery {
+  readonly text: string;
+  readonly anchor: ProtoDate | undefined;
+  readonly mixed: boolean;
+  readonly key: string;
+}
 
 /** The free text an Item waits on; a Person id (P2) as is. */
 const waitingOn = (item: Item): string | undefined => item.waiting?.on?.ref.value;
@@ -85,6 +114,10 @@ function shared(items: readonly Item[], of: (item: Item) => string): string | un
 
 export class Prompts {
   private readonly dates: Latest<{ kind: PromptKind; text: string }, ParseDateResponse | undefined>;
+  private readonly repeats: Latest<RepeatQuery, ParseRecurrenceResponse | undefined>;
+  /** The anchor key of the repeat preview last asked for, and of the one shown. */
+  private repeatAsked: string | undefined;
+  private repeatShown: string | undefined;
   private readonly bulk: Bulk;
 
   constructor(private readonly c: Controller) {
@@ -99,6 +132,20 @@ export class Prompts {
         // A response for text since edited is stale: the newer request follows.
         if (mode.kind !== "prompt" || mode.prompt !== kind || mode.line.text !== text) return;
         this.c.setMode({ ...mode, preview: this.previewOf(kind, text, res, mode.target.ids.length) });
+      },
+    );
+    this.repeats = new Latest(
+      ({ text, anchor }) =>
+        text.trim()
+          ? parseRecurrence(c.items, text, { timeoutMs: c.timing.rpcTimeoutMs, ...(anchor && { anchor }) })
+          : Promise.resolve(undefined),
+      (query, res) => {
+        const { mode } = this.c.state;
+        // Stale too when the anchor moved (a due date changed elsewhere): sync asked again.
+        if (mode.kind !== "prompt" || mode.prompt !== "repeat" || mode.line.text !== query.text) return;
+        if (this.repeatQuery(mode).key !== query.key) return;
+        this.repeatShown = query.key;
+        this.c.setMode({ ...mode, preview: this.repeatPreviewOf(query, res, mode.target.ids.length) });
       },
     );
   }
@@ -135,6 +182,9 @@ export class Prompts {
       case "waiting":
         text = waitingText(item);
         break;
+      case "repeat":
+        text = ruleText(item.recurrence?.rule);
+        break;
     }
     this.c.setMode({ kind: "prompt", prompt: kind, target, line: lineOf(text), ...(base && { base }) });
     this.preview();
@@ -142,8 +192,8 @@ export class Prompts {
   }
 
   /**
-   * The bulk prompt: empty for t ("+a -b"); for a date or waiting, the
-   * value the marked Items share, if they share one.
+   * The bulk prompt: empty for t ("+a -b"); for a date, waiting or the
+   * repeat rule, the value the marked Items share, if they share one.
    */
   private openBulk(kind: PromptKind, target: Target): void | Promise<void> {
     const items = this.bulk.items(target);
@@ -151,6 +201,7 @@ export class Prompts {
     if (kind === "due") text = shared(items, (i) => (i.dueDate ? isoDay(dayOf(i.dueDate)) : ""));
     if (kind === "defer") text = shared(items, (i) => (i.deferUntil ? isoDay(dayOf(i.deferUntil)) : ""));
     if (kind === "waiting") text = shared(items, waitingText);
+    if (kind === "repeat") text = shared(items, (i) => ruleText(i.recurrence?.rule));
     this.c.setMode({ kind: "prompt", prompt: kind, target, line: lineOf(text ?? "") });
     this.preview();
     if (kind === "waiting") return this.loadPeople(target);
@@ -184,12 +235,53 @@ export class Prompts {
   private preview(): void {
     const { mode } = this.c.state;
     if (mode.kind !== "prompt" || mode.prompt === "title" || mode.prompt === "labels") return;
+    if (mode.prompt === "repeat") {
+      const query = this.repeatQuery(mode);
+      this.repeatAsked = query.key;
+      return this.repeats.request(query);
+    }
     this.dates.request({ kind: mode.prompt, text: mode.line.text });
   }
 
+  /**
+   * After a store change: the repeat preview again when the anchor it was
+   * asked for moved, so that weekly and monthly show the day enter saves.
+   */
+  sync(): void {
+    const { mode } = this.c.state;
+    if (mode.kind === "prompt" && mode.prompt === "repeat" && this.repeatQuery(mode).key !== this.repeatAsked) this.preview();
+  }
+
+  /**
+   * The anchor `@`'s preview resolves weekly and monthly against: the
+   * Item's due date, else today; with marks, the due date they share, else
+   * today, and the first date is left out, since each counts from its own.
+   */
+  private repeatQuery(mode: Prompt): RepeatQuery {
+    const items = this.bulk.items(mode.target);
+    const keys = new Set(items.map(anchorKey));
+    const mixed = keys.size > 1;
+    return { text: mode.line.text, anchor: mixed ? undefined : items[0]?.dueDate, mixed, key: mixed ? "*" : ([...keys][0] ?? "") };
+  }
+
+  /**
+   * enter on weekly or monthly whose preview was made for another anchor
+   * than `key`, the one it saves against (a due date that moved, or an
+   * Item read back with one): shows the preview for it and keeps the
+   * prompt open, so what enter saves is what was shown. Else false.
+   */
+  private anchorMoved(mode: Prompt, key: string): boolean {
+    const latest = this.latest(mode);
+    if (!onAnchor(latest.line.text) || latest.preview?.for !== latest.line.text || this.repeatShown === key) return false;
+    this.c.setMode({ ...latest, preview: undefined });
+    this.c.dropQueued();
+    this.preview();
+    return true;
+  }
+
   /** Resolves once the preview has caught up with the text (tests). */
-  previewIdle(): Promise<void> {
-    return this.dates.idle();
+  async previewIdle(): Promise<void> {
+    await Promise.all([this.dates.idle(), this.repeats.idle()]);
   }
 
   private previewOf(kind: PromptKind, text: string, res: ParseDateResponse | undefined, bulk = 1): PromptPreview {
@@ -207,6 +299,21 @@ export class Prompts {
     }
     if (!text.trim()) return info(`enter clears the ${kind === "due" ? "due" : "defer"} date${of}`);
     return date ? info(`→ ${date}`) : warn(singleLine(res?.warning ?? ""));
+  }
+
+  /**
+   * "→ every Mon, Thu · first Mon Nov 2", or the warning. With marks due on
+   * different days the first date is left out, and weekly or monthly says
+   * that each takes its own day.
+   */
+  private repeatPreviewOf({ text, mixed }: RepeatQuery, res: ParseRecurrenceResponse | undefined, bulk: number): PromptPreview {
+    const info = (t: string): PromptPreview => ({ for: text, text: t, warn: false });
+    if (!res) return info(`enter stops repeating${bulk > 1 ? ` on ${bulk} items` : ""}`);
+    if (!res.rule || res.warning) return { for: text, text: repeatPreview(res, this.c.today()), warn: true };
+    if (!mixed) return info(repeatPreview(res, this.c.today()));
+    const own = onAnchor(text);
+    if (own) return info(`→ ${own}, each on its own due date's ${own === "weekly" ? "weekday" : "day"} (else today's)`);
+    return info(repeatPreview({ ...res, first: undefined }, this.c.today()));
   }
 
   /** The people already waited on, for tab: one ListItems over every Item waiting. */
@@ -290,6 +397,8 @@ export class Prompts {
         return this.saveDate(mode, item);
       case "waiting":
         return this.saveWaiting(mode, item);
+      case "repeat":
+        return this.saveRepeat(mode, item);
     }
   }
 
@@ -416,6 +525,25 @@ export class Prompts {
     this.c.toastIfLeft(item.id, out.res.result?.opId, opText("edit", item.title));
   }
 
+  /**
+   * @: the text through ParseRecurrence, anchored on the Item's due date;
+   * empty stops the repeat. SetRecurrence is absolute: no expected_revision.
+   */
+  private async saveRepeat(mode: Prompt, item: Item): Promise<void> {
+    const text = mode.line.text.trim();
+    if (this.anchorMoved(mode, anchorKey(item))) return;
+    let rule: RecurrenceRule | undefined;
+    if (text) {
+      rule = await this.parseRepeat(mode, item, text, item.dueDate);
+      if (!rule) return;
+    }
+    if (rule ? sameRule(rule, item.recurrence?.rule) : !item.recurrence) return this.c.setMode(normalMode);
+    const out = await this.c.pipeline.run({ call: (opts) => setRecurrence(this.c.items, item.id, rule, opts), items: single });
+    if (!out.ok) return this.c.failed(errorText(out.err, item.title));
+    this.c.setMode(normalMode);
+    this.c.toastIfLeft(item.id, out.res.result?.opId, opText(rule ? "set repeat" : "stop repeating", item.title));
+  }
+
   // --- with marks ---
 
   /**
@@ -425,6 +553,7 @@ export class Prompts {
   private async saveBulk(mode: Prompt): Promise<void> {
     const items = this.bulk.items(mode.target);
     let steps: BulkStep[];
+    let describe = (done: readonly BulkStep[]) => bulkText("edit", done);
     switch (mode.prompt) {
       case "title":
         return;
@@ -461,8 +590,17 @@ export class Prompts {
         if (!steps.length) return this.done("Waiting unchanged");
         break;
       }
+      case "repeat": {
+        const r = await this.bulkRepeat(mode, items);
+        if (!r) return;
+        steps = r;
+        if (!steps.length) return this.done("Repeat rules unchanged");
+        const verb = mode.line.text.trim() ? "set repeat" : "stop repeating";
+        describe = (done) => bulkText(verb, done, true);
+        break;
+      }
     }
-    if (await this.bulk.run(steps, (done) => bulkText("edit", done))) this.c.setMode(normalMode);
+    if (await this.bulk.run(steps, describe)) this.c.setMode(normalMode);
   }
 
   /** Closes the prompt, saying why nothing was sent. */
@@ -500,6 +638,49 @@ export class Prompts {
       const waiting = { on: { ref: { case: "freeText" as const, value: person } }, ...(followUpOn && { followUpOn }) };
       return updateStep({ id: i.id, waiting }, ["waiting"]);
     });
+  }
+
+  /**
+   * @ with marks, per Item as for one: the text is resolved against each
+   * Item's own due date (one ParseRecurrence per date they have), so
+   * `weekly` repeats each on its own weekday; empty stops every repeat.
+   * Undefined when the prompt stays open.
+   */
+  private async bulkRepeat(mode: Prompt, items: readonly Item[]): Promise<BulkStep[] | undefined> {
+    const text = mode.line.text.trim();
+    const step = (id: string, rule: RecurrenceRule | undefined) => ({ kind: { case: "setRecurrence" as const, value: { id, rule } } });
+    if (!text) return stepsOf(items, (i) => (i.recurrence ? step(i.id, undefined) : undefined));
+    if (this.anchorMoved(mode, this.repeatQuery(mode).key)) return undefined;
+    const rules = new Map<string, RecurrenceRule>();
+    for (const item of items) {
+      const key = anchorKey(item);
+      if (rules.has(key)) continue;
+      const rule = await this.parseRepeat(mode, undefined, text, item.dueDate);
+      if (!rule) return undefined;
+      rules.set(key, rule);
+    }
+    return stepsOf(items, (i) => {
+      const rule = rules.get(anchorKey(i));
+      return sameRule(rule, i.recurrence?.rule) ? undefined : step(i.id, rule);
+    });
+  }
+
+  /** ParseRecurrence on enter (the preview may be stale): the rule, or the prompt kept open with the warning. */
+  private async parseRepeat(mode: Prompt, item: Item | undefined, text: string, anchor: ProtoDate | undefined): Promise<RecurrenceRule | undefined> {
+    let res: ParseRecurrenceResponse;
+    try {
+      res = await this.c.pipeline.call(({ timeoutMs }) =>
+        parseRecurrence(this.c.items, text, { ...(timeoutMs !== undefined && { timeoutMs }), ...(anchor && { anchor }) }),
+      );
+    } catch (err) {
+      this.c.failed(errorText(err, item?.title));
+      return undefined;
+    }
+    if (res.rule && !res.warning) return res.rule;
+    const latest = this.latest(mode);
+    this.c.setMode({ ...latest, preview: { for: latest.line.text, text: repeatPreview(res, this.c.today()), warn: true } });
+    this.c.dropQueued();
+    return undefined;
   }
 
   /** ParseDate on enter (the preview may be stale): the date, or the prompt kept open with the warning. */

@@ -27,6 +27,8 @@ export function errorText(err: unknown, title?: string): string {
       return title === undefined ? "The Item was deleted elsewhere" : `${quoted(title)} was deleted elsewhere`;
     case "PARENT_DELETED":
       return "Undelete the parent first";
+    case "ITEM_CLOSED":
+      return `${title === undefined ? "The Item" : quoted(title)} is done or cancelled: reopen it first`;
   }
   if (isConnectionFailure(err)) return "Not saved: daemon unavailable";
   const e = ConnectError.from(err);

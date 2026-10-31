@@ -47,6 +47,20 @@ describe("marks on screen", () => {
   });
 });
 
+describe("bulk @ on screen", () => {
+  it("names the marks in the prompt, with the hint for each marked Item, and toasts the one op", async () => {
+    const t = renderTui({ daemon: fakeDaemon(rows(3)), columns: 100, rows: 10 });
+    await t.live();
+    await t.press("mm@");
+    await t.waitFrame((f) => expect(f.split("\n").slice(-3)).toEqual([expect.stringMatching(/^a rule for each marked Item: daily/), expect.stringMatching(/^EDIT/), "Repeats (2 marked):  "]));
+    await t.press("2w");
+    await t.waitFrame((f) => expect(f.split("\n").at(-3)).toBe("→ 2 weeks after done"));
+    await t.press("<enter>");
+    await t.waitFrame((f) => expect(f.split("\n").at(-1)).toBe("set repeat (2 items) · u undo"));
+    expect(t.lines().filter((l) => l.includes("🔁"))).toHaveLength(2);
+  });
+});
+
 describe("the Search tab on screen", () => {
   it("sits after the views, unnumbered, with its count, and says when nothing matches", async () => {
     const t = renderTui({ daemon: fakeDaemon([item("milk"), item("oat milk")]), columns: 120, rows: 10 });

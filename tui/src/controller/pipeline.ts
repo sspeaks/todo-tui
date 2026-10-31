@@ -43,9 +43,9 @@ export interface Effect<R> {
 
 export type Outcome<R> = { readonly ok: true; readonly res: R } | { readonly ok: false; readonly err: unknown };
 
-/** The Items and revision of a single-Item mutation's response. */
-export const single = <R extends { item?: Item; result?: { revision: bigint } }>(res: R) => ({
-  items: res.item ? [res.item] : [],
+/** The Items and revision of a single-Item mutation's response, with the next instance of a series it completed (SetStatus). */
+export const single = <R extends { item?: Item; generated?: Item; result?: { revision: bigint } }>(res: R) => ({
+  items: [res.item, res.generated].filter((i) => i !== undefined),
   revision: res.result?.revision ?? 0n,
 });
 
