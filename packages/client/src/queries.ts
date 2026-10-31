@@ -1,11 +1,13 @@
 // Thin helpers over the read RPCs behind the tab bar, the counts, the
-// date prompts and the quick-add preview: ListViews, GetStatusCounts,
-// ParseDate and ParseCapture. The daemon does all the work; "today" is
-// always the daemon's, in its zone.
+// date prompts, the quick-add preview and the repeat prompt: ListViews,
+// GetStatusCounts, ParseDate, ParseCapture and ParseRecurrence. The
+// daemon does all the work; "today" is always the daemon's, in its zone.
 
+import type { MessageInitShape } from "@bufbuild/protobuf";
 import { type Timestamp, timestampFromDate } from "@bufbuild/protobuf/wkt";
 import type { CallOptions, Client } from "@connectrpc/connect";
-import type { GetStatusCountsResponse, ParseCaptureResponse, ParseDateResponse } from "./gen/todo/v1/item_service_pb.js";
+import type { DateSchema } from "./gen/google/type/date_pb.js";
+import type { GetStatusCountsResponse, ParseCaptureResponse, ParseDateResponse, ParseRecurrenceResponse } from "./gen/todo/v1/item_service_pb.js";
 import type { ListViewsResponse, ViewService } from "./gen/todo/v1/view_service_pb.js";
 import type { ItemsClient } from "./mutations.js";
 
@@ -59,4 +61,21 @@ export function parseDate(client: ItemsClient, text: string, opts: ReferenceOpti
 export function parseCapture(client: ItemsClient, text: string, opts: ReferenceOptions = {}): Promise<ParseCaptureResponse> {
   const [fields, call] = reference(opts);
   return client.parseCapture({ ...fields, text }, call);
+}
+
+/**
+ * Resolves a repeat rule with the capture rule grammar (design 2.3), e.g.
+ * "daily", "mon,thu", "15th" or "2w", with an optional leading "@".
+ * `weekly` and `monthly` take the anchor's weekday or day (the Item's due
+ * date; defaults to today), and `first` is the first scheduled date on or
+ * after it. When it does not parse, `rule` is unset and `warning` says why.
+ */
+export function parseRecurrence(
+  client: ItemsClient,
+  text: string,
+  opts: ReferenceOptions & { anchor?: MessageInitShape<typeof DateSchema> } = {},
+): Promise<ParseRecurrenceResponse> {
+  const { anchor, ...rest } = opts;
+  const [fields, call] = reference(rest);
+  return client.parseRecurrence({ ...fields, text, ...(anchor !== undefined && { anchor }) }, call);
 }

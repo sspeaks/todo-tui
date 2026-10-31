@@ -11,7 +11,9 @@ import {
   ArchivedSchema,
   CreatedVia,
   type Item,
+  ItemRecurrenceSchema,
   ItemSchema,
+  RecurrenceRuleSchema,
   ResolutionKind,
   Status,
   StatusCategory,
@@ -32,8 +34,11 @@ import {
   type ParseCaptureRequest,
   type ParseDateRequest,
   type ParseDateResponseSchema,
+  type ParseRecurrenceRequest,
+  type ParseRecurrenceResponse,
   type RedoRequest,
   type RemoveRelationRequest,
+  type SetRecurrenceRequest,
   type UndoRequest,
   type UpdateItemRequest,
 } from "./gen/todo/v1/item_service_pb.js";
@@ -44,7 +49,7 @@ import { type View, ViewSchema } from "./gen/todo/v1/view_pb.js";
 import { ViewService } from "./gen/todo/v1/view_service_pb.js";
 import { type Change, ChangeSchema, type SubscribeResponse, SubscribeResponseSchema, WatchService } from "./gen/todo/v1/watch_service_pb.js";
 import { parseCaptureText } from "./capture.js";
-import { dayIn, epochMs, parseDateExpr, protoDate, rustTrim } from "./dates.js";
+import { civil, dayIn, dayOf, epochMs, isDate, parseDateExpr, protoDate, rustTrim, weekday } from "./dates.js";
 import { defaultViews } from "./default-views.js";
 import {
   type FilterProblem,
@@ -63,6 +68,7 @@ import {
   sortTuple,
 } from "./filter-eval.js";
 import { DEFAULT_PAGE_SIZE, MAX_CAPTURE_BYTES, MAX_PAGE_SIZE } from "./limits.js";
+import { type Rule, firstOnOrAfter, isFixed, nextInstance, parseRecurrenceText, ruleFromProto, ruleToProto } from "./recurrence.js";
 import { ulid } from "./ulid.js";
 
 type Waiter = (msg: SubscribeResponse | Error) => void;
@@ -75,6 +81,8 @@ type Fields = Record<string, unknown>;
 interface MutationResponse {
   item: Item;
   result: MutationResult;
+  /** The next instances the op created (design 3.8). */
+  generated: Item[];
 }
 
 /** Who made an op: the user for every RPC, the system for put and update. */
@@ -134,7 +142,7 @@ interface Recorded {
   op: FakeOp;
 }
 
-type MutationKind = "update" | "setStatus" | "archive" | "unarchive" | "delete" | "undelete";
+type MutationKind = "update" | "setStatus" | "setRecurrence" | "archive" | "unarchive" | "delete" | "undelete";
 
 /** One single-item mutation, checked and converted as the daemon's request layer does before the store sees it. */
 interface Planned {
@@ -151,6 +159,20 @@ interface Planned {
   mask?: { paths: readonly string[]; values: Fields };
   /** SetStatus: the target. */
   status?: Status;
+  /**
+   * SetRecurrence: the rule (undefined clears it), the series a rule starts
+   * on an Item that does not recur yet, and the day a fixed rule's first
+   * occurrence is counted from when the Item has no due date.
+   */
+  recurrence?: { rule: Rule | undefined; seriesId: string; today: number };
+}
+
+/** What an op did to one Item's status_entered_at: FakeDaemon's private record of when each Item closed. */
+interface Entered {
+  id: string;
+  /** In nanoseconds; undefined when it was unknown. */
+  old: bigint | undefined;
+  new: bigint | undefined;
 }
 
 /** One field change of a mutation or restore. */
@@ -177,6 +199,22 @@ const NANOS = 1_000_000_000n;
 /** The most mutations one BatchMutate may carry. */
 const MAX_BATCH = 1000;
 
+/** How long a done or cancelled Item stays out of Archive: 7 days (design 3.7), in milliseconds. */
+export const ARCHIVE_DONE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** The most Items one auto-archive op changes (archive.rs AUTO_ARCHIVE_LIMIT). */
+const AUTO_ARCHIVE_LIMIT = 1000;
+
+/** What one {@link FakeDaemon.runScheduler} sweep changed. */
+export interface FakeSweep {
+  /** The Items archived AUTO_DONE, oldest close first. */
+  archived: string[];
+  /** The Items archived AUTO_DONE that were open again and are unarchived, in archive order. */
+  healed: string[];
+  /** The ops it recorded, each of at most 1000 Items; none when nothing was due. */
+  ops: FakeOp[];
+}
+
 /** The stored fields behind the derived status, in SetStatus event order (design 3.4). */
 const TRIPLE: readonly string[] = ["statusCategory", "resolutionKind", "todoRefinement"];
 
@@ -194,6 +232,23 @@ function contribution(item: Item | undefined): string {
   if (!item) return "";
   const counted = item.deletedAt === undefined && item.status !== Status.CANCELLED;
   return `${item.parentId ?? ""}:${counted}:${counted && item.status === Status.DONE}`;
+}
+
+/** The closed statuses: an Item in one is in the done category. */
+const CLOSED = new Set([Status.DONE, Status.CANCELLED]);
+
+/** Done or cancelled, as Status::is_closed has it. */
+function isClosed(item: Item): boolean {
+  return item.statusCategory === StatusCategory.DONE;
+}
+
+/** A timestamp in nanoseconds; 0 when unset. */
+function nanosOf(t: Timestamp | undefined): bigint {
+  return t === undefined ? 0n : t.seconds * NANOS + BigInt(t.nanos);
+}
+
+function compareBig(a: bigint, b: bigint): number {
+  return a < b ? -1 : a > b ? 1 : 0;
 }
 
 /** Summaries cut titles to this many characters, ellipsis included (summary.rs). */
@@ -262,9 +317,9 @@ export interface FakeDaemonOptions {
  *   and labels as a set, and report the rest as UndoSkips (CHANGED_SINCE,
  *   ITEM_DELETED, INVALID); the parent rule holds where the whole undo
  *   leaves the Items, and a step that breaks it there is skipped; one that
- *   restores nothing drops its entry; an undone capture is soft-deleted; replays return the original
- *   entry and skips. GetUndoState, and OpSummary texts and error messages
- *   as the daemon words them.
+ *   restores nothing drops its entry; an undone capture is soft-deleted;
+ *   replays return the original entry and skips. GetUndoState, and
+ *   OpSummary texts and error messages as the daemon words them.
  * - Parent rules (design 3.7): DeleteItem soft-deletes the live
  *   descendants in the same op; UndeleteItem restores the ones deleted by
  *   the Item's delete, and fails with PARENT_DELETED while the parent is
@@ -279,6 +334,20 @@ export interface FakeDaemonOptions {
  *   a ~ token waits on free text since that day. created_via must be TUI,
  *   CLI or MCP; a replay by request_id or spool_id returns the original
  *   capture, with the text parsed on the day the Item was created.
+ * - Recurrence (design 3.8), with todo_core::recurrence ported
+ *   (recurrence.ts): an @ token starts a new series, due on its first date
+ *   unless a ^ token set one. SetRecurrence (alone and in a batch) sets,
+ *   replaces (same series) or clears the rule, with the daemon's rule
+ *   paths and ITEM_CLOSED; ParseRecurrence. Completing an instance (open
+ *   before the op, done or cancelled after it, live, still with a rule)
+ *   creates the next one in the same op, as generate_tx does: a post-pass on
+ *   the op's final state, guarded by any other live, open instance of the
+ *   series. It is returned as `generated` (also on a replay), named in the
+ *   op's events and summary, re-emits its parent, and is soft-deleted by an
+ *   undo and undeleted by a redo.
+ * - The scheduler's auto_done archive and its healing, run on demand by
+ *   {@link runScheduler}; SetStatus to an open status clears an auto_done
+ *   archive itself.
  * - UpdateItem checks its mask's paths as the daemon does: Item field paths
  *   only, each field once; status, archived, relations and read-only paths
  *   are refused. Of the values it checks titles (stored trimmed, then
@@ -299,10 +368,15 @@ export interface FakeDaemonOptions {
  * unlinked Item are taken as given). An op records a changed top-level
  * field as one event, so a nested waiting path records, and its undo
  * restores, the whole `waiting`. Staleness signals are not maintained or
- * restored (`updated_at` is set on every op that touches an Item); request
- * ids never expire. MATCHES approximates the full-text index (lower case,
- * accents stripped, runs of letters and digits), so it agrees on ASCII and
- * Latin text but not on every script or symbol.
+ * restored (`updated_at` is set on every op that touches an Item), except
+ * that the fake records privately when each Item entered its status, for
+ * the scheduler's clock, and undo and redo restore that with the status;
+ * put enters a new status at the Item's updated_at, so a test can
+ * back-date a close. There is no background scheduler: archives happen
+ * only when a test calls runScheduler. Request ids never expire. MATCHES
+ * approximates the full-text index (lower case, accents stripped, runs of
+ * letters and digits), so it agrees on ASCII and Latin text but not on
+ * every script or symbol.
  */
 export class FakeDaemon {
   revision = 0n;
@@ -335,6 +409,17 @@ export class FakeDaemon {
   private nextId = 0;
   /** The last write time handed out, in nanoseconds. */
   private lastWrite = -(2n ** 63n);
+  /**
+   * Each Item's status_entered_at, in nanoseconds: when an op last changed
+   * its derived status, so for a closed Item when it closed (done →
+   * cancelled closes it again). The fake keeps no staleness signals on its
+   * Items, so it records them here, for the scheduler's clock. An Item
+   * without an entry falls back to its updated_at, as a row from before the
+   * signal was recorded does.
+   */
+  private readonly statusEnteredAt = new Map<string, bigint>();
+  /** By op id, what each op did to statusEnteredAt, for undo and redo to restore it. */
+  private readonly statusEnteredBy = new Map<string, Entered[]>();
 
   constructor(initial: MessageInitShape<typeof ItemSchema>[] = [], options: FakeDaemonOptions = {}) {
     this.now = options.now ?? (() => new Date());
@@ -377,15 +462,16 @@ export class FakeDaemon {
           return { item: this.present(this.get(idOf("id", req.id)), this.today()), revision: this.revision };
         },
         updateItem: (req) => this.single("UpdateItem", OpKind.UPDATE, req.requestId, () => planUpdate(req, "", this.today())),
-        setStatus: (req) => this.single("SetStatus", OpKind.SET_STATUS, req.requestId, () => planSetStatus(req, "")),
-        // Stubs, as in the daemon until recurrence is stored (M5 phase 2).
-        setRecurrence: () => {
-          this.check();
-          throw notImplemented("SetRecurrence");
+        setStatus: (req) => {
+          // Closing an instance creates at most one next instance (design 3.8).
+          const { generated, ...rest } = this.single("SetStatus", OpKind.SET_STATUS, req.requestId, () => planSetStatus(req, ""));
+          return { ...rest, generated: generated[0] };
         },
-        parseRecurrence: () => {
+        setRecurrence: (req) =>
+          this.single("SetRecurrence", OpKind.SET_RECURRENCE, req.requestId, () => planSetRecurrence(req, "", this.today())),
+        parseRecurrence: (req) => {
           this.check();
-          throw notImplemented("ParseRecurrence");
+          return this.parseRecurrence(req);
         },
         archiveItem: (req) => this.single("ArchiveItem", OpKind.ARCHIVE, req.requestId, () => planItemOp("archive", req, "")),
         unarchiveItem: (req) => this.single("UnarchiveItem", OpKind.UNARCHIVE, req.requestId, () => planItemOp("unarchive", req, "")),
@@ -397,7 +483,6 @@ export class FakeDaemon {
           if (req.mutations.length < 1 || req.mutations.length > MAX_BATCH) {
             throw badRequest("mutations", `must hold 1 to ${MAX_BATCH} mutations`);
           }
-          if (req.mutations.some((m) => m.kind.case === "setRecurrence")) throw notImplemented("SetRecurrence");
           const today = this.today();
           const planned = req.mutations.map((m, i) => planMutation(m, `mutations[${i}].`, today));
           return this.mutate("BatchMutate", OpKind.BATCH, requestId, planned);
@@ -482,6 +567,9 @@ export class FakeDaemon {
     item.relations = this.relationsOf(id);
     item.revision = this.revision;
     this.settle(item);
+    // A new status is entered at the Item's updated_at, which a test may set
+    // to back-date it for the scheduler.
+    if (prev?.status !== item.status) this.statusEnteredAt.set(id, nanosOf(item.updatedAt));
     this.items.set(id, item);
     this.hierarchy(item);
     this.publish({ revision: item.revision, topic: Topic.ITEM, id, resource: { case: "item", value: item } });
@@ -501,6 +589,7 @@ export class FakeDaemon {
     const prev = this.items.get(id);
     this.revision++;
     this.items.delete(id);
+    this.statusEnteredAt.delete(id);
     this.publish({ revision: this.revision, topic: Topic.ITEM, id, deleted: true });
     if (prev?.parentId !== undefined && this.items.has(prev.parentId)) this.reemit(prev.parentId);
   }
@@ -543,6 +632,8 @@ export class FakeDaemon {
     this.ops.length = 0;
     this.requests.clear();
     this.spools.clear();
+    this.statusEnteredAt.clear();
+    this.statusEnteredBy.clear();
     for (const item of items) {
       this.items.set(item.id, this.settle(item));
       for (const r of item.relations) this.relations.set(relationKey(r), clone(RelationSchema, r));
@@ -635,19 +726,26 @@ export class FakeDaemon {
    * The ids whose derived hierarchy fields change when Items go from
    * `before` to `after` (pairwise; undefined for a new Item), without
    * changing them: the old and new parent of each whose contribution
-   * changed, and the subtasks of each retitled one (Batch::fan_out).
+   * changed, and the subtasks of each retitled one (Batch::fan_out). In
+   * its order: every parent first, the new one before the old, then the
+   * subtasks, the stored ones by creation and then those `after` moves in.
    */
   private relatives(before: readonly (Item | undefined)[], after: readonly Item[]): string[] {
     const out = new Set<string>();
+    const retitled: string[] = [];
     after.forEach((item, i) => {
       const prev = before[i];
       if (contribution(prev) !== contribution(item)) {
-        for (const p of [prev?.parentId, item.parentId]) if (p !== undefined) out.add(p);
+        for (const p of [item.parentId, prev?.parentId]) if (p !== undefined) out.add(p);
       }
-      if (prev && prev.title !== item.title) {
-        for (const child of this.items.values()) if (child.parentId === item.id) out.add(child.id);
-      }
+      if (prev && prev.title !== item.title) retitled.push(item.id);
     });
+    const now = new Map(after.map((item) => [item.id, item]));
+    for (const id of retitled) {
+      const stored = [...this.items.values()].filter((c) => c.parentId === id).sort(byCreation);
+      for (const child of stored) if ((now.get(child.id) ?? child).parentId === id) out.add(child.id);
+      for (const child of after) if (child.parentId === id) out.add(child.id);
+    }
     return [...out];
   }
 
@@ -806,6 +904,19 @@ export class FakeDaemon {
       ...(draft.waitingOn !== undefined && { waiting: { on: draft.waitingOn, reason: "", since: protoDate(day) } }),
       ...(parentId !== undefined && { parentId }),
     });
+    if (draft.recurrence !== undefined) {
+      // A rule on an Item without recurrence (design 3.8): a new series,
+      // scheduled on the draft's first date, which also becomes the due date
+      // when no ^ token set one. The capture is never deferred.
+      const first = draft.recurrenceFirst;
+      if (item.dueDate === undefined && first !== undefined) item.dueDate = clone(DateSchema, first);
+      item.recurrence = create(ItemRecurrenceSchema, {
+        seriesId: ulid(),
+        rule: clone(RecurrenceRuleSchema, draft.recurrence),
+        ...(first !== undefined && { occurrenceDate: clone(DateSchema, first) }),
+      });
+    }
+    this.statusEnteredAt.set(item.id, nanosOf(now));
     // A subtask re-emits its parent first, so the capture's revision is the op's last.
     this.items.set(item.id, this.settle(item));
     if (parentId !== undefined) this.reemit(parentId);
@@ -822,8 +933,20 @@ export class FakeDaemon {
   private single(rpc: string, kind: OpKind, requestId: string, plan: () => Planned): MutationResponse {
     this.check();
     const key = requestIdOf(requestId);
-    const { items, result } = this.mutate(rpc, kind, key, [plan()]);
-    return { item: items[0]!, result };
+    const { items, result, generated } = this.mutate(rpc, kind, key, [plan()]);
+    return { item: items[0]!, result, generated };
+  }
+
+  /**
+   * ParseRecurrence, with the daemon's checks in its order (the text's
+   * length, reference_time, the anchor): the rule grammar of an `@` token,
+   * resolved against the anchor, else the reference day.
+   */
+  private parseRecurrence(req: ParseRecurrenceRequest): ParseRecurrenceResponse {
+    if (overCaptureLimit(req.text)) throw badRequest("text", TOO_LONG);
+    const today = this.referenceDay(req.referenceTime);
+    const anchor = req.anchor === undefined ? undefined : dateArg("anchor", req.anchor);
+    return parseRecurrenceText(req.text, anchor, today);
   }
 
   /**
@@ -833,13 +956,19 @@ export class FakeDaemon {
    * expected_revision (as it was before the op) and, unless the mutation is
    * a delete or undelete, not be deleted. A delete takes the live
    * descendants along, an undelete the descendants its delete took; no
-   * Item the op undeleted may end it live under a deleted parent.
+   * Item the op undeleted may end it live under a deleted parent. Then the
+   * recurrence post-pass ({@link generate}) creates the next instances.
+   * A replay also answers the instances the op created, as they are now.
    */
-  private mutate(rpc: string, kind: OpKind, requestId: string, planned: Planned[]): { items: Item[]; result: MutationResult } {
+  private mutate(rpc: string, kind: OpKind, requestId: string, planned: Planned[]): { items: Item[]; result: MutationResult; generated: Item[] } {
+    const today = this.today();
     // A single-item op names its Item, so the same request id on another Item
     // is a different request; a batch is matched by its RPC alone.
     const recorded = this.recorded(rpc, requestId, kind === OpKind.BATCH ? undefined : planned[0]!.id);
-    if (recorded) return { items: planned.map((p) => this.present(this.get(p.id), this.today())), result: recorded.result };
+    if (recorded) {
+      const created = recorded.op.events.flatMap((e) => (e.kind === "create" ? [this.present(this.get(e.itemId), today)] : []));
+      return { items: planned.map((p) => this.present(this.get(p.id), today)), result: recorded.result, generated: created };
+    }
     const now = this.stamp();
     const batch = this.batch();
     // For the summary: the Items a cascade took along that no mutation names.
@@ -866,6 +995,8 @@ export class FakeDaemon {
       // Read before the undelete replaces it.
       const deletedBy = p.kind === "undelete" ? batch.deletedBy(p.id) : undefined;
       const { next, changes } = applyPatch(item, patchOf(p, item, now));
+      // As the core maintains status_entered_at, mutation by mutation.
+      if (next.status !== item.status) batch.statusChanged.add(p.id);
       const parent = changes.find((c) => c.field === "parentId")?.new;
       const problem = typeof parent === "string" ? batch.parentProblem(p.id, parent) : undefined;
       if (problem) throw badRequest(`${p.prefix}item.parent_id`, problem);
@@ -901,10 +1032,46 @@ export class FakeDaemon {
       const message = `item ${id} cannot be undeleted while its parent ${parentId} is deleted: undelete the parent first`;
       throw errorInfo(Code.FailedPrecondition, "PARENT_DELETED", inBatch(p, message), { item_id: id, parent_id: parentId });
     }
-    const actions = planned.map((p, i) => ({ verb: verbOf(p), status: p.kind === "setStatus", id: p.id, title: batch.items[slots[i]!]!.title }));
-    const op = this.commit(batch, kind, mutationSummary(actions, subtasks.size), now);
+    const generated = this.generate(batch, slots, today, now);
+    const actions = planned.map((p, i) => ({
+      verb: verbOf(p),
+      parens: p.kind === "setStatus" || p.kind === "setRecurrence",
+      id: p.id,
+      title: batch.items[slots[i]!]!.title,
+    }));
+    const dates = generated.map((s) => dayOf(batch.items[s]!.dueDate!));
+    const op = this.commit(batch, kind, mutationSummary(actions, subtasks.size, dates, today), now);
     const result = this.record(rpc, requestId, planned[0]!.id, op);
-    return { items: slots.map((s) => this.present(batch.items[s]!, this.today())), result };
+    return {
+      items: slots.map((s) => this.present(batch.items[s]!, today)),
+      result,
+      generated: generated.map((s) => this.present(batch.items[s]!, today)),
+    };
+  }
+
+  /**
+   * The recurrence post-pass (design 3.8), as generate_tx runs it: for each
+   * Item the op completed, in mutation order, the next instance of its
+   * series, created in the same op. Returns their slots.
+   *
+   * It runs on the op's final state, so `[x A, s A→next]`, `[x A, dd A]` and
+   * `[x A, @clear A]` create nothing. It never creates an instance while
+   * another instance of the series is live and open: the guard sees the
+   * working copies, the instances this pass has made, and the stored Items.
+   * An instance whose parent is gone or deleted starts at the top level.
+   */
+  private generate(batch: Working, slots: readonly number[], today: number, now: Timestamp): number[] {
+    const out: number[] = [];
+    for (const slot of new Set(slots)) {
+      const completed = batch.completedInstance(slot);
+      if (!completed || batch.seriesIsOpen(completed.recurrence!.seriesId, completed.id)) continue;
+      const next = nextInstance(completed, this.newId(), today, now)!;
+      // The fake keeps no staleness signals on its Items.
+      delete next.staleness;
+      if (next.parentId !== undefined && batch.unusableParent(next.parentId)) delete next.parentId;
+      out.push(batch.create(next));
+    }
+    return out;
   }
 
   /**
@@ -944,7 +1111,8 @@ export class FakeDaemon {
     }
     const summary = `${verb}: ${entry.summary}`;
     const now = this.stamp();
-    const steps = inverse(this.sourceOf(entry, redo).events, now);
+    const source = this.sourceOf(entry, redo);
+    const steps = inverse(source.events, now);
     // The parent rule holds where the undo leaves the Items, as for a batch,
     // not after each step: a batch may pass through a live Item under a
     // deleted parent, and its undo then passes through it too, in reverse.
@@ -967,6 +1135,7 @@ export class FakeDaemon {
       return { result: this.record(rpc, requestId, "", op), entry: summarized, items: [], skipped };
     }
     const op = this.commit(batch, kind, summary, now, { entryOp: entry.id, skipped });
+    this.noteEntered(op, this.enteredRestores(source, pass.statusRestored));
     entry.undoState = redo ? "done" : "undone";
     const items = itemIdsOf(batch.events).map((id) => batch.items[batch.slots.get(id)!]!);
     return { result: this.record(rpc, requestId, "", op), entry: summarized, items, skipped };
@@ -988,6 +1157,8 @@ export class FakeDaemon {
     // the last one that deleted it.
     const placed = new Map<string, number>();
     const deleted = new Map<string, number>();
+    // The Items whose status a unit restored, for their status_entered_at.
+    const statusRestored = new Set<string>();
     let changed = false;
     for (const [at, step] of steps.entries()) {
       if (step.kind === "restore") {
@@ -1002,6 +1173,7 @@ export class FakeDaemon {
           continue;
         }
         changed = true;
+        if (unit.some((r) => TRIPLE.includes(r.field))) statusRestored.add(itemId);
         for (const r of unit) {
           if (r.field === "deletedAt" && r.value !== undefined) deleted.set(itemId, at);
           else if (r.field === "deletedAt" || r.field === "parentId") placed.set(itemId, at);
@@ -1036,7 +1208,7 @@ export class FakeDaemon {
       }
       return out;
     };
-    return { batch, skipped, changed, relations, broken };
+    return { batch, skipped, changed, relations, broken, statusRestored };
   }
 
   /**
@@ -1074,6 +1246,21 @@ export class FakeDaemon {
     after.status = deriveStatus(after);
     batch.record(slot, after, changes);
     return "restored";
+  }
+
+  /**
+   * The status_entered_at changes an undo (or redo) of `source` makes, as
+   * the store restores the signal: back to what `source` found, for each
+   * Item whose status the undo restored, where the signal still holds what
+   * `source` wrote.
+   */
+  private enteredRestores(source: FakeOp, statusRestored: ReadonlySet<string>): Entered[] {
+    const out: Entered[] = [];
+    for (const e of [...(this.statusEnteredBy.get(source.id) ?? [])].reverse()) {
+      const current = this.statusEnteredAt.get(e.id);
+      if (statusRestored.has(e.id) && current === e.new) out.push({ id: e.id, old: current, new: e.old });
+    }
+    return out;
   }
 
   /** AddRelation (`add`) or RemoveRelation. */
@@ -1132,7 +1319,13 @@ export class FakeDaemon {
    * Writes the op `batch` built: one revision (in first-touch order),
    * `updated_at` and Change per touched Item, then the op itself.
    */
-  private commit(batch: Working, kind: OpKind, summary: string, now: Timestamp, extra: Pick<FakeOp, "entryOp" | "skipped"> = {}): FakeOp {
+  private commit(
+    batch: Working,
+    kind: OpKind,
+    summary: string,
+    now: Timestamp,
+    { actor = "user", ...extra }: Pick<FakeOp, "entryOp" | "skipped"> & { actor?: FakeActor } = {},
+  ): FakeOp {
     // The fan-out (relatives whose counts or parent title change) is
     // touched without updated_at, as Batch::fan_out does it.
     const loaded = batch.items.map((item) => this.items.get(item.id));
@@ -1152,7 +1345,103 @@ export class FakeDaemon {
       const item = this.hierarchy(batch.items[slot]!);
       this.publish({ revision: item.revision, topic: Topic.ITEM, id: item.id, resource: { case: "item", value: item } });
     }
-    return this.log({ kind, actor: "user", summary, events: batch.events, ...extra });
+    const op = this.log({ kind, actor, summary, events: batch.events, ...extra });
+    // A mutation that changed an Item's status starts its clock; so does a
+    // creation, whose twin has the same signals and so records nothing.
+    const at = nanosOf(now);
+    this.noteEntered(op, [...batch.statusChanged].map((id) => ({ id, old: this.statusEnteredAt.get(id), new: at })));
+    for (const slot of batch.created) this.statusEnteredAt.set(batch.items[slot]!.id, at);
+    return op;
+  }
+
+  /** Applies what `op` did to the status_entered_at of Items, and keeps it for undo and redo. */
+  private noteEntered(op: FakeOp, entered: Entered[]): void {
+    for (const e of entered) {
+      if (e.new === undefined) this.statusEnteredAt.delete(e.id);
+      else this.statusEnteredAt.set(e.id, e.new);
+    }
+    if (entered.length > 0) this.statusEnteredBy.set(op.id, entered);
+  }
+
+  /**
+   * The scheduler's sweep (design 3.7), as auto_archive_tx runs it, now: ops
+   * by the system (never undo stack entries) of kind AUTO_ARCHIVE, each of at
+   * most 1000 Items, until nothing more is due.
+   *
+   * - **Healing first:** live Items archived AUTO_DONE that are open again
+   *   are unarchived, in archive order.
+   * - **The auto_done archive:** live, unarchived done or cancelled Items
+   *   that closed at least `after` milliseconds ago (default 7 days) are
+   *   archived AUTO_DONE, oldest close first. An Item closes when it enters
+   *   done or cancelled (done → cancelled closes it again), as the store's
+   *   status_entered_at says; an Item put without one falls back to its
+   *   updated_at. An Item whose archive the user set (a `z`, either way) at
+   *   or after its close is skipped, until it closes again. Only a decision
+   *   still in effect counts: not one of the system, of an undo or redo, or
+   *   of an op that is undone or discarded.
+   */
+  runScheduler(after: number = ARCHIVE_DONE_AFTER_MS): FakeSweep {
+    const out: FakeSweep = { archived: [], healed: [], ops: [] };
+    for (let more = true; more; ) {
+      const now = this.stamp();
+      let healed = this.reopened();
+      more = healed.length > AUTO_ARCHIVE_LIMIT;
+      healed = healed.slice(0, AUTO_ARCHIVE_LIMIT);
+      const room = AUTO_ARCHIVE_LIMIT - healed.length;
+      let archived = more ? [] : this.closedBefore(nanosOf(now) - BigInt(Math.trunc(after)) * 1_000_000n);
+      more ||= archived.length > room;
+      archived = archived.slice(0, room);
+      if (healed.length === 0 && archived.length === 0) break;
+      const batch = this.batch();
+      const sweeps: [string[], () => Fields][] = [
+        [healed, () => ({ archived: undefined })],
+        [archived, () => ({ archived: create(ArchivedSchema, { at: clone(TimestampSchema, now), reason: ArchiveReason.AUTO_DONE }) })],
+      ];
+      for (const [ids, patch] of sweeps) {
+        for (const id of ids) {
+          const slot = batch.load(id);
+          const { next, changes } = applyPatch(batch.items[slot]!, patch());
+          batch.record(slot, next, changes);
+        }
+      }
+      out.ops.push(this.commit(batch, OpKind.AUTO_ARCHIVE, autoArchiveSummary(archived.length, healed.length), now, { actor: "system" }));
+      out.archived.push(...archived);
+      out.healed.push(...healed);
+    }
+    return out;
+  }
+
+  /** The live Items archived AUTO_DONE that are open again, in archive order. */
+  private reopened(): string[] {
+    return [...this.items.values()]
+      .filter((i) => i.archived?.reason === ArchiveReason.AUTO_DONE && !isClosed(i) && i.deletedAt === undefined)
+      .map((i) => ({ id: i.id, at: nanosOf(i.archived!.at) }))
+      .sort((a, b) => compareBig(a.at, b.at))
+      .map((r) => r.id);
+  }
+
+  /** The live, unarchived done or cancelled Items that closed at or before `cutoff` (nanoseconds) and that no user archive keeps, oldest close first. */
+  private closedBefore(cutoff: bigint): string[] {
+    return [...this.items.values()]
+      .filter((i) => isClosed(i) && i.archived === undefined && i.deletedAt === undefined)
+      .map((i) => ({ id: i.id, closed: this.statusEnteredAt.get(i.id) ?? nanosOf(i.updatedAt) }))
+      .filter((r) => r.closed <= cutoff && !this.archiveDecided(r.id, r.closed))
+      .sort((a, b) => compareBig(a.closed, b.closed))
+      .map((r) => r.id);
+  }
+
+  /** Whether an op still in effect, by the user, set `id`'s archive at or after `since` (nanoseconds). */
+  private archiveDecided(id: string, since: bigint): boolean {
+    return this.ops.some(
+      (op) =>
+        op.actor !== "system" &&
+        op.kind !== OpKind.UNDO &&
+        op.kind !== OpKind.REDO &&
+        op.undoState !== "undone" &&
+        op.undoState !== "discarded" &&
+        nanosOf(op.at) >= since &&
+        op.events.some((e) => e.kind === "set" && e.itemId === id && e.field === "archived"),
+    );
   }
 
   /**
@@ -1257,6 +1546,10 @@ class Working {
   private readonly fanout = new Set<number>();
   /** Items this op soft-deleted and has not undeleted since. */
   private readonly deletedHere = new Set<string>();
+  /** Slots this op created ({@link create}), in creation order. */
+  readonly created: number[] = [];
+  /** Items a mutation of this op changed the derived status of, so their status_entered_at is the op's. */
+  readonly statusChanged = new Set<string>();
 
   constructor(
     private readonly stored: ReadonlyMap<string, Item>,
@@ -1290,6 +1583,45 @@ class Working {
     if (changes.length > 0) this.dirty.add(slot);
     for (const c of changes) this.events.push({ kind: "set", itemId: next.id, field: c.field, old: c.old, new: c.new });
     this.items[slot] = next;
+  }
+
+  /**
+   * Adds `item` as a new Item of this op, with a `create` event, and returns
+   * its slot. It has no stored twin, so it contributes nothing to its
+   * parent's counts as loaded and the commit's fan-out re-emits the parent.
+   */
+  create(item: Item): number {
+    const slot = this.items.push(item) - 1;
+    this.slots.set(item.id, slot);
+    this.events.push({ kind: "create", itemId: item.id });
+    this.created.push(slot);
+    this.dirty.add(slot);
+    return slot;
+  }
+
+  /**
+   * The Item in `slot` when this op completed it and it still repeats: it
+   * was open before the op, is done or cancelled now (so done → cancelled is
+   * no completion), is live, and kept a rule. It is the template of the next
+   * instance (design 3.8).
+   */
+  completedInstance(slot: number): Item | undefined {
+    const item = this.items[slot]!;
+    const loaded = this.stored.get(item.id);
+    const closedHere = loaded !== undefined && !isClosed(loaded) && isClosed(item);
+    return closedHere && item.deletedAt === undefined && item.recurrence?.rule !== undefined ? item : undefined;
+  }
+
+  /**
+   * Whether an instance of `seriesId` other than `but` is still live and
+   * open, as of this point in the op: a working copy (which includes the
+   * instances this op has created), or a stored Item the op has not loaded.
+   */
+  seriesIsOpen(seriesId: string, but: string): boolean {
+    const open = (item: Item) => item.id !== but && item.deletedAt === undefined && !isClosed(item) && item.recurrence?.seriesId === seriesId;
+    if (this.items.some(open)) return true;
+    for (const item of this.stored.values()) if (!this.slots.has(item.id) && open(item)) return true;
+    return false;
   }
 
   /** Takes `next` as the slot's Item without an event of its own (a relation end, or with `fanout` a relative). */
@@ -1477,8 +1809,14 @@ function patchOf(p: Planned, item: Item, now: Timestamp): Fields {
       }
       return patch;
     }
-    case "setStatus":
-      return p.status === undefined || deriveStatus(item) === p.status ? {} : withStatus(item, p.status);
+    case "setStatus": {
+      const patch: Fields = p.status === undefined || deriveStatus(item) === p.status ? {} : { ...withStatus(item, p.status) };
+      // Reopened, an Item leaves an auto_done archive in the same op (design 3.7); a user archive stays.
+      if (p.status !== undefined && !CLOSED.has(p.status) && item.archived?.reason === ArchiveReason.AUTO_DONE) patch.archived = undefined;
+      return patch;
+    }
+    case "setRecurrence":
+      return recurrencePatch(p, item);
     case "archive":
       return { archived: item.archived ?? create(ArchivedSchema, { at: now, reason: ArchiveReason.USER }) };
     case "unarchive":
@@ -1488,6 +1826,31 @@ function patchOf(p: Planned, item: Item, now: Timestamp): Fields {
     case "undelete":
       return { deletedAt: undefined };
   }
+}
+
+/**
+ * What SetRecurrence sets (design 3.8). No rule clears the recurrence. A
+ * rule on an Item without recurrence starts the planned series, and on one
+ * that recurs keeps its series. A fixed rule's occurrence_date is its first
+ * date on or after the due date (else the planned today), which becomes the
+ * due date if there is none; an after-completion rule's is the due date,
+ * which is kept. A rule on a done or cancelled Item fails with ITEM_CLOSED.
+ */
+function recurrencePatch(p: Planned, item: Item): Fields {
+  const { rule, seriesId, today } = p.recurrence!;
+  if (rule === undefined) return { recurrence: undefined };
+  if (isClosed(item)) {
+    throw errorInfo(Code.FailedPrecondition, "ITEM_CLOSED", inBatch(p, `item ${p.id} is done or cancelled: reopen it first`), { item_id: p.id });
+  }
+  const due = item.dueDate === undefined ? undefined : dayOf(item.dueDate);
+  const occurrence = isFixed(rule) ? firstOnOrAfter(rule, due ?? today) : due;
+  const recurrence = create(ItemRecurrenceSchema, {
+    seriesId: item.recurrence?.seriesId ?? seriesId,
+    rule: ruleToProto(rule),
+    ...(occurrence !== undefined && { occurrenceDate: protoDate(occurrence) }),
+  });
+  const dueDate = item.dueDate ?? (isFixed(rule) && occurrence !== undefined ? create(DateSchema, protoDate(occurrence)) : undefined);
+  return { recurrence, dueDate };
 }
 
 /** `item` with `patch` applied and its changes, in patch order; `item` itself when nothing changes. */
@@ -1649,9 +2012,21 @@ function verbOf(p: Planned): string {
       return "edit";
     case "setStatus":
       return STATUS_VERBS[p.status ?? Status.UNSPECIFIED] ?? "set status";
+    case "setRecurrence":
+      return p.recurrence?.rule === undefined ? "stop repeating" : "set repeat";
     default:
       return p.kind;
   }
+}
+
+const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+/** `Mon Nov 2`, with the year when it is not `today`'s (summary.rs `day`). */
+function summaryDay(n: number, today: number): string {
+  const { year, month, day } = civil(n);
+  const text = `${WEEKDAY_NAMES[weekday(n) - 1]} ${MONTH_NAMES[month - 1]} ${day}`;
+  return year === civil(today).year ? text : `${text} ${year}`;
 }
 
 /** `"<title>"`, cut to MAX_TITLE_CHARS characters with `…`. */
@@ -1662,11 +2037,19 @@ function quoted(title: string): string {
 
 /**
  * The summary of a mutate op from its mutations in request order (titles as
- * after the op) and the number of descendants a cascade took along that no
- * mutation names: `mark done "x"`, `mark done (3 items)`, `edit 3 items`,
- * `change 3 items`, `delete "x" and 2 subtasks`.
+ * after the op), the number of descendants a cascade took along that no
+ * mutation names, and the due dates of the instances it generated, with
+ * `today` deciding when a date needs its year: `mark done "x"`, `mark done
+ * (3 items)` (a status or repeat verb, `parens`), `edit 3 items`, `change 3
+ * items`, `delete "x" and 2 subtasks`, then `· next Mon Nov 2` for one Item
+ * or `· 2 next` for several.
  */
-function mutationSummary(actions: readonly { verb: string; status: boolean; id: string; title: string }[], subtasks: number): string {
+function mutationSummary(
+  actions: readonly { verb: string; parens: boolean; id: string; title: string }[],
+  subtasks: number,
+  generated: readonly number[],
+  today: number,
+): string {
   const first = actions[0];
   if (!first) return "change nothing";
   const n = new Set(actions.map((a) => a.id)).size;
@@ -1674,13 +2057,23 @@ function mutationSummary(actions: readonly { verb: string; status: boolean; id: 
   const text = shared
     ? n === 1
       ? `${first.verb} ${quoted(first.title)}`
-      : first.status
+      : first.parens
         ? `${first.verb} (${n} items)`
         : `${first.verb} ${n} items`
     : n === 1
       ? `change ${quoted(first.title)}`
       : `change ${n} items`;
-  return subtasks === 0 ? text : `${text} and ${subtasks} ${subtasks === 1 ? "subtask" : "subtasks"}`;
+  const cascade = subtasks === 0 ? text : `${text} and ${subtasks} ${subtasks === 1 ? "subtask" : "subtasks"}`;
+  if (generated.length === 0) return cascade;
+  return generated.length === 1 && n === 1 ? `${cascade} · next ${summaryDay(generated[0]!, today)}` : `${cascade} · ${generated.length} next`;
+}
+
+/** `auto-archive 3 done items`, `unarchive 1 reopened item`, or both joined by `and` (summary.rs `auto_archive`). */
+function autoArchiveSummary(archived: number, healed: number): string {
+  const items = (k: number, what: string) => `${k} ${what} ${k === 1 ? "item" : "items"}`;
+  const archive = `auto-archive ${items(archived, "done")}`;
+  const heal = `unarchive ${items(healed, "reopened")}`;
+  return healed === 0 ? archive : archived === 0 ? heal : `${archive} and ${heal}`;
 }
 
 function msg(message: MessageInitShape<typeof SubscribeResponseSchema>["message"]): SubscribeResponse {
@@ -1695,11 +2088,6 @@ function errorInfo(code: Code, reason: string, message: string, metadata: Record
 /** `message`, prefixed in a batch with the mutation's id path, so a precondition failure names the mutation. */
 function inBatch(p: Planned, message: string): string {
   return p.batched ? `${p.idPath}: ${message}` : message;
-}
-
-/** UNIMPLEMENTED for an RPC the daemon does not serve yet. */
-function notImplemented(rpc: string): ConnectError {
-  return errorInfo(Code.Unimplemented, "NOT_IMPLEMENTED", `${rpc} is not implemented yet`, {});
 }
 
 function notFound(id: string): ConnectError {
@@ -1847,8 +2235,54 @@ function planMutation(m: Mutation, prefix: string, today: number): Planned {
     case "undeleteItem":
       return planItemOp("undelete", k.value, inner);
     case "setRecurrence":
-      throw notImplemented("SetRecurrence");
+      return planSetRecurrence(k.value, inner, today);
   }
+}
+
+/**
+ * SetRecurrence, converted as set_recurrence_from_proto does: errors in the
+ * rule are at `rule.<oneof case>`. Each call names a fresh series, which
+ * the Item takes only if it does not recur yet, so every Item of a batch
+ * gets its own; `today` places a fixed rule's first occurrence on an Item
+ * without a due date.
+ */
+function planSetRecurrence(req: SetRecurrenceRequest, prefix: string, today: number): Planned {
+  const idPath = `${prefix}id`;
+  const id = idOf(idPath, req.id);
+  let rule: Rule | undefined;
+  if (req.rule !== undefined) {
+    const read = ruleFromProto(`${prefix}rule`, req.rule);
+    if ("reason" in read) throw badRequest(read.path, read.reason);
+    rule = read.rule;
+  }
+  return {
+    kind: "setRecurrence",
+    id,
+    expectedRevision: req.expectedRevision,
+    prefix,
+    idPath,
+    batched: prefix !== "",
+    recurrence: { rule, seriesId: ulid(), today },
+  };
+}
+
+/**
+ * The date at request field `field`, as date_from_proto reads it: a year of
+ * 1 to 9999 and a real date, with jiff's wording.
+ */
+function dateArg(field: string, d: { year: number; month: number; day: number }): number {
+  const bad = (reason: string) => badRequest(field, reason);
+  if (!(d.year >= 1 && d.year <= 9999)) throw bad(`year ${d.year} is not in 1..=9999`);
+  // Rust's i8::try_from.
+  if ([d.month, d.day].some((n) => n < -128 || n > 127)) throw bad("out of range integral type conversion attempted");
+  if (!(d.month >= 1 && d.month <= 12)) throw bad("parameter 'month' is not in the required range of 1..=12");
+  if (d.day < 1) throw bad("parameter 'day' is not in the required range of 1..=31");
+  if (!isDate(d.year, d.month, d.day)) {
+    const last = [31, 30, 29, 28].find((n) => isDate(d.year, d.month, n))!;
+    const pad = (n: number, w: number) => String(n).padStart(w, "0");
+    throw bad(`parameter 'day' for \`${pad(d.year, 4)}-${pad(d.month, 2)}\` is invalid, must be in range \`1..=${last}\``);
+  }
+  return dayOf(d);
 }
 
 /** UpdateItem; `today` is the day a `waiting` without `since` is waiting since. */
@@ -1879,13 +2313,20 @@ const FIELDS_BY_NAME = new Map(ItemSchema.fields.map((f) => [f.name, f]));
 /** The Item fields whose own fields are mask paths too ("waiting.reason"), as ItemField names them. */
 const NESTED_PATHS = new Set(["waiting", "archived", "remote_link", "recurrence", "staleness"]);
 
-/** Whether `path` names an Item field, or a field of one of the NESTED_PATHS messages. */
+/**
+ * Whether `path` names an Item field, or a field of one of the NESTED_PATHS
+ * messages that ItemField names (its number is the parent's × 1000 plus its
+ * own), as the daemon reads a path: `recurrence.rule` is no ItemField, so
+ * no path.
+ */
 function knownPath(path: string): boolean {
   const [top, sub, ...deeper] = path.split(".");
   const field = FIELDS_BY_NAME.get(top!);
   if (field === undefined || deeper.length > 0) return false;
   if (sub === undefined) return true;
-  return NESTED_PATHS.has(top!) && field.fieldKind === "message" && field.message.fields.some((f) => f.name === sub);
+  if (!NESTED_PATHS.has(top!) || field.fieldKind !== "message") return false;
+  const nested = field.message.fields.find((f) => f.name === sub);
+  return nested !== undefined && ItemField[field.number * 1000 + nested.number] !== undefined;
 }
 
 /**

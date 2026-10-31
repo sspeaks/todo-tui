@@ -18,6 +18,7 @@ import { resolvePaths, envFromProcess } from "../src/paths.js";
 import { ulid } from "../src/ulid.js";
 import { CAPTURE_ZONE, captureConformance } from "./conformance/capture.js";
 import { FILTER_ZONE, filterViewsConformance } from "./conformance/filter-views.js";
+import { RECURRENCE_ZONE, recurrenceConformance } from "./conformance/recurrence.js";
 import { undoRelationsConformance } from "./conformance/undo-relations.js";
 
 const TODO_BIN = process.env.TODO_BIN;
@@ -272,5 +273,16 @@ describe.skipIf(!TODO_BIN)("capture syntax and waiting against $TODO_BIN", { tim
     const h = await home({ TZ: CAPTURE_ZONE }, false);
     const conn = await h.open();
     return { items: conn.items, timeZone: CAPTURE_ZONE, close: h.close };
+  });
+});
+
+describe.skipIf(!TODO_BIN)("recurrence against $TODO_BIN", { timeout: 60_000 }, () => {
+  // The suite FakeDaemon runs too, each test on a fresh daemon spawned in
+  // the same zone. Its scheduler cases are FakeDaemon's alone: the daemon's
+  // scheduler is tested in crates/todo-daemon/tests/server.rs.
+  recurrenceConformance(async () => {
+    const h = await home({ TZ: RECURRENCE_ZONE });
+    const conn = await h.open();
+    return { items: conn.items, timeZone: RECURRENCE_ZONE };
   });
 });

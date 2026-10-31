@@ -134,6 +134,10 @@ export function captureConformance(open: () => Promise<CaptureTarget>): void {
         ['ask ~"the vendor', 'ask ~"the vendor', '~"the: missing closing quote'],
         ['x ~""', 'x ~""', '~"": waiting needs a name'],
         ['x ~"   " y', 'x ~" " y', '~"   ": waiting needs a name'],
+        ["x @home", "x @home", "@home: not a repeat rule"],
+        ["x @@daily", "x @@daily", "@@daily: not a repeat rule"],
+        ["x @22th", "x @22th", "@22th: write 22nd"],
+        ["x @0w", "x @0w", "@0w: after completion must be 1 to 3650 days"],
       ];
       for (const [text, title, warning] of rows) {
         const d = await parse(text);
@@ -174,6 +178,8 @@ export function captureConformance(open: () => Promise<CaptureTarget>): void {
         ["a\\#b", "a\\#b"],
         ['\\~"the vendor"', '~"the vendor"'],
         ["a + b ^ c # d ~ e > f", "a + b ^ c # d ~ e > f"],
+        ["\\@daily standup", "@daily standup"],
+        ["mail bob@x.com @ noon", "mail bob@x.com @ noon"],
       ];
       for (const [text, title] of titles) expect(await parse(text), text).toMatchObject({ title, tokens: [], warnings: [] });
       expect(await parse("\\#1 fan +1")).toMatchObject({ title: "#1 fan", priority: Priority.HIGHEST, tokens: [[8, 10, K.PRIORITY, true, ""]] });
@@ -183,6 +189,73 @@ export function captureConformance(open: () => Promise<CaptureTarget>): void {
       expect(await parse('~"a"b c" d')).toMatchObject({ title: "d", waiting: 'a"b c', tokens: [[0, 8, K.WAITING, true, ""]] });
       expect(await parse('x ~dana"')).toMatchObject({ waiting: 'dana"' });
       expect(await parse('ask ~"the vendor"x')).toMatchObject({ title: 'ask ~"the vendor"x', tokens: [[4, 9, K.WAITING, false, '~"the: missing closing quote']] });
+    });
+
+    it("parses @ repeat rules, resolved against the winning ^ date, else the reference day", async () => {
+      const rule = async (text: string, referenceTime: Timestamp = THU) => {
+        const d = (await parseCapture(t.items, text, { referenceTime })).draft;
+        const r = d?.recurrence?.kind;
+        const shownRule = r?.case === "weekly" ? `weekly ${r.value.days.join(",")}` : r?.case === "monthly" ? `monthly ${r.value.day}` : r?.case === "afterCompletion" ? `after ${r.value.days}` : r?.case;
+        return [d?.title, shownRule, iso(d?.recurrenceFirst), iso(d?.dueDate)];
+      };
+      expect(await parse("water plants @mon,thu +2")).toEqual({
+        title: "water plants",
+        priority: Priority.HIGH,
+        due: undefined,
+        labels: [],
+        waiting: undefined,
+        status: Status.INBOX,
+        tokens: [
+          [13, 21, K.RECURRENCE, true, ""],
+          [22, 24, K.PRIORITY, true, ""],
+        ],
+        warnings: [],
+      });
+      // Thursday 2026-10-22: Monday 1 … Sunday 7.
+      const rows: [string, (string | undefined)[]][] = [
+        ["x @daily", ["x", "daily", "2026-10-22", undefined]],
+        ["x @DAILY", ["x", "daily", "2026-10-22", undefined]],
+        ["x @weekdays", ["x", "weekly 1,2,3,4,5", "2026-10-22", undefined]],
+        ["x @weekly", ["x", "weekly 4", "2026-10-22", undefined]],
+        ["x @mon,thu", ["x", "weekly 1,4", "2026-10-22", undefined]],
+        ["x @mon", ["x", "weekly 1", "2026-10-26", undefined]],
+        ["x @monthly", ["x", "monthly 22", "2026-10-22", undefined]],
+        ["x @15th", ["x", "monthly 15", "2026-11-15", undefined]],
+        ["x @3d", ["x", "after 3", undefined, undefined]],
+        ["x @2w ^fri", ["x", "after 14", "2026-10-23", "2026-10-23"]],
+        // The anchor is the winning ^ date, wherever it is.
+        ["x @weekly ^fri", ["x", "weekly 5", "2026-10-23", "2026-10-23"]],
+        ["x ^fri @weekly", ["x", "weekly 5", "2026-10-23", "2026-10-23"]],
+        ["@weekly x ^fri", ["x", "weekly 5", "2026-10-23", "2026-10-23"]],
+        ["x ^tom @weekly ^mon", ["x", "weekly 1", "2026-10-26", "2026-10-26"]],
+        ["x ^2026-11-30 @monthly", ["x", "monthly 30", "2026-11-30", "2026-11-30"]],
+        // A due date off the schedule: the first scheduled date on or after it.
+        ["x ^fri @mon,wed", ["x", "weekly 1,3", "2026-10-26", "2026-10-23"]],
+        // A failed ^ anchors nothing.
+        ["x ^someday @weekly", ["x ^someday", "weekly 4", "2026-10-22", undefined]],
+        // A later rule wins; a failed one overrides nothing.
+        ["x @daily @3d", ["x", "after 3", undefined, undefined]],
+        ["x @daily @home", ["x @home", "daily", "2026-10-22", undefined]],
+      ];
+      for (const [text, want] of rows) expect(await rule(text), text).toEqual(want);
+      expect(await rule("x @weekly", at(10, 25, 2026, 23, 59))).toEqual(["x", "weekly 7", "2026-10-25", undefined]);
+      expect((await parse("x @daily @3d"))?.warnings).toEqual(["@daily: overridden by @3d"]);
+      // Alone, a rule is kept as the title, like any token.
+      expect(await parse("@daily")).toMatchObject({
+        title: "@daily",
+        tokens: [[0, 6, K.RECURRENCE, false, "@daily: kept as title text"]],
+        warnings: ["@daily: kept as title text", "no title words: the text was kept as typed"],
+      });
+      expect(await rule("@daily")).toEqual(["@daily", undefined, undefined, undefined]);
+
+      // CaptureItem stores it: a series due on its first date, unless a ^ set one.
+      const res = await capture("water plants @mon,wed ^fri");
+      expect([iso(res.item?.dueDate), iso(res.item?.recurrence?.occurrenceDate), res.item?.recurrence?.seriesId]).toEqual(["2026-10-23", "2026-10-26", expect.any(String)]);
+      expect(res.draft?.recurrence).toEqual(res.item?.recurrence?.rule);
+      const daily = await capture("feed cat @daily");
+      expect([iso(daily.item?.dueDate), iso(daily.item?.recurrence?.occurrenceDate)]).toEqual(["2026-10-22", "2026-10-22"]);
+      const home = (await capture("x @home")).item;
+      expect([home?.title, home?.recurrence, home?.dueDate]).toEqual(["x @home", undefined, undefined]);
     });
 
     it("counts offsets in code points through emoji, CJK and combining marks", async () => {

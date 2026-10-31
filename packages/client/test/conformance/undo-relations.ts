@@ -762,16 +762,34 @@ export function undoRelationsConformance(open: () => Promise<UndoTarget>): void 
       const b = await capture("b", p.item.id);
       const { store } = await live();
 
-      await updateItem(items, { id: p.item.id, title: "parent" }, ["title"]);
+      const retitled = await updateItem(items, { id: p.item.id, title: "parent" }, ["title"]);
       expect((await get(a.item.id)).parentTitle).toBe("parent");
       await waitFor(() => store.getItem(b.item.id)?.parentTitle === "parent");
+      // The subtasks follow the parent, in the order they were created.
+      const after = retitled.item!.revision;
+      expect([(await get(a.item.id)).revision, (await get(b.item.id)).revision]).toEqual([after + 1n, after + 2n]);
 
       const moved = await updateItem(items, { id: a.item.id, parentId: q.item.id }, ["parent_id"]);
       expect(moved.item?.parentTitle).toBe("q");
       expect((await get(p.item.id)).subtasksTotal).toBe(1);
       expect((await get(q.item.id)).subtasksTotal).toBe(1);
+      // The new parent is re-emitted before the old one.
+      const rev = moved.item!.revision;
+      expect([(await get(q.item.id)).revision, (await get(p.item.id)).revision]).toEqual([rev + 1n, rev + 2n]);
       await waitFor(() => store.getItem(p.item.id)?.subtasksTotal === 1 && store.getItem(q.item.id)?.subtasksTotal === 1);
       expect((await get(q.item.id)).parentTitle).toBeUndefined();
+
+      // In a batch every moved Item's parents come first, then the
+      // subtasks of every retitled one.
+      const edit = (id: string, item: { title?: string; parentId?: string }, path: string) => ({
+        kind: { case: "updateItem" as const, value: { item: { id, ...item }, updateMask: { paths: [path] } } },
+      });
+      const batch = await batchMutate(items, [edit(q.item.id, { title: "queue" }, "title"), edit(b.item.id, { parentId: q.item.id }, "parent_id")]);
+      const end = batch.result!.revision;
+      const revs = await Promise.all([q, b, p, a].map(async (x) => (await get(x.item.id)).revision));
+      // q and b, then b's new parent (q, already in the op) and its old one, then q's subtasks.
+      expect(revs).toEqual([end - 3n, end - 2n, end - 1n, end]);
+      expect((await get(b.item.id)).parentTitle).toBe("queue");
     });
   });
 }

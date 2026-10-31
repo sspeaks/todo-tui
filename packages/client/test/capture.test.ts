@@ -4,8 +4,9 @@ import { parseCaptureText } from "../src/capture.js";
 import { dayNumber } from "../src/dates.js";
 import { DateSchema } from "../src/gen/google/type/date_pb.js";
 import { PersonRefSchema } from "../src/gen/todo/v1/common_pb.js";
-import { Priority, Status } from "../src/gen/todo/v1/item_pb.js";
+import { Priority, Status, Weekday } from "../src/gen/todo/v1/item_pb.js";
 import { type CaptureDraft, CaptureDraftSchema, CaptureTokenKind as K, CaptureTokenSchema } from "../src/gen/todo/v1/item_service_pb.js";
+import { type Rule, ruleToProto } from "../src/recurrence.js";
 
 // The cases of crates/todo-core/src/capture.rs, whose parser FakeDaemon's
 // ParseCapture and CaptureItem port. test/conformance/capture.ts checks the
@@ -98,6 +99,7 @@ describe("parseCaptureText", () => {
     const rows = [
       ["\\#1 fan", "#1 fan"],
       ["\\+2 \\^fri \\~dana \\>next", "+2 ^fri ~dana >next"],
+      ["\\@daily \\@x", "@daily @x"],
       ["\\~dana", "~dana"],
       ["\\foo", "\\foo"],
       ["\\\\#x", "\\\\#x"],
@@ -113,7 +115,7 @@ describe("parseCaptureText", () => {
   });
 
   it("keeps bare sigils as title text", () => {
-    const text = "a + b ^ c # d ~ e > f";
+    const text = "a + b ^ c # d ~ e > f @ g";
     expect(parse(text)).toEqual(fromTitle(text));
     expect(parse("+")).toEqual(fromTitle("+"));
   });
@@ -312,7 +314,8 @@ describe("parseCaptureText", () => {
       "call dentist ^fri +2 #home",
       "+1 +2",
       '~"a b" ~"c',
-      "\\+1 + ++ ^ ^^ # ## ~ ~~ > >>",
+      "\\+1 + ++ ^ ^^ # ## ~ ~~ > >> @ @@",
+      "x @weekly ^fri @3d @nope",
       "  ",
       "x +1 #é",
       '~"" ~"x"y" z',
@@ -330,5 +333,119 @@ describe("parseCaptureText", () => {
       const tokenWarnings = draft.tokens.filter((t) => !t.applied).map((t) => t.warning);
       expect(draft.warnings.slice(0, tokenWarnings.length), text).toEqual(tokenWarnings);
     }
+  });
+
+  describe("@ repeat rules", () => {
+    const { MONDAY, TUESDAY, WEDNESDAY, THURSDAY, FRIDAY } = Weekday;
+    const rule = (r: Rule) => ruleToProto(r);
+    const weekly = (days: Weekday[]) => rule({ kind: "weekly", days });
+
+    it("parses a rule and its first occurrence", () => {
+      let draft = parse("water plants @mon,thu");
+      expect(draft.title).toBe("water plants");
+      expect(draft.recurrence).toEqual(weekly([MONDAY, THURSDAY]));
+      // Without a due date, the first occurrence on or after today.
+      expect(draft.recurrenceFirst).toEqual(date(2026, 10, 22));
+      expect(draft.dueDate).toBeUndefined();
+      expect(draft.tokens).toEqual([token(13, 21, K.RECURRENCE)]);
+      expect(draft.warnings).toEqual([]);
+
+      const rows: [string, Rule, ReturnType<typeof date>][] = [
+        ["x @daily", { kind: "daily" }, date(2026, 10, 22)],
+        ["x @DAILY", { kind: "daily" }, date(2026, 10, 22)],
+        ["x @weekdays", { kind: "weekly", days: [MONDAY, TUESDAY, WEDNESDAY, THURSDAY, FRIDAY] }, date(2026, 10, 22)],
+        ["x @weekly", { kind: "weekly", days: [THURSDAY] }, date(2026, 10, 22)],
+        ["x @monthly", { kind: "monthly", day: 22 }, date(2026, 10, 22)],
+        ["x @15th", { kind: "monthly", day: 15 }, date(2026, 11, 15)],
+        ["x @mon", { kind: "weekly", days: [MONDAY] }, date(2026, 10, 26)],
+      ];
+      for (const [text, want, first] of rows) {
+        const d = parse(text);
+        expect(d.recurrence, text).toEqual(rule(want));
+        expect(d.recurrenceFirst, text).toEqual(first);
+        expect(d.title, text).toBe("x");
+      }
+
+      // After completion: the first occurrence is the due date, if any.
+      draft = parse("x @3d");
+      expect(draft.recurrence).toEqual(rule({ kind: "afterCompletion", days: 3 }));
+      expect(draft.recurrenceFirst).toBeUndefined();
+      draft = parse("x @2w ^fri");
+      expect(draft.recurrence).toEqual(rule({ kind: "afterCompletion", days: 14 }));
+      expect(draft.recurrenceFirst).toEqual(date(2026, 10, 23));
+    });
+
+    it("resolves against the due date in any order", () => {
+      const friday = date(2026, 10, 23);
+      for (const text of ["x @weekly ^fri", "x ^fri @weekly", "@weekly x ^fri"]) {
+        const d = parse(text);
+        expect(d.recurrence, text).toEqual(weekly([FRIDAY]));
+        expect(d.recurrenceFirst, text).toEqual(friday);
+        expect(d.dueDate, text).toEqual(friday);
+      }
+      for (const text of ["x @monthly ^2026-11-30", "x ^2026-11-30 @monthly"]) {
+        const d = parse(text);
+        expect(d.recurrence, text).toEqual(rule({ kind: "monthly", day: 30 }));
+        expect(d.recurrenceFirst, text).toEqual(date(2026, 11, 30));
+      }
+      // The winning due date anchors, not an overridden one.
+      let draft = parse("x ^tom @weekly ^mon");
+      expect(draft.recurrence).toEqual(weekly([MONDAY]));
+      // A due date off the schedule: the first scheduled date on or after it.
+      draft = parse("x ^fri @mon,wed");
+      expect(draft.dueDate).toEqual(friday);
+      expect(draft.recurrenceFirst).toEqual(date(2026, 10, 26));
+      // A failed due date anchors nothing.
+      draft = parse("x ^someday @weekly");
+      expect(draft.recurrence).toEqual(weekly([THURSDAY]));
+      expect(draft.warnings).toEqual(["^someday: not a date"]);
+    });
+
+    it("lets a later rule override an earlier one", () => {
+      let draft = parse("x @daily @3d");
+      expect(draft.recurrence).toEqual(rule({ kind: "afterCompletion", days: 3 }));
+      expect(draft.warnings).toEqual(["@daily: overridden by @3d"]);
+      expect(draft.tokens).toEqual([failed(2, 8, K.RECURRENCE, "@daily: overridden by @3d"), token(9, 12, K.RECURRENCE)]);
+      // A failed token overrides nothing.
+      draft = parse("x @daily @home");
+      expect(draft.recurrence).toEqual(rule({ kind: "daily" }));
+      expect(draft.title).toBe("x @home");
+    });
+
+    it("keeps a rule that does not parse in the title", () => {
+      const rows = [
+        ["x @home", "@home: not a repeat rule"],
+        ["x @@daily", "@@daily: not a repeat rule"],
+        ["x @mon,fr", "@mon,fr: fr is not a weekday"],
+        ["x @mon,", "@mon,: a day is missing between commas"],
+        ["x @22th", "@22th: write 22nd"],
+        ["x @32nd", "@32nd: the day of the month must be 1st to 31st"],
+        ["x @0d", "@0d: after completion must be 1 to 3650 days"],
+        ["x @15", "@15: a number needs d or w, or a day suffix, e.g. 3d, 2w or 15th"],
+      ];
+      for (const [text, warning] of rows) {
+        const draft = parse(text!);
+        expect(draft.title, text).toBe(text);
+        expect(draft.warnings, text).toEqual([warning]);
+        expect(draft.recurrence, text).toBeUndefined();
+        expect(draft.recurrenceFirst, text).toBeUndefined();
+        expect(draft.tokens[0]?.kind).toBe(K.RECURRENCE);
+        expect(draft.tokens[0]?.applied).toBe(false);
+      }
+    });
+
+    it("keeps @ as title text mid-word, alone or escaped", () => {
+      for (const text of ["mail bob@x.com", "meet @", "a @ b", "x@daily"]) expect(parse(text), text).toEqual(fromTitle(text));
+      expect(parse("\\@daily standup")).toEqual(fromTitle("@daily standup"));
+      // Alone, a rule is kept as the title, like any token.
+      let draft = parse("@daily");
+      expect(draft.title).toBe("@daily");
+      expect(draft.recurrence).toBeUndefined();
+      expect(draft.recurrenceFirst).toBeUndefined();
+      expect(draft.warnings).toEqual(["@daily: kept as title text", "no title words: the text was kept as typed"]);
+      draft = parse("@daily ^fri");
+      expect(draft.title).toBe("@daily ^fri");
+      expect([draft.recurrence, draft.dueDate]).toEqual([undefined, undefined]);
+    });
   });
 });

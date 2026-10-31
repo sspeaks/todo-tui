@@ -8,8 +8,9 @@ import { PersonRefSchema } from "./gen/todo/v1/common_pb.js";
 import { Priority, Status } from "./gen/todo/v1/item_pb.js";
 import { type CaptureDraft, CaptureDraftSchema, CaptureTokenKind, CaptureTokenSchema } from "./gen/todo/v1/item_service_pb.js";
 import { parseDateExpr, protoDate, rustTrim } from "./dates.js";
+import { type RuleSpec, firstOccurrence, parseRule, resolve, ruleToProto } from "./recurrence.js";
 
-const SIGILS = ["+", "^", "#", "~", ">"];
+const SIGILS = ["+", "^", "#", "~", ">", "@"];
 
 const WHITESPACE = /^\p{White_Space}$/u;
 const WHITESPACE_RUNS = /\p{White_Space}+/u;
@@ -21,7 +22,9 @@ type Effect =
   | { set: "dueDate"; day: number }
   | { set: "label"; label: string }
   | { set: "waiting"; name: string }
-  | { set: "status"; status: Status };
+  | { set: "status"; status: Status }
+  /** Resolved once the due date is known. */
+  | { set: "recurrence"; spec: RuleSpec };
 
 /** A title word, or a token of `kind` with what it sets or why it does not parse. */
 type Piece = { title: string } | { kind: CaptureTokenKind; result: Effect | string };
@@ -73,7 +76,7 @@ export function parseCaptureText(text: string, today: number): CaptureDraft {
     }
   } else {
     draft.title = title.join(" ");
-    applyEffects(draft, parsed, typed);
+    applyEffects(draft, parsed, typed, today);
   }
   draft.warnings = draft.tokens.filter((t) => !t.applied).map((t) => t.warning);
   if (keptAsTyped) draft.warnings.push("no title words: the text was kept as typed");
@@ -83,12 +86,15 @@ export function parseCaptureText(text: string, today: number): CaptureDraft {
 /**
  * Applies parsed tokens (indexes into `draft.tokens`, with the text of each
  * token in `typed`). The last token of a single-valued kind wins; every
- * label applies, once.
+ * label applies, once. The rule is resolved last, against the winning due
+ * date (else `today`), so `@weekly ^fri` reads as `^fri @weekly`.
  */
-function applyEffects(draft: CaptureDraft, parsed: readonly [number, Effect][], typed: readonly string[]): void {
+function applyEffects(draft: CaptureDraft, parsed: readonly [number, Effect][], typed: readonly string[], today: number): void {
   const winners = new Map<CaptureTokenKind, number>();
   for (const [i, effect] of parsed) if (effect.set !== "label") winners.set(draft.tokens[i]!.kind, i);
   const labels = new Set<string>();
+  let due: number | undefined;
+  let spec: RuleSpec | undefined;
   for (const [i, effect] of parsed) {
     const token = draft.tokens[i]!;
     const winner = winners.get(token.kind);
@@ -102,6 +108,7 @@ function applyEffects(draft: CaptureDraft, parsed: readonly [number, Effect][], 
         draft.priority = effect.priority;
         break;
       case "dueDate":
+        due = effect.day;
         draft.dueDate = create(DateSchema, protoDate(effect.day));
         break;
       case "label":
@@ -116,7 +123,16 @@ function applyEffects(draft: CaptureDraft, parsed: readonly [number, Effect][], 
       case "status":
         draft.status = effect.status;
         break;
+      case "recurrence":
+        spec = effect.spec;
+        break;
     }
+  }
+  if (spec !== undefined) {
+    const rule = resolve(spec, due ?? today);
+    draft.recurrence = ruleToProto(rule);
+    const first = firstOccurrence(rule, due, today);
+    if (first !== undefined) draft.recurrenceFirst = create(DateSchema, protoDate(first));
   }
 }
 
@@ -173,8 +189,13 @@ function classify(word: string, quoted: boolean, today: number): Piece {
       return { kind: CaptureTokenKind.LABEL, result: CONTROL.test(rest) ? "labels must not contain control characters" : { set: "label", label: rest } };
     case "~":
       return { kind: CaptureTokenKind.WAITING, result: waiting(rest, quoted) };
-    default:
+    case ">":
       return { kind: CaptureTokenKind.STATUS, result: status(rest) };
+    default: {
+      // The whole word, so that `@@daily` is not a rule, as `^^fri` is not a date.
+      const rule = parseRule(word);
+      return { kind: CaptureTokenKind.RECURRENCE, result: "spec" in rule ? { set: "recurrence", spec: rule.spec } : rule.reason };
+    }
   }
 }
 

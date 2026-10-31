@@ -1,7 +1,7 @@
 import { Code, ConnectError, createClient, createRouterTransport } from "@connectrpc/connect";
 import { describe, expect, it } from "vitest";
 import { ErrorInfoSchema } from "../src/gen/google/rpc/error_details_pb.js";
-import { CreatedVia, Status } from "../src/gen/todo/v1/item_pb.js";
+import { CreatedVia, Status, Weekday } from "../src/gen/todo/v1/item_pb.js";
 import {
   type AddRelationRequest,
   type ArchiveItemRequest,
@@ -11,6 +11,7 @@ import {
   ItemService,
   type RedoRequest,
   type RemoveRelationRequest,
+  type SetRecurrenceRequest,
   type SetStatusRequest,
   type UnarchiveItemRequest,
   type UndeleteItemRequest,
@@ -29,6 +30,7 @@ import {
   getUndoState,
   redo,
   removeRelation,
+  setRecurrence,
   setStatus,
   unarchiveItem,
   undeleteItem,
@@ -43,6 +45,7 @@ function recorder() {
   const got = {
     updateItem: [] as UpdateItemRequest[],
     setStatus: [] as SetStatusRequest[],
+    setRecurrence: [] as SetRecurrenceRequest[],
     archiveItem: [] as ArchiveItemRequest[],
     unarchiveItem: [] as UnarchiveItemRequest[],
     deleteItem: [] as DeleteItemRequest[],
@@ -59,6 +62,7 @@ function recorder() {
     service(ItemService, {
       updateItem: (req) => (got.updateItem.push(req), {}),
       setStatus: (req) => (got.setStatus.push(req), {}),
+      setRecurrence: (req) => (got.setRecurrence.push(req), {}),
       archiveItem: (req) => (got.archiveItem.push(req), {}),
       unarchiveItem: (req) => (got.unarchiveItem.push(req), {}),
       deleteItem: (req) => (got.deleteItem.push(req), {}),
@@ -108,6 +112,17 @@ describe("mutation helpers", () => {
     expect(got.setStatus[0]?.status).toBe(Status.DONE);
     for (const r of reqs) expect(r.requestId).toMatch(ULID);
     expect(new Set(reqs.map((r) => r.requestId)).size).toBe(reqs.length);
+  });
+
+  it("SetRecurrence sends the rule, and none to clear it", async () => {
+    const { client, got } = recorder();
+    await setRecurrence(client, "A", { kind: { case: "weekly", value: { days: [Weekday.MONDAY, Weekday.THURSDAY] } } }, { expectedRevision: 5n });
+    await setRecurrence(client, "B", undefined, { requestId: "01JRETRY000000000000000000" });
+    const [set, clear] = got.setRecurrence;
+    expect([set?.id, set?.expectedRevision, set?.rule?.kind.case]).toEqual(["A", 5n, "weekly"]);
+    expect(set?.rule?.kind.case === "weekly" && set.rule.kind.value.days).toEqual([Weekday.MONDAY, Weekday.THURSDAY]);
+    expect(set?.requestId).toMatch(ULID);
+    expect([clear?.id, clear?.rule, clear?.expectedRevision, clear?.requestId]).toEqual(["B", undefined, undefined, "01JRETRY000000000000000000"]);
   });
 
   it("CaptureItem sends the text, created_via, a fresh request id, and parent_id and reference_time only when given", async () => {

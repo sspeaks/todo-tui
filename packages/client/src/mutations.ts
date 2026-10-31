@@ -6,7 +6,7 @@ import type { MessageInitShape } from "@bufbuild/protobuf";
 import { type Timestamp, timestampFromDate } from "@bufbuild/protobuf/wkt";
 import { type CallOptions, type Client, ConnectError } from "@connectrpc/connect";
 import { ErrorInfoSchema } from "./gen/google/rpc/error_details_pb.js";
-import type { CreatedVia, ItemSchema, Status } from "./gen/todo/v1/item_pb.js";
+import type { CreatedVia, ItemSchema, RecurrenceRuleSchema, Status } from "./gen/todo/v1/item_pb.js";
 import type {
   AddRelationResponse,
   ArchiveItemResponse,
@@ -18,6 +18,7 @@ import type {
   MutationSchema,
   RedoResponse,
   RemoveRelationResponse,
+  SetRecurrenceResponse,
   SetStatusResponse,
   UndeleteItemResponse,
   UnarchiveItemResponse,
@@ -96,6 +97,21 @@ export function setStatus(
 ): Promise<SetStatusResponse> {
   const [fields, call] = split(opts);
   return client.setStatus({ ...fields, id, status }, call);
+}
+
+/**
+ * SetRecurrence (design 3.8): sets or replaces the Item's repeat rule, or
+ * clears it when `rule` is undefined. Setting a rule on a done or cancelled
+ * Item fails with FAILED_PRECONDITION (ErrorInfo ITEM_CLOSED).
+ */
+export function setRecurrence(
+  client: ItemsClient,
+  id: string,
+  rule: MessageInitShape<typeof RecurrenceRuleSchema> | undefined,
+  opts: MutationOptions = {},
+): Promise<SetRecurrenceResponse> {
+  const [fields, call] = split(opts);
+  return client.setRecurrence({ ...fields, id, ...(rule !== undefined && { rule }) }, call);
 }
 
 export function archiveItem(client: ItemsClient, id: string, opts: MutationOptions = {}): Promise<ArchiveItemResponse> {
