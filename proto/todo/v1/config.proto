@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package todo.v1;
+
+import "google/protobuf/timestamp.proto";
+import "todo/v1/item.proto";
+
+// The daemon's reading of config.toml (design 8.2), with the defaults filled
+// in. Only the daemon reads the file, and it never writes it. Config is not
+// stored: a TOPIC_CONFIG change carries the snapshot current when it is
+// sent, also on replay.
+message ConfigSnapshot {
+  // The file the snapshot was read from.
+  string path = 1;
+  // False when the file does not exist: every value is a default.
+  bool exists = 2;
+  // The file's config_version (1 when it has none).
+  uint32 config_version = 3;
+  UiConfig ui = 4;
+  // [keymap]: key sequence (tokens separated by spaces, e.g. "g g",
+  // "ctrl+d") → action id (e.g. "move_up"). An empty action unbinds the
+  // sequence. Only overrides; the defaults are the client's.
+  map<string, string> keymap = 5;
+  BackupConfig backup = 6;
+  // Problems found while reading, in file order. A warning never stops the
+  // daemon: the value it names falls back to its default.
+  repeated ConfigWarning warnings = 7;
+  // When the daemon read the file.
+  google.protobuf.Timestamp loaded_at = 8;
+}
+
+// [ui].
+message UiConfig {
+  // The day the weekly review is offered (P4).
+  Weekday review_day = 1;
+  // How long a done or cancelled Item stays out of Archive before the
+  // scheduler archives it (design 3.7).
+  uint32 archive_done_after_days = 2;
+}
+
+// [backup] (design 7.5).
+message BackupConfig {
+  // Automatic backups run. False also when retain_days is invalid.
+  bool enabled = 1;
+  // "daily", the only interval.
+  string interval = 2;
+  // Backups older than this many days are deleted after each backup.
+  uint32 retain_days = 3;
+}
+
+message ConfigWarning {
+  // The dotted key the warning is about, e.g. "ui.archive_done_after_days"
+  // or "keymap.K"; empty for the file as a whole.
+  string key = 1;
+  // e.g. "must be a whole number ≥ 1; using 7".
+  string message = 2;
+}

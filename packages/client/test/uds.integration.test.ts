@@ -1,7 +1,7 @@
 // UDS spike (S0.7, ADR-0002): Connect-ES against the real tonic daemon.
 // Runs only with TODO_BIN pointing at a built `todo` binary.
 import { execFile } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -17,6 +17,7 @@ import { updateItem } from "../src/mutations.js";
 import { resolvePaths, envFromProcess } from "../src/paths.js";
 import { ulid } from "../src/ulid.js";
 import { CAPTURE_ZONE, captureConformance } from "./conformance/capture.js";
+import { configConformance } from "./conformance/config.js";
 import { FILTER_ZONE, filterViewsConformance } from "./conformance/filter-views.js";
 import { RECURRENCE_ZONE, recurrenceConformance } from "./conformance/recurrence.js";
 import { undoRelationsConformance } from "./conformance/undo-relations.js";
@@ -284,5 +285,21 @@ describe.skipIf(!TODO_BIN)("recurrence against $TODO_BIN", { timeout: 60_000 }, 
     const h = await home({ TZ: RECURRENCE_ZONE });
     const conn = await h.open();
     return { items: conn.items, timeZone: RECURRENCE_ZONE };
+  });
+});
+
+describe.skipIf(!TODO_BIN)("config against $TODO_BIN", { timeout: 60_000 }, () => {
+  // The suite FakeDaemon runs too, each test on a fresh daemon: the config
+  // is the file in its TODO_TUI_HOME, reloaded with `todo config reload`.
+  configConformance(async () => {
+    const h = await home();
+    const conn = await h.open();
+    return {
+      transport: conn.transport,
+      configure: async (days) => {
+        writeFileSync(join(h.dir, "config.toml"), `[ui]\narchive_done_after_days = ${days}\n[keymap]\n"K" = "move_up"\n`);
+        await run(TODO_BIN!, ["config", "reload"], { env: h.env });
+      },
+    };
   });
 });

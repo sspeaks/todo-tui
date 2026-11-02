@@ -28,6 +28,42 @@ const NAMED: readonly [keyof Key, KeyToken][] = [
   ["delete", "delete"],
 ];
 
+/**
+ * Every named token a key sequence may use, beside single characters and
+ * ctrl+<letter>: what a binding (or a [keymap] override) can name. The
+ * daemon checks config against a copy (crates/todo-daemon/src/keymap.json).
+ */
+export const NAMED_TOKENS: readonly KeyToken[] = [
+  "enter",
+  "esc",
+  "tab",
+  "shift+tab",
+  "space",
+  "backspace",
+  "delete",
+  "up",
+  "down",
+  "left",
+  "right",
+  "home",
+  "end",
+  "pageup",
+  "pagedown",
+  "fkey",
+  "ctrl+space",
+];
+
+/**
+ * ctrl+<letter> keys a terminal sends as the byte of another key, so they
+ * arrive as that key's token and can never be bound themselves.
+ */
+export const CTRL_ALIASES: Readonly<Record<KeyToken, KeyToken>> = {
+  "ctrl+h": "backspace",
+  "ctrl+i": "tab",
+  "ctrl+j": "enter",
+  "ctrl+m": "enter",
+};
+
 /** The token for one character of a burst. */
 function charToken(ch: string): KeyToken | undefined {
   switch (ch) {

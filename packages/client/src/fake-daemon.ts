@@ -4,6 +4,7 @@ import { Code, ConnectError, type Transport, createRouterTransport } from "@conn
 import { BadRequestSchema, ErrorInfoSchema } from "./gen/google/rpc/error_details_pb.js";
 import { DateSchema } from "./gen/google/type/date_pb.js";
 import { type MutationResultSchema, type PersonRef, PersonRefSchema, Topic } from "./gen/todo/v1/common_pb.js";
+import { BackupConfigSchema, type ConfigSnapshot, ConfigSnapshotSchema, UiConfigSchema } from "./gen/todo/v1/config_pb.js";
 import { ItemField } from "./gen/todo/v1/field_pb.js";
 import { type Filter, FilterSchema, type OperandSchema, Operator, RelativeDate_Anchor } from "./gen/todo/v1/filter_pb.js";
 import {
@@ -20,6 +21,7 @@ import {
   TodoRefinement,
   type Waiting,
   WaitingSchema,
+  Weekday,
 } from "./gen/todo/v1/item_pb.js";
 import {
   type AddRelationRequest,
@@ -199,8 +201,30 @@ const NANOS = 1_000_000_000n;
 /** The most mutations one BatchMutate may carry. */
 const MAX_BATCH = 1000;
 
-/** How long a done or cancelled Item stays out of Archive: 7 days (design 3.7), in milliseconds. */
-export const ARCHIVE_DONE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** How long a done or cancelled Item stays out of Archive by default: 7 days (design 3.7), in milliseconds. */
+export const ARCHIVE_DONE_AFTER_MS = 7 * DAY_MS;
+
+/** The daemon's config with no config file: every value a default. */
+export function defaultConfig(path = "/fake/config.toml"): ConfigSnapshot {
+  return create(ConfigSnapshotSchema, {
+    path,
+    exists: false,
+    configVersion: 1,
+    ui: DEFAULT_UI,
+    backup: DEFAULT_BACKUP,
+  });
+}
+
+const DEFAULT_UI = { reviewDay: Weekday.MONDAY, archiveDoneAfterDays: 7 };
+const DEFAULT_BACKUP = { enabled: true, interval: "daily", retainDays: 14 };
+
+/** A message init's own fields, without the message marker. */
+function strip<T extends object>(init: T): Omit<T, "$typeName" | "$unknown"> {
+  const { $typeName: _t, $unknown: _u, ...rest } = init as T & { $typeName?: unknown; $unknown?: unknown };
+  return rest;
+}
 
 /** The most Items one auto-archive op changes (archive.rs AUTO_ARCHIVE_LIMIT). */
 const AUTO_ARCHIVE_LIMIT = 1000;
@@ -346,8 +370,13 @@ export interface FakeDaemonOptions {
  *   op's events and summary, re-emits its parent, and is soft-deleted by an
  *   undo and undeleted by a redo.
  * - The scheduler's auto_done archive and its healing, run on demand by
- *   {@link runScheduler}; SetStatus to an open status clears an auto_done
- *   archive itself.
+ *   {@link runScheduler}, after the config's archive_done_after_days by
+ *   default; SetStatus to an open status clears an auto_done archive itself.
+ * - The config (design 8.2): GetConfig serves {@link config}; ReloadConfig
+ *   answers unchanged (there is no file); {@link setConfig} stands for an
+ *   edited file being reloaded and publishes a TOPIC_CONFIG Change. As the
+ *   daemon's, a config change carries the config current when it is sent,
+ *   also on replay.
  * - UpdateItem checks its mask's paths as the daemon does: Item field paths
  *   only, each field once; status, archived, relations and read-only paths
  *   are refused. Of the values it checks titles (stored trimmed, then
@@ -394,7 +423,9 @@ export class FakeDaemon {
   maxPageSize = MAX_PAGE_SIZE;
   /** Runs before every ListItems; throw from it to fail that call. */
   onListItems: ((req: ListItemsRequest) => void) | undefined;
-  apiMinor = 8;
+  apiMinor = 9;
+  /** What GetConfig serves; change it with {@link setConfig}. */
+  config: ConfigSnapshot = defaultConfig();
   readonly calls = { listItems: 0, listViews: 0, getStatusCounts: 0, subscribe: [] as (bigint | undefined)[] };
   readonly transport: Transport;
   readonly now: () => Date;
@@ -435,6 +466,14 @@ export class FakeDaemon {
           return { daemonVersion: "fake", apiMinor: this.apiMinor, capabilities: [] };
         },
         shutdown: () => ({}),
+        getConfig: () => {
+          this.check();
+          return { config: this.config, revision: this.revision };
+        },
+        reloadConfig: () => {
+          this.check();
+          return { config: this.config, changed: false };
+        },
       });
       service(ItemService, {
         captureItem: (req) => this.capture(req),
@@ -525,7 +564,7 @@ export class FakeDaemon {
               if (since < self.replayFloor || since > self.revision) {
                 yield msg({ case: "resyncRequired", value: { currentRevision: self.revision } });
               } else {
-                for (const c of self.changes) if (c.revision > since && wants(c)) yield msg({ case: "change", value: c });
+                for (const c of self.changes) if (c.revision > since && wants(c)) yield msg({ case: "change", value: self.asSent(c) });
               }
             }
             yield msg({ case: "caughtUp", value: { revision: self.revision } });
@@ -612,6 +651,27 @@ export class FakeDaemon {
     this.revision++;
     this.views.delete(id);
     this.publish({ revision: this.revision, topic: Topic.VIEW, id, deleted: true });
+  }
+
+  /**
+   * Replaces the config, as a reload of an edited file does: one revision
+   * and a TOPIC_CONFIG Change carrying it. Unset fields keep their
+   * defaults.
+   */
+  setConfig(patch: MessageInitShape<typeof ConfigSnapshotSchema>): ConfigSnapshot {
+    const defaults = defaultConfig(this.config.path);
+    const config = create(ConfigSnapshotSchema, patch);
+    if (!("path" in patch)) config.path = defaults.path;
+    if (!("exists" in patch)) config.exists = true;
+    if (!("configVersion" in patch)) config.configVersion = defaults.configVersion;
+    // Field by field: a partial [ui] or [backup] keeps the other defaults.
+    config.ui = create(UiConfigSchema, { ...DEFAULT_UI, ...(patch.ui && strip(patch.ui)) });
+    config.backup = create(BackupConfigSchema, { ...DEFAULT_BACKUP, ...(patch.backup && strip(patch.backup)) });
+    this.config = config;
+    this.revision++;
+    // Stored without the config: it is attached when sent, as the daemon does.
+    this.publish({ revision: this.revision, topic: Topic.CONFIG, id: "config" });
+    return config;
   }
 
   /** Fails every open Subscribe stream, as if the connection dropped. */
@@ -1380,7 +1440,7 @@ export class FakeDaemon {
    *   still in effect counts: not one of the system, of an undo or redo, or
    *   of an op that is undone or discarded.
    */
-  runScheduler(after: number = ARCHIVE_DONE_AFTER_MS): FakeSweep {
+  runScheduler(after: number = (this.config.ui?.archiveDoneAfterDays ?? 7) * DAY_MS): FakeSweep {
     const out: FakeSweep = { archived: [], healed: [], ops: [] };
     for (let more = true; more; ) {
       const now = this.stamp();
@@ -1520,7 +1580,13 @@ export class FakeDaemon {
   private publish(init: MessageInitShape<typeof ChangeSchema>): void {
     const change = create(ChangeSchema, init);
     this.changes.push(change);
-    for (const w of [...this.watchers]) w(msg({ case: "change", value: change }));
+    for (const w of [...this.watchers]) w(msg({ case: "change", value: this.asSent(change) }));
+  }
+
+  /** A change as sent: config is not stored, so a config change carries the config current now. */
+  private asSent(change: Change): Change {
+    if (change.topic !== Topic.CONFIG || change.deleted) return change;
+    return create(ChangeSchema, { ...change, resource: { case: "config", value: this.config } });
   }
 
   private check(): void {

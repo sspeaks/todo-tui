@@ -4,6 +4,7 @@ import type { Item } from "./gen/todo/v1/item_pb.js";
 import type {
   ConnectionSnapshot,
   CountsSnapshot,
+  LiveConfigSnapshot,
   LiveStore,
   SavedViewsSnapshot,
   UndoSnapshot,
@@ -72,6 +73,12 @@ export function useConnection(): ConnectionSnapshot {
 export function useViews(): SavedViewsSnapshot {
   const store = useLiveStore();
   return useSyncExternalStore(store.subscribe, store.getViews);
+}
+
+/** The daemon's config (GetConfig), kept live from TOPIC_CONFIG changes. */
+export function useConfig(): LiveConfigSnapshot {
+  const store = useLiveStore();
+  return useSyncExternalStore(store.subscribe, store.getConfig);
 }
 
 /**

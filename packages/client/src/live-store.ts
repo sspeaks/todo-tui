@@ -3,10 +3,12 @@ import { Code, type Client, ConnectError, type Transport, createClient } from "@
 import { ErrorInfoSchema } from "./gen/google/rpc/error_details_pb.js";
 import type { Date as ProtoDate } from "./gen/google/type/date_pb.js";
 import { Topic } from "./gen/todo/v1/common_pb.js";
+import type { ConfigSnapshot } from "./gen/todo/v1/config_pb.js";
 import type { FilterSchema, SortKeySchema } from "./gen/todo/v1/filter_pb.js";
 import type { Item } from "./gen/todo/v1/item_pb.js";
 import { ItemService, type ListItemsRequest, ListItemsRequestSchema, type StatusCounts } from "./gen/todo/v1/item_service_pb.js";
 import type { OpSummary } from "./gen/todo/v1/op_pb.js";
+import { SystemService } from "./gen/todo/v1/system_service_pb.js";
 import type { View } from "./gen/todo/v1/view_pb.js";
 import { ViewService } from "./gen/todo/v1/view_service_pb.js";
 import { type Change, type Notice, WatchService } from "./gen/todo/v1/watch_service_pb.js";
@@ -44,6 +46,16 @@ export interface SavedViewsSnapshot {
   readonly status: "loading" | "ready" | "error";
   /** In tab order. */
   readonly views: readonly View[];
+  readonly error?: unknown;
+}
+
+/** The daemon's config (SystemService.GetConfig, then TOPIC_CONFIG changes). */
+export interface LiveConfigSnapshot {
+  readonly status: "loading" | "ready" | "error";
+  /** Unset until loaded, and when the daemon cannot serve it. */
+  readonly config?: ConfigSnapshot;
+  /** Revision of the read or change it came from. */
+  readonly revision: bigint;
   readonly error?: unknown;
 }
 
@@ -118,6 +130,8 @@ export class LiveStore {
   private readonly seenViews = new Map<string, bigint>();
   private savedSnap: SavedViewsSnapshot = { status: "loading", views: [] };
   private savedSeq = 0;
+  private configSnap: LiveConfigSnapshot = { status: "loading", revision: 0n };
+  private configSeq = 0;
   private readonly liveCounts: LiveCounts;
   /** GetItem calls in flight, by id. */
   private readonly fetches = new Map<string, Promise<Item | undefined>>();
@@ -125,6 +139,7 @@ export class LiveStore {
   private readonly noticeListeners = new Set<(n: Notice) => void>();
   private readonly itemsClient: Client<typeof ItemService>;
   private readonly viewsClient: Client<typeof ViewService>;
+  private readonly systemClient: Client<typeof SystemService>;
   private readonly watchClient: Client<typeof WatchService>;
   private revision: bigint | undefined;
   /** Set while a ResyncRequired reload has not completed; retried on CaughtUp. */
@@ -143,6 +158,7 @@ export class LiveStore {
   constructor(private readonly opts: LiveStoreOptions) {
     this.itemsClient = createClient(ItemService, opts.transport);
     this.viewsClient = createClient(ViewService, opts.transport);
+    this.systemClient = createClient(SystemService, opts.transport);
     this.watchClient = createClient(WatchService, opts.transport);
     this.debounceMs = opts.debounceMs ?? 150;
     this.pageSize = opts.pageSize ?? MAX_PAGE_SIZE;
@@ -191,6 +207,9 @@ export class LiveStore {
 
   /** The saved views in tab order; referentially stable until they change. */
   getViews = (): SavedViewsSnapshot => this.savedSnap;
+
+  /** The daemon's config; referentially stable until it changes. */
+  getConfig = (): LiveConfigSnapshot => this.configSnap;
 
   /** A saved view by id (in any case), once loaded. */
   getSavedView = (id: string): View | undefined => this.savedViews.get(id.toUpperCase());
@@ -365,6 +384,31 @@ export class LiveStore {
     }
   }
 
+  /**
+   * Runs GetConfig and applies it unless a change has brought one newer. A
+   * failure (an older daemon answers UNIMPLEMENTED) keeps what it had; with
+   * `rethrow` it rejects, so a baseline leaves it out of its subscribe
+   * point. Returns the read revision.
+   */
+  private async loadConfig(rethrow = false): Promise<bigint> {
+    const seq = ++this.configSeq;
+    try {
+      const res = await this.systemClient.getConfig({}, this.callOptions());
+      if (seq === this.configSeq && (this.configSnap.status !== "ready" || this.configSnap.revision <= res.revision)) {
+        this.configSnap = { status: "ready", revision: res.revision, ...(res.config && { config: res.config }) };
+        this.bump();
+      }
+      return res.revision;
+    } catch (err) {
+      if (seq === this.configSeq && this.configSnap.status !== "ready" && !isConnectionFailure(err)) {
+        this.configSnap = { status: "error", revision: 0n, error: err };
+        this.bump();
+      }
+      if (rethrow || isConnectionFailure(err)) throw err;
+      return this.revision ?? 0n;
+    }
+  }
+
   /** A new saved-views snapshot, in tab order. */
   private savedViewsChanged(status: SavedViewsSnapshot["status"], error?: unknown): void {
     const views = [...this.savedViews.values()].sort((a, b) => a.position - b.position || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
@@ -407,6 +451,9 @@ export class LiveStore {
         // ends by failing (the daemon killed), and the outage that starts
         // then respawns the daemon again and backs off from the start.
         await this.consume(signal, () => {
+          // A daemon that came back may have read another config file,
+          // and its change is older than our revision.
+          if (attempt > 0) void this.loadConfig().catch(() => {});
           attempt = 0;
           spawnedAt = undefined;
         });
@@ -473,6 +520,7 @@ export class LiveStore {
           } else {
             for (const v of this.views.values()) if (v.needsLoad) void v.load();
             if (this.savedSnap.status !== "ready") void this.loadSavedViews();
+            if (this.configSnap.status !== "ready") void this.loadConfig().catch(() => {});
             if (this.liveCounts.wanted && this.liveCounts.needsLoad) void this.liveCounts.load();
             if (this.undoState.wanted && this.undoState.needsLoad) void this.undoState.load();
           }
@@ -484,6 +532,7 @@ export class LiveStore {
           this.revision = msg.value.currentRevision;
           this.seen.clear();
           this.seenViews.clear();
+          this.configSnap = { ...this.configSnap, revision: 0n };
           this.pendingResync = true;
           break;
         case "notice":
@@ -498,6 +547,14 @@ export class LiveStore {
     if (change.topic === Topic.VIEW) {
       this.conn = { ...this.conn, revision: this.revision };
       this.applyViewChange(change);
+      return;
+    }
+    if (change.topic === Topic.CONFIG) {
+      this.conn = { ...this.conn, revision: this.revision };
+      if (change.resource.case === "config" && change.revision >= this.configSnap.revision) {
+        this.configSnap = { status: "ready", revision: change.revision, config: change.resource.value };
+      }
+      this.bump();
       return;
     }
     if (change.topic !== Topic.ITEM) {
@@ -546,6 +603,7 @@ export class LiveStore {
   private loads(): Promise<bigint>[] {
     const loads = [...this.views.values()].map((v) => v.load(true));
     loads.push(this.loadSavedViews(true));
+    loads.push(this.loadConfig(true));
     if (this.liveCounts.wanted) loads.push(this.liveCounts.load(true));
     else this.liveCounts.reload();
     this.undoState.invalidate();

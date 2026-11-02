@@ -1,6 +1,7 @@
 //! The `todo` binary.
 
 mod add;
+mod config;
 mod launch;
 mod rpc;
 mod spawn;
@@ -53,6 +54,11 @@ enum Command {
         #[arg(long)]
         read_only: bool,
     },
+    /// The config file: where it is, what is wrong with it, and reloading it.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
     /// Run the daemon (in the foreground unless --detach).
     Daemon {
         /// Start the daemon in the background and return once it is listening.
@@ -61,6 +67,16 @@ enum Command {
         #[command(subcommand)]
         action: Option<DaemonAction>,
     },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Print the path of the config file.
+    Path,
+    /// Check the config file without applying it; fails if anything is wrong.
+    Check,
+    /// Have the running daemon read the config file again (as SIGHUP does).
+    Reload,
 }
 
 #[derive(Subcommand)]
@@ -107,6 +123,13 @@ async fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
         Command::Redo => return undo::undo(&paths, undo::Direction::Redo).await,
         // `--short` is run by main.
         Command::Status { .. } => return status::status(&paths).await,
+        Command::Config { action } => {
+            return match action {
+                ConfigAction::Path => Ok(config::path(&paths)),
+                ConfigAction::Check => Ok(config::check(&paths)),
+                ConfigAction::Reload => config::reload(&paths).await,
+            };
+        }
         // Run by main, which execs it.
         Command::Mcp { .. } => unreachable!("todo mcp is run by main"),
         Command::Daemon {
@@ -205,6 +228,14 @@ mod tests {
         ));
         let cli = Cli::try_parse_from(["todo", "status", "--short"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Status { short: true })));
+        let cli = Cli::try_parse_from(["todo", "config", "check"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Config {
+                action: ConfigAction::Check
+            })
+        ));
+        assert!(Cli::try_parse_from(["todo", "config"]).is_err());
         // Without a command, `todo` opens the TUI; --help still helps.
         assert!(Cli::try_parse_from(["todo"]).unwrap().command.is_none());
         let help = Cli::try_parse_from(["todo", "--help"]).err().unwrap();

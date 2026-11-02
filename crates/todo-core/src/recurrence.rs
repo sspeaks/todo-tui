@@ -44,8 +44,14 @@ impl Weekday {
         date.weekday().into()
     }
 
+    /// The weekday `name` is a prefix of, at least three letters long and
+    /// in any case (`mon`, `Thursday`).
+    pub fn from_name(name: &str) -> Option<Weekday> {
+        weekday(&name.to_ascii_lowercase())
+    }
+
     /// The full lowercase English name.
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Weekday::Monday => "monday",
             Weekday::Tuesday => "tuesday",

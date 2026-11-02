@@ -3,6 +3,7 @@ syntax = "proto3";
 package todo.v1;
 
 import "todo/v1/common.proto";
+import "todo/v1/config.proto";
 import "todo/v1/item.proto";
 import "todo/v1/view.proto";
 
@@ -53,7 +54,9 @@ message Change {
     View view = 12;
     // Allocated: Person person = 13;
     // Allocated: ReviewSession review = 15;
-    // Allocated: ConfigSnapshot config = 16;
+    // The config current when the change is sent (not stored), also on
+    // replay. Its id is "config".
+    ConfigSnapshot config = 16;
   }
 }
 

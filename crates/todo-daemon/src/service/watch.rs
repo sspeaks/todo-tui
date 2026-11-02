@@ -18,6 +18,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tonic::{Request, Response, Status};
 
 use super::Ctx;
+use crate::config::ConfigHandle;
 use crate::error;
 
 pub(crate) struct Watch(pub(crate) Ctx);
@@ -42,6 +43,7 @@ impl WatchService for Watch {
         let wants = move |row: &ChangeRow| topics.is_empty() || topics.contains(&row.topic);
 
         let store = self.0.store.clone();
+        let config = self.0.config.clone();
         let mut shutdown = self.0.shutdown.signal();
         let stream = async_stream::stream! {
             let mut live = store.subscribe();
@@ -53,7 +55,7 @@ impl WatchService for Watch {
                         for row in rows {
                             last = row.revision;
                             if wants(&row) {
-                                yield Ok(change_message(row));
+                                yield Ok(change_message(row, &config));
                             }
                         }
                         last
@@ -85,7 +87,7 @@ impl WatchService for Watch {
                                 for row in rows {
                                     last = row.revision;
                                     if wants(&row) {
-                                        yield Ok(change_message(row));
+                                        yield Ok(change_message(row, &config));
                                     }
                                 }
                             }
@@ -104,7 +106,7 @@ impl WatchService for Watch {
                 };
                 last = row.revision;
                 if wants(&row) {
-                    yield Ok(change_message(row));
+                    yield Ok(change_message(row, &config));
                 }
             }
         };
@@ -132,11 +134,21 @@ fn message(m: Message) -> SubscribeResponse {
     SubscribeResponse { message: Some(m) }
 }
 
-fn change_message(row: ChangeRow) -> SubscribeResponse {
-    let resource = row.resource.map(|r| match r {
-        Resource::Item(item) => change::Resource::Item(Box::new(v1::Item::from(&*item))),
-        Resource::View(view) => change::Resource::View(Box::new(v1::View::from(&*view))),
-    });
+/// A change as sent. Config is not stored, so a config change, live or
+/// replayed, carries the config current now.
+fn change_message(row: ChangeRow, config: &ConfigHandle) -> SubscribeResponse {
+    let resource = match row.resource {
+        Some(Resource::Item(item)) => {
+            Some(change::Resource::Item(Box::new(v1::Item::from(&*item))))
+        }
+        Some(Resource::View(view)) => {
+            Some(change::Resource::View(Box::new(v1::View::from(&*view))))
+        }
+        None if row.topic == Topic::Config && !row.deleted => Some(change::Resource::Config(
+            Box::new(v1::ConfigSnapshot::from(&*config.current())),
+        )),
+        None => None,
+    };
     message(Message::Change(v1::Change {
         revision: row.revision,
         topic: row.topic.to_i32(),
@@ -156,6 +168,7 @@ mod tests {
 
     use super::*;
     use crate::ShutdownHandle;
+    use crate::config::Config;
     use crate::conn::Clients;
     use crate::scheduler::Wake;
 
@@ -192,6 +205,7 @@ mod tests {
             clients: Clients::default(),
             shutdown: ShutdownHandle::new(),
             wake: Wake::default(),
+            config: ConfigHandle::new(Config::defaults("/c/config.toml".into())),
         });
         let mut stream = watch
             .subscribe(Request::new(SubscribeRequest::default()))
@@ -224,6 +238,7 @@ mod tests {
             clients: Clients::default(),
             shutdown: ShutdownHandle::new(),
             wake: Wake::default(),
+            config: ConfigHandle::new(Config::defaults("/c/config.toml".into())),
         });
         let subscribe = async |since_revision| {
             let req = SubscribeRequest {

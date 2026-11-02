@@ -9,13 +9,10 @@ use std::time::Duration;
 
 use jiff::{SignedDuration, Zoned};
 use todo_store::{AutoArchiveInput, Store};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
+use crate::config::Config;
 use crate::shutdown::ShutdownSignal;
-
-/// How long a done or cancelled Item stays out of Archive, until M6 makes
-/// it the `archive_done_after_days` setting.
-pub const ARCHIVE_DONE_AFTER_DAYS: i64 = 7;
 
 /// How often the scheduler sweeps without being woken.
 pub(crate) const INTERVAL: Duration = Duration::from_secs(60);
@@ -41,6 +38,24 @@ impl Wake {
     }
 }
 
+/// How long the scheduler waits before it archives a closed Item.
+#[derive(Debug, Clone)]
+pub(crate) enum After {
+    /// The config's `archive_done_after_days`, as of each sweep.
+    Config(watch::Receiver<std::sync::Arc<Config>>),
+    /// A fixed wait (tests).
+    Fixed(SignedDuration),
+}
+
+impl After {
+    fn current(&self) -> SignedDuration {
+        match self {
+            After::Config(config) => config.borrow().archive_done_after(),
+            After::Fixed(after) => *after,
+        }
+    }
+}
+
 /// Sweeps at start, then every `interval` or when `wake` is poked, until
 /// `stop`. Items are archived after `after`, by the wall clock, which the
 /// auto-archive's stickiness compares with the user's own archive events.
@@ -49,10 +64,10 @@ pub(crate) async fn run(
     wake: Wake,
     mut stop: ShutdownSignal,
     interval: Duration,
-    after: SignedDuration,
+    after: After,
 ) {
     loop {
-        sweep(&store, after).await;
+        sweep(&store, after.current()).await;
         tokio::select! {
             () = tokio::time::sleep(interval) => {}
             () = wake.woken() => {}
@@ -92,19 +107,4 @@ async fn sweep(store: &Store, after: SignedDuration) {
         tokio::task::yield_now().await;
     }
     tracing::info!("auto-archive backlog left for the next sweep");
-}
-
-/// The default `archive_done_after`.
-pub(crate) fn archive_done_after() -> SignedDuration {
-    SignedDuration::from_hours(ARCHIVE_DONE_AFTER_DAYS * 24)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_default_is_seven_days() {
-        assert_eq!(archive_done_after(), SignedDuration::from_hours(7 * 24));
-    }
 }

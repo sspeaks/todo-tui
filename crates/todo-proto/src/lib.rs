@@ -31,4 +31,5 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
 /// subtask counts and parent title. 7 added recurrence rules and the M5
 /// RPCs (SetRecurrence, ParseRecurrence) as stubs; 8 is the first that
 /// implements them, reports generated instances and runs the scheduler.
-pub const API_MINOR: u32 = 8;
+/// 9 added the config: GetConfig, ReloadConfig and Change.config.
+pub const API_MINOR: u32 = 9;

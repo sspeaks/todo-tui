@@ -3,7 +3,8 @@ import { Code, ConnectError, type Transport, createClient } from "@connectrpc/co
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ItemField } from "../src/gen/todo/v1/field_pb.js";
 import { Operator } from "../src/gen/todo/v1/filter_pb.js";
-import { ItemSchema, Priority, Status } from "../src/gen/todo/v1/item_pb.js";
+import { ConfigSnapshotSchema } from "../src/gen/todo/v1/config_pb.js";
+import { ItemSchema, Priority, Status, Weekday } from "../src/gen/todo/v1/item_pb.js";
 import { ItemService } from "../src/gen/todo/v1/item_service_pb.js";
 import type { SubscribeResponse } from "../src/gen/todo/v1/watch_service_pb.js";
 import { FakeDaemon } from "../src/fake-daemon.js";
@@ -301,6 +302,63 @@ describe("LiveStore", () => {
     await waitFor(() => store.getItem(x!.id)?.title === "after restore");
     daemon.put({ title: "new" });
     await waitFor(() => titles(store).includes("new"));
+  });
+
+  it("keeps the config live from TOPIC_CONFIG changes", async () => {
+    const { daemon, store } = setup(0);
+    store.start();
+    await waitFor(() => store.getConfig().status === "ready");
+    expect(store.getConfig().config?.ui?.archiveDoneAfterDays).toBe(7);
+    daemon.setConfig({ keymap: { K: "move_up" } });
+    await waitFor(() => store.getConfig().config?.keymap.K === "move_up");
+    expect(store.getConfig().revision).toBe(daemon.revision);
+  });
+
+  it("re-reads the config after an outage, which a restarted daemon may have read anew", async () => {
+    const { daemon, store } = setup(0);
+    store.start();
+    await waitFor(() => store.getConfig().status === "ready" && store.getConnection().state === "live");
+    daemon.down = true;
+    daemon.dropStreams();
+    await waitFor(() => store.getConnection().state === "reconnecting");
+    // The new daemon's config, with no change after the store's revision.
+    daemon.config = create(ConfigSnapshotSchema, { path: daemon.config.path, configVersion: 1, ui: { reviewDay: Weekday.MONDAY, archiveDoneAfterDays: 2 } });
+    daemon.down = false;
+    await waitFor(() => store.getConfig().config?.ui?.archiveDoneAfterDays === 2);
+  });
+
+  it("takes the config of a restored database whose revision went backwards", async () => {
+    const { daemon, store } = setup(0);
+    store.start();
+    await waitFor(() => store.getConnection().state === "live");
+    for (let i = 0; i < 5; i++) daemon.setConfig({ ui: { archiveDoneAfterDays: 10 + i } });
+    await waitFor(() => store.getConfig().config?.ui?.archiveDoneAfterDays === 14);
+    daemon.down = true;
+    daemon.dropStreams();
+    await waitFor(() => store.getConnection().state === "reconnecting");
+    daemon.restore(3n, []);
+    daemon.down = false;
+    await waitFor(() => store.getConnection().revision === 3n);
+    daemon.setConfig({ ui: { archiveDoneAfterDays: 4 } });
+    await waitFor(() => store.getConfig().config?.ui?.archiveDoneAfterDays === 4);
+  });
+
+  it("a GetConfig the daemon rejects does not move the subscribe point", async () => {
+    const daemon = new FakeDaemon([{ title: "a" }]);
+    daemon.setConfig({});
+    const inner = daemon.transport;
+    const transport: Transport = {
+      unary: (method, ...rest) =>
+        method.name === "GetConfig" ? Promise.reject(new ConnectError("no", Code.Unimplemented)) : inner.unary(method, ...rest),
+      stream: (...args) => inner.stream(...args),
+    };
+    const store = new LiveStore({ transport, debounceMs: 20, backoff: { initialMs: 10, maxMs: 40 } });
+    stores.push(store);
+    store.view();
+    store.start();
+    await waitFor(() => store.getConnection().state === "live");
+    expect(daemon.calls.subscribe).toEqual([daemon.revision]);
+    expect(store.getConfig().status).toBe("error");
   });
 
   it("retries a view whose re-query failed once the stream comes back", async () => {

@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package todo.v1;
 
+import "todo/v1/config.proto";
+
 service SystemService {
   // The first call from any client (design 4.2).
   rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
@@ -9,6 +11,12 @@ service SystemService {
   // interactive clients are connected. Otherwise waits up to 10s for in-flight
   // work, responds, then exits.
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+  // The config the daemon is running with (design 8.2).
+  rpc GetConfig(GetConfigRequest) returns (GetConfigResponse);
+  // Reads config.toml again, as SIGHUP does. A file that is not valid TOML
+  // fails with INVALID_ARGUMENT and the running config stays. A changed
+  // snapshot is streamed as a TOPIC_CONFIG change.
+  rpc ReloadConfig(ReloadConfigRequest) returns (ReloadConfigResponse);
 }
 
 enum ClientKind {
@@ -39,3 +47,19 @@ message ShutdownRequest {
 }
 
 message ShutdownResponse {}
+
+message GetConfigRequest {}
+
+message GetConfigResponse {
+  ConfigSnapshot config = 1;
+  // The revision this was read at.
+  uint64 revision = 2;
+}
+
+message ReloadConfigRequest {}
+
+message ReloadConfigResponse {
+  ConfigSnapshot config = 1;
+  // Whether the snapshot differs from the one it replaced (loaded_at aside).
+  bool changed = 2;
+}

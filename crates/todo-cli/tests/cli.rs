@@ -1085,3 +1085,58 @@ fn status_short_without_a_daemon_prints_nothing_and_starts_none() {
     assert!(took >= Duration::from_millis(40), "took {took:?}");
     assert!(!paths.data.exists());
 }
+
+#[test]
+fn config_path_check_and_reload() {
+    let h = Home::new();
+    let config = h.home.join("config.toml");
+    assert_eq!(h.ok(&["config", "path"]), format!("{}\n", config.display()));
+    assert_eq!(
+        h.ok(&["config", "check"]),
+        format!("{}: no config file; the defaults apply\n", config.display())
+    );
+    assert!(!socket_in(&h.home.join("run")), "check needs no daemon");
+
+    std::fs::write(&config, "[ui]\narchive_done_after_days = 2\n").unwrap();
+    assert_eq!(
+        h.ok(&["config", "check"]),
+        format!("{}: ok\n", config.display())
+    );
+    // The daemon starts with this file, so a reload changes nothing.
+    assert_eq!(h.ok(&["config", "reload"]), "unchanged\n");
+
+    std::fs::write(
+        &config,
+        "[ui]\narchive_done_after_days = 0\n[keymap]\nK = \"move_up\"\n",
+    )
+    .unwrap();
+    let out = h.todo(&["config", "check"]);
+    assert!(!out.status.success());
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "{}: ui.archive_done_after_days: must be a whole number ≥ 1; using 7\n",
+            config.display()
+        )
+    );
+    assert_eq!(
+        h.ok(&["config", "reload"]),
+        "reloaded\nwarning: ui.archive_done_after_days: must be a whole number ≥ 1; using 7\n"
+    );
+
+    std::fs::write(&config, "[ui\n").unwrap();
+    let out = h.todo(&["config", "check"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out.stderr).contains("line 1"),
+        "{}",
+        text(&out.stderr)
+    );
+    let out = h.todo(&["config", "reload"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out.stderr).contains("line 1"),
+        "{}",
+        text(&out.stderr)
+    );
+}

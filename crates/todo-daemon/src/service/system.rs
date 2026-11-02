@@ -1,10 +1,13 @@
 use todo_proto::v1::system_service_server::SystemService;
 use todo_proto::v1::{
-    ClientKind, GetServerInfoRequest, GetServerInfoResponse, ShutdownRequest, ShutdownResponse,
+    self, ClientKind, GetConfigRequest, GetConfigResponse, GetServerInfoRequest,
+    GetServerInfoResponse, ReloadConfigRequest, ReloadConfigResponse, ShutdownRequest,
+    ShutdownResponse,
 };
 use tonic::{Code, Request, Response, Status};
 
 use super::Ctx;
+use crate::config::ReloadError;
 use crate::conn::ConnId;
 use crate::error;
 
@@ -50,5 +53,34 @@ impl SystemService for System {
         // Graceful: the server stops accepting and lets this response finish.
         self.0.shutdown.trigger();
         Ok(Response::new(ShutdownResponse {}))
+    }
+
+    async fn get_config(
+        &self,
+        _request: Request<GetConfigRequest>,
+    ) -> Result<Response<GetConfigResponse>, Status> {
+        // The revision first: a change recorded after it brings a config at
+        // least as new as this one.
+        let revision = self.0.store.current_revision();
+        Ok(Response::new(GetConfigResponse {
+            config: Some(v1::ConfigSnapshot::from(&*self.0.config.current())),
+            revision,
+        }))
+    }
+
+    async fn reload_config(
+        &self,
+        _request: Request<ReloadConfigRequest>,
+    ) -> Result<Response<ReloadConfigResponse>, Status> {
+        let (config, changed) = crate::config::reload(&self.0.config, &self.0.store)
+            .await
+            .map_err(|e| match e {
+                ReloadError::File(e) => error::bad_request("config", e.to_string()),
+                ReloadError::Store(e) => error::store(e),
+            })?;
+        Ok(Response::new(ReloadConfigResponse {
+            config: Some(v1::ConfigSnapshot::from(&*config)),
+            changed,
+        }))
     }
 }

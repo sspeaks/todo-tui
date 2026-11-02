@@ -19,15 +19,16 @@ use todo_proto::v1::view_service_client::ViewServiceClient;
 use todo_proto::v1::watch_service_client::WatchServiceClient;
 use todo_proto::v1::{
     AddRelationRequest, ArchiveItemRequest, ArchiveReason, BatchMutateRequest, CaptureItemRequest,
-    CaptureTokenKind, Clause, ClauseGroup, ClientKind, CreatedVia, DeleteItemRequest, FieldValue,
-    Filter, GetItemRequest, GetServerInfoRequest, GetStatusCountsRequest, GetUndoStateRequest,
-    Item, ItemField, ListItemsRequest, ListViewsRequest, Mutation, MutationResult, OpKind, Operand,
-    Operator, ParseCaptureRequest, ParseDateRequest, ParseRecurrenceRequest, PersonRef, Predicate,
-    Priority, RecurrenceRule, RedoRequest, RedoResponse, Relation, RelationKind,
-    RemoveRelationRequest, SetRecurrenceRequest, SetStatusRequest, ShutdownRequest, SortKey,
-    Status, SubscribeRequest, SubscribeResponse, Topic, UnarchiveItemRequest, UndeleteItemRequest,
-    UndoRequest, UndoResponse, UndoSkip, UndoSkipReason, UpdateItemRequest, View, Weekday, clause,
-    field_value, mutation, operand, person_ref, recurrence_rule, subscribe_response::Message,
+    CaptureTokenKind, Clause, ClauseGroup, ClientKind, ConfigSnapshot, CreatedVia,
+    DeleteItemRequest, FieldValue, Filter, GetConfigRequest, GetItemRequest, GetServerInfoRequest,
+    GetStatusCountsRequest, GetUndoStateRequest, Item, ItemField, ListItemsRequest,
+    ListViewsRequest, Mutation, MutationResult, OpKind, Operand, Operator, ParseCaptureRequest,
+    ParseDateRequest, ParseRecurrenceRequest, PersonRef, Predicate, Priority, RecurrenceRule,
+    RedoRequest, RedoResponse, Relation, RelationKind, ReloadConfigRequest, RemoveRelationRequest,
+    SetRecurrenceRequest, SetStatusRequest, ShutdownRequest, SortKey, Status, SubscribeRequest,
+    SubscribeResponse, Topic, UnarchiveItemRequest, UndeleteItemRequest, UndoRequest, UndoResponse,
+    UndoSkip, UndoSkipReason, UpdateItemRequest, View, Weekday, clause, field_value, mutation,
+    operand, person_ref, recurrence_rule, subscribe_response::Message,
 };
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -40,6 +41,10 @@ const WAIT: Duration = Duration::from_secs(10);
 
 /// A new store's revision: one per default view, seeded when it opens.
 const SEEDED: u64 = 6;
+
+/// A new daemon's revision: the seeded views, then the config change it
+/// records at start.
+const STARTED: u64 = SEEDED + 1;
 
 struct TestDaemon {
     home: TempDir,
@@ -295,7 +300,7 @@ async fn handshake_reports_version_and_api_minor() {
         .into_inner();
     assert_eq!(info.daemon_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(info.api_minor, todo_proto::API_MINOR);
-    assert_eq!(info.api_minor, 8);
+    assert_eq!(info.api_minor, 9);
     d.stop().await;
 }
 
@@ -881,7 +886,7 @@ async fn next_change_to(stream: &mut Streaming<SubscribeResponse>, id: &str) -> 
 async fn the_scheduler_archives_done_items_and_a_user_unarchive_sticks() {
     let d = start_with(DaemonOptions {
         scheduler_interval: Duration::from_millis(20),
-        archive_done_after: SignedDuration::ZERO,
+        archive_done_after: Some(SignedDuration::ZERO),
         ..DaemonOptions::default()
     })
     .await;
@@ -944,7 +949,7 @@ async fn the_scheduler_archives_done_items_and_a_user_unarchive_sticks() {
 async fn a_panicked_scheduler_is_restarted() {
     let d = start_with(DaemonOptions {
         scheduler_interval: Duration::from_millis(20),
-        archive_done_after: SignedDuration::ZERO,
+        archive_done_after: Some(SignedDuration::ZERO),
         restart_after: Duration::from_millis(10),
         scheduler_panics: 2,
         ..DaemonOptions::default()
@@ -976,7 +981,7 @@ async fn a_panicked_scheduler_is_restarted() {
 async fn the_scheduler_sweeps_every_interval_unwoken() {
     let d = start_with(DaemonOptions {
         scheduler_interval: Duration::from_millis(20),
-        archive_done_after: SignedDuration::from_millis(300),
+        archive_done_after: Some(SignedDuration::from_millis(300)),
         ..DaemonOptions::default()
     })
     .await;
@@ -1006,7 +1011,7 @@ async fn the_scheduler_sweeps_every_interval_unwoken() {
 async fn the_scheduler_sweeps_when_it_starts() {
     let hour = DaemonOptions {
         scheduler_interval: Duration::from_secs(3600),
-        archive_done_after: SignedDuration::from_hours(1),
+        archive_done_after: Some(SignedDuration::from_hours(1)),
         ..DaemonOptions::default()
     };
     let d = start_with(hour).await;
@@ -1022,7 +1027,7 @@ async fn the_scheduler_sweeps_when_it_starts() {
     let d = start_with_in(
         home,
         DaemonOptions {
-            archive_done_after: SignedDuration::ZERO,
+            archive_done_after: Some(SignedDuration::ZERO),
             ..hour
         },
     )
@@ -1047,7 +1052,7 @@ async fn the_scheduler_sweeps_when_it_starts() {
 async fn an_undone_completion_is_unarchived_at_once() {
     let d = start_with(DaemonOptions {
         scheduler_interval: Duration::from_secs(3600),
-        archive_done_after: SignedDuration::ZERO,
+        archive_done_after: Some(SignedDuration::ZERO),
         ..DaemonOptions::default()
     })
     .await;
@@ -1330,7 +1335,7 @@ async fn the_seeded_views_replay_and_list_items_through_them() {
         assert_eq!(view.id, c.id);
         views.push(*view);
     }
-    assert!(matches!(next(&mut stream).await, Message::CaughtUp(c) if c.revision == SEEDED));
+    assert!(matches!(next(&mut stream).await, Message::CaughtUp(c) if c.revision == STARTED));
     let seeds: Vec<_> = views.iter().map(|v| v.seed.as_deref().unwrap()).collect();
     assert_eq!(
         seeds,
@@ -1536,7 +1541,7 @@ async fn list_views_returns_the_seeded_views_in_tab_order() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(listed.revision, SEEDED);
+    assert_eq!(listed.revision, STARTED);
     let defaults = todo_core::view::defaults();
     assert_eq!(listed.views.len(), defaults.len());
     for (i, (view, default)) in listed.views.iter().zip(&defaults).enumerate() {
@@ -2063,7 +2068,7 @@ async fn parse_capture_previews_without_writing() {
         .unwrap()
         .into_inner();
     assert!(page.items.is_empty());
-    assert_eq!(page.revision, SEEDED);
+    assert_eq!(page.revision, STARTED);
     d.stop().await;
 }
 
@@ -2889,7 +2894,7 @@ async fn subscribe_replays_then_goes_live_without_loss_or_duplicates() {
     // From the first Item change: the seeded views come before it.
     let mut from_start = d
         .subscribe(SubscribeRequest {
-            since_revision: Some(SEEDED),
+            since_revision: Some(STARTED),
             topics: vec![],
         })
         .await;
@@ -2907,16 +2912,19 @@ async fn subscribe_replays_then_goes_live_without_loss_or_duplicates() {
             Message::Change(c) => changes.push((c.revision, c.id)),
             Message::CaughtUp(c) => {
                 assert!(caught_up.is_none(), "CaughtUp sent twice");
-                assert_eq!(c.revision, changes.last().map_or(SEEDED, |(r, _)| *r));
+                assert_eq!(c.revision, changes.last().map_or(STARTED, |(r, _)| *r));
                 caught_up = Some(c.revision);
             }
             other => panic!("unexpected {other:?}"),
         }
     }
-    assert!(caught_up.unwrap() >= SEEDED + BEFORE as u64);
+    assert!(caught_up.unwrap() >= STARTED + BEFORE as u64);
     let revisions: Vec<u64> = changes.iter().map(|(r, _)| *r).collect();
     let total = total as u64;
-    assert_eq!(revisions, (SEEDED + 1..=SEEDED + total).collect::<Vec<_>>());
+    assert_eq!(
+        revisions,
+        (STARTED + 1..=STARTED + total).collect::<Vec<_>>()
+    );
     let seen: HashSet<_> = changes.into_iter().map(|(_, id)| id).collect();
     assert_eq!(seen, expected.iter().cloned().collect::<HashSet<_>>());
 
@@ -2924,11 +2932,11 @@ async fn subscribe_replays_then_goes_live_without_loss_or_duplicates() {
     let Message::CaughtUp(start) = next(&mut from_now).await else {
         panic!("expected CaughtUp first");
     };
-    let tail = collect_changes(&mut from_now, (SEEDED + total - start.revision) as usize).await;
+    let tail = collect_changes(&mut from_now, (STARTED + total - start.revision) as usize).await;
     let tail: Vec<u64> = tail.into_iter().map(|(r, _)| r).collect();
     assert_eq!(
         tail,
-        (start.revision + 1..=SEEDED + total).collect::<Vec<_>>()
+        (start.revision + 1..=STARTED + total).collect::<Vec<_>>()
     );
     d.stop().await;
 }
@@ -3024,7 +3032,7 @@ async fn many_concurrent_writers_stream_in_order() {
     const N: usize = 1600;
     let d = start().await;
     let mut stream = d.subscribe(SubscribeRequest::default()).await;
-    assert!(matches!(next(&mut stream).await, Message::CaughtUp(c) if c.revision == SEEDED));
+    assert!(matches!(next(&mut stream).await, Message::CaughtUp(c) if c.revision == STARTED));
     let items = d.items().await;
     let writers: Vec<_> = (0..8)
         .map(|w| {
@@ -3046,7 +3054,7 @@ async fn many_concurrent_writers_stream_in_order() {
         .collect();
     assert_eq!(
         revisions,
-        (SEEDED + 1..=SEEDED + N as u64).collect::<Vec<_>>()
+        (STARTED + 1..=STARTED + N as u64).collect::<Vec<_>>()
     );
     d.stop().await;
 }
@@ -3542,7 +3550,7 @@ async fn undo_on_an_empty_stack_succeeds_and_keeps_its_request_id() {
     assert_eq!((empty.items.len(), empty.skipped.len()), (0, 0));
     let result = empty.result.clone().unwrap();
     assert!(result.op_id.parse::<ulid::Ulid>().is_ok());
-    assert_eq!(result.revision, SEEDED);
+    assert_eq!(result.revision, STARTED);
     let out = redo(&mut items).await;
     assert_eq!(out.entry, None);
     assert_eq!(undo_state(&mut items).await, (None, None));
@@ -3687,8 +3695,17 @@ async fn undo_reports_the_changes_it_leaves_alone() {
     let d = start_in(home).await;
     let mut items = d.items().await;
     let x_id = x.id.to_string();
-    // The current revision: y's, from the relation add.
-    let revision = get(&mut items, &y.id.to_string()).await.revision;
+    // The current revision: the config change this daemon recorded at start.
+    let revision = SystemServiceClient::new(d.channel().await)
+        .get_config(GetConfigRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .revision;
+    assert_eq!(
+        revision,
+        get(&mut items, &y.id.to_string()).await.revision + 1
+    );
     let out = undo(&mut items).await;
     let entry = out.entry.unwrap();
     assert_eq!(entry.op_id, added.result.op_id.to_string());
@@ -4275,5 +4292,242 @@ async fn subscribe_re_emits_parents_and_subtasks() {
     let seen = changed_items(&mut stream, 2).await;
     let child = seen.iter().find(|i| i.id == a.id).unwrap();
     assert_eq!(child.parent_title.as_deref(), Some("parent"));
+    d.stop().await;
+}
+
+fn write_config(d: &TestDaemon, text: &str) {
+    std::fs::write(&d.paths.config, text).unwrap();
+}
+
+fn config_change(message: Message) -> (u64, ConfigSnapshot) {
+    let Message::Change(c) = message else {
+        panic!("not a change: {message:?}");
+    };
+    assert_eq!(
+        (c.topic, c.id.as_str(), c.deleted),
+        (Topic::Config as i32, "config", false)
+    );
+    let Some(todo_proto::v1::change::Resource::Config(config)) = c.resource else {
+        panic!("a config change without its config");
+    };
+    (c.revision, *config)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_config_serves_the_defaults_without_a_file() {
+    let d = start().await;
+    let res = SystemServiceClient::new(d.channel().await)
+        .get_config(GetConfigRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let config = res.config.unwrap();
+    assert_eq!(config.path, d.paths.config.display().to_string());
+    assert!(!config.exists);
+    assert_eq!(config.config_version, 1);
+    let ui = config.ui.unwrap();
+    assert_eq!(
+        (ui.review_day, ui.archive_done_after_days),
+        (Weekday::Monday as i32, 7)
+    );
+    let backup = config.backup.unwrap();
+    assert_eq!(
+        (backup.enabled, backup.interval.as_str(), backup.retain_days),
+        (true, "daily", 14)
+    );
+    assert!(config.keymap.is_empty() && config.warnings.is_empty());
+    assert_eq!(res.revision, STARTED);
+    d.stop().await;
+}
+
+/// A reload that changes the config streams it; one that does not streams
+/// nothing; a file that is not TOML is refused and the config kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn reload_config_streams_a_change_and_keeps_the_config_on_bad_toml() {
+    let d = start().await;
+    let mut system = SystemServiceClient::new(d.channel().await);
+    let mut stream = d
+        .subscribe(SubscribeRequest {
+            since_revision: Some(STARTED),
+            topics: vec![Topic::Config.into()],
+        })
+        .await;
+    assert!(matches!(next(&mut stream).await, Message::CaughtUp(c) if c.revision == STARTED));
+
+    let res = system
+        .reload_config(ReloadConfigRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!res.changed);
+
+    write_config(
+        &d,
+        "[ui]\narchive_done_after_days = 3\nweird = 1\n[keymap]\n\"K\" = \"move_up\"\n",
+    );
+    let res = system
+        .reload_config(ReloadConfigRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(res.changed);
+    let (revision, streamed) = config_change(next(&mut stream).await);
+    assert_eq!(revision, STARTED + 1);
+    assert_eq!(streamed.ui.unwrap().archive_done_after_days, 3);
+    assert_eq!(
+        streamed.keymap.get("K").map(String::as_str),
+        Some("move_up")
+    );
+    assert_eq!(streamed.warnings.len(), 1);
+    assert_eq!(streamed.warnings[0].key, "ui.weird");
+    assert_eq!(res.config.unwrap().keymap, streamed.keymap);
+
+    write_config(&d, "[ui\n");
+    let err = system
+        .reload_config(ReloadConfigRequest {})
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert!(err.message().contains("line 1"), "{}", err.message());
+    let kept = system
+        .get_config(GetConfigRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(kept.config.unwrap().ui.unwrap().archive_done_after_days, 3);
+    assert_eq!(kept.revision, STARTED + 1);
+    d.stop().await;
+}
+
+/// Config is not stored: a replayed config change carries the config
+/// current when it is sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replayed_config_change_carries_the_current_config() {
+    let d = start().await;
+    let mut system = SystemServiceClient::new(d.channel().await);
+    for days in [2, 5] {
+        write_config(&d, &format!("[ui]\narchive_done_after_days = {days}\n"));
+        assert!(
+            system
+                .reload_config(ReloadConfigRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+                .changed
+        );
+    }
+    let mut stream = d
+        .subscribe(SubscribeRequest {
+            since_revision: Some(STARTED),
+            topics: vec![],
+        })
+        .await;
+    for revision in [STARTED + 1, STARTED + 2] {
+        let (r, config) = config_change(next(&mut stream).await);
+        assert_eq!(r, revision);
+        assert_eq!(config.ui.unwrap().archive_done_after_days, 5);
+    }
+    assert!(matches!(next(&mut stream).await, Message::CaughtUp(c) if c.revision == STARTED + 2));
+    d.stop().await;
+}
+
+/// The config read at start, a bad value warned about and defaulted.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_config_is_read_at_start() {
+    let home = TempDir::new().unwrap();
+    std::fs::write(
+        paths_for(&home).config,
+        "[ui]\narchive_done_after_days = 0\n[backup]\nretain_days = 30\n",
+    )
+    .unwrap();
+    let d = start_in(home).await;
+    let config = SystemServiceClient::new(d.channel().await)
+        .get_config(GetConfigRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .config
+        .unwrap();
+    assert!(config.exists);
+    assert_eq!(config.ui.unwrap().archive_done_after_days, 7);
+    assert_eq!(config.backup.unwrap().retain_days, 30);
+    let keys: Vec<_> = config.warnings.iter().map(|w| w.key.as_str()).collect();
+    assert_eq!(keys, ["ui.archive_done_after_days"]);
+    d.stop().await;
+}
+
+/// With no fixed wait in the options, the scheduler follows the config:
+/// a reload from 7 days to 1 archives an Item closed a day and a half ago.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_scheduler_follows_archive_done_after_days() {
+    let d = start_with(DaemonOptions {
+        scheduler_interval: Duration::from_millis(20),
+        ..DaemonOptions::default()
+    })
+    .await;
+    let mut items = d.items().await;
+    let a = capture(&mut items, "a").await;
+    items
+        .set_status(status_req(&a.id, Status::Done))
+        .await
+        .unwrap();
+    // Closed a day and a half ago, as the scheduler sees it.
+    let at = jiff::Timestamp::now() - SignedDuration::from_hours(36);
+    rusqlite::Connection::open(d.paths.database())
+        .unwrap()
+        .execute(
+            "UPDATE items SET status_entered_at = ?1 WHERE id = ?2",
+            rusqlite::params![at.as_nanosecond() as i64, a.id],
+        )
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        get(&mut items, &a.id).await.archived,
+        None,
+        "7 days have not passed"
+    );
+
+    write_config(&d, "[ui]\narchive_done_after_days = 1\n");
+    SystemServiceClient::new(d.channel().await)
+        .reload_config(ReloadConfigRequest {})
+        .await
+        .unwrap();
+    // The reload is not a user op, so it is the interval sweep that sees it.
+    let archived = timeout(WAIT, async {
+        loop {
+            if let Some(archived) = get(&mut items, &a.id).await.archived {
+                return archived;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("never archived after the reload");
+    assert_eq!(archived.reason, ArchiveReason::AutoDone as i32);
+    d.stop().await;
+}
+
+/// A file edited while no daemon ran reaches a client that resumes from
+/// before the restart: each start records a config change.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_streams_the_config_it_read() {
+    let d = start().await;
+    let home = d.stop().await;
+    std::fs::write(
+        paths_for(&home).config,
+        "[ui]\narchive_done_after_days = 4\n",
+    )
+    .unwrap();
+    let d = start_in(home).await;
+    let mut stream = d
+        .subscribe(SubscribeRequest {
+            since_revision: Some(STARTED),
+            topics: vec![],
+        })
+        .await;
+    let (revision, config) = config_change(next(&mut stream).await);
+    assert_eq!(revision, STARTED + 1);
+    assert_eq!(config.ui.unwrap().archive_done_after_days, 4);
+    assert!(matches!(next(&mut stream).await, Message::CaughtUp(c) if c.revision == STARTED + 1));
     d.stop().await;
 }

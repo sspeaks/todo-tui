@@ -8,6 +8,7 @@ pub(crate) mod watch;
 use todo_store::Store;
 
 use crate::ShutdownHandle;
+use crate::config::ConfigHandle;
 use crate::conn::Clients;
 use crate::scheduler::Wake;
 
@@ -18,4 +19,5 @@ pub(crate) struct Ctx {
     pub(crate) shutdown: ShutdownHandle,
     /// Poked after every user op, which may give the scheduler work.
     pub(crate) wake: Wake,
+    pub(crate) config: ConfigHandle,
 }

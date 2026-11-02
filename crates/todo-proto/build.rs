@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 const PROTOS: &[&str] = &[
     "todo/v1/common.proto",
+    "todo/v1/config.proto",
     "todo/v1/field.proto",
     "todo/v1/field_value.proto",
     "todo/v1/filter.proto",
@@ -25,6 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::configure()
         .boxed(".todo.v1.Change.resource.item")
         .boxed(".todo.v1.Change.resource.view")
+        .boxed(".todo.v1.Change.resource.config")
         .file_descriptor_set_path(out.join("todo_descriptor.bin"))
         .compile_protos(&protos, &[root])?;
     Ok(())

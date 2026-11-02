@@ -1,4 +1,5 @@
 export * from "./gen/todo/v1/common_pb.js";
+export * from "./gen/todo/v1/config_pb.js";
 export * from "./gen/todo/v1/field_pb.js";
 export * from "./gen/todo/v1/field_value_pb.js";
 export * from "./gen/todo/v1/filter_pb.js";

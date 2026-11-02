@@ -151,6 +151,9 @@ pub enum ChangesSinceError {
     Store(#[from] StoreError),
 }
 
+/// The resource id of every [`Topic::Config`] change.
+pub const CONFIG_ID: &str = "config";
+
 /// A resource snapshot attached to a [`ChangeRow`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum Resource {
@@ -779,6 +782,14 @@ impl Store {
     /// [`StoreError::InvalidPageToken`].
     pub async fn list_items(&self, input: ListInput) -> Result<ItemPage> {
         self.read(move |conn| query::list_items_tx(conn, input))
+            .await
+    }
+
+    /// Records that the daemon's config changed: one [`Topic::Config`]
+    /// change with id [`CONFIG_ID`] and no resource. The config is not
+    /// stored, so whoever sends the change attaches the current one.
+    pub async fn record_config_change(&self) -> Result<Revision> {
+        self.write(|tx| tx.record_change(Topic::Config, CONFIG_ID, false, None))
             .await
     }
 

@@ -1,6 +1,7 @@
 //! The todo-tui daemon: tonic services, scheduler and watch fan-out.
 
 pub mod client;
+pub mod config;
 mod conn;
 mod error;
 mod logging;
@@ -12,6 +13,6 @@ mod shutdown;
 pub mod spool;
 mod supervise;
 
-pub use scheduler::ARCHIVE_DONE_AFTER_DAYS;
-pub use server::{Daemon, DaemonOptions, Exit, Started, run};
+pub use config::ARCHIVE_DONE_AFTER_DAYS;
+pub use server::{Daemon, DaemonOptions, Exit, ReloadHandle, Started, run};
 pub use shutdown::ShutdownHandle;

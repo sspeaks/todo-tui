@@ -19,6 +19,7 @@ use tonic::transport::Server;
 
 use crate::ShutdownHandle;
 use crate::client;
+use crate::config::{self, Config, ConfigHandle};
 use crate::conn::Clients;
 use crate::paths::Paths;
 use crate::scheduler::{self, Wake};
@@ -41,9 +42,9 @@ pub struct DaemonOptions {
     /// How often the scheduler sweeps when no user op wakes it (60 s).
     pub scheduler_interval: Duration,
     /// How long a done or cancelled Item stays out of Archive before the
-    /// scheduler archives it `auto_done`
-    /// ([`ARCHIVE_DONE_AFTER_DAYS`](crate::ARCHIVE_DONE_AFTER_DAYS) days).
-    pub archive_done_after: SignedDuration,
+    /// scheduler archives it `auto_done`. `None` follows the config's
+    /// `archive_done_after_days`, read on each sweep; tests set it.
+    pub archive_done_after: Option<SignedDuration>,
     /// How often a running daemon looks at the capture spool (30 s).
     pub spool_interval: Duration,
     /// How long a background task that panicked waits before its first
@@ -59,7 +60,7 @@ impl Default for DaemonOptions {
     fn default() -> Self {
         DaemonOptions {
             scheduler_interval: scheduler::INTERVAL,
-            archive_done_after: scheduler::archive_done_after(),
+            archive_done_after: None,
             spool_interval: spool::INTERVAL,
             restart_after: Backoff::default().first,
             scheduler_panics: 0,
@@ -71,6 +72,7 @@ impl Default for DaemonOptions {
 pub struct Daemon {
     paths: Paths,
     store: Store,
+    config: ConfigHandle,
     listener: UnixListener,
     shutdown: ShutdownHandle,
     options: DaemonOptions,
@@ -107,6 +109,13 @@ impl Daemon {
         lock.set_len(0)?;
         writeln!(lock, "{}", std::process::id())?;
 
+        let config_path = paths.config.clone();
+        let config =
+            tokio::task::spawn_blocking(move || Config::load_or_defaults(&config_path)).await?;
+        for warning in &config.warnings {
+            tracing::warn!(%warning, path = %config.path.display(), "config");
+        }
+
         let db = paths.database();
         let store = tokio::task::spawn_blocking(move || Store::open(&db))
             .await?
@@ -126,6 +135,7 @@ impl Daemon {
         Ok(Started::Running(Box::new(Daemon {
             paths,
             store,
+            config: ConfigHandle::new(config),
             listener,
             shutdown: ShutdownHandle::new(),
             options,
@@ -145,6 +155,14 @@ impl Daemon {
         self.shutdown.clone()
     }
 
+    /// Reloads the config as SIGHUP does.
+    pub fn reload_handle(&self) -> ReloadHandle {
+        ReloadHandle {
+            config: self.config.clone(),
+            store: self.store.clone(),
+        }
+    }
+
     /// Imports the capture spool (design 2.1), then serves until shutdown is
     /// triggered (by a handle or the `Shutdown` RPC), then drains for up to
     /// 10s, removes the socket and releases the lock. Meanwhile imports the
@@ -156,12 +174,19 @@ impl Daemon {
         let Daemon {
             paths,
             store,
+            config,
             listener,
             shutdown,
             options,
             _lock,
         } = self;
         let clients = Clients::default();
+        // The file may have changed while no daemon ran, and config is not
+        // stored: a change at every start makes each resuming client read
+        // the config this daemon runs with.
+        if let Err(e) = store.record_config_change().await {
+            tracing::warn!(error = %e, "recording the config read at start failed");
+        }
         spool::import_logged(&paths, &store).await;
         let backoff = Backoff {
             first: options.restart_after,
@@ -182,6 +207,7 @@ impl Daemon {
         let wake = Wake::default();
         let scheduler = {
             let (store, wake, stop) = (store.clone(), wake.clone(), shutdown.signal());
+            let config = config.subscribe();
             let mut panics = options.scheduler_panics;
             spawn_supervised("scheduler", shutdown.signal(), backoff, move || {
                 let panic = panics > 0;
@@ -191,7 +217,10 @@ impl Daemon {
                     wake.clone(),
                     stop.clone(),
                     options.scheduler_interval,
-                    options.archive_done_after,
+                    match options.archive_done_after {
+                        Some(after) => scheduler::After::Fixed(after),
+                        None => scheduler::After::Config(config.clone()),
+                    },
                 );
                 async move {
                     assert!(!panic, "scheduler_panics test hook");
@@ -204,6 +233,7 @@ impl Daemon {
             clients: clients.clone(),
             shutdown: shutdown.clone(),
             wake,
+            config,
         };
 
         let incoming = async_stream::stream! {
@@ -268,16 +298,21 @@ pub async fn run(paths: Paths) -> anyhow::Result<Exit> {
     };
 
     let shutdown = daemon.shutdown_handle();
+    let reload = daemon.reload_handle();
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
-    // Detached daemons outlive their terminal.
+    // SIGHUP reloads the config; it never stops the daemon, which outlives
+    // its terminal when detached.
     let mut hup = signal(SignalKind::hangup())?;
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = term.recv() => break,
                 _ = int.recv() => break,
-                _ = hup.recv() => tracing::info!("ignoring SIGHUP"),
+                _ = hup.recv() => {
+                    tracing::info!("SIGHUP: reloading the config");
+                    reload.reload().await;
+                }
             }
         }
         tracing::info!("signal received, shutting down");
@@ -318,4 +353,23 @@ fn create_runtime_dir(dir: &Path) -> anyhow::Result<()> {
     }
     client::check_runtime_dir(dir)?;
     Ok(())
+}
+
+/// Reloads the config of a running [`Daemon`], as SIGHUP does.
+#[derive(Clone)]
+pub struct ReloadHandle {
+    config: ConfigHandle,
+    store: Store,
+}
+
+impl ReloadHandle {
+    /// Reads the file again; a change is streamed to every subscriber. A
+    /// file that is not TOML is logged and the running config kept.
+    pub async fn reload(&self) {
+        match config::reload(&self.config, &self.store).await {
+            Ok((_, false)) => tracing::info!("config unchanged"),
+            Ok((_, true)) => {}
+            Err(e) => tracing::warn!(error = %e, "config not reloaded"),
+        }
+    }
 }
