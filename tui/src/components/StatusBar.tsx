@@ -1,6 +1,8 @@
 import { type ConnectionSnapshot, useConnection, useUndoState } from "@todo-tui/client";
 import { Box, Text } from "ink";
 import { displayWidth, singleLine, truncate } from "../format/text.js";
+import { keyFor, keyPair } from "../keys/overrides.js";
+import { sequenceLabel } from "../keys/tokenize.js";
 import type { UiState } from "../state/types.js";
 import { tabQuery } from "../state/tabs.js";
 import { useController, useOptionalView, useUi } from "./hooks.js";
@@ -40,10 +42,24 @@ function modeLabel(s: UiState): string {
   }
 }
 
+/** "? help" for the key the keymap in effect binds `id` to; empty when it binds none. */
+function hint(s: UiState, id: string, text: string): string {
+  const key = keyFor(s.keymap.bindings, id, sequenceLabel);
+  return key ? `${key} ${text}` : "";
+}
+
+/** "j/k scroll" for a down and an up action. */
+function pair(s: UiState, down: string, up: string, text: string): string {
+  const keys = keyPair(s.keymap.bindings, down, up, sequenceLabel);
+  return keys ? `${keys} ${text}` : "";
+}
+
+const joined = (...parts: string[]) => parts.filter(Boolean).join(" · ");
+
 function hints(s: UiState): string {
   switch (s.mode.kind) {
     case "help":
-      return "j/k scroll · esc close";
+      return joined(pair(s, "help_down", "help_up", "scroll"), hint(s, "help_close", "close"));
     case "command":
       return "enter run · tab complete · esc cancel";
     case "quickAdd":
@@ -58,7 +74,9 @@ function hints(s: UiState): string {
       return "enter keep · esc clear";
     default:
       if (s.visual) return "move to mark · V or esc ends";
-      return s.focus === "detail" ? "j/k scroll · esc back · q quit" : "? help · : command · q quit";
+      return s.focus === "detail"
+        ? joined(pair(s, "move_down", "move_up", "scroll"), hint(s, "back", "back"), hint(s, "quit", "quit"))
+        : joined(hint(s, "help", "help"), hint(s, "command", "command"), hint(s, "quit", "quit"));
   }
 }
 

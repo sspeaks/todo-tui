@@ -375,3 +375,72 @@ describe("midnight", () => {
     expect(refresh).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("[keymap] from the config", () => {
+  it("rebuilds the keymap when the config changes, and help lists the effective keys", async () => {
+    const t = await setup();
+    await t.c.press("J");
+    expect(t.selected()).toBe("row 0");
+    t.daemon.setConfig({ keymap: { J: "move_down", j: "" } });
+    await vi.waitFor(() => expect(t.state().keymap.bindings.find((b) => b.id === "move_down")?.keys).toEqual(["down", "J"]));
+    await t.c.press("J");
+    expect(t.selected()).toBe("row 1");
+    await t.c.press("j");
+    expect(t.selected()).toBe("row 1");
+    expect(t.state().toast).toMatchObject({ text: expect.stringContaining("j") });
+    expect(t.state().toast?.text).not.toMatch(/config:/);
+  });
+
+  it("skips an override that would break the keymap, toasts it once, and :config says what", async () => {
+    const t = await setup();
+    t.daemon.setConfig({ keymap: { p: "quit" }, warnings: [{ key: "ui.colour", message: "unknown key; ignored" }] });
+    await vi.waitFor(() => expect(t.state().keymap.warnings).toHaveLength(1));
+    expect(t.state().toast).toMatchObject({ level: "error", text: "config: 2 warnings · :config" });
+    await t.c.press("p1");
+    expect(t.state().quitting).toBe(false);
+    expect(t.quit).not.toHaveBeenCalled();
+    await t.c.press(":config<enter>");
+    expect(t.state().toast?.text).toBe(
+      'keymap "p": p (quit) is also a prefix · ui.colour: unknown key; ignored · 2 warnings: todo config check',
+    );
+  });
+
+  it("names the keys in effect in hints, and q quits past an action in flight only while it is quit", async () => {
+    const t = await setup();
+    t.daemon.setConfig({ keymap: { q: "", Q: "quit", U: "undo", u: "", "?": "", fkey: "", H: "help" } });
+    await vi.waitFor(() => expect(t.c.keyFor("quit")).toBe("ctrl-c"));
+    await t.c.press("x");
+    expect(t.state().toast?.text).toMatch(/· U undo$/);
+    await t.c.press("Z");
+    expect(t.state().toast?.text).toBe("Z: not bound · H for help");
+    await t.c.press("q");
+    expect(t.quit).not.toHaveBeenCalled();
+  });
+
+  it("toasts the same config's warnings once, across a reconnect", async () => {
+    const t = await setup();
+    t.daemon.setConfig({ keymap: { p: "quit" } });
+    await vi.waitFor(() => expect(t.state().toast?.text).toBe("config: 1 warning · :config"));
+    await t.c.press("j");
+    t.daemon.down = true;
+    t.dropStreams();
+    await vi.waitFor(() => expect(t.store.getConnection().state).toBe("reconnecting"));
+    t.daemon.down = false;
+    await vi.waitFor(() => expect(t.store.getConnection().state).toBe("live"));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(t.state().toast?.text).not.toBe("config: 1 warning · :config");
+  });
+
+  it("lists a which-key group as a range only while it is one", async () => {
+    const t = await setup();
+    t.daemon.setConfig({ keymap: { "p 6": "set_priority_1", "p 3": "" } });
+    await vi.waitFor(() => expect(t.state().keymap.bindings.find((b) => b.id === "set_priority_3")?.keys).toEqual([]));
+    expect(t.c.whichKey(["p"])).toBe("p… 1 2 4 5 6 Set the priority · 0 Clear the priority");
+  });
+
+  it(":config with no warnings names the file", async () => {
+    const t = await setup();
+    await t.c.press(":config<enter>");
+    expect(t.state().toast).toMatchObject({ level: "info", text: "/fake/config.toml (none; the defaults apply) · no warnings" });
+  });
+});

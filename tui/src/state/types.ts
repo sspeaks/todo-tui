@@ -2,7 +2,8 @@
 // to, what the message line says. Server data stays in LiveStore.
 
 import type { CaptureDraft } from "@todo-tui/client";
-import type { PromptKind } from "../keys/keymap.js";
+import { BINDINGS, type Binding, type PromptKind } from "../keys/keymap.js";
+import type { KeymapWarning } from "../keys/overrides.js";
 import type { LineState } from "../keys/line-editor.js";
 import type { KeyToken } from "../keys/tokenize.js";
 import type { ListState } from "./selection.js";
@@ -130,6 +131,8 @@ export interface UiState {
   /** An action that has run for a while: "saving…" in the status bar. */
   readonly busy?: string;
   readonly quitting: boolean;
+  /** The keymap in effect: the defaults with config's [keymap] overrides, and what was wrong with them. */
+  readonly keymap: { readonly bindings: readonly Binding[]; readonly warnings: readonly KeymapWarning[] };
 }
 
 export const normalMode: Mode = { kind: "normal", pending: [] };
@@ -145,4 +148,5 @@ export const initialUiState = (size = { columns: 80, rows: 24 }): UiState => ({
   detail: { scroll: 0, lines: 0 },
   size,
   quitting: false,
+  keymap: { bindings: BINDINGS, warnings: [] },
 });

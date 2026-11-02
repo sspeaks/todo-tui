@@ -6,7 +6,8 @@ import { useUi } from "./hooks.js";
 /** The help, generated from the keymap, scrolled by j/k and windowed to the body. */
 export function HelpOverlay({ width, height }: { width: number; height: number }) {
   const scroll = useUi((s) => (s.mode.kind === "help" ? s.mode.scroll : 0));
-  const lines = useMemo(helpLines, []);
+  const bindings = useUi((s) => s.keymap.bindings);
+  const lines = useMemo(() => helpLines(bindings), [bindings]);
   return (
     <Box flexDirection="column" width={width} height={height} overflow="hidden">
       {lines.slice(scroll, scroll + height).map((line, i) => (

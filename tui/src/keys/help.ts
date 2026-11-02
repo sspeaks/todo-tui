@@ -4,6 +4,7 @@
 
 import { COMMANDS } from "./commands.js";
 import { BINDINGS, type Binding, type Section, bindingModes, isAvailable, sequences } from "./keymap.js";
+import { keyFor, keyPair } from "./overrides.js";
 import { sequenceLabel } from "./tokenize.js";
 
 export interface HelpLine {
@@ -30,9 +31,10 @@ const section = (text: string): HelpLine[] => [{ text: "", kind: "blank" }, { te
 export const bindingKeys = (b: Binding): string => b.helpKeys ?? sequences(b).map(sequenceLabel).join(" ");
 
 /** The normal-mode bindings that run now, in table order, one per help row (a helpKeys group counts once). */
-export function helpBindings(): Binding[][] {
+export function helpBindings(bindings: readonly Binding[] = BINDINGS): Binding[][] {
   const rows = new Map<string, Binding[]>();
-  for (const b of BINDINGS) {
+  for (const b of bindings) {
+    if (!b.keys.length) continue;
     if (!bindingModes(b).includes("normal") || !isAvailable(b)) continue;
     const key = b.helpKeys ?? b.id;
     rows.set(key, [...(rows.get(key) ?? []), b]);
@@ -68,9 +70,13 @@ const RULES: readonly [string, string][] = [
   ["3d 2w", "days, weeks after done"],
 ];
 
-export function helpLines(): HelpLine[] {
-  const lines: HelpLine[] = [{ text: "Help · j/k scroll · esc close", kind: "title" }];
-  const rows = helpBindings();
+/** The help for `bindings`: the keymap in effect, with its [keymap] overrides. */
+export function helpLines(bindings: readonly Binding[] = BINDINGS): HelpLine[] {
+  const hint = (k: string | undefined, text: string) => (k ? ` · ${k} ${text}` : "");
+  const scroll = hint(keyPair(bindings, "help_down", "help_up", sequenceLabel), "scroll");
+  const close = hint(keyFor(bindings, "help_close", sequenceLabel), "close");
+  const lines: HelpLine[] = [{ text: `Help${scroll}${close}`, kind: "title" }];
+  const rows = helpBindings(bindings);
   for (const name of SECTIONS) {
     const inSection = rows.filter(([first]) => first?.section === name);
     if (!inSection.length) continue;

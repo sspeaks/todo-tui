@@ -2,7 +2,7 @@
 // completion over them, and a pointer to the milestone that brings each
 // planned one.
 
-export type CommandName = "quit" | "help" | "refresh" | "search";
+export type CommandName = "quit" | "help" | "refresh" | "search" | "config";
 
 interface CommandSpec {
   readonly name: string;
@@ -19,6 +19,7 @@ export const COMMANDS: readonly CommandSpec[] = [
   { name: "help", aliases: ["h"], help: "Keys, capture syntax and dates", runs: "help" },
   { name: "refresh", help: "Re-read every view and the counts", runs: "refresh" },
   { name: "search", help: "Search everything, done, archived and deferred too", runs: "search", args: "<query>" },
+  { name: "config", help: "The config file and what is wrong with it", runs: "config" },
 ];
 
 /** Commands from the design that a later milestone brings, and where they arrive. */

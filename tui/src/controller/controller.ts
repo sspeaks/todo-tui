@@ -4,15 +4,28 @@
 // its selection pinned, and runs the midnight poll. No Ink here, so the
 // controller tests drive it directly.
 
-import { type Item, type ItemsClient, type LiveStore, type LiveView, type ViewSnapshot, envFromProcess, resolvePaths } from "@todo-tui/client";
+import {
+  type ConfigSnapshot,
+  ConfigSnapshotSchema,
+  type Item,
+  type ItemsClient,
+  type LiveStore,
+  type LiveView,
+  type ViewSnapshot,
+  create,
+  envFromProcess,
+  equals,
+  resolvePaths,
+} from "@todo-tui/client";
 import type { Key } from "ink";
 import { dayOf, localDay } from "../format/dates.js";
 import { singleLine } from "../format/text.js";
 import { completeCommand, resolveCommand } from "../keys/commands.js";
 import { helpLines } from "../keys/help.js";
 import { type Action, BINDINGS, type Binding, isAvailable, type KeymapMode } from "../keys/keymap.js";
+import { applyOverrides, keyFor } from "../keys/overrides.js";
 import { altInLine, editLine, emptyLine, insert, type LineState, lineOf } from "../keys/line-editor.js";
-import { altKey, isChar, type KeyToken, keyLabel, parseKeys, tokenize } from "../keys/tokenize.js";
+import { altKey, isChar, type KeyToken, keyLabel, parseKeys, sequenceLabel, tokenize } from "../keys/tokenize.js";
 import { buildTrie, continuations, step, type TrieNode } from "../keys/trie.js";
 import { layout } from "../state/layout.js";
 import { anchorIndex, markedInOrder, pruneMarks, rangeMarks, toggleMark } from "../state/marks.js";
@@ -50,6 +63,8 @@ export interface ControllerOptions {
   stateDir?: string;
   /** ctrl-z: stops the process as a shell job, resolving once it continues; false when nothing stopped it (default: job.ts). */
   stopProcess?: () => Promise<boolean>;
+  /** The default bindings, before config's [keymap] (default: BINDINGS). */
+  bindings?: readonly Binding[];
 }
 
 /** How a toast is cut when it does not fit (Toast.keepEnd). */
@@ -64,6 +79,14 @@ const NAVIGATION: ReadonlySet<Action["type"]> = new Set(["move", "top", "bottom"
 const TEXT_MODES: ReadonlySet<Mode["kind"]> = new Set(["quickAdd", "prompt", "command", "search"]);
 
 const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n));
+
+/** Keys of a which-key group: "1–5" for a run of consecutive digits, else each ("1 2 4 5", "1 6"). */
+function keyRange(keys: readonly string[]): string {
+  const sorted = [...keys].sort();
+  const digits = sorted.every((k) => /^\d$/.test(k));
+  const run = digits && sorted.every((k, i) => i === 0 || Number(k) === Number(sorted[i - 1]) + 1);
+  return run && sorted.length > 2 ? `${sorted[0]}–${sorted.at(-1)}` : (digits ? sorted : keys).join(" ");
+}
 
 const describe = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
@@ -86,7 +109,10 @@ export class Controller {
   private readonly stopProcess: () => Promise<boolean>;
   private readonly now: () => Date;
   private readonly queue: InputQueue;
-  private readonly tries: Readonly<Record<KeymapMode, TrieNode>>;
+  private readonly defaults: readonly Binding[];
+  private tries: Readonly<Record<KeymapMode, TrieNode>>;
+  /** The config the keymap was last built from, without its load time. */
+  private keymapFrom: ConfigSnapshot | undefined;
   private readonly stops: (() => void)[] = [];
   /** The current tab's view, observed so that it stays live (only that one). */
   private watched: { tab: TabId; stop: () => void } | undefined;
@@ -103,7 +129,9 @@ export class Controller {
     this.ui = opts.ui ?? new UiStore();
     this.now = opts.now ?? (() => new Date());
     this.timing = { ...DEFAULT_TIMING, ...opts.timing };
-    this.tries = { normal: buildTrie(BINDINGS, "normal"), help: buildTrie(BINDINGS, "help") };
+    this.defaults = opts.bindings ?? BINDINGS;
+    this.tries = { normal: buildTrie(this.defaults, "normal"), help: buildTrie(this.defaults, "help") };
+    this.ui.setState((s) => ({ ...s, keymap: { bindings: this.defaults, warnings: [] } }));
     this.queue = new InputQueue(
       (input) => this.handle(input),
       (err) => this.toast("error", describe(err)),
@@ -184,7 +212,8 @@ export class Controller {
   private push(inputs: readonly Input[]): void {
     const { mode } = this.state;
     const [first] = inputs;
-    const quitKey = first === "q" || first === "ctrl+c";
+    const bound = typeof first === "string" ? step(this.tries.normal, [], first) : undefined;
+    const quitKey = bound?.kind === "run" && bound.binding.action.type === "quit";
     if (quitKey && this.queue.inFlight && !this.queue.waiting && mode.kind === "normal" && !mode.pending.length) {
       void this.quit();
       return;
@@ -214,11 +243,16 @@ export class Controller {
     return cur && reconcile(this.listState(cur.tab), cur.ids, this.height).selectedId;
   }
 
+  /** The first key the keymap in effect binds `id` to, as help shows it; undefined when it binds none. */
+  keyFor(id: string): string | undefined {
+    return keyFor(this.state.keymap.bindings, id, sequenceLabel);
+  }
+
   /** The which-key hint for a pending prefix: "g… g First row". */
   whichKey(pending: readonly KeyToken[]): string {
     const groups = new Map<string, string[]>();
     for (const [key, b] of continuations(this.tries.normal, pending)) groups.set(b.help, [...(groups.get(b.help) ?? []), keyLabel(key)]);
-    const hints = [...groups].map(([help, keys]) => `${keys.length > 2 ? `${keys[0]}–${keys.at(-1)}` : keys.join(" ")} ${help}`);
+    const hints = [...groups].map(([help, keys]) => `${keyRange(keys)} ${help}`);
     return `${pending.map(keyLabel).join(" ")}… ${hints.join(" · ")}`;
   }
 
@@ -395,7 +429,9 @@ export class Controller {
    */
   toastOp(opId: string | undefined, fallback: string, more = ""): void {
     const top = this.store.undoState.getSnapshot().undo;
-    this.toast("info", `${top && opId !== undefined && top.opId === opId ? `${singleLine(top.description)} · u undo` : fallback}${more}`);
+    const undoKey = this.keyFor("undo");
+    const offer = undoKey ? ` · ${undoKey} undo` : "";
+    this.toast("info", `${top && opId !== undefined && top.opId === opId ? `${singleLine(top.description)}${offer}` : fallback}${more}`);
   }
 
   /** A plain edit's toast: only when the Item left the current tab. */
@@ -494,6 +530,7 @@ export class Controller {
    * moved.
    */
   private sync(): void {
+    this.applyConfig();
     this.prompts.sync();
     const { views } = this.store.getViews();
     const { tab } = this.state;
@@ -576,7 +613,10 @@ export class Controller {
     const r = step(this.tries.normal, pending, key);
     if (r.kind === "pending") return this.setMode({ kind: "normal", pending: r.pending });
     if (pending.length) this.setMode(normalMode);
-    if (r.kind === "unbound") return this.toast("info", `${r.keys.map(keyLabel).join(" ")}: not bound · ? for help`);
+    if (r.kind === "unbound") {
+      const help = this.keyFor("help");
+      return this.toast("info", `${r.keys.map(keyLabel).join(" ")}: not bound${help ? ` · ${help} for help` : ""}`);
+    }
     return this.runBinding(r.binding);
   }
 
@@ -628,6 +668,46 @@ export class Controller {
     }
   }
 
+  /**
+   * Rebuilds the keymap when the daemon's config changes: the defaults with
+   * its [keymap] overrides. An override that would break the keymap is
+   * skipped, and each new config's warnings are toasted once. A pending
+   * prefix is dropped, since its keys may mean something else now.
+   */
+  private applyConfig(): void {
+    const { config } = this.store.getConfig();
+    // By content: a reconnect reads the same config again as a new object.
+    const from = config && create(ConfigSnapshotSchema, { ...config, loadedAt: undefined });
+    if (from === this.keymapFrom || (from && this.keymapFrom && equals(ConfigSnapshotSchema, from, this.keymapFrom))) return;
+    this.keymapFrom = from;
+    const effective = applyOverrides(this.defaults, config?.keymap ?? {});
+    this.tries = { normal: buildTrie(effective.bindings, "normal"), help: buildTrie(effective.bindings, "help") };
+    this.ui.setState((s) => ({
+      ...s,
+      keymap: effective,
+      ...(s.mode.kind === "normal" && s.mode.pending.length && { mode: normalMode }),
+    }));
+    const count = (config?.warnings.length ?? 0) + effective.warnings.length;
+    if (count) this.toast("error", `config: ${count} ${count === 1 ? "warning" : "warnings"} · :config`);
+  }
+
+  /** :config: the file, and each warning about it (the daemon's, then the keymap's). */
+  private showConfig(): void {
+    const { config } = this.store.getConfig();
+    if (!config) return this.toast("info", "The daemon has not sent its config");
+    // The keymap's own first: only this TUI can tell them; `todo config
+    // check` lists the daemon's.
+    const warnings = [
+      ...this.state.keymap.warnings.map((w) => `keymap ${JSON.stringify(w.keys)}: ${w.message}`),
+      ...config.warnings.map((w) => (w.key ? `${w.key}: ${w.message}` : w.message)),
+    ];
+    const file = config.exists ? config.path : `${config.path} (none; the defaults apply)`;
+    if (!warnings.length) return this.toast("info", `${file} · no warnings`);
+    const more = warnings.length - 1;
+    const where = config.warnings.length ? "todo config check" : "the help (?)";
+    return this.toast("error", `${warnings.join(" · ")}${more ? ` · ${more + 1} warnings: ${where}` : ""}`);
+  }
+
   private runCommand(text: string): void | Promise<void> {
     const r = resolveCommand(text);
     if (r.kind === "message") return this.toast(r.level, r.text);
@@ -643,6 +723,8 @@ export class Controller {
         return this.toast("info", "Refreshed");
       case "search":
         return this.openSearch(r.args);
+      case "config":
+        return this.showConfig();
     }
   }
 
@@ -742,7 +824,7 @@ export class Controller {
   private navigate(scroll: (offset: number, max: number) => number, list: (l: ListState, ids: readonly string[]) => Resolved): void {
     const { mode } = this.state;
     if (mode.kind === "help") {
-      const max = Math.max(0, helpLines().length - this.height);
+      const max = Math.max(0, helpLines(this.state.keymap.bindings).length - this.height);
       return this.setMode({ kind: "help", scroll: clamp(scroll(mode.scroll, max), 0, max) });
     }
     if (this.state.focus === "detail") {
