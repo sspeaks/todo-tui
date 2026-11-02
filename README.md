@@ -12,9 +12,11 @@ done: filters, sorting and paging, the six default views and their counts in the
 API, and `todo status`. Milestone M4 (the TUI) is done: the views as tabs, a detail
 pane, one-key triage, quick-add with a live preview, undo, bulk actions on marked
 items, search and `$EDITOR` for descriptions; see [Using the TUI](#using-the-tui).
-Next come M5 (recurring items), M6 (config, export/import, backups, editing views)
-and M7 (the MCP server). The CLI captures, undoes and counts; listing, editing and
-completing items happen in the TUI.
+Milestone M5 (recurring items) is done: repeat rules with `@`, in captures and as
+a TUI key, the next instance created when you complete one, and done items archived
+after a week; see [Recurring items](#recurring-items). Next come M6 (config,
+export/import, backups, editing views) and M7 (the MCP server). The CLI captures,
+undoes and counts; listing, editing and completing items happen in the TUI.
 
 ## Quick start
 
@@ -140,6 +142,7 @@ the inner quotes.
 | `#<label>` | Label; repeat for more | `#home #errand` |
 | `~<person>` | Waiting on someone | `~dana`, `~"the vendor"` |
 | `>next`, `>someday` | Status instead of the default `inbox` | `>someday` |
+| `@<rule>` | Repeats ([Recurring items](#recurring-items)) | `@daily`, `@mon,thu`, `@15th`, `@2w` |
 | `\` | Escapes a sigil so it stays in the title | `fix \#1 fan` |
 
 Everything else is the title. A capture that is only tokens (`todo add '+2 #home'`)
@@ -322,12 +325,13 @@ key hints) and a message line for prompts and results.
 | `s` | Set the status: `i` inbox, `n` next, `p` in progress, `s` someday, `d` done, `c` cancelled |
 | `x`, `X` | Mark done; mark cancelled |
 | `t` | Edit the labels |
+| `@` | Set the repeat rule; empty stops it |
 | `z` | Archive / unarchive |
 | `dd` | Delete, with its subtasks (asks first: `y` deletes) |
 | **Marks and bulk** | |
 | `m` | Mark or unmark the item, and move down |
 | `V` | Mark the rows you move over; `V` or `esc` ends it |
-| `x X s p ^ D w W t z dd` | With marks: act on every marked item at once, as one undo step (`t` then takes `+a -b` to add and remove labels) |
+| `x X s p ^ D w W t z dd @` | With marks: act on every marked item at once, as one undo step (`t` then takes `+a -b` to add and remove labels) |
 | **Search** | |
 | `/` | Narrow this view as you type; `enter` keeps it, `esc` clears it |
 | `:search <words>` | Search everything, done, archived and deferred items too, in a `Search:` tab |
@@ -389,6 +393,54 @@ itself unless it is already set, so the TUI starts that `todo`'s daemon. Under
 `pnpm -C tui dev` with neither, it stops with
 `todo-tui: cannot run todo: spawn todo ENOENT`. Give `TODO_BIN` as an absolute path:
 `pnpm -C tui dev` runs from `tui/`, so a relative one does not resolve.
+
+### Recurring items
+
+An `@` token in a capture makes the item repeat:
+
+| Rule | Repeats |
+|---|---|
+| `@daily` | Every day |
+| `@weekdays` | Monday to Friday |
+| `@mon,thu` | On those weekdays (each 3+ letters) |
+| `@weekly`, `@monthly` | On the weekday, or the day of the month, of its `^` date (else today) |
+| `@15th` | That day of every month, or the month's last day when it is shorter (`@31st`) |
+| `@3d`, `@2w` | That long after you complete the previous one |
+
+Without a `^` date, the first date on the schedule becomes its due date (an `@3d` or
+`@2w` item has none; the next one is due that long after you complete it). `todo add`
+prints the rule as a token, a `weekly` or `monthly` with its day:
+
+```console
+$ todo add 'water plants @mon,thu'
+KFXWF8X6  water plants  ^2026-11-02 @mon,thu
+$ todo add 'review budget ^fri @weekly'
+YKZ4GCVW  review budget  ^2026-11-06 @fri
+```
+
+A rule that does not parse stays in the title, with
+`todo: warning: @home: not a repeat rule`; an `@` inside a word (`bob@x.com`) is
+title text, and `\@` escapes one.
+
+In the TUI, `@` sets the rule of the selected item (or the marked ones), prefilled
+with its rule (`mon,thu`) and previewed (`→ every Mon, Thu · first Mon Nov 2`).
+`enter` on an empty line stops the repeat. The details show it as `Repeats`, and the
+row has a `🔁`.
+
+`x` (or `X`, which skips one) creates the next instance, with the same title,
+priority, labels and rule, and the message line says when:
+`mark done "water plants" · next Thu Nov 5 · u undo`. If you were late, the dates you
+missed are skipped: the next one is never before today. Unless that is today, it is
+deferred until its day, so it stays out of the views until then (`:search` finds it). One `u` undoes
+both, reopening the item and removing the next one. To end a series, stop its repeat
+with `@`, or delete the open instance with `dd` (`u` brings it back, and the series
+with it). Changing the rule changes the open instance and keeps its due date; the ones you
+completed keep theirs. `@` on a done or cancelled item is refused: reopen it first.
+
+Done and cancelled items, recurring or not, show in the Archive tab straight away,
+and the daemon archives them 7 days after they closed. A `z` after closing one
+sticks: unarchived, it is not archived again until you close it again. Reopening an
+item it archived takes it out of the archive.
 
 ### The daemon
 
