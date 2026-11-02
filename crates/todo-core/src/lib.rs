@@ -9,6 +9,7 @@ pub mod ids;
 pub mod inverse;
 pub mod item;
 pub mod mutation;
+pub mod query;
 pub mod recurrence;
 pub mod relation;
 pub mod status;
@@ -30,6 +31,7 @@ pub use mutation::{
     Actor, Applied, ApplyCtx, FieldChange, FieldRestore, FieldUpdate, Mutation, MutationError,
     MutationOp, RestoreSkip, RestoreUnit, SkipReason, apply,
 };
+pub use query::{MAX_QUERY_BYTES, ParsedQuery, Query, QueryError, parse_query, print_query};
 pub use recurrence::{
     InvalidRule, Rule, RuleError, RuleSpec, Weekday, first_on_or_after, next_after, next_instance,
     parse_rule, resolve,

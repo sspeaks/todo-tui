@@ -6,7 +6,7 @@ import { DateSchema } from "./gen/google/type/date_pb.js";
 import { type MutationResultSchema, type PersonRef, PersonRefSchema, Topic } from "./gen/todo/v1/common_pb.js";
 import { BackupConfigSchema, type ConfigSnapshot, ConfigSnapshotSchema, UiConfigSchema } from "./gen/todo/v1/config_pb.js";
 import { ItemField } from "./gen/todo/v1/field_pb.js";
-import { type Filter, FilterSchema, type OperandSchema, Operator, RelativeDate_Anchor } from "./gen/todo/v1/filter_pb.js";
+import { type Filter, FilterSchema, type OperandSchema, Operator, RelativeDate_Anchor, type SortKey, SortKeySchema } from "./gen/todo/v1/filter_pb.js";
 import {
   ArchiveReason,
   ArchivedSchema,
@@ -48,11 +48,11 @@ import { OpKind, type OpSummary, OpSummarySchema, type UndoSkip, UndoSkipReason,
 import { type Relation, RelationKind, RelationSchema } from "./gen/todo/v1/relation_pb.js";
 import { SystemService } from "./gen/todo/v1/system_service_pb.js";
 import { type View, ViewSchema } from "./gen/todo/v1/view_pb.js";
-import { ViewService } from "./gen/todo/v1/view_service_pb.js";
+import { type ParseQueryRequest, type ParseQueryResponseSchema, ViewService } from "./gen/todo/v1/view_service_pb.js";
 import { type Change, ChangeSchema, type SubscribeResponse, SubscribeResponseSchema, WatchService } from "./gen/todo/v1/watch_service_pb.js";
 import { parseCaptureText } from "./capture.js";
 import { civil, dayIn, dayOf, epochMs, isDate, parseDateExpr, protoDate, rustTrim, weekday } from "./dates.js";
-import { defaultViews } from "./default-views.js";
+import { DEFAULT_QUERIES, defaultViews } from "./default-views.js";
 import {
   type FilterProblem,
   checkFilter,
@@ -423,7 +423,7 @@ export class FakeDaemon {
   maxPageSize = MAX_PAGE_SIZE;
   /** Runs before every ListItems; throw from it to fail that call. */
   onListItems: ((req: ListItemsRequest) => void) | undefined;
-  apiMinor = 9;
+  apiMinor = 10;
   /** What GetConfig serves; change it with {@link setConfig}. */
   config: ConfigSnapshot = defaultConfig();
   readonly calls = { listItems: 0, listViews: 0, getStatusCounts: 0, subscribe: [] as (bigint | undefined)[] };
@@ -435,6 +435,8 @@ export class FakeDaemon {
   private readonly requests = new Map<string, Recorded>();
   /** Captures by spool_id (upper case), for replays. */
   private readonly spools = new Map<string, Recorded>();
+  /** What ParseQuery reads, by text: the default views' and defineQuery's. */
+  private readonly queries = new Map<string, { filter: Filter; sort: SortKey[]; showCount: boolean }>();
   /** Every relation, by relationKey. */
   private readonly relations = new Map<string, Relation>();
   private nextId = 0;
@@ -456,6 +458,7 @@ export class FakeDaemon {
     this.now = options.now ?? (() => new Date());
     this.timeZone = options.timeZone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
     this.seedViews();
+    for (const [i, init] of defaultViews().entries()) this.defineQuery(DEFAULT_QUERIES[i] ?? "", init);
     for (const init of initial) this.put(init);
     // A parent seeded after its subtasks counts them too.
     for (const item of this.items.values()) this.hierarchy(item);
@@ -541,6 +544,7 @@ export class FakeDaemon {
           this.calls.listViews++;
           return { views: this.tabOrder(), revision: this.revision };
         },
+        parseQuery: (req) => this.parseQuery(req),
       });
       const self = this;
       service(WatchService, {
@@ -633,14 +637,22 @@ export class FakeDaemon {
     if (prev?.parentId !== undefined && this.items.has(prev.parentId)) this.reemit(prev.parentId);
   }
 
-  /** Changes a saved view and publishes its Change, as an edit will (views are read-only over the API until M6). */
+  /**
+   * Changes a saved view and publishes its Change, as an edit will (views are read-only over the API until M6). A
+   * patch that changes the filter, sort or count flag must give the query text too, which ParseQuery then reads
+   * back, since the fake cannot print a filter.
+   */
   updateView(id: string, patch: MessageInitShape<typeof ViewSchema>): View {
+    if (("filter" in patch || "sort" in patch || "showCount" in patch) && patch.query === undefined) {
+      throw new Error("updateView: give the query text of the new filter, sort or count flag");
+    }
     const prev = this.views.get(id);
     if (!prev) throw new Error(`no view ${id}`);
     const fields = create(ViewSchema, patch) as unknown as Fields;
     const view = clone(ViewSchema, prev);
     for (const k of Object.keys(patch)) (view as unknown as Fields)[k] = fields[k];
     Object.assign(view, { id, revision: ++this.revision, updatedAt: this.stamp() });
+    if (patch.query !== undefined) this.defineQuery(view.query, view);
     this.views.set(id, view);
     this.publish({ revision: view.revision, topic: Topic.VIEW, id, resource: { case: "view", value: view } });
     return view;
@@ -725,6 +737,31 @@ export class FakeDaemon {
       this.views.set(view.id, view);
       this.publish({ revision: view.revision, topic: Topic.VIEW, id: view.id, resource: { case: "view", value: view } });
     }
+  }
+
+  /**
+   * Query text a test parses, as the daemon would read it. ParseQuery knows
+   * the default views' text and what {@link defineQuery} adds; any other
+   * text is one error over all of it, since the grammar is the daemon's.
+   */
+  defineQuery(text: string, query: { filter?: MessageInitShape<typeof FilterSchema>; sort?: MessageInitShape<typeof SortKeySchema>[]; showCount?: boolean }): void {
+    this.queries.set(text, { filter: create(FilterSchema, query.filter ?? {}), sort: (query.sort ?? []).map((k) => create(SortKeySchema, k)), showCount: query.showCount ?? true });
+  }
+
+  /** ParseQuery from {@link queries}. */
+  private parseQuery(req: ParseQueryRequest): MessageInitShape<typeof ParseQueryResponseSchema> {
+    this.check();
+    if (new TextEncoder().encode(req.text).length > 4096) throw badRequest("text", "is longer than 4096 bytes");
+    const known = this.queries.get(req.text);
+    // As the daemon, the count flag is answered even beside errors.
+    if (!known) return { errors: [{ start: 0, end: [...req.text].length, message: "fake: unknown query" }], showCount: !/(^|\s)count:off(\s|$)/i.test(req.text) };
+    const today = this.referenceDay(req.referenceTime);
+    return {
+      filter: known.filter,
+      sort: known.sort,
+      showCount: known.showCount,
+      ...(req.count && { count: this.passing(known.filter, today).length }),
+    };
   }
 
   /** Every view in tab order. */

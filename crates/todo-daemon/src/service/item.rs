@@ -720,7 +720,10 @@ fn check_capture_length(text: &str) -> Result<(), Status> {
 
 /// A request's reference time in `now`'s zone: `reference_time` if set and
 /// storable, else `now`.
-fn reference_time(t: Option<&prost_types::Timestamp>, now: &Zoned) -> Result<Zoned, Status> {
+pub(crate) fn reference_time(
+    t: Option<&prost_types::Timestamp>,
+    now: &Zoned,
+) -> Result<Zoned, Status> {
     let Some(t) = t else {
         return Ok(now.clone());
     };

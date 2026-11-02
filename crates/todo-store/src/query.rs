@@ -772,6 +772,11 @@ fn select(filter: &Resolved, keys: &[SortKey], cursor: Option<&[Value]>, limit: 
     sql
 }
 
+/// How many Items `filter` lists on its today, as a view's tab count.
+pub(crate) fn count_tx(conn: &Connection, filter: &Resolved) -> Result<u32> {
+    count(conn, filter)
+}
+
 /// How many Items `filter` passes.
 fn count(conn: &Connection, filter: &Resolved) -> Result<u32> {
     let mut sql = Sql::default();

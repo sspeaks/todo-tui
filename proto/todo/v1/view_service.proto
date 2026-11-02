@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package todo.v1;
 
+import "google/protobuf/timestamp.proto";
+import "todo/v1/filter.proto";
 import "todo/v1/view.proto";
 
 // Saved views (design 2.4, 4.3). The defaults are seeded into every
@@ -9,6 +11,10 @@ import "todo/v1/view.proto";
 service ViewService {
   // Every view, in tab order (position).
   rpc ListViews(ListViewsRequest) returns (ListViewsResponse);
+  // Reads query text (design 4.8 "Query text"), as :view new and :view edit
+  // take it, into a filter and sort. A problem with the text is an error in
+  // the response, with its span, not a failed call.
+  rpc ParseQuery(ParseQueryRequest) returns (ParseQueryResponse);
 }
 
 message ListViewsRequest {}
@@ -17,4 +23,34 @@ message ListViewsResponse {
   repeated View views = 1;
   // The revision this was read at.
   uint64 revision = 2;
+}
+
+message ParseQueryRequest {
+  // At most 4096 bytes of UTF-8 (INVALID_ARGUMENT on text otherwise).
+  string text = 1;
+  // "Now", for today in count; defaults to the daemon's clock.
+  google.protobuf.Timestamp reference_time = 2;
+  // Also count the Items the query lists, as a view would.
+  bool count = 3;
+}
+
+message ParseQueryResponse {
+  // Set only when errors is empty.
+  Filter filter = 1;
+  repeated SortKey sort = 2;
+  // False with count:off.
+  bool show_count = 3;
+  // In text order.
+  repeated QueryError errors = 4;
+  // With count and no errors: the Items the filter lists on today.
+  optional uint32 count = 5;
+}
+
+// A problem with a span of query text.
+message QueryError {
+  // Offset of the first character, in Unicode code points.
+  uint32 start = 1;
+  // Exclusive end, in Unicode code points.
+  uint32 end = 2;
+  string message = 3;
 }

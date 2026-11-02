@@ -68,5 +68,19 @@ export function defaultViews(): MessageInitShape<typeof ViewSchema>[] {
       false,
     ],
   ];
-  return rows.map(([seed, name, filter, sort, showCount], position) => ({ name, filter, sort, showCount, position, seed }));
+  return rows.map(([seed, name, filter, sort, showCount], position) => ({ name, filter, sort, showCount, position, seed, query: DEFAULT_QUERIES[position] }));
 }
+
+/**
+ * The default views' query text (design 4.8), as todo_core::print_query
+ * writes it, in tab order. FakeDaemon parses only these (and what a test
+ * defines): the grammar is the daemon's alone.
+ */
+export const DEFAULT_QUERIES: readonly string[] = [
+  "is:inbox sort:created_at",
+  "any:(due_date<=today is:in_progress (has:waiting waiting.follow_up_on<=today) focus_week:=this_week) sort:-is_overdue,-effective_priority,due_date",
+  "is:next,in_progress sort:-effective_priority,due_date",
+  "has:waiting sort:waiting.since",
+  "is:someday sort:-updated_at count:off",
+  "any:(has:archived is:done,cancelled) include:archived,done,deferred sort:-updated_at count:off",
+];

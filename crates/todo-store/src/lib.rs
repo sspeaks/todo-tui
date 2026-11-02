@@ -798,6 +798,12 @@ impl Store {
         self.read(view::list_views_tx).await
     }
 
+    /// How many Items a resolved filter lists, as [`Store::list_items`]
+    /// would: a view's tab count.
+    pub async fn count_items(&self, filter: todo_core::Resolved) -> Result<u32> {
+        self.read(move |conn| query::count_tx(conn, &filter)).await
+    }
+
     /// The status counts on `today` and, with `include_views`, the count of
     /// each view whose `show_count` is set, all read at one revision. A
     /// view's count is the number of Items [`Store::list_items`] lists for

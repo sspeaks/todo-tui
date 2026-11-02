@@ -354,7 +354,7 @@ impl ValueClass {
     }
 
     /// Whether LT, LE, GT and GE apply.
-    fn is_ordered(self) -> bool {
+    pub(crate) fn is_ordered(self) -> bool {
         matches!(
             self,
             ValueClass::Priority

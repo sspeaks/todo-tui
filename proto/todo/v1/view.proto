@@ -31,4 +31,7 @@ message View {
   uint64 revision = 8;
   google.protobuf.Timestamp created_at = 9;
   google.protobuf.Timestamp updated_at = 10;
+  // The filter, sort and count flag as query text (design 4.8), which
+  // ParseQuery reads back: what :view edit starts from. Output only.
+  string query = 11;
 }

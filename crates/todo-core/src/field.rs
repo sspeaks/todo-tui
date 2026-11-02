@@ -79,6 +79,88 @@ pub enum ItemField {
 }
 
 impl ItemField {
+    /// The field's path in `todo.v1.Item` (a `FieldMask` path), which is
+    /// also its name in query text: `due_date`, `waiting.on`.
+    pub fn path(self) -> &'static str {
+        match self {
+            ItemField::Id => "id",
+            ItemField::CreatedVia => "created_via",
+            ItemField::CreatedAt => "created_at",
+            ItemField::UpdatedAt => "updated_at",
+            ItemField::Revision => "revision",
+            ItemField::RemoteLink => "remote_link",
+            ItemField::Title => "title",
+            ItemField::Description => "description",
+            ItemField::ItemType => "item_type",
+            ItemField::StatusCategory => "status_category",
+            ItemField::ResolutionKind => "resolution_kind",
+            ItemField::RemoteStatusName => "remote_status_name",
+            ItemField::Priority => "priority",
+            ItemField::Assignee => "assignee",
+            ItemField::Reporter => "reporter",
+            ItemField::Labels => "labels",
+            ItemField::Components => "components",
+            ItemField::FixVersions => "fix_versions",
+            ItemField::DueDate => "due_date",
+            ItemField::ParentId => "parent_id",
+            ItemField::Sprint => "sprint",
+            ItemField::StoryPoints => "story_points",
+            ItemField::OriginalEstimate => "original_estimate",
+            ItemField::RemainingEstimate => "remaining_estimate",
+            ItemField::Resolution => "resolution",
+            ItemField::RemoteCreatedAt => "remote_created_at",
+            ItemField::RemoteUpdatedAt => "remote_updated_at",
+            ItemField::TodoRefinement => "todo_refinement",
+            ItemField::Waiting => "waiting",
+            ItemField::DeferUntil => "defer_until",
+            ItemField::PrivateNotes => "private_notes",
+            ItemField::FocusWeek => "focus_week",
+            ItemField::LocalPriorityOverride => "local_priority_override",
+            ItemField::Archived => "archived",
+            ItemField::Recurrence => "recurrence",
+            ItemField::RemoteExtras => "remote_extras",
+            ItemField::Status => "status",
+            ItemField::EffectivePriority => "effective_priority",
+            ItemField::IsMine => "is_mine",
+            ItemField::PendingFields => "pending_fields",
+            ItemField::HasConflict => "has_conflict",
+            ItemField::HasPushFailure => "has_push_failure",
+            ItemField::DescriptionLossy => "description_lossy",
+            ItemField::DescriptionDirty => "description_dirty",
+            ItemField::Staleness => "staleness",
+            ItemField::Scopes => "scopes",
+            ItemField::DeletedAt => "deleted_at",
+            ItemField::MergedInto => "merged_into",
+            ItemField::IsOverdue => "is_overdue",
+            ItemField::WaitingOn => "waiting.on",
+            ItemField::WaitingReason => "waiting.reason",
+            ItemField::WaitingSince => "waiting.since",
+            ItemField::WaitingFollowUpOn => "waiting.follow_up_on",
+            ItemField::ArchivedAt => "archived.at",
+            ItemField::ArchivedReason => "archived.reason",
+            ItemField::RemoteLinkTrackerKind => "remote_link.tracker_kind",
+            ItemField::RemoteLinkInstanceId => "remote_link.instance_id",
+            ItemField::RemoteLinkRemoteId => "remote_link.remote_id",
+            ItemField::RemoteLinkKey => "remote_link.key",
+            ItemField::RemoteLinkUrl => "remote_link.url",
+            ItemField::RemoteLinkLastPulledVersion => "remote_link.last_pulled_version",
+            ItemField::RemoteLinkLinkState => "remote_link.link_state",
+            ItemField::RemoteLinkPinned => "remote_link.pinned",
+            ItemField::RecurrenceSeriesId => "recurrence.series_id",
+            ItemField::RecurrenceOccurrenceDate => "recurrence.occurrence_date",
+            ItemField::StalenessLastUserTouchAt => "staleness.last_user_touch_at",
+            ItemField::StalenessLastRemoteChangeAt => "staleness.last_remote_change_at",
+            ItemField::StalenessStatusEnteredAt => "staleness.status_entered_at",
+            ItemField::StalenessWaitingSince => "staleness.waiting_since",
+        }
+    }
+
+    /// The field whose [`ItemField::path`] is `path`; `None` for an unknown
+    /// path.
+    pub fn from_path(path: &str) -> Option<ItemField> {
+        ItemField::ALL.iter().copied().find(|f| f.path() == path)
+    }
+
     pub const ALL: &[ItemField] = &[
         ItemField::Id,
         ItemField::CreatedVia,

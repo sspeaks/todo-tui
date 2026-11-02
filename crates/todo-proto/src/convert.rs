@@ -1145,6 +1145,11 @@ impl From<&core::View> for v1::View {
             revision: v.revision,
             created_at: v.created_at.map(timestamp_to_proto),
             updated_at: v.updated_at.map(timestamp_to_proto),
+            query: core::print_query(&core::Query {
+                filter: v.filter.clone(),
+                sort: v.sort.clone(),
+                show_count: v.show_count,
+            }),
         }
     }
 }
@@ -1182,86 +1187,12 @@ impl TryFrom<&v1::View> for core::View {
 /// The `FieldMask` path of `field`: its `todo.v1.Item` field name, dotted
 /// for a field inside an Item sub-message (`waiting.follow_up_on`).
 pub fn item_field_path(field: core::ItemField) -> &'static str {
-    use core::ItemField as F;
-    match field {
-        F::Id => "id",
-        F::CreatedVia => "created_via",
-        F::CreatedAt => "created_at",
-        F::UpdatedAt => "updated_at",
-        F::Revision => "revision",
-        F::RemoteLink => "remote_link",
-        F::Title => "title",
-        F::Description => "description",
-        F::ItemType => "item_type",
-        F::StatusCategory => "status_category",
-        F::ResolutionKind => "resolution_kind",
-        F::RemoteStatusName => "remote_status_name",
-        F::Priority => "priority",
-        F::Assignee => "assignee",
-        F::Reporter => "reporter",
-        F::Labels => "labels",
-        F::Components => "components",
-        F::FixVersions => "fix_versions",
-        F::DueDate => "due_date",
-        F::ParentId => "parent_id",
-        F::Sprint => "sprint",
-        F::StoryPoints => "story_points",
-        F::OriginalEstimate => "original_estimate",
-        F::RemainingEstimate => "remaining_estimate",
-        F::Resolution => "resolution",
-        F::RemoteCreatedAt => "remote_created_at",
-        F::RemoteUpdatedAt => "remote_updated_at",
-        F::TodoRefinement => "todo_refinement",
-        F::Waiting => "waiting",
-        F::DeferUntil => "defer_until",
-        F::PrivateNotes => "private_notes",
-        F::FocusWeek => "focus_week",
-        F::LocalPriorityOverride => "local_priority_override",
-        F::Archived => "archived",
-        F::Recurrence => "recurrence",
-        F::RemoteExtras => "remote_extras",
-        F::Status => "status",
-        F::EffectivePriority => "effective_priority",
-        F::IsMine => "is_mine",
-        F::PendingFields => "pending_fields",
-        F::HasConflict => "has_conflict",
-        F::HasPushFailure => "has_push_failure",
-        F::DescriptionLossy => "description_lossy",
-        F::DescriptionDirty => "description_dirty",
-        F::Staleness => "staleness",
-        F::Scopes => "scopes",
-        F::DeletedAt => "deleted_at",
-        F::MergedInto => "merged_into",
-        F::IsOverdue => "is_overdue",
-        F::WaitingOn => "waiting.on",
-        F::WaitingReason => "waiting.reason",
-        F::WaitingSince => "waiting.since",
-        F::WaitingFollowUpOn => "waiting.follow_up_on",
-        F::ArchivedAt => "archived.at",
-        F::ArchivedReason => "archived.reason",
-        F::RemoteLinkTrackerKind => "remote_link.tracker_kind",
-        F::RemoteLinkInstanceId => "remote_link.instance_id",
-        F::RemoteLinkRemoteId => "remote_link.remote_id",
-        F::RemoteLinkKey => "remote_link.key",
-        F::RemoteLinkUrl => "remote_link.url",
-        F::RemoteLinkLastPulledVersion => "remote_link.last_pulled_version",
-        F::RemoteLinkLinkState => "remote_link.link_state",
-        F::RemoteLinkPinned => "remote_link.pinned",
-        F::RecurrenceSeriesId => "recurrence.series_id",
-        F::RecurrenceOccurrenceDate => "recurrence.occurrence_date",
-        F::StalenessLastUserTouchAt => "staleness.last_user_touch_at",
-        F::StalenessLastRemoteChangeAt => "staleness.last_remote_change_at",
-        F::StalenessStatusEnteredAt => "staleness.status_entered_at",
-        F::StalenessWaitingSince => "staleness.waiting_since",
-    }
+    field.path()
 }
 
 /// The field a `FieldMask` path names; `None` for an unknown path.
 pub fn item_field_from_path(path: &str) -> Option<core::ItemField> {
-    core::ItemField::ALL
-        .iter()
-        .copied()
-        .find(|&f| item_field_path(f) == path)
+    core::ItemField::from_path(path)
 }
 
 // ---- undo ---------------------------------------------------------------

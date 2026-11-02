@@ -23,12 +23,12 @@ use todo_proto::v1::{
     DeleteItemRequest, FieldValue, Filter, GetConfigRequest, GetItemRequest, GetServerInfoRequest,
     GetStatusCountsRequest, GetUndoStateRequest, Item, ItemField, ListItemsRequest,
     ListViewsRequest, Mutation, MutationResult, OpKind, Operand, Operator, ParseCaptureRequest,
-    ParseDateRequest, ParseRecurrenceRequest, PersonRef, Predicate, Priority, RecurrenceRule,
-    RedoRequest, RedoResponse, Relation, RelationKind, ReloadConfigRequest, RemoveRelationRequest,
-    SetRecurrenceRequest, SetStatusRequest, ShutdownRequest, SortKey, Status, SubscribeRequest,
-    SubscribeResponse, Topic, UnarchiveItemRequest, UndeleteItemRequest, UndoRequest, UndoResponse,
-    UndoSkip, UndoSkipReason, UpdateItemRequest, View, Weekday, clause, field_value, mutation,
-    operand, person_ref, recurrence_rule, subscribe_response::Message,
+    ParseDateRequest, ParseQueryRequest, ParseRecurrenceRequest, PersonRef, Predicate, Priority,
+    RecurrenceRule, RedoRequest, RedoResponse, Relation, RelationKind, ReloadConfigRequest,
+    RemoveRelationRequest, SetRecurrenceRequest, SetStatusRequest, ShutdownRequest, SortKey,
+    Status, SubscribeRequest, SubscribeResponse, Topic, UnarchiveItemRequest, UndeleteItemRequest,
+    UndoRequest, UndoResponse, UndoSkip, UndoSkipReason, UpdateItemRequest, View, Weekday, clause,
+    field_value, mutation, operand, person_ref, recurrence_rule, subscribe_response::Message,
 };
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -300,7 +300,7 @@ async fn handshake_reports_version_and_api_minor() {
         .into_inner();
     assert_eq!(info.daemon_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(info.api_minor, todo_proto::API_MINOR);
-    assert_eq!(info.api_minor, 9);
+    assert_eq!(info.api_minor, 10);
     d.stop().await;
 }
 
@@ -4529,5 +4529,96 @@ async fn a_restart_streams_the_config_it_read() {
     assert_eq!(revision, STARTED + 1);
     assert_eq!(config.ui.unwrap().archive_done_after_days, 4);
     assert!(matches!(next(&mut stream).await, Message::CaughtUp(c) if c.revision == STARTED + 1));
+    d.stop().await;
+}
+
+async fn parse_query(
+    d: &TestDaemon,
+    text: &str,
+    count: bool,
+) -> todo_proto::v1::ParseQueryResponse {
+    ViewServiceClient::new(d.channel().await)
+        .parse_query(ParseQueryRequest {
+            text: text.to_owned(),
+            reference_time: None,
+            count,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn parse_query_reads_text_and_counts_what_it_lists() {
+    let d = start().await;
+    let mut items = d.items().await;
+    for text in ["a #work >next", "b #work", "c >next"] {
+        capture(&mut items, text).await;
+    }
+    let res = parse_query(&d, "is:next #work sort:-created_at count:off", true).await;
+    assert_eq!(res.errors, vec![]);
+    assert_eq!(res.count, Some(1));
+    assert!(!res.show_count);
+    assert_eq!(res.sort.len(), 1);
+    assert_eq!(res.filter.as_ref().unwrap().all_of.len(), 2);
+    // The filter it answers lists what it counted.
+    let listed = items
+        .list_items(ListItemsRequest {
+            filter: res.filter,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .items;
+    let titles: Vec<_> = listed.iter().map(|i| i.title.as_str()).collect();
+    assert_eq!(titles, ["a"]);
+    assert_eq!(parse_query(&d, "#work", false).await.count, None);
+
+    // A problem is an error with its span, in code points; nothing else.
+    let res = parse_query(&d, "ü dew:1", true).await;
+    assert_eq!(res.filter, None);
+    assert_eq!(res.count, None);
+    let spans: Vec<_> = res
+        .errors
+        .iter()
+        .map(|e| (e.start, e.end, e.message.as_str()))
+        .collect();
+    assert_eq!(spans, [(2, 7, "unknown field \"dew\"")]);
+
+    let err = ViewServiceClient::new(d.channel().await)
+        .parse_query(ParseQueryRequest {
+            text: "a".repeat(4097),
+            reference_time: None,
+            count: false,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument);
+    d.stop().await;
+}
+
+/// Each view carries its query text, which ParseQuery reads back to it.
+#[tokio::test(flavor = "multi_thread")]
+async fn views_carry_their_query_text() {
+    let d = start().await;
+    let views = ViewServiceClient::new(d.channel().await)
+        .list_views(ListViewsRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .views;
+    assert_eq!(views[0].query, "is:inbox sort:created_at");
+    assert_eq!(
+        views[5].query,
+        "any:(has:archived is:done,cancelled) include:archived,done,deferred sort:-updated_at count:off"
+    );
+    for view in &views {
+        let res = parse_query(&d, &view.query, false).await;
+        assert_eq!(res.errors, vec![], "{}", view.name);
+        assert_eq!(res.filter, view.filter, "{}", view.name);
+        assert_eq!(res.sort, view.sort, "{}", view.name);
+        assert_eq!(res.show_count, view.show_count, "{}", view.name);
+    }
     d.stop().await;
 }

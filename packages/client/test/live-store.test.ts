@@ -515,7 +515,7 @@ describe("LiveStore saved views, counts and paging", () => {
     expect(narrowed.getSnapshot().items.map((i) => i.title)).toEqual(["next"]);
 
     const calls = daemon.calls.listItems;
-    daemon.updateView(next.id, { filter: statusIn(Status.INBOX) });
+    daemon.updateView(next.id, { filter: statusIn(Status.INBOX), query: "is:inbox sort:-effective_priority,due_date" });
     await waitFor(() => narrowed.getSnapshot().items[0]?.title === "inboxed");
     await sleep(40);
     expect(daemon.calls.listItems).toBe(calls + 1);
@@ -526,7 +526,7 @@ describe("LiveStore saved views, counts and paging", () => {
     // No re-query within the test: what the views show comes from the store.
     const { daemon, store } = setup(2, { debounceMs: 60_000 });
     const inbox = saved(daemon, "inbox");
-    daemon.updateView(inbox.id, { filter: { ...statusIn(Status.INBOX), includeDeleted: true } });
+    daemon.updateView(inbox.id, { filter: { ...statusIn(Status.INBOX), includeDeleted: true }, query: "is:inbox include:deleted sort:created_at" });
     const items = createClient(ItemService, daemon.transport);
     const withDeleted = store.view({ viewId: inbox.id });
     const plain = store.view({ filter: statusIn(Status.INBOX) });
@@ -565,7 +565,7 @@ describe("LiveStore saved views, counts and paging", () => {
     await sleep(40);
     expect(daemon.calls.getStatusCounts).toBe(calls + 1);
     // So do view changes.
-    daemon.updateView(inbox, { showCount: false });
+    daemon.updateView(inbox, { showCount: false, query: "is:inbox sort:created_at count:off" });
     await waitFor(() => !store.getCounts().views.has(inbox));
 
     unsubscribe();
