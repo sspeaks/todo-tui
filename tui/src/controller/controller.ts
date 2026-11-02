@@ -490,7 +490,8 @@ export class Controller {
    * view, drops the marks whose Item left it, and pins its selection, so
    * that a later change starts from where this one left it and background
    * changes never move the selection. An open repeat prompt previews
-   * again when the due date it resolves against moved.
+   * again when the day it resolves against (the due date, else today)
+   * moved.
    */
   private sync(): void {
     this.prompts.sync();

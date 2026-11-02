@@ -1,6 +1,7 @@
 import { Status, Weekday, setRecurrence, setStatus, updateItem } from "@todo-tui/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fakeDaemon, item, rows } from "../fake.test-util.js";
+import { MIDNIGHT_POLL_MS } from "./controller.js";
 import { setup, stopControllers } from "./setup.test-util.js";
 
 afterEach(async () => {
@@ -139,6 +140,30 @@ describe("@", () => {
     expect((await prompt(t)).preview?.text).toBe("→ every Thu · first Thu Oct 29");
     await t.c.press("<enter>");
     expect(t.byTitle("X")?.recurrence?.rule?.kind).toMatchObject({ case: "weekly", value: { days: [Weekday.THURSDAY] } });
+  });
+
+  it("saves weekly on an Item with no due date on the day shown, though midnight passed since; the poll's new today previews again", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    let now = new Date(Date.UTC(2026, 9, 26, 23, 59));
+    const t = await setup(fakeDaemon([item("X"), item("Y")], { now: () => now, timeZone: "UTC" }), { now: () => now });
+    await vi.waitFor(() => expect(t.store.getCounts().today).toMatchObject(date(26)));
+    const [x, y] = [t.byTitle("X")!.id, t.byTitle("Y")!.id];
+    await t.c.press("@weekly");
+    expect((await prompt(t)).preview?.text).toBe("→ every Mon · first Mon Oct 26");
+    // The daemon's midnight, before the poll has seen it: enter saves the Monday shown.
+    now = new Date(Date.UTC(2026, 9, 27, 0, 0, 30));
+    await t.c.press("<enter>");
+    expect(t.mode().kind).toBe("normal");
+    expect(t.daemon.items.get(x)?.recurrence?.rule?.kind).toMatchObject({ case: "weekly", value: { days: [Weekday.MONDAY] } });
+
+    await t.c.press("j@weekly");
+    expect((await prompt(t)).preview?.text).toBe("→ every Mon · first Mon Oct 26");
+    // The poll's refresh: the preview follows the new today, and enter saves it.
+    vi.advanceTimersByTime(MIDNIGHT_POLL_MS);
+    await vi.waitFor(() => expect(t.store.getCounts().today).toMatchObject(date(27)));
+    await vi.waitFor(async () => expect((await prompt(t)).preview?.text).toBe("→ every Tue · first Tue Oct 27"));
+    await t.c.press("<enter>");
+    expect(t.daemon.items.get(y)?.recurrence?.rule?.kind).toMatchObject({ case: "weekly", value: { days: [Weekday.TUESDAY] } });
   });
 
   it("keeps the prompt on enter when the Item read back is due on another day than the preview counted from", async () => {

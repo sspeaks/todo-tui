@@ -343,6 +343,23 @@ fn today() -> jiff::civil::Date {
     jiff::Zoned::now().date()
 }
 
+/// Waits out local midnight when it is under 30 s away, so that a test
+/// counting dates from `today()` sees the day the daemon's own clock does
+/// on every request it makes.
+async fn away_from_midnight() {
+    let now = jiff::Zoned::now();
+    let midnight = now
+        .date()
+        .tomorrow()
+        .unwrap()
+        .to_zoned(now.time_zone().clone())
+        .unwrap();
+    let left = now.duration_until(&midnight);
+    if left < SignedDuration::from_secs(30) {
+        tokio::time::sleep((left + SignedDuration::from_millis(50)).unsigned_abs()).await;
+    }
+}
+
 fn day_after(date: jiff::civil::Date, days: i64) -> jiff::civil::Date {
     date.checked_add(jiff::Span::new().days(days)).unwrap()
 }
@@ -358,6 +375,7 @@ fn summary_day(date: jiff::civil::Date) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn set_recurrence_sets_replaces_and_clears_a_rule() {
+    away_from_midnight().await;
     let d = start().await;
     let mut items = d.items().await;
     let x = capture(&mut items, "water plants").await;
@@ -673,6 +691,7 @@ async fn parse_recurrence_resolves_the_rule_grammar() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_capture_with_a_repeat_rule_starts_a_series() {
+    away_from_midnight().await;
     let d = start().await;
     let mut items = d.items().await;
     let res = items
@@ -707,6 +726,7 @@ async fn a_capture_with_a_repeat_rule_starts_a_series() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn completing_an_instance_returns_and_streams_the_next() {
+    away_from_midnight().await;
     let d = start().await;
     let mut items = d.items().await;
     let x = capture(&mut items, "water plants @daily").await;
@@ -777,6 +797,7 @@ async fn completing_an_instance_returns_and_streams_the_next() {
 #[tokio::test(flavor = "multi_thread")]
 async fn batch_mutate_reports_the_generated_instances_in_order() {
     use mutation::Kind;
+    away_from_midnight().await;
     let d = start().await;
     let mut items = d.items().await;
     let a = capture(&mut items, "a @daily").await;
@@ -826,7 +847,10 @@ async fn batch_mutate_reports_the_generated_instances_in_order() {
 }
 
 async fn start_with(options: DaemonOptions) -> TestDaemon {
-    let home = TempDir::new().unwrap();
+    start_with_in(TempDir::new().unwrap(), options).await
+}
+
+async fn start_with_in(home: TempDir, options: DaemonOptions) -> TestDaemon {
     let paths = paths_for(&home);
     let Started::Running(daemon) = Daemon::start_with(paths.clone(), options).await.unwrap() else {
         panic!("lock unexpectedly held");
@@ -943,6 +967,78 @@ async fn a_panicked_scheduler_is_restarted() {
     let archived = next_change_to(&mut stream, &a.id).await;
     let reason = archived.archived.as_ref().unwrap().reason;
     assert_eq!(reason, ArchiveReason::AutoDone as i32);
+    d.stop().await;
+}
+
+/// No user op after the close: the sweep it wakes is too early, so only
+/// a sweep on the interval archives it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_scheduler_sweeps_every_interval_unwoken() {
+    let d = start_with(DaemonOptions {
+        scheduler_interval: Duration::from_millis(20),
+        archive_done_after: SignedDuration::from_millis(300),
+        ..DaemonOptions::default()
+    })
+    .await;
+    let mut items = d.items().await;
+    let a = capture(&mut items, "a").await;
+    let mut stream = d
+        .subscribe(SubscribeRequest {
+            since_revision: Some(a.revision),
+            topics: vec![],
+        })
+        .await;
+    assert!(matches!(next(&mut stream).await, Message::CaughtUp(_)));
+    items
+        .set_status(status_req(&a.id, Status::Done))
+        .await
+        .unwrap();
+    assert_eq!(next_change_to(&mut stream, &a.id).await.archived, None);
+    let archived = next_change_to(&mut stream, &a.id).await;
+    let reason = archived.archived.as_ref().unwrap().reason;
+    assert_eq!(reason, ArchiveReason::AutoDone as i32);
+    d.stop().await;
+}
+
+/// A restart over an Item already due archives it with no user op: the
+/// interval is an hour, and GetItem wakes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_scheduler_sweeps_when_it_starts() {
+    let hour = DaemonOptions {
+        scheduler_interval: Duration::from_secs(3600),
+        archive_done_after: SignedDuration::from_hours(1),
+        ..DaemonOptions::default()
+    };
+    let d = start_with(hour).await;
+    let mut items = d.items().await;
+    let a = capture(&mut items, "a").await;
+    items
+        .set_status(status_req(&a.id, Status::Done))
+        .await
+        .unwrap();
+    assert_eq!(get(&mut items, &a.id).await.archived, None);
+    let home = d.stop().await;
+
+    let d = start_with_in(
+        home,
+        DaemonOptions {
+            archive_done_after: SignedDuration::ZERO,
+            ..hour
+        },
+    )
+    .await;
+    let mut items = d.items().await;
+    let archived = timeout(WAIT, async {
+        loop {
+            if let Some(archived) = get(&mut items, &a.id).await.archived {
+                return archived;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("never archived without a user op");
+    assert_eq!(archived.reason, ArchiveReason::AutoDone as i32);
     d.stop().await;
 }
 

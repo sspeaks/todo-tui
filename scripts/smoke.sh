@@ -386,10 +386,11 @@ else
   # when the next instance is and the row leaves the Inbox. The instance is
   # deferred to its day, so ListItems leaves it out (as it does the done
   # one); :search finds both, and the instance's detail shows where it
-  # came from and its Repeats line.
+  # came from and its Repeats line. Due tomorrow, so that the next one is
+  # after today though midnight passes between the add and the x.
   rhome=$root/recur
   new_home "$rhome"
-  out=$(TODO_TUI_HOME=$rhome "$TODO_BIN" add "smoke daily @daily")
+  out=$(TODO_TUI_HOME=$rhome "$TODO_BIN" add "smoke daily ^tomorrow @daily")
   re='^[0-9A-Z]{8}  smoke daily  \^[0-9]{4}-[0-9]{2}-[0-9]{2} @daily$'
   [[ $out =~ $re ]] || fail "unexpected add output: $out"
   tmx new-window -t tui -n recur -e "TODO_TUI_HOME=$rhome" -e "TODO_BIN=$TODO_BIN" -e "TODO_TUI_ENTRY=$TODO_TUI_ENTRY" \

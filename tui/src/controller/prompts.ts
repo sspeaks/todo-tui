@@ -17,8 +17,10 @@ import {
   type ParseDateResponse,
   type ParseRecurrenceResponse,
   type ProtoDate,
+  ProtoDateSchema,
   type RecurrenceRule,
   RecurrenceRuleSchema,
+  create,
   equals,
   errorReason,
   parseDate,
@@ -26,7 +28,7 @@ import {
   setRecurrence,
   updateItem,
 } from "@todo-tui/client";
-import { dayLabel, dayOf, isoDay } from "../format/dates.js";
+import { civil, dayLabel, dayOf, isoDay } from "../format/dates.js";
 import {
   applyLabelEdits,
   commonPrefix,
@@ -70,11 +72,28 @@ const sameDate = (a: ProtoDate | undefined, b: ProtoDate | undefined) =>
 const sameRule = (a: RecurrenceRule | undefined, b: RecurrenceRule | undefined) =>
   a === undefined || b === undefined ? a === b : equals(RecurrenceRuleSchema, a, b);
 
-/** What anchors an Item's weekly or monthly: its due date, else (none) today. */
-const anchorKey = (item: Item): string => (item.dueDate ? isoDay(dayOf(item.dueDate)) : "");
+/**
+ * What anchors an Item's weekly or monthly: its due date, else the
+ * daemon's `today`, so that the preview made before midnight is stale
+ * after it.
+ */
+const anchorKey = (item: Item, today: number): string => (item.dueDate ? isoDay(dayOf(item.dueDate)) : `today ${isoDay(today)}`);
 
 /** `weekly` or `monthly`, which take their day from the anchor; else undefined. */
 const onAnchor = (text: string): string | undefined => /^@?\s*(weekly|monthly)$/i.exec(text.trim())?.[1]?.toLowerCase();
+
+/**
+ * What `@` sends ParseRecurrence as the anchor for `item`: its due date;
+ * else, for weekly or monthly, the `today` the preview counted from, so
+ * that past the daemon's midnight, before the midnight poll sees it,
+ * enter still saves the day shown. Else none, and the daemon counts from
+ * its own today (a 3d then has no first date).
+ */
+function anchorOf(item: Item | undefined, text: string, today: number): ProtoDate | undefined {
+  if (item?.dueDate || !onAnchor(text)) return item?.dueDate;
+  const { year, month, day } = civil(today);
+  return create(ProtoDateSchema, { year, month, day });
+}
 
 /**
  * What `@` asks ParseRecurrence about: the text, the anchor, and whether
@@ -259,16 +278,19 @@ export class Prompts {
    */
   private repeatQuery(mode: Prompt): RepeatQuery {
     const items = this.bulk.items(mode.target);
-    const keys = new Set(items.map(anchorKey));
+    const today = this.c.today();
+    const keys = new Set(items.map((i) => anchorKey(i, today)));
     const mixed = keys.size > 1;
-    return { text: mode.line.text, anchor: mixed ? undefined : items[0]?.dueDate, mixed, key: mixed ? "*" : ([...keys][0] ?? "") };
+    const { text } = mode.line;
+    return { text, anchor: mixed ? undefined : anchorOf(items[0], text, today), mixed, key: mixed ? "*" : ([...keys][0] ?? "") };
   }
 
   /**
    * enter on weekly or monthly whose preview was made for another anchor
-   * than `key`, the one it saves against (a due date that moved, or an
-   * Item read back with one): shows the preview for it and keeps the
-   * prompt open, so what enter saves is what was shown. Else false.
+   * than `key`, the one it saves against (a due date that moved, an Item
+   * read back with one, or the today of an Item with none): shows the
+   * preview for it and keeps the prompt open, so what enter saves is what
+   * was shown. Else false.
    */
   private anchorMoved(mode: Prompt, key: string): boolean {
     const latest = this.latest(mode);
@@ -531,10 +553,11 @@ export class Prompts {
    */
   private async saveRepeat(mode: Prompt, item: Item): Promise<void> {
     const text = mode.line.text.trim();
-    if (this.anchorMoved(mode, anchorKey(item))) return;
+    const today = this.c.today();
+    if (this.anchorMoved(mode, anchorKey(item, today))) return;
     let rule: RecurrenceRule | undefined;
     if (text) {
-      rule = await this.parseRepeat(mode, item, text, item.dueDate);
+      rule = await this.parseRepeat(mode, item, text, anchorOf(item, text, today));
       if (!rule) return;
     }
     if (rule ? sameRule(rule, item.recurrence?.rule) : !item.recurrence) return this.c.setMode(normalMode);
@@ -651,16 +674,17 @@ export class Prompts {
     const step = (id: string, rule: RecurrenceRule | undefined) => ({ kind: { case: "setRecurrence" as const, value: { id, rule } } });
     if (!text) return stepsOf(items, (i) => (i.recurrence ? step(i.id, undefined) : undefined));
     if (this.anchorMoved(mode, this.repeatQuery(mode).key)) return undefined;
+    const today = this.c.today();
     const rules = new Map<string, RecurrenceRule>();
     for (const item of items) {
-      const key = anchorKey(item);
+      const key = anchorKey(item, today);
       if (rules.has(key)) continue;
-      const rule = await this.parseRepeat(mode, undefined, text, item.dueDate);
+      const rule = await this.parseRepeat(mode, undefined, text, anchorOf(item, text, today));
       if (!rule) return undefined;
       rules.set(key, rule);
     }
     return stepsOf(items, (i) => {
-      const rule = rules.get(anchorKey(i));
+      const rule = rules.get(anchorKey(i, today));
       return sameRule(rule, i.recurrence?.rule) ? undefined : step(i.id, rule);
     });
   }
