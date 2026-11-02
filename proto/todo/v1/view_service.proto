@@ -2,12 +2,20 @@ syntax = "proto3";
 
 package todo.v1;
 
+import "google/protobuf/field_mask.proto";
 import "google/protobuf/timestamp.proto";
+import "todo/v1/common.proto";
 import "todo/v1/filter.proto";
 import "todo/v1/view.proto";
 
 // Saved views (design 2.4, 4.3). The defaults are seeded into every
-// database; until views can be edited, they are read-only here.
+// database. An edit is an op for its request_id, but never an undo stack
+// entry: it writes no events, and Undo does not reach it. A replay answers
+// the original result with the view as it is now, unset once it was
+// deleted. Positions are dense; each view an edit moves gets a revision and
+// a TOPIC_VIEW change. Names are unique ignoring case, in every script. A
+// view's relative dates are at most 36525 days from their anchor, so it
+// resolves on any day.
 service ViewService {
   // Every view, in tab order (position).
   rpc ListViews(ListViewsRequest) returns (ListViewsResponse);
@@ -15,6 +23,13 @@ service ViewService {
   // take it, into a filter and sort. A problem with the text is an error in
   // the response, with its span, not a failed call.
   rpc ParseQuery(ParseQueryRequest) returns (ParseQueryResponse);
+  // ALREADY_EXISTS / VIEW_NAME_TAKEN (metadata name) when another view has
+  // the name, ignoring case.
+  rpc CreateView(CreateViewRequest) returns (CreateViewResponse);
+  rpc UpdateView(UpdateViewRequest) returns (UpdateViewResponse);
+  // The view is gone for good: a deleted default is never seeded again.
+  rpc DeleteView(DeleteViewRequest) returns (DeleteViewResponse);
+  rpc MoveView(MoveViewRequest) returns (MoveViewResponse);
 }
 
 message ListViewsRequest {}
@@ -53,4 +68,63 @@ message QueryError {
   // Exclusive end, in Unicode code points.
   uint32 end = 2;
   string message = 3;
+}
+
+message CreateViewRequest {
+  // ULID, for idempotency (design 4.3 rule 4).
+  string request_id = 1;
+  // Trimmed; 1 to 64 characters, no control characters.
+  string name = 2;
+  Filter filter = 3;
+  repeated SortKey sort = 4;
+  bool show_count = 5;
+  // 0-based; unset or past the end is last.
+  optional uint32 position = 6;
+}
+
+message CreateViewResponse {
+  View view = 1;
+  // The other views whose position it changed.
+  repeated View moved = 2;
+  MutationResult result = 3;
+}
+
+message UpdateViewRequest {
+  string request_id = 1;
+  // Its id, and the fields update_mask names.
+  View view = 2;
+  // Paths: name, filter, sort, show_count. Others are INVALID_ARGUMENT.
+  google.protobuf.FieldMask update_mask = 3;
+  // ABORTED / REVISION_MISMATCH when the view changed since.
+  optional uint64 expected_revision = 4;
+}
+
+message UpdateViewResponse {
+  View view = 1;
+  MutationResult result = 2;
+}
+
+message DeleteViewRequest {
+  string request_id = 1;
+  string id = 2;
+}
+
+message DeleteViewResponse {
+  // The views whose position it changed.
+  repeated View moved = 1;
+  MutationResult result = 2;
+}
+
+message MoveViewRequest {
+  string request_id = 1;
+  string id = 2;
+  // 0-based; past the end is last.
+  uint32 position = 3;
+}
+
+message MoveViewResponse {
+  View view = 1;
+  // Every view whose position changed, itself included.
+  repeated View moved = 2;
+  MutationResult result = 3;
 }

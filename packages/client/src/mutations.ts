@@ -25,7 +25,16 @@ import type {
   UndoResponse,
   UpdateItemResponse,
 } from "./gen/todo/v1/item_service_pb.js";
+import type { FilterSchema, SortKeySchema } from "./gen/todo/v1/filter_pb.js";
 import type { RelationSchema } from "./gen/todo/v1/relation_pb.js";
+import type { ViewSchema } from "./gen/todo/v1/view_pb.js";
+import type {
+  CreateViewResponse,
+  DeleteViewResponse,
+  MoveViewResponse,
+  UpdateViewResponse,
+} from "./gen/todo/v1/view_service_pb.js";
+import type { ViewsClient } from "./queries.js";
 import { ulid } from "./ulid.js";
 
 export type ItemsClient = Client<typeof ItemService>;
@@ -214,6 +223,50 @@ export function removeRelation(
  * "UNDO_STACK_CHANGED"; undefined for other errors and for errors without
  * an ErrorInfo detail.
  */
+// --- views (design 2.4): ops for idempotency, never undo stack entries ---
+
+export interface NewView {
+  name: string;
+  filter: MessageInitShape<typeof FilterSchema>;
+  sort?: MessageInitShape<typeof SortKeySchema>[];
+  /** Default true. */
+  showCount?: boolean;
+  /** 0-based; default last. */
+  position?: number;
+}
+
+/** CreateView: ALREADY_EXISTS (VIEW_NAME_TAKEN) when another view has the name, ignoring case. */
+export function createView(client: ViewsClient, view: NewView, opts: MutationOptions = {}): Promise<CreateViewResponse> {
+  const [fields, call] = split(opts);
+  return client.createView({ ...fields, ...view, sort: view.sort ?? [], showCount: view.showCount ?? true }, call);
+}
+
+/**
+ * UpdateView: sets the fields `paths` names (name, filter, sort,
+ * show_count) from `view`, which carries the id. `expectedRevision` is the
+ * view's revision as rendered (ABORTED / REVISION_MISMATCH if it changed).
+ */
+export function updateView(
+  client: ViewsClient,
+  view: MessageInitShape<typeof ViewSchema> & { id: string },
+  paths: readonly ("name" | "filter" | "sort" | "show_count")[],
+  opts: MutationOptions = {},
+): Promise<UpdateViewResponse> {
+  const [fields, call] = split(opts);
+  return client.updateView({ ...fields, view, updateMask: { paths: [...paths] } }, call);
+}
+
+export function deleteView(client: ViewsClient, id: string, opts: MutationOptions = {}): Promise<DeleteViewResponse> {
+  const [{ requestId }, call] = split(opts);
+  return client.deleteView({ requestId, id }, call);
+}
+
+/** MoveView: to `position` (0-based, past the end is last). */
+export function moveView(client: ViewsClient, id: string, position: number, opts: MutationOptions = {}): Promise<MoveViewResponse> {
+  const [{ requestId }, call] = split(opts);
+  return client.moveView({ requestId, id, position }, call);
+}
+
 export function errorReason(err: unknown): string | undefined {
   return err instanceof ConnectError ? err.findDetails(ErrorInfoSchema)[0]?.reason : undefined;
 }

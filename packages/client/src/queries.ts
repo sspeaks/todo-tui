@@ -8,7 +8,7 @@ import { type Timestamp, timestampFromDate } from "@bufbuild/protobuf/wkt";
 import type { CallOptions, Client } from "@connectrpc/connect";
 import type { DateSchema } from "./gen/google/type/date_pb.js";
 import type { GetStatusCountsResponse, ParseCaptureResponse, ParseDateResponse, ParseRecurrenceResponse } from "./gen/todo/v1/item_service_pb.js";
-import type { ListViewsResponse, ViewService } from "./gen/todo/v1/view_service_pb.js";
+import type { ListViewsResponse, ParseQueryResponse, ViewService } from "./gen/todo/v1/view_service_pb.js";
 import type { ItemsClient } from "./mutations.js";
 
 export type ViewsClient = Client<typeof ViewService>;
@@ -78,4 +78,15 @@ export function parseRecurrence(
   const { anchor, ...rest } = opts;
   const [fields, call] = reference(rest);
   return client.parseRecurrence({ ...fields, text, ...(anchor !== undefined && { anchor }) }, call);
+}
+
+/**
+ * Reads query text (design 4.8 "Query text") into a filter and sort, with
+ * `count` the Items it lists. A problem is in `errors`, with its span in
+ * code points; the call itself fails only for text over 4096 bytes.
+ */
+export function parseQuery(client: ViewsClient, text: string, opts: ReferenceOptions & { count?: boolean } = {}): Promise<ParseQueryResponse> {
+  const { count, ...rest } = opts;
+  const [fields, call] = reference(rest);
+  return client.parseQuery({ ...fields, text, ...(count && { count }) }, call);
 }

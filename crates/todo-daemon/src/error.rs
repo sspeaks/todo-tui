@@ -104,6 +104,27 @@ pub(crate) fn store(e: StoreError) -> Status {
             bad_request("request_id", "was already used for a different request")
         }
         StoreError::InvalidPageToken => bad_request("page_token", e.to_string()),
+        StoreError::ViewNameTaken(ref name) => error_info(
+            Code::AlreadyExists,
+            "VIEW_NAME_TAKEN",
+            e.to_string(),
+            [("name", name.clone())],
+        ),
+        StoreError::ViewName(ref why) => bad_request("name", why.clone()),
+        StoreError::ViewRevisionMismatch {
+            id,
+            expected,
+            actual,
+        } => error_info(
+            Code::Aborted,
+            "REVISION_MISMATCH",
+            e.to_string(),
+            [
+                ("view_id", id.to_string()),
+                ("expected_revision", expected.to_string()),
+                ("actual_revision", actual.to_string()),
+            ],
+        ),
         StoreError::ViewNotFound(id) => error_info(
             Code::NotFound,
             "VIEW_NOT_FOUND",

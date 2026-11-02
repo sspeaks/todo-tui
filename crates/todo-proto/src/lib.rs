@@ -32,5 +32,6 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
 /// RPCs (SetRecurrence, ParseRecurrence) as stubs; 8 is the first that
 /// implements them, reports generated instances and runs the scheduler.
 /// 9 added the config: GetConfig, ReloadConfig and Change.config. 10 added
-/// query text: ViewService.ParseQuery and View.query.
-pub const API_MINOR: u32 = 10;
+/// query text: ViewService.ParseQuery and View.query. 11 added the view
+/// edits: CreateView, UpdateView, DeleteView and MoveView.
+pub const API_MINOR: u32 = 11;

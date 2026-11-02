@@ -38,6 +38,10 @@ use ulid::Ulid;
 use codec::{SqlEnum, is_overdue, load_item, rev_from_sql, rev_to_sql, ts_to_sql};
 pub use schema::SCHEMA_VERSION;
 use summary::Action;
+pub use view::{
+    CreateViewInput, MAX_VIEW_NAME_CHARS, MAX_VIEW_OFFSET_DAYS, MoveViewInput, UpdateViewInput,
+    ViewOutput, ViewUpdate, check_view_filter, check_view_name,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -72,6 +76,19 @@ pub enum StoreError {
     /// NOT_FOUND with ErrorInfo `VIEW_NOT_FOUND` (`view_id`).
     #[error("view {0} not found")]
     ViewNotFound(ViewId),
+    /// Another view has the name, ignoring case. The daemon maps it to
+    /// ALREADY_EXISTS with ErrorInfo `VIEW_NAME_TAKEN` (`name`).
+    #[error("a view named {0:?} exists")]
+    ViewNameTaken(String),
+    /// The name cannot name a view (blank, too long, a control character).
+    #[error("name {0}")]
+    ViewName(String),
+    #[error("view {id}: revision conflict: expected {expected}, found {actual}")]
+    ViewRevisionMismatch {
+        id: ViewId,
+        expected: Revision,
+        actual: Revision,
+    },
     /// A listing's filter or sort is invalid, or valid but not built yet
     /// ([`todo_core::FilterErrorKind`]). The path is relative to the filter
     /// (`all_of[0].predicate.op`, empty for the whole filter) or starts with
@@ -214,6 +231,11 @@ pub enum OpKind {
     RemoveRelation,
     /// `SetRecurrence`: sets, replaces or clears an Item's repeat rule.
     SetRecurrence,
+    /// The view edits (design 2.4): never undo stack entries, no events.
+    CreateView,
+    UpdateView,
+    DeleteView,
+    MoveView,
     /// [`Store::auto_archive`]: the scheduler's archive of done Items and
     /// its healing (design 3.7). Actor system, so never an undo stack entry.
     AutoArchive,
@@ -791,6 +813,29 @@ impl Store {
     pub async fn record_config_change(&self) -> Result<Revision> {
         self.write(|tx| tx.record_change(Topic::Config, CONFIG_ID, false, None))
             .await
+    }
+
+    /// Creates a view (design 2.4) at its position, moving the views from
+    /// there on one place later.
+    pub async fn create_view(&self, input: CreateViewInput) -> Result<ViewOutput> {
+        self.write(move |tx| view::create_view_tx(tx, input)).await
+    }
+
+    /// Changes a view's name, filter, sort or count flag.
+    pub async fn update_view(&self, input: UpdateViewInput) -> Result<ViewOutput> {
+        self.write(move |tx| view::update_view_tx(tx, input)).await
+    }
+
+    /// Deletes a view, closing the gap it leaves; a deleted default is never
+    /// seeded again.
+    pub async fn delete_view(&self, request_id: String, id: ViewId) -> Result<ViewOutput> {
+        self.write(move |tx| view::delete_view_tx(tx, request_id, id))
+            .await
+    }
+
+    /// Moves a view to `position`, the ones between moving one place.
+    pub async fn move_view(&self, input: MoveViewInput) -> Result<ViewOutput> {
+        self.write(move |tx| view::move_view_tx(tx, input)).await
     }
 
     /// Every view, in tab order, with the revision they were read at.

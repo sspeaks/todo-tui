@@ -6,7 +6,16 @@ import { DateSchema } from "./gen/google/type/date_pb.js";
 import { type MutationResultSchema, type PersonRef, PersonRefSchema, Topic } from "./gen/todo/v1/common_pb.js";
 import { BackupConfigSchema, type ConfigSnapshot, ConfigSnapshotSchema, UiConfigSchema } from "./gen/todo/v1/config_pb.js";
 import { ItemField } from "./gen/todo/v1/field_pb.js";
-import { type Filter, FilterSchema, type OperandSchema, Operator, RelativeDate_Anchor, type SortKey, SortKeySchema } from "./gen/todo/v1/filter_pb.js";
+import {
+  type Clause as ClauseMessage,
+  type Filter,
+  FilterSchema,
+  type OperandSchema,
+  Operator,
+  RelativeDate_Anchor,
+  type SortKey,
+  SortKeySchema,
+} from "./gen/todo/v1/filter_pb.js";
 import {
   ArchiveReason,
   ArchivedSchema,
@@ -48,7 +57,19 @@ import { OpKind, type OpSummary, OpSummarySchema, type UndoSkip, UndoSkipReason,
 import { type Relation, RelationKind, RelationSchema } from "./gen/todo/v1/relation_pb.js";
 import { SystemService } from "./gen/todo/v1/system_service_pb.js";
 import { type View, ViewSchema } from "./gen/todo/v1/view_pb.js";
-import { type ParseQueryRequest, type ParseQueryResponseSchema, ViewService } from "./gen/todo/v1/view_service_pb.js";
+import {
+  type CreateViewRequest,
+  type CreateViewResponseSchema,
+  type DeleteViewRequest,
+  type DeleteViewResponseSchema,
+  type MoveViewRequest,
+  type MoveViewResponseSchema,
+  type ParseQueryRequest,
+  type ParseQueryResponseSchema,
+  type UpdateViewRequest,
+  type UpdateViewResponseSchema,
+  ViewService,
+} from "./gen/todo/v1/view_service_pb.js";
 import { type Change, ChangeSchema, type SubscribeResponse, SubscribeResponseSchema, WatchService } from "./gen/todo/v1/watch_service_pb.js";
 import { parseCaptureText } from "./capture.js";
 import { civil, dayIn, dayOf, epochMs, isDate, parseDateExpr, protoDate, rustTrim, weekday } from "./dates.js";
@@ -329,7 +350,12 @@ export interface FakeDaemonOptions {
  *   grammar.
  * - The six default views (todo_core::view::defaults()), seeded first as
  *   the store seeds them, each with a revision and a TOPIC_VIEW Change;
- *   ListViews. Views are read-only, as the daemon's are.
+ *   ListViews. CreateView, UpdateView, DeleteView and MoveView as the
+ *   store's view.rs: ops for their request_id that are never undo stack
+ *   entries, names unique ignoring case, positions dense, every view that
+ *   moves with a revision and a Change. A view's query text is the
+ *   daemon's printer's, which the fake does not have: it knows the default
+ *   views' and what defineQuery gives, and is empty otherwise.
  * - An op log ({@link ops}): each touched Item gets one revision and one
  *   Change, and each changed field one event. BatchMutate applies its
  *   mutations in order as one op, all or nothing, under the single-item
@@ -423,7 +449,7 @@ export class FakeDaemon {
   maxPageSize = MAX_PAGE_SIZE;
   /** Runs before every ListItems; throw from it to fail that call. */
   onListItems: ((req: ListItemsRequest) => void) | undefined;
-  apiMinor = 10;
+  apiMinor = 11;
   /** What GetConfig serves; change it with {@link setConfig}. */
   config: ConfigSnapshot = defaultConfig();
   readonly calls = { listItems: 0, listViews: 0, getStatusCounts: 0, subscribe: [] as (bigint | undefined)[] };
@@ -545,6 +571,10 @@ export class FakeDaemon {
           return { views: this.tabOrder(), revision: this.revision };
         },
         parseQuery: (req) => this.parseQuery(req),
+        createView: (req) => this.createView(req),
+        updateView: (req) => this.editView(req),
+        deleteView: (req) => this.deleteView(req),
+        moveView: (req) => this.moveView(req),
       });
       const self = this;
       service(WatchService, {
@@ -638,7 +668,7 @@ export class FakeDaemon {
   }
 
   /**
-   * Changes a saved view and publishes its Change, as an edit will (views are read-only over the API until M6). A
+   * Changes a saved view and publishes its Change, off the op log (UpdateView logs an op). A
    * patch that changes the filter, sort or count flag must give the query text too, which ParseQuery then reads
    * back, since the fake cannot print a filter.
    */
@@ -762,6 +792,156 @@ export class FakeDaemon {
       showCount: known.showCount,
       ...(req.count && { count: this.passing(known.filter, today).length }),
     };
+  }
+
+  // --- view edits (design 2.4), as the store's view.rs: ops for their
+  // request_id, never undo stack entries, positions kept dense ---
+
+  private createView(req: CreateViewRequest): MessageInitShape<typeof CreateViewResponseSchema> {
+    this.check();
+    // The daemon's order: request_id, the filter and sort, the replay, then the store's checks.
+    const requestId = requestIdOf(req.requestId);
+    const filter = req.filter ?? create(FilterSchema);
+    checkViewFilter("", filter, req.sort);
+    const recorded = this.recorded("CreateView", requestId);
+    if (recorded) return { ...this.replayedView(recorded.id), result: recorded.result };
+    const name = viewName(req.name, "name");
+    this.nameFree(name);
+    const count = this.views.size;
+    const position = Math.min(req.position ?? count, count);
+    const moved = this.shiftViews(position, count - 1, 1);
+    const at = this.stamp();
+    const view = create(ViewSchema, { id: ulid(), name, filter, sort: req.sort, showCount: req.showCount, position, revision: ++this.revision, createdAt: at, updatedAt: at });
+    this.storeView(view, "unknown");
+    const op = this.log({ kind: OpKind.CREATE_VIEW, actor: "user", summary: `create view ${JSON.stringify(name)}`, events: [] });
+    return { view, moved, result: this.record("CreateView", requestId, view.id, op) };
+  }
+
+  private editView(req: UpdateViewRequest): MessageInitShape<typeof UpdateViewResponseSchema> {
+    this.check();
+    const requestId = requestIdOf(req.requestId);
+    if (!req.view) throw badRequest("view", "is required");
+    const id = canonicalUlid(req.view.id);
+    if (id === null) throw badRequest("view.id", "must be a ULID");
+    const paths = req.updateMask?.paths ?? [];
+    if (!paths.length) throw badRequest("update_mask", "names no field");
+    const seen = new Set<string>();
+    for (const [i, path] of paths.entries()) {
+      if (!["name", "filter", "sort", "show_count"].includes(path)) {
+        throw badRequest(`update_mask.paths[${i}]`, `${JSON.stringify(path)} cannot be updated: use name, filter, sort or show_count`);
+      }
+      if (seen.has(path)) throw badRequest(`update_mask.paths[${i}]`, `${path} is named twice`);
+      seen.add(path);
+    }
+    // Only what the mask names is read.
+    checkViewFilter("view.", seen.has("filter") ? (req.view.filter ?? create(FilterSchema)) : undefined, seen.has("sort") ? req.view.sort : undefined);
+    const name = seen.has("name") ? viewName(req.view.name, "view.name") : undefined;
+    const recorded = this.recorded("UpdateView", requestId, id);
+    if (recorded) return { ...this.replayedView(recorded.id), result: recorded.result };
+    const prev = this.views.get(id);
+    if (!prev) throw errorInfo(Code.NotFound, "VIEW_NOT_FOUND", `view ${id} not found`, { view_id: id });
+    if (req.expectedRevision !== undefined && req.expectedRevision !== prev.revision) {
+      throw errorInfo(Code.Aborted, "REVISION_MISMATCH", `view ${id}: revision conflict: expected ${req.expectedRevision}, found ${prev.revision}`, {
+        view_id: id,
+        expected_revision: String(req.expectedRevision),
+        actual_revision: String(prev.revision),
+      });
+    }
+    const next = clone(ViewSchema, prev);
+    if (name !== undefined) {
+      this.nameFree(name, id);
+      next.name = name;
+    }
+    if (seen.has("filter")) next.filter = req.view.filter ?? create(FilterSchema);
+    if (seen.has("sort")) next.sort = req.view.sort;
+    if (seen.has("show_count")) next.showCount = req.view.showCount;
+    if (!equals(ViewSchema, next, prev)) {
+      Object.assign(next, { revision: ++this.revision, updatedAt: this.stamp() });
+      this.storeView(next, "unknown");
+    }
+    const op = this.log({ kind: OpKind.UPDATE_VIEW, actor: "user", summary: `edit view ${JSON.stringify(next.name)}`, events: [] });
+    return { view: next, result: this.record("UpdateView", requestId, id, op) };
+  }
+
+  private deleteView(req: DeleteViewRequest): MessageInitShape<typeof DeleteViewResponseSchema> {
+    this.check();
+    const requestId = requestIdOf(req.requestId);
+    const id = canonicalUlid(req.id);
+    if (id === null) throw badRequest("id", "must be a ULID");
+    const recorded = this.recorded("DeleteView", requestId, id);
+    if (recorded) return { result: recorded.result };
+    const view = this.views.get(id);
+    if (!view) throw errorInfo(Code.NotFound, "VIEW_NOT_FOUND", `view ${id} not found`, { view_id: id });
+    this.views.delete(id);
+    this.publish({ revision: ++this.revision, topic: Topic.VIEW, id, deleted: true });
+    const moved = this.shiftViews(view.position + 1, this.views.size, -1);
+    const op = this.log({ kind: OpKind.DELETE_VIEW, actor: "user", summary: `delete view ${JSON.stringify(view.name)}`, events: [] });
+    return { moved, result: this.record("DeleteView", requestId, id, op) };
+  }
+
+  private moveView(req: MoveViewRequest): MessageInitShape<typeof MoveViewResponseSchema> {
+    this.check();
+    const requestId = requestIdOf(req.requestId);
+    const id = canonicalUlid(req.id);
+    if (id === null) throw badRequest("id", "must be a ULID");
+    const recorded = this.recorded("MoveView", requestId, id);
+    if (recorded) return { ...this.replayedView(recorded.id), result: recorded.result };
+    const view = this.views.get(id);
+    if (!view) throw errorInfo(Code.NotFound, "VIEW_NOT_FOUND", `view ${id} not found`, { view_id: id });
+    const from = view.position;
+    const to = Math.min(req.position, this.views.size - 1);
+    const summary = `move view ${JSON.stringify(view.name)}`;
+    if (to === from) {
+      const op = this.log({ kind: OpKind.MOVE_VIEW, actor: "user", summary, events: [] });
+      return { view, result: this.record("MoveView", requestId, id, op) };
+    }
+    const moved = to < from ? this.shiftViews(to, from - 1, 1, id) : this.shiftViews(from + 1, to, -1, id);
+    const next = create(ViewSchema, { ...view, position: to, revision: ++this.revision, updatedAt: this.stamp() });
+    this.storeView(next, "unknown");
+    moved.push(next);
+    const op = this.log({ kind: OpKind.MOVE_VIEW, actor: "user", summary, events: [] });
+    return { view: next, moved, result: this.record("MoveView", requestId, id, op) };
+  }
+
+  /** The views with a position from `lo` to `hi`, moved by `by`, each with a revision and a change. */
+  private shiftViews(lo: number, hi: number, by: number, except?: string): View[] {
+    const moved: View[] = [];
+    for (const v of this.tabOrder()) {
+      if (v.id === except || v.position < lo || v.position > hi) continue;
+      const next = create(ViewSchema, { ...v, position: v.position + by, revision: ++this.revision });
+      this.storeView(next, "keep");
+      moved.push(next);
+    }
+    return moved;
+  }
+
+  /**
+   * Stores and publishes a view. Its query text is the daemon's printer's,
+   * which the fake does not have: "keep" leaves it, as a move does; "unknown"
+   * keeps it only if the fake knows the text names this filter, sort and
+   * count flag (a test gives it with defineQuery).
+   */
+  private storeView(view: View, query: "keep" | "unknown"): void {
+    if (query === "unknown") {
+      const known = [...this.queries].find(([, q]) => equals(FilterSchema, q.filter, view.filter ?? create(FilterSchema)) && q.showCount === view.showCount && q.sort.length === view.sort.length && q.sort.every((k, i) => equals(SortKeySchema, k, view.sort[i]!)));
+      view.query = known?.[0] ?? "";
+    }
+    this.views.set(view.id, view);
+    this.publish({ revision: view.revision, topic: Topic.VIEW, id: view.id, resource: { case: "view", value: view } });
+  }
+
+  /** Fails with VIEW_NAME_TAKEN when a view but `except` has `name`, ignoring case in every script, as Rust's to_lowercase. */
+  private nameFree(name: string, except?: string): void {
+    const lower = name.toLowerCase();
+    if ([...this.views.values()].some((v) => v.id !== except && v.name.toLowerCase() === lower)) {
+      throw errorInfo(Code.AlreadyExists, "VIEW_NAME_TAKEN", `a view named ${JSON.stringify(name)} exists`, { name });
+    }
+  }
+
+  /** The view a replayed request made, as it is now: none once deleted. */
+  private replayedView(id: string): { view?: View } {
+    const view = this.views.get(id);
+    return view ? { view } : {};
   }
 
   /** Every view in tab order. */
@@ -2184,6 +2364,56 @@ function msg(message: MessageInitShape<typeof SubscribeResponseSchema>["message"
 }
 
 /** An error with an ErrorInfo detail, as the daemon sends them. */
+/** A view name trimmed, or INVALID_ARGUMENT on `field`, as check_view_name. */
+function viewName(name: string, field: string): string {
+  const trimmed = rustTrim(name);
+  if (trimmed === "") throw badRequest(field, "must not be blank");
+  if ([...trimmed].length > 64) throw badRequest(field, "is longer than 64 characters");
+  if (/\p{Cc}/u.test(trimmed)) throw badRequest(field, "must not hold a control character");
+  return trimmed;
+}
+
+/** The longest relative-date offset a stored view takes (MAX_VIEW_OFFSET_DAYS). */
+const MAX_VIEW_OFFSET_DAYS = 36_525;
+
+/**
+ * A view's filter and sort, as the daemon checks them: an invalid filter,
+ * then the sort, then a filter not built yet, then an offset too far for a
+ * view. Paths start with `prefix`; either may be left out (not in a mask).
+ */
+function checkViewFilter(prefix: string, filter: Filter | undefined, sort: readonly SortKey[] | undefined): void {
+  const at = (p: FilterProblem): FilterProblem => ({ ...p, path: `${prefix}${p.path}` });
+  const problem = filter && checkFilter(filter, undefined);
+  if (problem?.kind === "invalid") throw problemError(at(problem));
+  const sortProblem = sort && checkSort(sort);
+  if (sortProblem) throw problemError(at(sortProblem));
+  if (problem) throw problemError(at(problem));
+  if (filter) {
+    const far = farOffset(filter.allOf, filter.anyOf, "filter");
+    if (far) throw badRequest(`${prefix}${far}`, `a view's offset is at most ${MAX_VIEW_OFFSET_DAYS} days`);
+  }
+}
+
+/** The path of the first relative date further than MAX_VIEW_OFFSET_DAYS. */
+function farOffset(allOf: readonly ClauseMessage[], anyOf: readonly ClauseMessage[], path: string): string | undefined {
+  for (const [list, clauses] of [["all_of", allOf], ["any_of", anyOf]] as const) {
+    for (const [i, c] of clauses.entries()) {
+      const here = `${path}.${list}[${i}]`;
+      if (c.kind.case === "predicate") {
+        for (const [k, o] of c.kind.value.operands.entries()) {
+          if (o.kind.case === "relativeDate" && Math.abs(o.kind.value.offsetDays) > MAX_VIEW_OFFSET_DAYS) {
+            return `${here}.predicate.operands[${k}].relative_date.offset_days`;
+          }
+        }
+      } else if (c.kind.case === "group") {
+        const inner = farOffset(c.kind.value.allOf, c.kind.value.anyOf, `${here}.group`);
+        if (inner) return inner;
+      }
+    }
+  }
+  return undefined;
+}
+
 function errorInfo(code: Code, reason: string, message: string, metadata: Record<string, string>): ConnectError {
   return new ConnectError(message, code, undefined, [{ desc: ErrorInfoSchema, value: { reason, domain: "todo-tui", metadata } }]);
 }

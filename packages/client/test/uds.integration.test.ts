@@ -19,6 +19,7 @@ import { ulid } from "../src/ulid.js";
 import { CAPTURE_ZONE, captureConformance } from "./conformance/capture.js";
 import { configConformance } from "./conformance/config.js";
 import { queryConformance } from "./conformance/query.js";
+import { viewEditsConformance } from "./conformance/view-edits.js";
 import { FILTER_ZONE, filterViewsConformance } from "./conformance/filter-views.js";
 import { RECURRENCE_ZONE, recurrenceConformance } from "./conformance/recurrence.js";
 import { undoRelationsConformance } from "./conformance/undo-relations.js";
@@ -315,4 +316,13 @@ describe.skipIf(!TODO_BIN)("query text against $TODO_BIN", { timeout: 60_000 }, 
     },
     { grammar: true },
   );
+});
+
+describe.skipIf(!TODO_BIN)("view edits against $TODO_BIN", { timeout: 60_000 }, () => {
+  // The suite FakeDaemon runs too, each test on a fresh daemon.
+  viewEditsConformance(async () => {
+    const h = await home();
+    const conn = await h.open();
+    return { transport: conn.transport };
+  });
 });

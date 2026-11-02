@@ -26,6 +26,11 @@ enum OpKind {
   // The daemon's scheduler archiving done and cancelled Items (design 3.7).
   // Never an undo stack entry.
   OP_KIND_AUTO_ARCHIVE = 14;
+  // The view edits (design 2.4). Never undo stack entries.
+  OP_KIND_CREATE_VIEW = 15;
+  OP_KIND_UPDATE_VIEW = 16;
+  OP_KIND_DELETE_VIEW = 17;
+  OP_KIND_MOVE_VIEW = 18;
 }
 
 // An entry of the undo stack (design 3.10).

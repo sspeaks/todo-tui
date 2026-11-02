@@ -19,15 +19,16 @@ use todo_proto::v1::view_service_client::ViewServiceClient;
 use todo_proto::v1::watch_service_client::WatchServiceClient;
 use todo_proto::v1::{
     AddRelationRequest, ArchiveItemRequest, ArchiveReason, BatchMutateRequest, CaptureItemRequest,
-    CaptureTokenKind, Clause, ClauseGroup, ClientKind, ConfigSnapshot, CreatedVia,
-    DeleteItemRequest, FieldValue, Filter, GetConfigRequest, GetItemRequest, GetServerInfoRequest,
-    GetStatusCountsRequest, GetUndoStateRequest, Item, ItemField, ListItemsRequest,
-    ListViewsRequest, Mutation, MutationResult, OpKind, Operand, Operator, ParseCaptureRequest,
-    ParseDateRequest, ParseQueryRequest, ParseRecurrenceRequest, PersonRef, Predicate, Priority,
-    RecurrenceRule, RedoRequest, RedoResponse, Relation, RelationKind, ReloadConfigRequest,
-    RemoveRelationRequest, SetRecurrenceRequest, SetStatusRequest, ShutdownRequest, SortKey,
-    Status, SubscribeRequest, SubscribeResponse, Topic, UnarchiveItemRequest, UndeleteItemRequest,
-    UndoRequest, UndoResponse, UndoSkip, UndoSkipReason, UpdateItemRequest, View, Weekday, clause,
+    CaptureTokenKind, Clause, ClauseGroup, ClientKind, ConfigSnapshot, CreateViewRequest,
+    CreatedVia, DeleteItemRequest, DeleteViewRequest, FieldValue, Filter, GetConfigRequest,
+    GetItemRequest, GetServerInfoRequest, GetStatusCountsRequest, GetUndoStateRequest, Item,
+    ItemField, ListItemsRequest, ListViewsRequest, MoveViewRequest, Mutation, MutationResult,
+    OpKind, Operand, Operator, ParseCaptureRequest, ParseDateRequest, ParseQueryRequest,
+    ParseRecurrenceRequest, PersonRef, Predicate, Priority, RecurrenceRule, RedoRequest,
+    RedoResponse, Relation, RelationKind, ReloadConfigRequest, RemoveRelationRequest,
+    SetRecurrenceRequest, SetStatusRequest, ShutdownRequest, SortKey, Status, SubscribeRequest,
+    SubscribeResponse, Topic, UnarchiveItemRequest, UndeleteItemRequest, UndoRequest, UndoResponse,
+    UndoSkip, UndoSkipReason, UpdateItemRequest, UpdateViewRequest, View, Weekday, clause,
     field_value, mutation, operand, person_ref, recurrence_rule, subscribe_response::Message,
 };
 use tokio::task::JoinHandle;
@@ -300,7 +301,7 @@ async fn handshake_reports_version_and_api_minor() {
         .into_inner();
     assert_eq!(info.daemon_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(info.api_minor, todo_proto::API_MINOR);
-    assert_eq!(info.api_minor, 10);
+    assert_eq!(info.api_minor, 11);
     d.stop().await;
 }
 
@@ -4620,5 +4621,186 @@ async fn views_carry_their_query_text() {
         assert_eq!(res.sort, view.sort, "{}", view.name);
         assert_eq!(res.show_count, view.show_count, "{}", view.name);
     }
+    d.stop().await;
+}
+
+fn create_view_req(name: &str, text: &str) -> CreateViewRequest {
+    let parsed = todo_core::parse_query(text);
+    assert_eq!(parsed.errors, vec![], "{text}");
+    CreateViewRequest {
+        request_id: new_ulid().to_string(),
+        name: name.to_owned(),
+        filter: Some((&parsed.query.filter).into()),
+        sort: parsed.query.sort.into_iter().map(Into::into).collect(),
+        show_count: parsed.query.show_count,
+        position: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn view_edits_stream_on_the_view_topic_and_map_their_errors() {
+    let d = start().await;
+    let mut views = ViewServiceClient::new(d.channel().await);
+    let mut stream = d
+        .subscribe(SubscribeRequest {
+            since_revision: Some(STARTED),
+            topics: vec![Topic::View.into()],
+        })
+        .await;
+    assert!(matches!(next(&mut stream).await, Message::CaughtUp(_)));
+
+    let created = views
+        .create_view(CreateViewRequest {
+            position: Some(0),
+            ..create_view_req("Work", "#work sort:-priority")
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let work = created.view.unwrap();
+    assert_eq!(
+        (work.position, work.query.as_str()),
+        (0, "#work sort:-priority")
+    );
+    assert_eq!(created.moved.len(), 6);
+    // The six shifted views, then Work, each a change.
+    let mut ids = HashSet::new();
+    for _ in 0..7 {
+        let Message::Change(c) = next(&mut stream).await else {
+            panic!("expected a change");
+        };
+        ids.insert(c.id);
+    }
+    assert!(ids.contains(&work.id));
+
+    // A name taken in another case.
+    let err = views
+        .create_view(create_view_req("work", "is:next"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::AlreadyExists);
+    assert_eq!(
+        err.get_details_error_info().unwrap().reason,
+        "VIEW_NAME_TAKEN"
+    );
+    let err = views
+        .create_view(create_view_req("  ", "is:next"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.get_details_bad_request().unwrap().field_violations[0].field,
+        "name"
+    );
+    // A bad filter names its path.
+    let mut bad = create_view_req("Bad", "is:next");
+    bad.filter.as_mut().unwrap().all_of[0] = Clause {
+        kind: Some(clause::Kind::Predicate(Predicate {
+            target: ItemField::Status as i32,
+            op: Operator::Lt as i32,
+            operands: vec![],
+        })),
+    };
+    let err = views.create_view(bad).await.unwrap_err();
+    assert_eq!(
+        err.get_details_bad_request().unwrap().field_violations[0].field,
+        "filter.all_of[0].predicate.op"
+    );
+
+    // Update: the masked fields only, with expected_revision.
+    let update = |mask: &[&str], view: View, expected: Option<u64>| UpdateViewRequest {
+        request_id: new_ulid().to_string(),
+        view: Some(view),
+        update_mask: Some(FieldMask {
+            paths: mask.iter().map(|p| (*p).to_owned()).collect(),
+        }),
+        expected_revision: expected,
+    };
+    let renamed = View {
+        name: "Deep work".into(),
+        show_count: false,
+        ..work.clone()
+    };
+    let out = views
+        .update_view(update(&["name"], renamed.clone(), Some(work.revision)))
+        .await
+        .unwrap()
+        .into_inner()
+        .view
+        .unwrap();
+    assert_eq!((out.name.as_str(), out.show_count), ("Deep work", true));
+    let err = views
+        .update_view(update(
+            &["show_count"],
+            renamed.clone(),
+            Some(work.revision),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::Aborted);
+    let err = views
+        .update_view(update(&["seed"], renamed.clone(), None))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.get_details_bad_request().unwrap().field_violations[0].field,
+        "update_mask.paths[0]"
+    );
+    let mut bad_filter = renamed.clone();
+    bad_filter.filter = Some(Filter {
+        all_of: vec![Clause { kind: None }],
+        ..Filter::default()
+    });
+    let err = views
+        .update_view(update(&["filter"], bad_filter, None))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.get_details_bad_request().unwrap().field_violations[0].field,
+        "view.filter.all_of[0]"
+    );
+
+    // Move, then delete.
+    let moved = views
+        .move_view(MoveViewRequest {
+            request_id: new_ulid().to_string(),
+            id: work.id.clone(),
+            position: 99,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(moved.view.unwrap().position, 6);
+    assert_eq!(moved.moved.len(), 7);
+    let deleted = views
+        .delete_view(DeleteViewRequest {
+            request_id: new_ulid().to_string(),
+            id: work.id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(deleted.moved.is_empty());
+    let err = views
+        .delete_view(DeleteViewRequest {
+            request_id: new_ulid().to_string(),
+            id: work.id.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::NotFound);
+    let err = views
+        .delete_view(DeleteViewRequest {
+            request_id: "nope".into(),
+            id: work.id,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.get_details_bad_request().unwrap().field_violations[0].field,
+        "request_id"
+    );
+    // None of it reached the undo stack.
+    let (top, _) = undo_state(&mut d.items().await).await;
+    assert_eq!(top, None);
     d.stop().await;
 }

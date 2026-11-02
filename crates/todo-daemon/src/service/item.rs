@@ -681,6 +681,10 @@ fn op_kind(kind: OpKind) -> v1::OpKind {
         OpKind::RemoveRelation => v1::OpKind::RemoveRelation,
         OpKind::SetRecurrence => v1::OpKind::SetRecurrence,
         OpKind::AutoArchive => v1::OpKind::AutoArchive,
+        OpKind::CreateView => v1::OpKind::CreateView,
+        OpKind::UpdateView => v1::OpKind::UpdateView,
+        OpKind::DeleteView => v1::OpKind::DeleteView,
+        OpKind::MoveView => v1::OpKind::MoveView,
     }
 }
 
@@ -696,7 +700,7 @@ fn undo_skip(skip: &UndoSkipRow) -> v1::UndoSkip {
 
 /// Every mutating request carries a client ULID (design 4.3 rule 4),
 /// returned in canonical form.
-fn check_request_id(request_id: &str) -> Result<String, Status> {
+pub(crate) fn check_request_id(request_id: &str) -> Result<String, Status> {
     canonical_ulid(request_id).ok_or_else(|| error::bad_request("request_id", "must be a ULID"))
 }
 
@@ -765,6 +769,10 @@ mod tests {
             OpKind::RemoveRelation,
             OpKind::SetRecurrence,
             OpKind::AutoArchive,
+            OpKind::CreateView,
+            OpKind::UpdateView,
+            OpKind::DeleteView,
+            OpKind::MoveView,
         ];
         let proto: HashSet<i32> = kinds.iter().map(|&k| op_kind(k) as i32).collect();
         assert_eq!(proto.len(), kinds.len());
