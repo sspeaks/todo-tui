@@ -1,0 +1,125 @@
+{
+  "skill_name": "todo",
+  "evals": [
+    {
+      "id": 1,
+      "name": "capture-with-fields-and-repeat",
+      "prompt": "Add a todo to send Priya the Q4 deck by Friday, high priority, tag it work. And remind me every Monday to check the build dashboard.",
+      "expected_output": "Two items: 'Send Priya the Q4 deck' due Fri 2026-11-06, priority 1 or 2, label work, title free of the date words; and a 'Check the build dashboard' item repeating @mon. Reply confirms both with short ids.",
+      "seed": [],
+      "mcp": true,
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "due-today-and-complete",
+      "prompt": "what's due today? also i went to the dentist this morning so mark that one done",
+      "expected_output": "Lists today's/overdue items (pay rent overdue, dentist, standup notes) and marks only the dentist item done; other items untouched.",
+      "seed": [
+        "Dentist appointment ^today",
+        "Pay rent ^2026-11-01 +2",
+        "Write standup notes ^today #work",
+        "Plan vacation >someday",
+        "Renew passport ^dec15"
+      ],
+      "mcp": true,
+      "files": []
+    },
+    {
+      "id": 3,
+      "name": "triage-inbox-with-rules",
+      "prompt": "Triage my inbox: anything about the cluster goes to next with a #brgs label, the rest goes to someday.",
+      "expected_output": "The two cluster items are status next with label brgs (existing labels kept); the other inbox items are someday; the inbox is empty; non-inbox items untouched.",
+      "seed": [
+        "Fix the flaky deploy on the dev cluster",
+        "Upgrade cluster node pool #infra",
+        "Learn to make sourdough",
+        "Read the Rust async book",
+        "Ship M7 >next"
+      ],
+      "mcp": true,
+      "files": []
+    },
+    {
+      "id": 4,
+      "name": "cli-fallback-capture",
+      "prompt": "add these to my todo list: call mom tomorrow, buy dog food (it's an errand), and I'm waiting on Dana to send the budget numbers",
+      "expected_output": "Without MCP tools, uses `todo add` with single-quoted capture text: 'Call mom' due tomorrow, 'Buy dog food' #errand, and a budget-numbers item waiting on Dana.",
+      "seed": [],
+      "mcp": false,
+      "files": []
+    },
+    {
+      "id": 5,
+      "name": "add-label-keeps-existing",
+      "prompt": "tag the passport renewal as urgent too",
+      "expected_output": "Renew passport gets label urgent added; its existing labels #travel and #docs are kept; nothing else changes.",
+      "seed": [
+        "Renew passport ^dec15 #travel #docs",
+        "Book flights #travel"
+      ],
+      "mcp": true,
+      "files": []
+    },
+    {
+      "id": 6,
+      "name": "ambiguous-title-asks",
+      "prompt": "mark the budget one done",
+      "expected_output": "Two open items mention budget; the model does not guess: it closes neither and asks which one, showing both short ids.",
+      "seed": [
+        "Send budget numbers to finance ^fri #work",
+        "Review household budget >next"
+      ],
+      "mcp": true,
+      "files": []
+    },
+    {
+      "id": 7,
+      "name": "jira-local-priority",
+      "prompt": "PLAT-530 matters less to me this week, push it down my list. Oh and PLAT-611 got reassigned to Marcus, get it off my list.",
+      "expected_output": "PLAT-530 gets a local_priority override lower than its Jira priority; its Jira-owned priority is unchanged. PLAT-611 is removed from the list without being marked done or cancelled (deleted locally, Jira untouched).",
+      "seed": [
+        "Fix login timeout +2 #auth >next",
+        "Migrate session store +3 >next",
+        "Write release notes ^fri"
+      ],
+      "jira": {
+        "Fix login timeout": [
+          "PLAT-530",
+          "In Progress"
+        ],
+        "Migrate session store": [
+          "PLAT-611",
+          "To Do"
+        ]
+      },
+      "mcp": true,
+      "files": []
+    },
+    {
+      "id": 8,
+      "name": "whats-on-my-plate",
+      "prompt": "what's on my plate?",
+      "expected_output": "A grouped overview: overdue/today first (pay rent overdue, standup), then next items by priority, plus waiting items whose follow-up matters; deferred and someday items left out; no changes made.",
+      "seed": [
+        "Pay rent ^2026-10-30 +2",
+        "Write standup notes ^today",
+        "Ship M7 +1 >next",
+        "Refactor launch.rs +4 >next",
+        "Budget sign-off ~Dana",
+        "Learn sourdough >someday"
+      ],
+      "mcp": true,
+      "files": []
+    },
+    {
+      "id": 9,
+      "name": "vague-date",
+      "prompt": "add a todo to review Ana's design doc by end of next week",
+      "expected_output": "One item 'Review Ana's design doc' due Fri 2026-11-13 (next week's Friday, not this week's eow 2026-11-06), with no date words left in the title.",
+      "seed": [],
+      "mcp": true,
+      "files": []
+    }
+  ]
+}

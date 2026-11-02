@@ -6,3 +6,4 @@ packages/client/src/gen/
 .DS_Store
 result
 result-*
+claude/skills/*-workspace/

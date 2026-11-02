@@ -214,6 +214,35 @@ fn no_command_execs_the_tui_entry_with_node() {
 }
 
 #[test]
+fn mcp_execs_the_mcp_entry_with_node() {
+    if Command::new("node").arg("--version").output().is_err() {
+        eprintln!("skipped: node is not on PATH");
+        return;
+    }
+    let h = Home::new();
+    let entry = h.home.join("mcp.js");
+    std::fs::create_dir_all(&h.home).unwrap();
+    let stub = "console.log(JSON.stringify([process.argv.slice(2), process.env.TODO_BIN])); process.exit(3);";
+    std::fs::write(&entry, stub).unwrap();
+    let run = |args: &[&str]| {
+        let mut cmd = h.command(args);
+        cmd.env("TODO_MCP_ENTRY", &entry).env_remove("TODO_BIN");
+        cmd.output().unwrap()
+    };
+    let exe = Path::new(env!("CARGO_BIN_EXE_todo"));
+    for (args, passed) in [
+        (&["mcp"][..], &[][..]),
+        (&["mcp", "--read-only"], &["--read-only"]),
+    ] {
+        let out = run(args);
+        assert_eq!(out.status.code(), Some(3), "{}", text(&out.stderr));
+        let (got, bin): (Vec<String>, PathBuf) = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(got, passed);
+        assert_eq!(bin.canonicalize().unwrap(), exe.canonicalize().unwrap());
+    }
+}
+
+#[test]
 fn a_tui_entry_that_is_missing_is_an_error() {
     let h = Home::new();
     std::fs::create_dir_all(&h.home).unwrap();

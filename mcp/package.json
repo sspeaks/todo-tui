@@ -3,12 +3,23 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "exports": "./src/index.ts",
+  "bin": {
+    "todo-mcp": "./dist/mcp.js"
+  },
   "scripts": {
+    "dev": "tsx src/main.ts",
+    "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "echo \"no tests yet\""
+    "test": "vitest run"
   },
   "dependencies": {
-    "@todo-tui/client": "workspace:*"
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@todo-tui/client": "workspace:*",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "tsx": "4.23.15",
+    "vitest": "5.0.5"
   }
 }

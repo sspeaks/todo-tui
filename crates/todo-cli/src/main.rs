@@ -1,10 +1,10 @@
 //! The `todo` binary.
 
 mod add;
+mod launch;
 mod rpc;
 mod spawn;
 mod status;
-mod tui;
 mod undo;
 
 use std::fmt::Display;
@@ -47,6 +47,12 @@ enum Command {
         #[arg(long)]
         short: bool,
     },
+    /// Serve the MCP tools on stdio, for Claude Code: `claude mcp add todo -- todo mcp`.
+    Mcp {
+        /// Offer only the tools that read: list, get, views and counts.
+        #[arg(long)]
+        read_only: bool,
+    },
     /// Run the daemon (in the foreground unless --detach).
     Daemon {
         /// Start the daemon in the background and return once it is listening.
@@ -65,9 +71,14 @@ enum DaemonAction {
 
 fn main() -> ExitCode {
     let Some(command) = Cli::parse().command else {
-        eprintln!("todo: {:#}", tui::launch());
+        eprintln!("todo: {:#}", launch::launch(launch::TUI, &[]));
         return ExitCode::FAILURE;
     };
+    if let Command::Mcp { read_only } = command {
+        let args: &[&str] = if read_only { &["--read-only"] } else { &[] };
+        eprintln!("todo: {:#}", launch::launch(launch::MCP, args));
+        return ExitCode::FAILURE;
+    }
     // Ahead of anything that could fail: a prompt hook must not.
     if let Command::Status { short: true } = command {
         return status::short();
@@ -96,6 +107,8 @@ async fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
         Command::Redo => return undo::undo(&paths, undo::Direction::Redo).await,
         // `--short` is run by main.
         Command::Status { .. } => return status::status(&paths).await,
+        // Run by main, which execs it.
+        Command::Mcp { .. } => unreachable!("todo mcp is run by main"),
         Command::Daemon {
             action: Some(DaemonAction::Stop),
             ..

@@ -14,9 +14,11 @@ pane, one-key triage, quick-add with a live preview, undo, bulk actions on marke
 items, search and `$EDITOR` for descriptions; see [Using the TUI](#using-the-tui).
 Milestone M5 (recurring items) is done: repeat rules with `@`, in captures and as
 a TUI key, the next instance created when you complete one, and done items archived
-after a week; see [Recurring items](#recurring-items). Next come M6 (config,
-export/import, backups, editing views) and M7 (the MCP server). The CLI captures,
-undoes and counts; listing, editing and completing items happen in the TUI.
+after a week; see [Recurring items](#recurring-items). Milestone M7 (the MCP
+server) is done, ahead of M6: `todo mcp` gives Claude Code tools to list, capture,
+edit and complete items; see [Claude Code](#claude-code). Next comes M6 (config,
+export/import, backups, editing views). The CLI captures, undoes and counts; listing,
+editing and completing items happen in the TUI or through Claude Code.
 
 ## Quick start
 
@@ -442,10 +444,40 @@ and the daemon archives them 7 days after they closed. A `z` after closing one
 sticks: unarchived, it is not archived again until you close it again. Reopening an
 item it archived takes it out of the archive.
 
+### Claude Code
+
+`todo mcp` serves the todo tools to Claude Code over stdio. Register it once:
+
+```sh
+claude mcp add --scope user todo -- todo mcp
+```
+
+| Tool | What it does |
+|---|---|
+| `todo_list` | Items in a view (`today`, `next`, `waiting`, …), narrowed by text or labels |
+| `todo_get`, `todo_status`, `todo_views` | One item in full; the counts; the views |
+| `todo_capture` | A capture, as `todo add` takes it (tokens and all) |
+| `todo_update` | Title, description, priority, local priority, due, defer, labels, waiting, private notes |
+| `todo_set_status` | `inbox`, `next`, `someday`, `in_progress`, `done`, `cancelled`; completing a repeating item returns the next one |
+| `todo_set_repeat` | Sets or clears the repeat rule |
+| `todo_archive`, `todo_unarchive`, `todo_delete`, `todo_undelete` | As named |
+| `todo_undo`, `todo_redo` | The same undo stack as `todo undo` and `u` in the TUI |
+
+Tools take the full id or the 8-character short id `todo add` prints. Their captures
+are `created_via = mcp`, and every change is yours, so `todo undo` or `u` undoes it.
+`todo mcp --read-only` offers only `todo_list`, `todo_get`, `todo_status` and
+`todo_views`. Like the TUI, it runs a bundle with Node (`share/todo-tui/mcp.js`, or
+`mcp/dist/mcp.js` in a checkout; `TODO_MCP_ENTRY` overrides it) and starts the daemon
+if needed.
+
+[`claude/skills/todo/`](claude/skills/todo/SKILL.md) is a Claude Code skill that
+teaches Claude the capture syntax, the views, recurrence and, for later, Jira-linked
+items. To use it everywhere: `ln -s ~/todo-tui/claude/skills/todo ~/.claude/skills/todo`.
+
 ### The daemon
 
-You rarely need to manage it: `todo add`, `todo undo`, `todo redo`, `todo status`
-and the TUI start it when needed, and only one daemon runs per data directory.
+You rarely need to manage it: `todo add`, `todo undo`, `todo redo`, `todo status`,
+`todo mcp` and the TUI start it when needed, and only one daemon runs per data directory.
 
 | Command | What it does |
 |---|---|
@@ -491,7 +523,8 @@ rm -rf "$TODO_TUI_HOME"; unset TODO_TUI_HOME
 - `proto/` — the `todo.v1` contract (Buf)
 - `crates/` — Rust workspace: core, store, sync, jira, assistant, proto, daemon, cli
 - `packages/client/` — shared TypeScript client (Connect-ES)
-- `tui/`, `mcp/` — the Ink TUI and the MCP server (a stub so far)
+- `tui/`, `mcp/` — the Ink TUI and the MCP server
+- `claude/skills/todo/` — the Claude Code skill for managing todos through the MCP server (not in `skills/`, which symposium would sync into `.claude/skills/`)
 - `scripts/smoke.sh` — end-to-end smoke test
 
 ## Development

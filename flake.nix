@@ -1,6 +1,7 @@
 # Nix packaging for todo-tui: `nix build`, `nix run`, `nix profile add`,
 # `nix develop`. The default package is `todo` (CLI + daemon) with the TUI
-# bundle at share/todo-tui/tui.js and Node 24 on its PATH.
+# and MCP server bundles at share/todo-tui/{tui,mcp}.js and Node 24 on its
+# PATH.
 #
 # Maintenance:
 #   - pnpm-lock.yaml changed: update every entry of `pnpmDepsHash` below. The
@@ -14,8 +15,8 @@
 #   - rust-toolchain.toml raised past nixpkgs' rustc: `nix flake update`.
 #   - The build reads a new top-level file or directory: add it to `rustSrc`
 #     or `jsSrc`. Nix also sees only git-tracked files, so `git add` first.
-#   - Something new to install (say the MCP server): add a package for it and
-#     copy it into `default`.
+#   - Something new to install: build it in `todo-tui-js` (or a package of
+#     its own) and copy it into `default`.
 {
   description = "todo-tui: a local-first todo list with a daemon, a CLI and an Ink TUI";
 
@@ -37,7 +38,7 @@
       pnpmDepsHash = {
         x86_64-linux = "sha256-UQCNT9d14RUBXuWQ1/wT2zJnQER+uWKAedS0yi2KLGk=";
         aarch64-linux = "sha256-UQCNT9d14RUBXuWQ1/wT2zJnQER+uWKAedS0yi2KLGk=";
-        aarch64-darwin = "sha256-4E7O7FHIRoeI9Tij3wu3kcjB+oJbVVm71PMXNpS9jV8=";
+        aarch64-darwin = "sha256-GD0k69V28HOBnQrUXKOfaYzyMW3rS9mVsZlZV2q1HRA=";
       };
 
       # Each part sees only the files it builds from, so a README edit
@@ -106,17 +107,19 @@
               runHook preBuild
               pnpm gen
               pnpm -C tui build
+              pnpm -C mcp build
               runHook postBuild
             '';
             installPhase = ''
               runHook preInstall
               install -Dm644 tui/dist/tui.js $out/share/todo-tui/tui.js
+              install -Dm644 mcp/dist/mcp.js $out/share/todo-tui/mcp.js
               runHook postInstall
             '';
           });
 
-          # `todo` runs <its own dir>/../share/todo-tui/tui.js with `node` from
-          # PATH. The binary is copied, not symlinked, because the kernel
+          # `todo` runs <its own dir>/../share/todo-tui/tui.js (`todo mcp`,
+          # mcp.js) with `node` from PATH. The binary is copied, not symlinked, because the kernel
           # reports a symlinked exe by its target; the wrapper adds Node 24.
           default =
             pkgs.runCommand "todo-tui-${version}"
@@ -127,6 +130,7 @@
               ''
                 install -Dm755 ${todo-cli}/bin/todo $out/bin/todo
                 install -Dm644 ${todo-tui-js}/share/todo-tui/tui.js $out/share/todo-tui/tui.js
+                install -Dm644 ${todo-tui-js}/share/todo-tui/mcp.js $out/share/todo-tui/mcp.js
                 wrapProgram $out/bin/todo --prefix PATH : ${lib.makeBinPath [ nodejs ]}
               '';
         };
