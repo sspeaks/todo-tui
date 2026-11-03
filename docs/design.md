@@ -1,6 +1,6 @@
 # todo-tui — Design Document
 
-> Status: Draft v1 (reader-tested, 2 rounds) · Owner: sspeaks · Last updated: 2026-10-30
+> Status: Draft v1 (reader-tested, 2 rounds) · Owner: sspeaks · Last updated: 2026-11-02
 >
 > Audience: an implementing agent who will design the gRPC APIs and then build the system. This doc defines *what* and *why*; API and schema details are deliberately left to the next phase except where they constrain the design.
 
@@ -51,6 +51,8 @@ Multi-device sync (other than through Jira) · team or multi-user features · we
 | **Event / `op_id`** | Recorded field change / the group of Events from one user action, the unit of undo (3.10) |
 | **Revision** | Global counter bumped on every write; drives the change stream (4.4) |
 | **Task kind** | One Claude feature: prompt, schema, trigger, model (6.2) |
+| **Energy** | How much focus an Item takes, `low`, `medium` or `high`: a local Overlay field (3.2) |
+| **L48 / N48** | "Last 48 / Next 48": the activity report of what moved in the last two working days and what is planned for the next two (6.6) |
 
 ### 1.5 How to read this document
 
@@ -91,8 +93,8 @@ Future capture surfaces (Raycast, macOS Shortcuts, mobile) are just more gRPC cl
 └────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **Tab bar**: the views (2.4). A view with `show_count` set (every default but Someday and Archive) shows its count, a COUNT over the same query its list runs, so the badge always equals the rows (`GetStatusCounts(include_views)`). `1`–`9` jump to a view; `[` / `]` go to the previous / next view.
-- **List**: one dense row per Item: status glyph (`○` todo, `◐` in progress, `●` done, `⊘` cancelled), *effective* priority (`*` suffix = local override, 3.2), title, Jira key, due, waiting (person + age), and markers: `✦` pending suggestions, `↑` pending push, `!` sync conflict / push failure, `🔁` recurring.
+- **Tab bar**: the views (2.4). A view with `show_count` set (every default but Someday and Archive) shows its count, a COUNT over the same query its list runs, so the badge always equals the rows (`GetStatusCounts(include_views)`). `1`–`9` jump to a view; `[` / `]` (and `h` / `l`, M8) go to the previous / next view.
+- **List**: one dense row per Item: status glyph (`○` todo, `◐` in progress, `●` done, `⊘` cancelled), *effective* priority (`*` suffix = local override, 3.2), title, Jira key, due, waiting (person + age), and markers: `✦` pending suggestions, `↑` pending push, `!` sync conflict / push failure, `🔁` recurring. From M8 a one-cell energy glyph follows the priority (`▁` low, `▄` medium, `█` high); it goes with the markers when the title runs short.
 - **Detail pane** shows the Jira status *name* when linked (e.g. "In Review") with the category glyph; the local status otherwise.
 - **Right pane**: shows either the **detail** of the selected Item, or the **Suggestions** drawer (`S` toggles). It follows the list selection.
 - **Status bar**: mode, per-instance sync state (5.11), pending outbox count, global suggestion count, key hints.
@@ -107,13 +109,13 @@ Future capture surfaces (Raycast, macOS Shortcuts, mobile) are just more gRPC cl
 - **Sanitizing**: every piece of user text has C0/C1 controls, bidi overrides and escape sequences stripped before it is rendered: a title can hold ESC (only line breaks are refused), and Ink passes SGR codes through.
 - **Empty states** follow the view's seed ("Inbox zero · a to add", "Nothing due today", …; a user view says "No Items match this view"); a narrowed list says what it matched.
 - **Status bar**: mode (`NORMAL`, `ADD`, `EDIT`, `VISUAL`, …) · connection (`● live`, or `◌ reconnecting (n)` with the error, the list dimmed) · `saving…` once an action has run 250 ms · `N marked` (`(k hidden)` under `/`) · the pending prefix with its continuations (`p… 1–5 Set the priority · 0 Clear the priority`) · `/q · n` · `u: <undo entry>` (the top of the global undo stack, 3.10) · key hints. Sync state, the outbox count and suggestions join in P2.
-- **Detail pane** (read-only in P1): title, status, priority (and override), due, defer, repeats (only with a rule, 3.8: the rule and the slot this instance is scheduled for, which the next counts from, `every Mon, Thu · this one Thu Oct 29`; an after-completion rule shows the rule alone, `3 days after done`, since its next counts from the day it is done), waiting (person, since and age, follow-up, reason), labels, created (with `created_via`), updated, description; archived, type, story points, estimates and private notes when set; the parent's title; the subtasks (any status); relations as "Blocks / Blocked by / Duplicates / Duplicated by / Related to", a deleted end dimmed. It follows the selection after about 80 ms; `tab` focuses it to scroll it.
+- **Detail pane** (read-only in P1): title, status, priority (and override), due, defer, repeats (only with a rule, 3.8: the rule and the slot this instance is scheduled for, which the next counts from, `every Mon, Thu · this one Thu Oct 29`; an after-completion rule shows the rule alone, `3 days after done`, since its next counts from the day it is done), waiting (person, since and age, follow-up, reason), labels, created (with `created_via`), updated, description; archived, type, energy (M8), story points, estimates and private notes when set; the parent's title; the subtasks (any status); relations as "Blocks / Blocked by / Duplicates / Duplicated by / Related to", a deleted end dimmed. It follows the selection after about 80 ms; `tab` focuses it to scroll it.
 
 ### 2.3 Inline capture syntax
 
 Parsed by the core (Rust) and exposed as a `ParseCapture(text, reference_time?)` RPC (reference time defaults to now), so CLI, TUI preview, MCP and spool import behave identically. A token is a whitespace-delimited word starting with a sigil; tokens never contain spaces except the quoted `~"…"` form. A token that fails to parse **stays in the title** and the parse result carries a warning (shown in the TUI preview, printed by the CLI). Everything else is the title. `\` escapes a sigil (`\#1 fan`). Capture text is at most **64 KiB** (65536 bytes of UTF-8): `CaptureItem`, `ParseCapture` and the spool import refuse longer text (`INVALID_ARGUMENT` on `text`), and an update refuses a longer title (`item.title`); description has no limit of its own.
 
-On a shell command line, single quotes are the safe form. Unquoted, bash treats `#label` as a comment and `>next` as a redirect, zsh fails on `~name` ("no such user or named directory"), and zsh with `extendedglob` expands `^fri` as a pattern. Double quotes protect the sigils but still expand `$`.
+On a shell command line, single quotes are the safe form. Unquoted, bash treats `#label` as a comment and `>next` as a redirect, zsh fails on `~name` ("no such user or named directory"), and zsh with `extendedglob` expands `^fri` as a pattern. Double quotes protect the sigils but still expand `$`. `%` needs no quoting.
 
 | Token | Meaning | Examples |
 |---|---|---|
@@ -123,6 +125,7 @@ On a shell command line, single quotes are the safe form. Unquoted, bash treats 
 | `~<person>` | Waiting on. Free text in P1; from P2 fuzzy-matched against known People (3.5), unknown names staying free text | `~dana`, `~"the vendor"` |
 | `>someday` / `>next` | Initial status refinement (default `inbox`) | `>someday` |
 | `@<rule>` | Repeats (rule grammar below, 3.8) | `@daily`, `@weekdays`, `@mon,thu`, `@15th`, `@2w` |
+| `%<energy>` | Energy (M8, 3.2): `low`, `med` or `medium`, `high`, case-insensitive. Anything else stays in the title ("not an energy level") | `%low`, `%high` |
 
 **Date grammar** (shared by `^`, the `^` / `D` prompts, and follow-up dates), case-insensitive, resolved in local time against the reference time. The prompts use `ParseDate(text, reference_time?)` (a leading `^` is allowed), since `ParseCapture` applies no token to text with no title words:
 
@@ -175,7 +178,7 @@ All bindings live in one declarative keymap table (4.6), are listed in the `F1` 
 
 **Key handling**: one input mode owns the keys at a time (normal, quick-add, prompt, status picker, confirm, command, `/`, help). Ink hands over a whole stdin chunk at once, so each chunk is split into one token per key: `jjj` is three moves, `milk⏎bread⏎` two captures. Ink reports ESC then a key within 20 ms and Alt+key alike: outside a text line that is `esc` then the key; in a line Alt with an arrow, `b`, `f`, `d` or backspace moves or deletes by word, and other Alt+named keys do nothing, so they never throw the line away. There are **no counts and no timeouts**: digits switch views, and `d`, `g`, `p` are prefixes (no binding is both complete and a prefix; a test enforces it). An unbound continuation (`d j`, `p 9`) is dropped with a hint, and the status bar shows a pending prefix with its continuations. A bracketed paste never runs as keys: in normal mode it is ignored with a hint.
 
-**Navigation**: `j`/`k` move · `gg`/`G` top/bottom · `ctrl-d`/`ctrl-u` half-page · `tab` cycle focus list ↔ right pane · `1`–`9`, `[`, `]` views (`[` and `]` wrap) · `/` incremental filter (below) · `esc` clear / close. `esc` steps back one level per press: a pending prefix, then the detail (overlay or focus), then a `V` range, then the `/` narrowing, then the marks; on the `Search:` tab with nothing else to clear, back to the view it was opened from. `n`/`N` stay unbound.
+**Navigation**: `j`/`k` move · `gg`/`G` top/bottom · `ctrl-d`/`ctrl-u` half-page · `tab` cycle focus list ↔ right pane · `1`–`9`, `[` / `h`, `]` / `l` views (`[` and `]` wrap; `h` and `l` from M8, and before that as a `[keymap]` override once M6 has them, 8.2) · `/` incremental filter (below) · `esc` clear / close. `esc` steps back one level per press: a pending prefix, then the detail (overlay or focus), then a `V` range, then the `/` narrowing, then the marks; on the `Search:` tab with nothing else to clear, back to the view it was opened from. `n`/`N` stay unbound.
 
 **`/` and `:search`**: `/` narrows the current view **on the server** as you type: `ListItems(view_id = current, filter = {any_of: [title, labels, remote_link.key MATCHES q]})`, one request in flight and the latest text winning (no debounce). `enter` keeps the narrowed list, `esc` clears it (back to the selection and scroll from before `/`), a view switch clears it, and the tab count stays un-narrowed. Blank or token-less text is un-narrowed (MATCHES refuses blank text), and the text is capped at 1024 bytes. The selection stays on its Item while it still matches, else goes to the first row. A narrowed list holds only matches, so `n`/`N` are not match jumps. `:search q` searches everything: no view, `any_of` the same targets plus description, with `include_archived`, `include_done` and `include_deferred` (deleted Items stay hidden), most recently updated first. It opens a transient `Search: q` tab after the views; a new `:search` replaces it, and leaving the tab closes it. MATCHES takes plain words, each a prefix, ignoring case and accents (4.8).
 
@@ -195,6 +198,8 @@ All bindings live in one declarative keymap table (4.6), are listed in the `F1` 
 | `s` | Status picker: a letter each, `i` inbox · `n` next · `p` in progress · `s` someday · `d` done · `c` cancelled; `j`/`k` + `enter` also work; the current status (with marks, the one they share) is ticked |
 | `x` / `X` | Mark done / cancelled. No toggle: on an Item already done the toast says "already done; s to reopen" |
 | `t` | Edit labels: prefilled `#a #b`, edited as the whole set (`#` optional; one `#` comes off, as in capture, so `##a` is the label `#a`). With marks, `+a -b` adds and removes on each Item's own set |
+| `e` then `l` / `m` / `h` / `0` | Set energy low / medium / high, or clear it (M8, 3.2). Local only, never pushed. Mark-aware |
+| `M` | Schedule a Teams meeting about the Item, or about the marked Items together (M8, 2.9) |
 | `P` | Promote to Jira (target from config; shows missing required fields on failure, 5.7) |
 | `L` | Link (attach) to an existing Jira issue by key |
 | `o` | Open in browser (Jira URL) |
@@ -204,11 +209,11 @@ All bindings live in one declarative keymap table (4.6), are listed in the `F1` 
 | `u` / `ctrl-r` | Undo / redo (per `op_id`), with `expected_op_id` from the status bar's `u:` entry, so `u` never undoes an op you have not seen (an `UNDO_STACK_CHANGED` refusal says what `u` now undoes). The toasts use the CLI's words: `Undid: …`, `Could not undo: …`, `· N changes kept (changed since)`, `Nothing to undo` |
 | `gs` | Sync now |
 
-**In P1 (M4)**: `P`, `L`, `o`, `gs`, `S` and the `space` leader are unbound until their services exist (P2–P4). **Marks** belong to the current view: a view switch, a successful bulk action and `esc` clear them; an Item that leaves the view leaves the marks; `/` keeps them (`3 marked (1 hidden)`). When the view has marks, the mark-aware keys `x X s p ^ D w W t z dd @` act on every marked Item through one `BatchMutate`, so one undo entry (`mark done (3 items) · u undo`); `z` on a mixed set archives if any is unarchived. `@` is prefilled with the rule the marked Items share, if they share one, and resolves its text against each Item's own due date (one `ParseRecurrence` per date), so `weekly` repeats each on its own weekday; each Item without recurrence gets its own series. `i`, `E`, `A` and `enter` act on the selected Item only, `u` and `ctrl-r` on the global stack. More than 1000 marks is refused, since splitting the batch would split the undo.
+**In P1 (M4)**: `P`, `L`, `o`, `gs`, `S` and the `space` leader are unbound until their services exist (P2–P4). **Marks** belong to the current view: a view switch, a successful bulk action and `esc` clear them; an Item that leaves the view leaves the marks; `/` keeps them (`3 marked (1 hidden)`). When the view has marks, the mark-aware keys `x X s p ^ D w W t z dd @` (and `e`, M8) act on every marked Item through one `BatchMutate`, so one undo entry (`mark done (3 items) · u undo`); `z` on a mixed set archives if any is unarchived. `@` is prefilled with the rule the marked Items share, if they share one, and resolves its text against each Item's own due date (one `ParseRecurrence` per date), so `weekly` repeats each on its own weekday; each Item without recurrence gets its own series. `i`, `E`, `A` and `enter` act on the selected Item only, `u` and `ctrl-r` on the global stack. More than 1000 marks is refused, since splitting the batch would split the undo.
 
-**Claude actions** (`space` leader; hidden if no provider configured): `space r` refine · `space p` prioritize · `space s` split · `space c` draft comment · `space l` find related. All produce Suggestions. `?` opens the **Ask bar** (6.7).
+**Claude actions** (`space` leader; hidden if no provider configured): `space r` refine · `space p` prioritize · `space s` split · `space c` draft comment · `space l` find related · `space m` draft a meeting agenda (2.9). All but the agenda produce Suggestions; the agenda is text for the meeting form, like the standup (6.6). `?` opens the **Ask bar** (6.7).
 
-**Command line** (`:`) with fuzzy completion, which doubles as the command palette: `:review`, `:standup`, `:sync`, `:promote`, `:link PLAT-123`, `:export`, `:view new …`, `:help`. P1 runs `:q`/`:quit`, `:help`/`:h`, `:search <q>` and `:refresh`, with `tab` prefix completion (the fuzzy palette comes later); a planned command says when it arrives (`:view` and `:export` in M6, `:sync`, `:promote`, `:link` and `:w` in P2, `:review` and `:standup` in P4), anything else "Not a command".
+**Command line** (`:`) with fuzzy completion, which doubles as the command palette: `:review`, `:standup`, `:sync`, `:promote`, `:link PLAT-123`, `:export`, `:view new …`, `:help`. P1 runs `:q`/`:quit`, `:help`/`:h`, `:search <q>` and `:refresh`, with `tab` prefix completion (the fuzzy palette comes later); a planned command says when it arrives (`:view` and `:export` in M6, `:l48` and `:meet` in M8, `:sync`, `:promote`, `:link` and `:w` in P2, `:review` and `:standup` in P4), anything else "Not a command".
 
 **Quitting**: `q`, `:q` and `ctrl-c` in normal mode; in an input mode `ctrl-c` cancels it. Quitting waits up to 1 s for an action in flight. `ctrl-z` stops the TUI as a shell job (`fg` resumes it, redrawn, the change stream catching up); with no job control it says so and carries on.
 
@@ -254,6 +259,18 @@ The single place where you review AI proposals **and** sync fallout:
 - **The daemon going away**: the status bar shows `◌ reconnecting (n)` with the error and the list dims; navigation keeps working on the rows shown. An action cut by a connection failure waits up to 5 s for the stream to be live, then sends the **same request** again, `request_id` and all, so it applies once (4.3 rule 4); otherwise "Not saved: daemon unavailable", with any typed text kept. The live store respawns the daemon at the start of an outage and every 5 s while it lasts.
 - **Selection**: an Item id, remembered per view. When the Item leaves the list (your action or another client's), the selection falls to the row now at its index, or the last row; when your own action reorders the list (`p 1` in Next), it follows the Item. Background changes never move the selection or the scroll: the scroll is anchored on the top row's id, with a scrolloff of 2. Rows a background change brings into view are highlighted briefly.
 - **Midnight**: a 60 s poll compares the local date with `GetStatusCountsResponse.today` and, once it passes, re-reads the views and counts once per `today` (4.4). A single long timer would stall while a laptop sleeps.
+
+### 2.9 Scheduling a Teams meeting (M8)
+
+Some todos are really "get these people in a room". `M` (and `:meet`) opens Microsoft Teams' new-meeting form, already filled in, so you finish scheduling there. todo-tui never creates the meeting itself: it needs no Microsoft login, no Graph API and no credentials, and Teams' own scheduling assistant still shows who is free.
+
+- **How**: Teams accepts a deep link, `https://teams.microsoft.com/l/meeting/new?subject=…&content=…&attendees=…&startTime=…&endTime=…`. Each parameter is optional, values are percent-encoded with `%20` for a space (Teams refuses `+`), times are ISO 8601 with a UTC offset, and Teams has no location parameter. The daemon builds the link (`ItemService.BuildMeetingLink`, so MCP and the CLI build the same one) and the client opens it as `o` opens a Jira URL: `open` on macOS, `xdg-open` on Linux. Teams, desktop or web, then shows the form; nothing is saved until you press Send there.
+- **What it fills**: the subject is the Item's title, or for marked Items the first title plus `+ 2 more`. The content is the description's first paragraph and, for linked Items, the Jira key and URL. The attendees are the email addresses of `waiting.on`, the assignee and the reporter, from People (3.5), so before P2 there are none and you add them in Teams. A `waiting.on` that is free text containing one `@` (`~dana@example.com`) counts as an address in P1 too. No times are filled: Teams applies its own default, and its scheduling assistant is the right place to find a slot.
+- **The prompt**: `M` opens a one-line prompt prefilled with the subject, then `enter` opens the link. `M` on a done or cancelled Item works (a post-mortem is a meeting too).
+- **Afterwards**: nothing is recorded on the Item, so `M` writes no event and is not an undo entry. If the meeting is something you now wait on, `w` sets that as usual.
+- **Feasibility**: the link opens the form only for an account whose Teams can schedule meetings, and an organisation can block deep links; then the browser shows Teams' own error. Opening the URL is the whole integration, so there is nothing to keep in sync.
+- **Claude (P4)**: with a provider configured, `space m` drafts the agenda for the `content` from the Item, its subtasks and recent events, shown in the prompt for you to edit first, as a `comment_draft` is (6.2).
+- **Config** (8.2): `[meetings] provider = "teams"`, the only provider; `"none"` unbinds `M`. Outlook (`outlook.office.com/calendar/deeplink/compose`) and Google Calendar links take the same fields, so another provider is just another link builder.
 
 ## 3. Domain Model
 
@@ -317,6 +334,7 @@ Item fields fall into three layers. The layer determines **who owns the field**,
 | `local_priority_override` | priority | Lets you rank an Item differently from its Jira priority without fighting your team. Views sort by *effective priority* = override if set, else `priority` |
 | `archived` | `{ at, reason: user \| left_scope \| remote_unavailable \| auto_done }` or null | See 3.7 |
 | `recurrence` | `{ series_id, occurrence_date?, rule? }` or null | The series the Item belongs to, the slot it is scheduled for, and its repeat rule (3.8). Written by `SetRecurrence`, a capture's `@`, the generation of a next instance, and undo and redo; `UpdateItem` refuses it |
+| `energy` | `none \| low \| medium \| high` (M8) | How much focus the Item takes, the GTD "energy" context: so on a tired afternoon a view of `%low` Items gives you something you can still finish. Not size, which is what `story_points` and the estimates are for, and not urgency, which is priority. Set by the `%` capture token (2.3), `e` (2.5) and `UpdateItem`; copied to the next instance of a series (3.8). Never pushed: Jira has no such field, so it is the same on linked Items |
 
 #### Remote extras
 
@@ -428,7 +446,7 @@ It writes `recurrence` and `due_date` as two events (only those that changed), s
 **Completing an instance.** After the mutations of a user op (`x`, `X`, `s`, a bulk action; MCP clients too, M7), and before its summary, the same op creates the next instance of each Item that was open before it, is `done` or `cancelled` after it (so done → cancelled does not count), is live and still has a rule. It creates none while another live, open instance of the series exists, counting the batch's working copies, the instances this pass has made and the stored rows. So the batch's final state decides: `[x A, s A→next]`, `[x A, dd A]` and `[x A, @clear A]` generate nothing, and two instances of one series completed in one batch generate one. `X` skips an instance: it generates the next just as done does. Reopening a completed instance can leave two open; completing either then generates nothing, since the other is still open, and completing the second generates the next. Undo and redo never generate: they restore what an op did, the instance it created included.
 
 - **Next date**: a fixed rule skips the dates missed, taking the first scheduled date after the slot (`occurrence_date`, else `due_date`, else today) that is not before today. An after-completion rule takes today + its days.
-- **Copied** from the completed instance: title, description, `item_type`, priority, local priority override, labels, parent and estimates. **Not copied**: remote link and extras, scopes, tracker-only fields, waiting, private notes, focus week, archive, relations and subtasks. A parent that is deleted (an M1-era orphan, 3.7) is dropped, so the new instance starts at the top level.
+- **Copied** from the completed instance: title, description, `item_type`, priority, local priority override, energy (M8), labels, parent and estimates. **Not copied**: remote link and extras, scopes, tracker-only fields, waiting, private notes, focus week, archive, relations and subtasks. A parent that is deleted (an M1-era orphan, 3.7) is dropped, so the new instance starts at the top level.
 - **The new instance** has `created_via = recurrence`; the same series and rule; `due_date` and `occurrence_date` on the next date; `defer_until` on it too, unless it is today or earlier; and the completed instance's refinement as its status, with `inbox` becoming `next`. Its status and its last user touch start now.
 - **One undo entry**: the op's actor stays `user`. It writes a `create` event for the instance, whose inverse is a soft delete (3.10), so `u` reopens the completed instance and removes the next one, and `ctrl-r` brings both back. A redo whose instance's parent was deleted since skips that undelete as `invalid`.
 - **Responses**: `SetStatusResponse.generated` and `BatchMutateResponse.generated` (in mutation order) hold the new instances; a `request_id` replay returns the same ones and creates none. The parent's subtask counts are re-emitted by the fan-out (4.8).
@@ -668,6 +686,7 @@ Binding conventions for the API design phase, so implementers don't diverge:
   - **Errors**: an invalid target × operator × operand combination is `INVALID_ARGUMENT` with a `BadRequest` naming the first offending path in document order, e.g. `filter.all_of[1].group.any_of[0].predicate.op` or `sort[2].key` (a total over a limit: `filter` or `sort`). A valid combination that is not built yet is `UNIMPLEMENTED` / `NOT_IMPLEMENTED` (metadata `field`), reported only when nothing is invalid: relative dates on instant targets, `remote_extras`, `pending_fields` with `contains_*`. The full type × operator table is in `filter.proto`.
   - **Limits** (`todo_core::filter`, mirrored in `packages/client/src/limits.ts`): groups nest at most 4 deep; a filter holds at most 128 predicates and 4000 operands, a predicate at most 1000; `matches` text at most 1024 bytes; a sort at most 8 keys. Groups themselves cost nothing: one that always matches (an empty group, or one of only such groups) compiles to nothing, so the SQL never nests deeper than the predicates do. Every value is a bound SQL parameter; SQL text comes only from a fixed vocabulary.
   - **Default views** (seeded, 2.4), with the implicit rules on top and every sort ending in the tie-break: **Inbox** `status in [inbox]`, `created_at asc`. **Today** `any_of: [due_date <= today, status in [in_progress], {all_of: [waiting is_set, waiting.follow_up_on <= today]}, focus_week = current_week]`, `is_overdue desc, effective_priority desc, due_date asc`. **Next** `status in [next, in_progress]`, `effective_priority desc, due_date asc`. **Waiting** `waiting is_set`, `waiting.since asc`. **Someday** `status in [someday]`, `updated_at desc`. **Archive** `include_archived, include_done, include_deferred, any_of: [archived is_set, status in [done, cancelled]]`, `updated_at desc`. **Instance tab** (P2) `remote_link.instance_id = <id>`, `remote_link.key asc`.
+  - **`energy`** (M8) is an enum target like `priority`: `Energy` ranks `low` = 1 … `high` = 3, and `ENERGY_NONE` behaves as unset for ordering, exactly as `PRIORITY_NONE` does (it never matches `<`, `<=`, `>`, `>=` and sorts last). Item field 48 (the first free Overlay number) and `ITEM_FIELD_ENERGY = 48`. No default view filters on it; a "Quick wins" view is one `:view new` away (`energy:low sort:-effective_priority`).
   - **`is_blocked`** (P4, standup and Ask; no tab, marker or key needs it before): true iff some relation `X blocks this` exists where X is not deleted and not `done`/`cancelled` (archive does not matter). When X crosses open/closed, or is deleted or undeleted, the op must also record a change for every Item X blocks, or cached Items go stale. Field number 83 is allocated by comment only (`item.proto`, `field.proto`).
   - **`subtasks_total`, `subtasks_done`, `parent_title`** (84–86) carry the same duty, and are kept by it: they are computed when an Item is read (`todo_store::hierarchy`, two batched queries beside the relations), and an op re-emits the Items whose values it changes without changing them (`Batch::fan_out`). That is the old and new parent of every Item whose parent, counted state (live and not cancelled) or done state changed, and every direct subtask of a retitled Item; one level, since a relative re-emitted this way does not change. The fan-out gets a revision and a change, **not** a new `updated_at` (Someday and Archive sort by it, so ticking a subtask must not move its parent), and it is not part of the op's answer (`MutateOutput`, `UndoOutput`, `OpSummary.item_ids`): clients see it on the stream. `write_op` attaches after it writes every row, so a snapshot has the op's counts; undo and redo share it. A capture under a parent re-emits the parent first, so the capture's revision is still the op's last. No `ItemField` yet: they are not filter or sort targets until a view needs them (84–86 allocated by comment).
 
@@ -864,6 +883,8 @@ Every Claude feature is a **task kind**, with its own prompt template, output sc
 | `stale_review` | Per-stale-Item action proposals (6.5) | Scheduled, weekly | Sonnet 5.5 |
 | `comment_draft` | A Jira comment / status update for an Item | On request | Sonnet 5.5 |
 | `standup` | Personal standup text (6.6) | On request | Sonnet 5.5 |
+| `l48` | The L48 / N48 report in your own style (6.6) | On request | Sonnet 5.5 |
+| `meeting_agenda` | An agenda for a Teams meeting about the Items (2.9) | On request | Haiku 5.5 |
 | `ask` | Answer to a free-form question, with Item references (6.7) | On request | Opus 5.5 |
 
 Model IDs are config values (`claude-haiku-5-5`, `claude-sonnet-5-5`, `claude-opus-5-5` at time of writing). Defaults favor cheap models for high-frequency work.
@@ -919,6 +940,28 @@ Every step uses the standard Suggestions checkbox interaction. The scheduler alw
 ### 6.6 Personal standup
 
 `todo standup` (and a TUI view) produces a short text: *done since last standup*, *in progress / planned today*, *blocked / waiting on*, built from Events since the last standup (the time of the last `todo standup` is stored; default for the first run: the previous working day). Without Claude it is a plain list; with Claude it is condensed into readable sentences. Output can be copied to the clipboard. It is never posted anywhere automatically.
+
+**L48 / N48 (M8 without Claude, P4 with it).** The report your scrum asks for: what you worked on in the **last 48** hours and what you plan for the **next 48**, a few short lines each:
+
+```
+L48:
+- Release 2.3 test support; certification run this week
+- Build tooling for the staging rollout (PLAT-412); 3 of 5 subtasks done
+- Started the load-model discussion with the perf team; follow-up next week
+N48:
+- Help Dana validate the replay tests
+- Planning memo; slightly behind schedule
+- Close out the database migration; waiting on Sam
+```
+
+It is the standup over a fixed window, so it shares the standup's builder. `todo l48` prints it, `:l48` shows it in a transient panel with `y` to copy, and `ItemService.GetActivityReport(window)` serves both, plus MCP (`todo_l48`). It is on `ItemService` because `ReviewService` does not exist until P4; the standup reuses it then.
+
+- **The window** is two **working days**, not 48 clock hours, so Monday's L48 covers Thursday and Friday: `[l48] working_days = ["mon", …, "fri"]` and `window_days = 2` (8.2). Holidays are not modelled; `--since DATE` overrides the start.
+- **L48 lines** are the Items with a user Event in the window (3.10): completed, moved to `in_progress`, edited, or given a subtask that was completed. One line per top-level Item, its subtasks folded under it (`MR-3 prep: 3 of 5 subtasks done`); a completed recurring instance is one line, not one per day. Sync, system and scheduler Events do not count, so an auto-archive is not work. An Item whose only changes in the window are to labels, priority, the override, energy or `focus_week` is left out: triage is not work.
+- **N48 lines** are the open Items that are `in_progress`, due within the next window, waiting with a follow-up in it, or in this week's focus (`focus_week`), ordered like Today: the planned work, not the whole backlog.
+- **Each line** is the Item's title, then `; waiting on <person>` when it waits. Linked Items get their Jira key in parentheses. Without Claude that is the whole text, and you add the colour ("we're slightly behind schedule") after copying.
+- **With Claude (P4)**: an `l48` task kind (6.2, Sonnet) rewrites the same lines into the style of your past reports. Each report you copy after editing is kept as an example (6.8), so it picks up your phrasing. It runs only on request, never posts anywhere, and the text is shown for you to edit before it is copied.
+- **Automation** (both stages): `todo l48 --copy` for a shell alias, and with the daemon running a reminder is just a recurring Item (`todo add "send L48/N48 @mon,thu"`). Sending to Teams or email is out of scope: you paste it.
 
 ### 6.7 Ask
 
@@ -1042,6 +1085,13 @@ enabled = true
 interval = "daily"
 retain_days = 14
 
+[l48]                       # M8 (6.6)
+window_days = 2
+working_days = ["mon", "tue", "wed", "thu", "fri"]
+
+[meetings]                  # M8 (2.9)
+provider = "teams"          # "teams" | "none"
+
 [[instances]]
 id = "work-jira"
 kind = "jira"
@@ -1096,9 +1146,9 @@ Each phase ends usable. Later phases must not require reworking earlier contract
 |---|---|---|
 | **P0 — Spike** | Repo skeleton (4.7 layout), Buf setup, a minimal `todo.v1` (`GetServerInfo`, `CaptureItem`, `ListItems`, `Subscribe`) using the **real** `Item` message shape from 3.2/4.8 (it can't be renumbered later), tonic daemon on a Unix socket with SQLite + revisions + `changes`, Connect-ES client in Node, Ink list that updates live | TS client calls tonic over UDS incl. a server stream; auto-spawn + lock works. Fallback decision (4.3) made |
 | **P1 — Local core** | Full domain model (Section 3, minus remote parts, Suggestions and comment drafts, which move to P2 where they can be pushed), store + migrations, capture parser + `ParseCapture`, `todo add` + spool, TUI layout/views/keymap/detail/undo/bulk, recurrence, archive/delete/undelete, export/import, backups, `todo status`, MCP server (incl. `--read-only`). **Services**: `SystemService`, `ItemService` (incl. `BatchMutate`, `SetRecurrence` and `ParseRecurrence`), `ViewService`, `WatchService` complete for local data; recurrence has no service of its own (3.8). People (`PeopleService`, `~` fuzzy matching) move to P2, since P1 cannot create a Person (3.5) | Daily-drivable as a local-only todo app |
-| **P2 — Jira sync** | Adapter trait + fake adapter + conformance suite, Jira adapter, discovery, pull loop + tracked set, reconciliation, outbox, promote/attach, conflicts, comment drafts and their push, **Suggestion model + pane** (for `sync_conflict` / `link_conflict` / `push_failed`), credentials, sync status, People and `~` fuzzy matching (3.5). **Services**: `SyncService`, `SuggestionService`, `PeopleService` | Your assigned Jira issues stay in sync both ways on a work instance; offline edits recover correctly |
+| **P2 — Jira sync** | Adapter trait + fake adapter + conformance suite, Jira adapter, discovery, pull loop + tracked set, reconciliation, outbox, promote/attach, conflicts, comment drafts and their push, **Suggestion model + pane** (for `sync_conflict` / `link_conflict` / `push_failed`), credentials, sync status, People and `~` fuzzy matching (3.5), Teams meeting attendees from People (2.9, after M8). **Services**: `SyncService`, `SuggestionService`, `PeopleService` | Your assigned Jira issues stay in sync both ways on a work instance; offline edits recover correctly |
 | **P3 — Claude core** | Providers (`api`, `claude_code`), job queue, context builder, `refine` (incl. merge), `relate`, `prioritize`, `fill_required`, learning from decisions, NL inference, usage tracking. **Services**: `AssistantService` (request jobs, usage) | Captures arrive refined; duplicates are caught |
-| **P4 — Review & Claude workflows** | Stale rules + `stale_review` (rules and Claude), weekly review mode, standup, Ask bar, `split`, `comment_draft`, derived `is_blocked` (4.8). **Services**: `ReviewService` | Monday review is the routine |
+| **P4 — Review & Claude workflows** | Stale rules + `stale_review` (rules and Claude), weekly review mode, standup, Ask bar, `split`, `comment_draft`, the Claude `l48` report (6.6) and `meeting_agenda` (2.9) on top of M8, derived `is_blocked` (4.8). **Services**: `ReviewService` | Monday review is the routine |
 | **P5 — Open source** | Packaging (Homebrew), docs, fixture scrubbing, a **second adapter** (GitHub Issues) to prove the adapter abstraction | Public release |
 
 **P1 progress.** P1 is built in milestones:
@@ -1112,6 +1162,7 @@ Each phase ends usable. Later phases must not require reworking earlier contract
 | M5 | Recurrence and the scheduler (incl. the `auto_done` archive, 3.7): `@` in capture and as a key, `SetRecurrence`, the next instance generated on completion (3.8), the supervisor (4.5) | done |
 | M6 | Config (incl. keymap overrides), export/import, backups, view CRUD (`:view`) | next |
 | M7 | The MCP server | done, ahead of M6: it needed nothing from M6, and Claude Code could then manage todos |
+| M8 | Personal workflow, after M6: the `energy` field (`%`, `e`, the glyph, a filter and sort target, 3.2, 4.8); `h` / `l` for the previous / next view (2.5); the L48 / N48 report without Claude (`todo l48`, `:l48`, 6.6); `M` / `:meet` for a prefilled Teams meeting form (2.9) | planned |
 
 M4 left these for later: keymap overrides and `:view` to M6 (config and view CRUD); the relation and reparent UI to P3, where `relate` and `split` first create relations (nothing in P1 does); the detail pane's field editor, and with it editing the local priority override and private notes, to P2, where they matter (every field P1 edits has a key); `✦`, sync state and the outbox count to P2; the Ask bar to P4. The contract did not change in M4 (`api_minor` is still 5).
 
@@ -1120,6 +1171,8 @@ After M4, subtask context on flat rows (2.2): `subtasks_total`, `subtasks_done` 
 - **Zoom tab (P3, with the reparent UI)**: `>` on an Item opens a transient tab after the views, as `Search:` does, holding that Item and its subtree indented by depth, every status shown (done and cancelled dimmed), the tree setting the order (siblings by `created_at`). `<` goes up to the parent's subtree; `esc`, with nothing else to clear, back to the view it was opened from; a new `>` replaces it. Its count is the subtree's. A subtree is small, so it is read whole: no paging, and no rows shown for context that the view does not hold. Marks, `V` and the triage keys work as on any tab.
 
 M7 built the MCP server (4.6) as `mcp/`: `todo mcp [--read-only]` execs the `mcp.js` bundle, found as the TUI's is (`$TODO_MCP_ENTRY`, then `share/todo-tui/mcp.js`, then `mcp/dist/mcp.js`). Its tools are `todo_list`, `todo_get`, `todo_status` and `todo_views` (the read-only set), and `todo_capture`, `todo_update`, `todo_set_status`, `todo_set_repeat`, `todo_archive` / `todo_unarchive`, `todo_delete` / `todo_undelete` and `todo_undo` / `todo_redo`. They take a full or a short (8-character) id, take dates in the capture grammar through `ParseDate`, and return a compact JSON projection of the Item that already carries the remote link, `has_conflict`, `has_push_failure` and `pending_fields`, for P2. Pending suggestions wait for P2. `claude/skills/todo/` is a Claude Code skill over the tools. The contract did not change (`api_minor` is still 8).
+
+M8 comes from the `#todo-tui` items in the todo list (2026-11-02). It runs after M6 because two of its pieces lean on M6: energy is most useful in a `:view`, and `h` / `l` change default keys, which M6's overrides let you undo (`"h" = ""`). Until M8, `"h" = "view_prev"` and `"l" = "view_next"` in `[keymap]` give the keys as soon as M6 ships. Neither key is bound today, and neither is a prefix, so the keymap's prefix test passes. What M8 leaves for later: Teams attendees need People (P2; until then only a `waiting.on` that is an email address); the Claude `l48` and `meeting_agenda` task kinds need the assistant (P4). The contract grows additively: `Item.energy`, `ITEM_FIELD_ENERGY`, `GetActivityReport` and `BuildMeetingLink`, one `api_minor` bump per contract phase, after M6's 13. The `energy` column is a new migration (`0005` or later, 7.2), and M6's config loader learns `[l48]` and `[meetings]`, which it warns about as unknown until then. `e` becomes a prefix in normal mode (`e` in the Suggestions pane, 2.6, is another mode).
 
 M5 left these for later: copying subtasks to the next instance (it copies the parent, never the children, 3.8); the health RPC for background tasks (4.5), so a restarted task shows only in `daemon.log`; the `archive_done_after_days` config key to M6, with config (until then 7 days, hard-coded, 3.7); staleness and nudges in the scheduler to P4. The contract grew additively in M5: `api_minor` 7 with the stubs, 8 since they work (4.2), with `Change` field 14 reserved and `TOPIC_SERIES` unused (4.4, ADR-0003).
 
