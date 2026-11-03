@@ -1,8 +1,15 @@
+use std::pin::Pin;
 use todo_proto::v1::system_service_server::SystemService;
+
+use futures_util::{Stream, StreamExt as _};
+use todo_proto::export::{
+    FORMAT, FORMAT_VERSION, Header, header_line, read_header, read_record, record_line,
+};
 use todo_proto::v1::{
-    self, BackupRequest, BackupResponse, ClientKind, GetConfigRequest, GetConfigResponse,
-    GetServerInfoRequest, GetServerInfoResponse, ReloadConfigRequest, ReloadConfigResponse,
-    ShutdownRequest, ShutdownResponse,
+    self, BackupRequest, BackupResponse, ClientKind, ExportRequest, ExportResponse,
+    GetConfigRequest, GetConfigResponse, GetServerInfoRequest, GetServerInfoResponse,
+    ImportRequest, ImportResponse, ReloadConfigRequest, ReloadConfigResponse, ShutdownRequest,
+    ShutdownResponse,
 };
 use tonic::{Code, Request, Response, Status};
 
@@ -13,8 +20,19 @@ use crate::error;
 
 pub(crate) struct System(pub(crate) Ctx);
 
+/// Lines an Export message carries.
+const EXPORT_BATCH: usize = 500;
+
+/// The most export text an Import takes, all lines together (1 GiB):
+/// personal scale is far below it.
+pub(crate) const MAX_IMPORT_BYTES: usize = 1 << 30;
+
+type ExportStream = Pin<Box<dyn Stream<Item = Result<ExportResponse, Status>> + Send>>;
+
 #[tonic::async_trait]
 impl SystemService for System {
+    type ExportStream = ExportStream;
+
     async fn get_server_info(
         &self,
         request: Request<GetServerInfoRequest>,
@@ -101,6 +119,90 @@ impl SystemService for System {
                 .iter()
                 .map(|p| p.display().to_string())
                 .collect(),
+        }))
+    }
+
+    async fn export(
+        &self,
+        request: Request<ExportRequest>,
+    ) -> Result<Response<ExportStream>, Status> {
+        let history = !request.into_inner().no_history;
+        let export = self.0.store.export(history).await.map_err(error::store)?;
+        let header = Header {
+            format: FORMAT.to_owned(),
+            format_version: FORMAT_VERSION,
+            schema_version: export.schema_version,
+            exported_at: Some(todo_proto::convert::timestamp_to_proto(
+                jiff::Timestamp::now(),
+            )),
+            daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
+            revision: export.revision,
+            history,
+        };
+        let mut lines = vec![header_line(&header)];
+        lines.extend(export.rows.iter().map(record_line));
+        let batches: Vec<Result<ExportResponse, Status>> = lines
+            .chunks(EXPORT_BATCH)
+            .map(|chunk| {
+                Ok(ExportResponse {
+                    lines: chunk.to_vec(),
+                })
+            })
+            .collect();
+        Ok(Response::new(Box::pin(futures_util::stream::iter(batches))))
+    }
+
+    async fn import(
+        &self,
+        request: Request<tonic::Streaming<ImportRequest>>,
+    ) -> Result<Response<ImportResponse>, Status> {
+        let mut stream = request.into_inner();
+        let mut header = None;
+        let mut rows = Vec::new();
+        // The line each record came from, for an error the store names by record.
+        let mut lines_of = Vec::new();
+        let mut bytes = 0usize;
+        let mut line_no = 0usize;
+        while let Some(message) = stream.next().await {
+            for line in message?.lines {
+                line_no += 1;
+                bytes += line.len();
+                if bytes > MAX_IMPORT_BYTES {
+                    return Err(Status::resource_exhausted(
+                        "the export is larger than 1 GiB",
+                    ));
+                }
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let at = |e: todo_proto::export::LineError| {
+                    error::bad_request(&format!("line {line_no}"), e.0)
+                };
+                if header.is_none() {
+                    header = Some(read_header(&line).map_err(at)?);
+                } else {
+                    rows.push(read_record(&line).map_err(at)?);
+                    lines_of.push(line_no);
+                }
+            }
+        }
+        let header = header.ok_or_else(|| error::bad_request("line 1", "an empty file"))?;
+        let out = self
+            .0
+            .store
+            .import(header.revision, rows)
+            .await
+            .map_err(|e| match e {
+                todo_store::StoreError::Import { record, error } => {
+                    let line = lines_of.get(record).copied().unwrap_or(0);
+                    error::bad_request(&format!("line {line}"), error)
+                }
+                e => error::store(e),
+            })?;
+        Ok(Response::new(ImportResponse {
+            items: out.items,
+            records: out.records,
+            revision: out.revision,
         }))
     }
 }

@@ -1239,3 +1239,45 @@ fn restores_in_one_minute_keep_every_previous_database() {
         2
     );
 }
+
+#[test]
+fn export_then_import_into_a_fresh_home() {
+    let h = Home::new();
+    h.ok(&["add", "one #a"]);
+    h.ok(&["add", "two"]);
+    let file = h.home.join("out.jsonl");
+    let out = h.todo(&["export", "--out", file.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).starts_with("exported "),
+        "{}",
+        text(&out.stderr)
+    );
+    let first = std::fs::read_to_string(&file).unwrap();
+    assert!(first.lines().next().unwrap().contains("todo-tui-export"));
+
+    let fresh = Home::new();
+    let out = fresh.todo(&["import", file.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("(2 items)"),
+        "{}",
+        text(&out.stderr)
+    );
+    let titles: Vec<_> = fresh.items().into_iter().map(|i| i.title).collect();
+    assert_eq!(titles, ["one", "two"]);
+    // To stdout, the same records.
+    let again = fresh.ok(&["export"]);
+    assert_eq!(
+        again.lines().skip(1).collect::<Vec<_>>(),
+        first.lines().skip(1).collect::<Vec<_>>()
+    );
+    // Not into a database that has Items.
+    let out = fresh.todo(&["import", file.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out.stderr).contains("not empty"),
+        "{}",
+        text(&out.stderr)
+    );
+}

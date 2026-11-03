@@ -1353,6 +1353,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "futures-util",
  "hyper-util",
  "jiff",
  "rusqlite",
@@ -1435,6 +1436,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "todo-core",
+ "todo-store",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",

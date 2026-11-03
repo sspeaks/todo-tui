@@ -177,6 +177,15 @@ pub(crate) fn store(e: StoreError) -> Status {
         ),
         StoreError::Closed => error_info(Code::Unavailable, "SHUTTING_DOWN", e.to_string(), []),
         StoreError::Backup(_) => error_info(Code::Internal, "BACKUP_FAILED", e.to_string(), []),
+        StoreError::NotEmpty => error_info(
+            Code::FailedPrecondition,
+            "DATABASE_NOT_EMPTY",
+            e.to_string(),
+            [],
+        ),
+        StoreError::Import { record, error } => {
+            bad_request(&format!("record {record}"), error.clone())
+        }
         StoreError::Sqlite(_) | StoreError::Corrupt(_) | StoreError::NotAMutation(_) => {
             tracing::error!(error = %e, "store failure");
             error_info(Code::Internal, "STORE", e.to_string(), [])

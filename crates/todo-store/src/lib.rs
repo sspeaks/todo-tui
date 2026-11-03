@@ -6,6 +6,7 @@
 
 mod archive;
 mod codec;
+mod export;
 mod hierarchy;
 mod query;
 mod relation;
@@ -37,6 +38,7 @@ use tokio::sync::{Semaphore, broadcast, oneshot};
 use ulid::Ulid;
 
 use codec::{SqlEnum, is_overdue, load_item, rev_from_sql, rev_to_sql, ts_to_sql};
+pub use export::{EventRecord, EventValue, Export, ExportRow, ImportOutput, OpRecord};
 pub use restore::{DbInfo, backup_file, inspect, prepare_restored};
 pub use schema::{SCHEMA_VERSION, free_backup_path};
 use summary::Action;
@@ -55,6 +57,14 @@ pub enum StoreError {
     /// does not run.
     #[error("{0}")]
     Backup(String),
+    /// An import into a database that holds Items or ops (design 7.4: into
+    /// an empty one only).
+    #[error("the database is not empty: import restores into an empty one only")]
+    NotEmpty,
+    /// Record `record` (0-based, after the header) of an import could not
+    /// go in; nothing was imported.
+    #[error("record {record}: {error}")]
+    Import { record: usize, error: String },
     #[error("item {0} not found")]
     NotFound(ItemId),
     #[error("item {id}: revision conflict: expected {expected}, found {actual}")]
@@ -474,6 +484,12 @@ impl WriteTx<'_> {
         &self.tx
     }
 
+    /// Makes `revision` the next one [`WriteTx::record_change`] allocates;
+    /// never earlier than it would have been.
+    pub(crate) fn skip_to(&mut self, revision: Revision) {
+        self.next_revision = self.next_revision.max(revision);
+    }
+
     /// The revision the next [`WriteTx::record_change`] call will allocate,
     /// so a resource can be stored with its revision before it is recorded.
     pub fn next_revision(&self) -> Revision {
@@ -641,6 +657,26 @@ impl Store {
             Ok(std::fs::metadata(&to).map(|m| m.len()).unwrap_or(0))
         })
         .await
+    }
+
+    /// Every record, read at one revision (design 7.4); without `history`,
+    /// no ops or events.
+    pub async fn export(&self, history: bool) -> Result<Export> {
+        self.read(move |conn| export::export_tx(conn, history))
+            .await
+    }
+
+    /// Puts an export's rows into this database, which must be empty (no
+    /// Item, no op), all or nothing. The revision moves past both the
+    /// export's and the database's, and the change log is emptied, so
+    /// every client resyncs.
+    pub async fn import(
+        &self,
+        export_revision: Revision,
+        rows: Vec<ExportRow>,
+    ) -> Result<ImportOutput> {
+        self.write(move |tx| export::import_tx(tx, export_revision, rows))
+            .await
     }
 
     /// Runs `f` on the writer thread inside one transaction. On `Ok` the

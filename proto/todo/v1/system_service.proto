@@ -21,6 +21,15 @@ service SystemService {
   // automatic backups are off. Old backups are cleaned up only while they
   // are on.
   rpc Backup(BackupRequest) returns (BackupResponse);
+  // Every record of the database (design 7.4) as lines of the export
+  // format (todo.export.v1): the header first, then the records in
+  // dependency order, a batch of lines per message.
+  rpc Export(ExportRequest) returns (stream ExportResponse);
+  // Puts an export into this database, which must be empty (no Item, no
+  // op: FAILED_PRECONDITION / DATABASE_NOT_EMPTY otherwise), all or
+  // nothing. A line that cannot go in is INVALID_ARGUMENT naming it
+  // ("line 3"). Every client then resyncs.
+  rpc Import(stream ImportRequest) returns (ImportResponse);
 }
 
 enum ClientKind {
@@ -76,4 +85,27 @@ message BackupResponse {
   uint64 bytes = 2;
   // The old backups it deleted.
   repeated string removed = 3;
+}
+
+message ExportRequest {
+  // Leave out the ops and events (the history behind undo).
+  bool no_history = 1;
+}
+
+message ExportResponse {
+  // JSON lines, without their newlines.
+  repeated string lines = 1;
+}
+
+message ImportRequest {
+  // JSON lines, in order across messages, the header first.
+  repeated string lines = 1;
+}
+
+message ImportResponse {
+  uint64 items = 1;
+  // Records after the header.
+  uint64 records = 2;
+  // The database's revision after the import.
+  uint64 revision = 3;
 }

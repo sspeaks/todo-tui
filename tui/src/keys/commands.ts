@@ -2,7 +2,7 @@
 // completion over them, and a pointer to the milestone that brings each
 // planned one.
 
-export type CommandName = "quit" | "help" | "refresh" | "search" | "config" | "view";
+export type CommandName = "quit" | "help" | "refresh" | "search" | "config" | "view" | "export";
 
 interface CommandSpec {
   readonly name: string;
@@ -21,11 +21,11 @@ export const COMMANDS: readonly CommandSpec[] = [
   { name: "search", help: "Search everything, done, archived and deferred too", runs: "search", args: "<query>" },
   { name: "config", help: "The config file and what is wrong with it", runs: "config" },
   { name: "view", help: "Views: new <name> [query], edit, rename, delete, move", runs: "view", args: "<sub> …" },
+  { name: "export", help: "Write every record to a file (~/todo-export-….jsonl)", runs: "export", args: "[path]" },
 ];
 
 /** Commands from the design that a later milestone brings, and where they arrive. */
 const PLANNED: Readonly<Record<string, string>> = {
-  export: "in M6",
   sync: "with Jira sync in P2",
   promote: "with Jira sync in P2",
   link: "with Jira sync in P2",

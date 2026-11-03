@@ -1,6 +1,7 @@
 //! Generated todo.v1 protobuf code and core conversions.
 
 pub mod convert;
+pub mod export;
 pub mod request;
 
 /// `google.*` types compiled from the vendored protos.
@@ -15,6 +16,11 @@ pub mod google {
 pub mod todo {
     pub mod v1 {
         include!(concat!(env!("OUT_DIR"), "/todo.v1.rs"));
+    }
+    pub mod export {
+        pub mod v1 {
+            include!(concat!(env!("OUT_DIR"), "/todo.export.v1.rs"));
+        }
     }
 }
 
@@ -34,5 +40,5 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
 /// 9 added the config: GetConfig, ReloadConfig and Change.config. 10 added
 /// query text: ViewService.ParseQuery and View.query. 11 added the view
 /// edits: CreateView, UpdateView, DeleteView and MoveView. 12 added
-/// SystemService.Backup.
-pub const API_MINOR: u32 = 12;
+/// SystemService.Backup. 13 added Export and Import.
+pub const API_MINOR: u32 = 13;

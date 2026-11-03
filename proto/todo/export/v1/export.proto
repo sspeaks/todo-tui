@@ -1,0 +1,111 @@
+syntax = "proto3";
+
+package todo.export.v1;
+
+import "google/protobuf/timestamp.proto";
+import "todo/v1/field.proto";
+import "todo/v1/field_value.proto";
+import "todo/v1/item.proto";
+import "todo/v1/relation.proto";
+import "todo/v1/view.proto";
+
+// The export format (design 7.4): JSON Lines, the Header first, then one
+// Record per line, each in the canonical proto3 JSON of its message:
+// `{"type": "<record case>", "data": {…}}`. Records come in dependency
+// order: items (parents first), relations, views, view_seeds, ops, events.
+// These messages are the schema, and follow todo.v1's rules: additive only.
+
+// Line 1.
+message Header {
+  // "todo-tui-export".
+  string format = 1;
+  // 1.
+  uint32 format_version = 2;
+  // The database schema the export was taken from.
+  uint32 schema_version = 3;
+  google.protobuf.Timestamp exported_at = 4;
+  string daemon_version = 5;
+  // The database's revision when exported.
+  uint64 revision = 6;
+  // Whether ops and events are in it (not with --no-history).
+  bool history = 7;
+}
+
+// One line after the header.
+message Record {
+  oneof record {
+    // Every Item, deleted ones too, with its stored fields: the fields
+    // computed when an Item is read (status, effective_priority,
+    // is_overdue, the subtask counts, parent_title and relations) are
+    // left unset. Relations are records of their own.
+    todo.v1.Item item = 1;
+    RelationRecord relation = 2;
+    // A saved view; its query (output only) is left unset.
+    todo.v1.View view = 3;
+    ViewSeed view_seed = 4;
+    Op op = 5;
+    Event event = 6;
+  }
+}
+
+message RelationRecord {
+  todo.v1.Relation relation = 1;
+  google.protobuf.Timestamp created_at = 2;
+}
+
+// A default view seeded once: a deleted default is not seeded again.
+message ViewSeed {
+  string seed = 1;
+  google.protobuf.Timestamp seeded_at = 2;
+}
+
+// A row of the op log (design 3.10), as stored: kinds, actors and undo
+// states are the store's own words, so a later kind exports losslessly.
+message Op {
+  string id = 1;
+  // e.g. "set_status", "create_view".
+  string kind = 2;
+  // "user", "sync", "system" or "suggestion:<ulid>".
+  string actor = 3;
+  google.protobuf.Timestamp at = 4;
+  optional string request_id = 5;
+  uint64 revision = 6;
+  // The op's place in the log, which orders the undo stack.
+  int64 seq = 7;
+  // "done", "undone", "dropped" or "discarded" for an undo stack entry.
+  optional string undo_state = 8;
+  optional string entry_op = 9;
+  string summary = 10;
+  // The store's JSON for a replay (an undo's skips, a no-op relation op's
+  // relation).
+  optional string report = 11;
+}
+
+// A recorded change (design 3.10).
+message Event {
+  string id = 1;
+  string op_id = 2;
+  string item_id = 3;
+  google.protobuf.Timestamp at = 4;
+  string actor = 5;
+  // "create", "set", "derived", "relation_add" or "relation_remove".
+  string kind = 6;
+  // For set and derived.
+  optional todo.v1.ItemField field = 7;
+  EventValue old = 8;
+  EventValue new = 9;
+  // The event's place in its op.
+  uint32 ord = 10;
+}
+
+// What an event recorded.
+message EventValue {
+  oneof value {
+    // A set's field value, or the staleness signals of a derived one.
+    todo.v1.FieldValue field_value = 1;
+    // A relation event's relation.
+    todo.v1.Relation relation = 2;
+    // A create's title.
+    string title = 3;
+  }
+}

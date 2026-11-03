@@ -275,7 +275,12 @@ impl Daemon {
         let server = Server::builder()
             .http2_keepalive_interval(Some(Duration::from_secs(30)))
             .http2_keepalive_timeout(Some(Duration::from_secs(10)))
-            .add_service(SystemServiceServer::new(System(ctx.clone())))
+            // An Import message holds a batch of export lines, and one line
+            // a whole Item: the cap is the import's own (1 GiB in all).
+            .add_service(
+                SystemServiceServer::new(System(ctx.clone()))
+                    .max_decoding_message_size(crate::service::system::MAX_IMPORT_BYTES),
+            )
             .add_service(ItemServiceServer::new(Items(ctx.clone())))
             .add_service(ViewServiceServer::new(Views(ctx.clone())))
             .add_service(WatchServiceServer::new(Watch(ctx)))

@@ -449,7 +449,9 @@ export class FakeDaemon {
   maxPageSize = MAX_PAGE_SIZE;
   /** Runs before every ListItems; throw from it to fail that call. */
   onListItems: ((req: ListItemsRequest) => void) | undefined;
-  apiMinor = 12;
+  apiMinor = 13;
+  /** What Export streams, as one batch; unset, Export is UNIMPLEMENTED (the format is the daemon's). */
+  exportLines: string[] | undefined;
   /** What GetConfig serves; change it with {@link setConfig}. */
   config: ConfigSnapshot = defaultConfig();
   readonly calls = { listItems: 0, listViews: 0, getStatusCounts: 0, subscribe: [] as (bigint | undefined)[] };
@@ -507,6 +509,19 @@ export class FakeDaemon {
         backup: () => {
           this.check();
           throw new ConnectError("FakeDaemon takes no backups", Code.Unimplemented);
+        },
+        // Lines a test gives in exportLines (the format is the daemon's).
+        export: () => {
+          this.check();
+          const lines = this.exportLines;
+          if (lines === undefined) throw new ConnectError("FakeDaemon does not export", Code.Unimplemented);
+          return (async function* () {
+            yield { lines };
+          })();
+        },
+        import: () => {
+          this.check();
+          throw new ConnectError("FakeDaemon does not import", Code.Unimplemented);
         },
       });
       service(ItemService, {

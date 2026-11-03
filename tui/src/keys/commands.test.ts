@@ -15,7 +15,7 @@ describe("command line", () => {
   it("says what is not a command, and when a planned one arrives", () => {
     expect(resolveCommand("zz")).toEqual({ kind: "message", level: "error", text: "Not a command: zz" });
     expect(resolveCommand("sync")).toEqual({ kind: "message", level: "info", text: ":sync arrives with Jira sync in P2" });
-    expect(resolveCommand("export")).toEqual({ kind: "message", level: "info", text: ":export arrives in M6" });
+    expect(resolveCommand("export ~/x.jsonl")).toEqual({ kind: "run", command: "export", args: "~/x.jsonl" });
     expect(resolveCommand("view new x is:next")).toEqual({ kind: "run", command: "view", args: "new x is:next" });
     expect(resolveCommand("review")).toMatchObject({ text: ":review arrives with the weekly review in P4" });
   });

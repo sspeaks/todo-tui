@@ -20,16 +20,17 @@ use todo_proto::v1::watch_service_client::WatchServiceClient;
 use todo_proto::v1::{
     AddRelationRequest, ArchiveItemRequest, ArchiveReason, BackupRequest, BatchMutateRequest,
     CaptureItemRequest, CaptureTokenKind, Clause, ClauseGroup, ClientKind, ConfigSnapshot,
-    CreateViewRequest, CreatedVia, DeleteItemRequest, DeleteViewRequest, FieldValue, Filter,
-    GetConfigRequest, GetItemRequest, GetServerInfoRequest, GetStatusCountsRequest,
-    GetUndoStateRequest, Item, ItemField, ListItemsRequest, ListViewsRequest, MoveViewRequest,
-    Mutation, MutationResult, OpKind, Operand, Operator, ParseCaptureRequest, ParseDateRequest,
-    ParseQueryRequest, ParseRecurrenceRequest, PersonRef, Predicate, Priority, RecurrenceRule,
-    RedoRequest, RedoResponse, Relation, RelationKind, ReloadConfigRequest, RemoveRelationRequest,
-    SetRecurrenceRequest, SetStatusRequest, ShutdownRequest, SortKey, Status, SubscribeRequest,
-    SubscribeResponse, Topic, UnarchiveItemRequest, UndeleteItemRequest, UndoRequest, UndoResponse,
-    UndoSkip, UndoSkipReason, UpdateItemRequest, UpdateViewRequest, View, Weekday, clause,
-    field_value, mutation, operand, person_ref, recurrence_rule, subscribe_response::Message,
+    CreateViewRequest, CreatedVia, DeleteItemRequest, DeleteViewRequest, ExportRequest, FieldValue,
+    Filter, GetConfigRequest, GetItemRequest, GetServerInfoRequest, GetStatusCountsRequest,
+    GetUndoStateRequest, ImportRequest, Item, ItemField, ListItemsRequest, ListViewsRequest,
+    MoveViewRequest, Mutation, MutationResult, OpKind, Operand, Operator, ParseCaptureRequest,
+    ParseDateRequest, ParseQueryRequest, ParseRecurrenceRequest, PersonRef, Predicate, Priority,
+    RecurrenceRule, RedoRequest, RedoResponse, Relation, RelationKind, ReloadConfigRequest,
+    RemoveRelationRequest, SetRecurrenceRequest, SetStatusRequest, ShutdownRequest, SortKey,
+    Status, SubscribeRequest, SubscribeResponse, Topic, UnarchiveItemRequest, UndeleteItemRequest,
+    UndoRequest, UndoResponse, UndoSkip, UndoSkipReason, UpdateItemRequest, UpdateViewRequest,
+    View, Weekday, clause, field_value, mutation, operand, person_ref, recurrence_rule,
+    subscribe_response::Message,
 };
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -301,7 +302,7 @@ async fn handshake_reports_version_and_api_minor() {
         .into_inner();
     assert_eq!(info.daemon_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(info.api_minor, todo_proto::API_MINOR);
-    assert_eq!(info.api_minor, 12);
+    assert_eq!(info.api_minor, 13);
     d.stop().await;
 }
 
@@ -4906,4 +4907,283 @@ async fn backups_off_take_none_and_keep_old_ones() {
     assert!(res.removed.is_empty());
     assert_eq!(backups_in(&d).len(), 2);
     d.stop().await;
+}
+
+async fn export_lines(d: &TestDaemon, no_history: bool) -> Vec<String> {
+    let mut stream = SystemServiceClient::new(d.channel().await)
+        .max_decoding_message_size(usize::MAX)
+        .export(ExportRequest { no_history })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut lines = Vec::new();
+    while let Some(batch) = stream.message().await.unwrap() {
+        lines.extend(batch.lines);
+    }
+    lines
+}
+
+async fn import_lines(
+    d: &TestDaemon,
+    lines: Vec<String>,
+) -> Result<todo_proto::v1::ImportResponse, tonic::Status> {
+    let batches: Vec<ImportRequest> = lines
+        .chunks(7)
+        .map(|c| ImportRequest { lines: c.to_vec() })
+        .collect();
+    SystemServiceClient::new(d.channel().await)
+        .import(futures_util::stream::iter(batches))
+        .await
+        .map(|r| r.into_inner())
+}
+
+/// A database with one of everything: subtasks, relations, a recurring
+/// Item completed (so its next instance), undo and redo, a deleted Item,
+/// an edited, moved and created view, a deleted default.
+async fn rich(d: &TestDaemon) {
+    let mut items = d.items().await;
+    let parent = capture(&mut items, "parent #work +2 ^2026-11-20").await;
+    let child = items
+        .capture_item(CaptureItemRequest {
+            parent_id: Some(parent.id.clone()),
+            ..capture_req("child ~dana")
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .item
+        .unwrap();
+    let water = capture(&mut items, "water plants @mon,thu").await;
+    let gone = capture(&mut items, "gone").await;
+    items
+        .add_relation(AddRelationRequest {
+            request_id: new_ulid().to_string(),
+            relation: Some(Relation {
+                from_id: parent.id.clone(),
+                to_id: child.id.clone(),
+                kind: RelationKind::Blocks as i32,
+            }),
+        })
+        .await
+        .unwrap();
+    items
+        .set_status(status_req(&water.id, Status::Done))
+        .await
+        .unwrap();
+    items
+        .update_item(update_req(&child.id, titled("child task"), &["title"]))
+        .await
+        .unwrap();
+    undo(&mut items).await;
+    items
+        .delete_item(DeleteItemRequest {
+            request_id: new_ulid().to_string(),
+            id: gone.id.clone(),
+            expected_revision: None,
+        })
+        .await
+        .unwrap();
+    let mut views = ViewServiceClient::new(d.channel().await);
+    let work = views
+        .create_view(create_view_req("Work", "#work sort:-priority"))
+        .await
+        .unwrap()
+        .into_inner()
+        .view
+        .unwrap();
+    views
+        .move_view(MoveViewRequest {
+            request_id: new_ulid().to_string(),
+            id: work.id,
+            position: 0,
+        })
+        .await
+        .unwrap();
+    let listed = views
+        .list_views(ListViewsRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .views;
+    let someday = listed.iter().find(|v| v.name == "Someday").unwrap();
+    views
+        .delete_view(DeleteViewRequest {
+            request_id: new_ulid().to_string(),
+            id: someday.id.clone(),
+        })
+        .await
+        .unwrap();
+}
+
+/// design 8.3's round trip: export, import into a fresh daemon, export
+/// again: every record line the same.
+#[tokio::test(flavor = "multi_thread")]
+async fn export_import_export_round_trips() {
+    let a = start().await;
+    rich(&a).await;
+    for no_history in [false, true] {
+        let first = export_lines(&a, no_history).await;
+        let header: serde_json::Value = serde_json::from_str(&first[0]).unwrap();
+        assert_eq!(header["format"], "todo-tui-export");
+        assert_eq!(header["formatVersion"], 1);
+        let b = start().await;
+        let out = import_lines(&b, first.clone()).await.unwrap();
+        assert_eq!(out.records as usize, first.len() - 1);
+        let second = export_lines(&b, no_history).await;
+        assert_eq!(first[1..], second[1..], "no_history {no_history}");
+        // What the import holds works: the views, search, and undo.
+        let views = ViewServiceClient::new(b.channel().await)
+            .list_views(ListViewsRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .views;
+        let names: Vec<_> = views.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["Work", "Inbox", "Today", "Next", "Waiting", "Archive"]
+        );
+        let mut items = b.items().await;
+        let found = items
+            .list_items(ListItemsRequest {
+                filter: Some(Filter {
+                    all_of: vec![Clause {
+                        kind: Some(clause::Kind::Predicate(Predicate {
+                            target: ItemField::Title as i32,
+                            op: Operator::Matches as i32,
+                            operands: vec![Operand {
+                                kind: Some(operand::Kind::Text("plants".into())),
+                            }],
+                        })),
+                    }],
+                    // Done, and the next instance deferred to its day.
+                    include_done: true,
+                    include_deferred: true,
+                    ..Filter::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .items;
+        assert_eq!(
+            found.len(),
+            2,
+            "water plants and its next instance, found by the index"
+        );
+        if !no_history {
+            let (top, _) = undo_state(&mut items).await;
+            assert!(top.is_some(), "the imported undo stack");
+            undo(&mut items).await;
+        }
+        b.stop().await;
+    }
+    a.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn import_refuses_a_database_in_use_and_a_bad_line() {
+    let a = start().await;
+    rich(&a).await;
+    let lines = export_lines(&a, false).await;
+    // Into a database with Items.
+    let err = import_lines(&a, lines.clone()).await.unwrap_err();
+    assert_eq!(
+        (
+            err.code(),
+            err.get_details_error_info().unwrap().reason.as_str()
+        ),
+        (Code::FailedPrecondition, "DATABASE_NOT_EMPTY")
+    );
+
+    let field = |e: &tonic::Status| {
+        e.get_details_bad_request().unwrap().field_violations[0]
+            .field
+            .clone()
+    };
+    for (bad, line) in [
+        (vec!["{}".to_owned()], "line 1"),
+        (
+            vec![
+                lines[0].clone(),
+                "{\"type\":\"frob\",\"data\":{}}".to_owned(),
+            ],
+            "line 2",
+        ),
+        (
+            vec![lines[0].clone(), lines[1].clone(), "not json".to_owned()],
+            "line 3",
+        ),
+    ] {
+        let b = start().await;
+        let err = import_lines(&b, bad).await.unwrap_err();
+        assert_eq!(
+            (err.code(), field(&err).as_str()),
+            (Code::InvalidArgument, line)
+        );
+        // Nothing went in.
+        // The header, and the six seeded views with their seeds.
+        assert_eq!(export_lines(&b, false).await.len(), 13);
+        b.stop().await;
+    }
+    a.stop().await;
+}
+
+/// Large Items: an import batch over tonic's 4 MiB default still goes in.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_large_export_imports_whole() {
+    let a = start().await;
+    let mut items = a.items().await;
+    let long = "x".repeat(60_000);
+    for i in 0..80 {
+        capture(&mut items, &format!("{i} {long}")).await;
+    }
+    let lines = export_lines(&a, false).await;
+    let b = start().await;
+    let batches = vec![ImportRequest {
+        lines: lines.clone(),
+    }];
+    let out = SystemServiceClient::new(b.channel().await)
+        .max_encoding_message_size(usize::MAX)
+        .import(futures_util::stream::iter(batches))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(out.items, 80);
+    a.stop().await;
+    b.stop().await;
+}
+
+/// A subscriber connected through an import is sent to resync, and the next
+/// write numbers after the import.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_import_resyncs_live_subscribers() {
+    let a = start().await;
+    rich(&a).await;
+    let lines = export_lines(&a, false).await;
+    let b = start().await;
+    let mut stream = b
+        .subscribe(SubscribeRequest {
+            since_revision: Some(STARTED),
+            topics: vec![],
+        })
+        .await;
+    assert!(matches!(next(&mut stream).await, Message::CaughtUp(_)));
+    let out = import_lines(&b, lines).await.unwrap();
+    loop {
+        match next(&mut stream).await {
+            Message::ResyncRequired(r) => {
+                assert_eq!(r.current_revision, out.revision);
+                break;
+            }
+            Message::Change(c) => panic!("a change from before the import: {c:?}"),
+            _ => {}
+        }
+    }
+    let mut items = b.items().await;
+    let after = capture(&mut items, "after").await;
+    assert_eq!(after.revision, out.revision + 1);
+    a.stop().await;
+    b.stop().await;
 }

@@ -41,6 +41,7 @@ import { Narrowing } from "./narrow.js";
 import { stopSelf } from "./job.js";
 import { DEFAULT_TIMING, Pipeline, type Timing } from "./pipeline.js";
 import { Prompts } from "./prompts.js";
+import { type ExportFs, Exporter } from "./export.js";
 import { Views } from "./views.js";
 import { QuickAdd, typedLines } from "./quick-add.js";
 import { type Input, InputQueue } from "./queue.js";
@@ -69,6 +70,8 @@ export interface ControllerOptions {
   bindings?: readonly Binding[];
   /** The ViewService client :view calls (default: one over the store's transport). */
   views?: ViewsClient;
+  /** Where :export writes (tests). */
+  exportFs?: ExportFs;
 }
 
 /** How a toast is cut when it does not fit (Toast.keepEnd). */
@@ -109,6 +112,7 @@ export class Controller {
   private readonly actions: ItemActions;
   private readonly prompts: Prompts;
   private readonly viewEdits: Views;
+  private readonly exporter: Exporter;
   private readonly quickAdd: QuickAdd;
   private readonly narrowing: Narrowing;
   private readonly editor: DescriptionEditor;
@@ -152,6 +156,7 @@ export class Controller {
     this.actions = new ItemActions(this);
     this.prompts = new Prompts(this);
     this.viewEdits = new Views(this);
+    this.exporter = new Exporter(this, opts.exportFs);
     this.quickAdd = new QuickAdd(this);
     this.narrowing = new Narrowing(this);
     const stateDir = opts.stateDir;
@@ -739,6 +744,8 @@ export class Controller {
         return this.showConfig();
       case "view":
         return this.viewEdits.run(r.args);
+      case "export":
+        return this.exporter.run(r.args);
     }
   }
 

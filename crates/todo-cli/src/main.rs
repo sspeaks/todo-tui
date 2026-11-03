@@ -3,6 +3,7 @@
 mod add;
 mod backup;
 mod config;
+mod export;
 mod launch;
 mod rpc;
 mod spawn;
@@ -59,6 +60,20 @@ enum Command {
     Config {
         #[command(subcommand)]
         action: ConfigAction,
+    },
+    /// Write every record of the database as JSON Lines (design 7.4).
+    Export {
+        /// Write to this file instead of stdout.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        /// Leave out the ops and events, the history behind undo.
+        #[arg(long)]
+        no_history: bool,
+    },
+    /// Restore an export into an empty database.
+    Import {
+        /// The export file, or - for stdin.
+        path: std::path::PathBuf,
     },
     /// Back up the database, or list the backups (design 7.5).
     Backup {
@@ -146,6 +161,10 @@ async fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
         Command::Redo => return undo::undo(&paths, undo::Direction::Redo).await,
         // `--short` is run by main.
         Command::Status { .. } => return status::status(&paths).await,
+        Command::Export { out, no_history } => {
+            return export::export(&paths, out, no_history).await;
+        }
+        Command::Import { path } => return export::import(&paths, &path).await,
         Command::Backup { action } => {
             return match action {
                 BackupAction::Now => backup::now(&paths).await,

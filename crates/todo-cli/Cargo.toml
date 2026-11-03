@@ -19,6 +19,7 @@ todo-core.workspace = true
 todo-store.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+futures-util.workspace = true
 hyper-util.workspace = true
 jiff.workspace = true
 rustix.workspace = true

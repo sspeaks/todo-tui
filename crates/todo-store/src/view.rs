@@ -72,7 +72,7 @@ pub(crate) fn list_views_tx(conn: &Connection) -> Result<(Vec<View>, Revision)> 
     Ok((load_all(&tx)?, revision))
 }
 
-fn insert(conn: &Connection, view: &View) -> Result<()> {
+pub(crate) fn insert(conn: &Connection, view: &View) -> Result<()> {
     let id = view
         .id
         .ok_or_else(|| corrupt("a view is stored with its id"))?;
