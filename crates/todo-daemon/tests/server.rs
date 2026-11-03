@@ -21,16 +21,16 @@ use todo_proto::v1::{
     AddRelationRequest, ArchiveItemRequest, ArchiveReason, BackupRequest, BatchMutateRequest,
     CaptureItemRequest, CaptureTokenKind, Clause, ClauseGroup, ClientKind, ConfigSnapshot,
     CreateViewRequest, CreatedVia, DeleteItemRequest, DeleteViewRequest, ExportRequest, FieldValue,
-    Filter, GetConfigRequest, GetItemRequest, GetServerInfoRequest, GetStatusCountsRequest,
-    GetUndoStateRequest, ImportRequest, Item, ItemField, ListItemsRequest, ListViewsRequest,
-    MoveViewRequest, Mutation, MutationResult, OpKind, Operand, Operator, ParseCaptureRequest,
-    ParseDateRequest, ParseQueryRequest, ParseRecurrenceRequest, PersonRef, Predicate, Priority,
-    RecurrenceRule, RedoRequest, RedoResponse, Relation, RelationKind, ReloadConfigRequest,
-    RemoveRelationRequest, SetRecurrenceRequest, SetStatusRequest, ShutdownRequest, SortKey,
-    Status, SubscribeRequest, SubscribeResponse, Topic, UnarchiveItemRequest, UndeleteItemRequest,
-    UndoRequest, UndoResponse, UndoSkip, UndoSkipReason, UpdateItemRequest, UpdateViewRequest,
-    View, Weekday, clause, field_value, mutation, operand, person_ref, recurrence_rule,
-    subscribe_response::Message,
+    Filter, GetActivityReportRequest, GetConfigRequest, GetItemRequest, GetServerInfoRequest,
+    GetStatusCountsRequest, GetUndoStateRequest, ImportRequest, Item, ItemField, ListItemsRequest,
+    ListViewsRequest, MoveViewRequest, Mutation, MutationResult, OpKind, Operand, Operator,
+    ParseCaptureRequest, ParseDateRequest, ParseQueryRequest, ParseRecurrenceRequest, PersonRef,
+    Predicate, Priority, RecurrenceRule, RedoRequest, RedoResponse, Relation, RelationKind,
+    ReloadConfigRequest, RemoveRelationRequest, SetRecurrenceRequest, SetStatusRequest,
+    ShutdownRequest, SortKey, Status, SubscribeRequest, SubscribeResponse, Topic,
+    UnarchiveItemRequest, UndeleteItemRequest, UndoRequest, UndoResponse, UndoSkip, UndoSkipReason,
+    UpdateItemRequest, UpdateViewRequest, View, Weekday, clause, field_value, mutation, operand,
+    person_ref, recurrence_rule, subscribe_response::Message,
 };
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -302,7 +302,7 @@ async fn handshake_reports_version_and_api_minor() {
         .into_inner();
     assert_eq!(info.daemon_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(info.api_minor, todo_proto::API_MINOR);
-    assert_eq!(info.api_minor, 14);
+    assert_eq!(info.api_minor, 15);
     d.stop().await;
 }
 
@@ -5250,5 +5250,77 @@ async fn parse_query_refuses_an_offset_a_view_would() {
         "{}",
         res.errors[0].message
     );
+    d.stop().await;
+}
+
+/// Monday 2026-11-02, noon in the test daemon's zone.
+fn monday_noon() -> prost_types::Timestamp {
+    let t = jiff::civil::date(2026, 11, 2)
+        .at(12, 0, 0, 0)
+        .to_zoned(jiff::tz::TimeZone::system())
+        .unwrap()
+        .timestamp();
+    todo_proto::convert::timestamp_to_proto(t)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn activity_report_covers_the_working_day_window() {
+    let d = start().await;
+    let mut items = d.items().await;
+    let done = capture(&mut items, "ship the release").await;
+    items
+        .set_status(status_req(&done.id, Status::Done))
+        .await
+        .unwrap();
+    capture(&mut items, "only captured").await;
+    let start_req = |since: &str| GetActivityReportRequest {
+        reference_time: Some(monday_noon()),
+        since: since.into(),
+    };
+    let res = items
+        .get_activity_report(start_req(""))
+        .await
+        .unwrap()
+        .into_inner();
+    // Monday's window: Thursday back, Wednesday on; today's work is in it.
+    let day = |d: &Option<todo_proto::google::r#type::Date>| d.as_ref().map(|d| (d.month, d.day));
+    assert_eq!(
+        (day(&res.since), day(&res.until), day(&res.today)),
+        (Some((10, 29)), Some((11, 4)), Some((11, 2)))
+    );
+    assert_eq!(
+        res.last.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(),
+        ["ship the release"]
+    );
+    assert_eq!(res.last[0].item_id, done.id);
+    assert!(
+        res.text.starts_with("L48:\n- ship the release\nN48:\n"),
+        "{}",
+        res.text
+    );
+    // [l48] widens the window; a since after today is refused.
+    write_config(&d, "[l48]\nwindow_days = 3\n");
+    SystemServiceClient::new(d.channel().await)
+        .reload_config(ReloadConfigRequest {})
+        .await
+        .unwrap();
+    let wide = items
+        .get_activity_report(start_req(""))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(day(&wide.since), Some((10, 28)));
+    // since counts back: thu is last Thursday.
+    let back = items
+        .get_activity_report(start_req("thu"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(day(&back.since), Some((10, 29)));
+    // After today, or before the store's range, is refused.
+    for bad in ["2026-11-03", "tomorrow", "1600-01-01"] {
+        let err = items.get_activity_report(start_req(bad)).await.unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument, "{bad}");
+    }
     d.stop().await;
 }

@@ -92,6 +92,9 @@ service ItemService {
   // Resolves a repeat rule with the capture rule grammar (design 2.3), for
   // the repeat prompt.
   rpc ParseRecurrence(ParseRecurrenceRequest) returns (ParseRecurrenceResponse);
+  // The L48 / N48 report (design 6.6): what moved in the last working days
+  // and what is planned for the next, over the [l48] window of the config.
+  rpc GetActivityReport(GetActivityReportRequest) returns (GetActivityReportResponse);
   rpc ArchiveItem(ArchiveItemRequest) returns (ArchiveItemResponse);
   rpc UnarchiveItem(UnarchiveItemRequest) returns (UnarchiveItemResponse);
   // Soft delete (design 3.7): the Item stays as a tombstone with deleted_at
@@ -339,6 +342,42 @@ message GetStatusCountsResponse {
   // The today every count used, in the daemon's zone. Clients refresh their
   // views and counts once their own date passes it.
   google.type.Date today = 4;
+}
+
+message GetActivityReportRequest {
+  // "Now", for today; defaults to the daemon's clock.
+  google.protobuf.Timestamp reference_time = 1;
+  // The first day of L48, instead of the [l48] window's (todo l48 --since),
+  // counting back from today: "thu" (the last one), "-3d", "oct29" (the
+  // last one), "yesterday" or "2026-10-29". Not after today; empty for the
+  // window's.
+  string since = 2;
+}
+
+message GetActivityReportResponse {
+  // L48: the Items with a user change in the window that is work (not a
+  // capture, not triage: labels, priority, the override, energy,
+  // focus_week), one line per top-level Item, newest first.
+  repeated ReportLine last = 1;
+  // N48: the open top-level Items in progress, due by `until`, waiting with
+  // a follow-up by then, or in this week's focus, ordered as Today is; at
+  // most 15.
+  repeated ReportLine next = 2;
+  // Both, as they are pasted: "L48:\n- …\nN48:\n- …\n".
+  string text = 3;
+  // L48 counts changes from the start of this day, in the daemon's zone.
+  google.type.Date since = 4;
+  // N48 plans through this day.
+  google.type.Date until = 5;
+  google.type.Date today = 6;
+  uint64 revision = 7;
+}
+
+message ReportLine {
+  string item_id = 1;
+  // The title, " (KEY)" when linked, ": 3 of 5 subtasks done", "; waiting on
+  // Sam".
+  string text = 2;
 }
 
 // Each count applies the implicit rules (filter.proto): deleted, archived,

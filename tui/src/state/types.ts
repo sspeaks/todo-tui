@@ -103,7 +103,9 @@ export type Mode =
   /** `/`: the text narrowing the tab, live as it is typed. */
   | { readonly kind: "search"; readonly line: LineState }
   /** `pending`: a prefix of one of help's own bindings (gg), when one is typed. */
-  | { readonly kind: "help"; readonly scroll: number; readonly pending?: readonly KeyToken[] };
+  | { readonly kind: "help"; readonly scroll: number; readonly pending?: readonly KeyToken[] }
+  /** :l48: the report's text, scrolled; `y` copies it. */
+  | { readonly kind: "report"; readonly scroll: number; readonly text: string; readonly pending?: readonly KeyToken[] };
 
 export type ModeKind = Mode["kind"];
 

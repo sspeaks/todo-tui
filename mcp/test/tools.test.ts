@@ -181,10 +181,22 @@ describe("todo mcp tools", () => {
     });
   });
 
+  it("todo_l48 returns the daemon's report, ready to paste", async () => {
+    const { daemon, call } = await harness();
+    daemon.setActivityReport({
+      last: [{ itemId: "01JB8X4Z5Q6R7S8T9V0W1X2Y3Z", text: "Ship the release" }],
+      text: "L48:\n- Ship the release\nN48:\n- (nothing)\n",
+      since: { year: 2026, month: 10, day: 29 },
+    });
+    const r = await call("todo_l48");
+    expect(r).toMatchObject({ since: "2026-10-29", last: [{ id: "V0W1X2Y3Z".slice(-8), text: "Ship the release" }], next: [] });
+    expect(r.text).toBe("L48:\n- Ship the release\nN48:\n- (nothing)\n");
+  });
+
   it("registers only the read tools when read-only", async () => {
     const { client } = await harness({ readOnly: true });
     const { tools } = await client.listTools();
-    expect(tools.map((t) => t.name).sort()).toEqual(["todo_get", "todo_list", "todo_status", "todo_views"]);
+    expect(tools.map((t) => t.name).sort()).toEqual(["todo_get", "todo_l48", "todo_list", "todo_status", "todo_views"]);
     expect(tools.every((t) => t.annotations?.readOnlyHint)).toBe(true);
   });
 });

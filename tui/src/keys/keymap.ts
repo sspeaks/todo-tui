@@ -37,12 +37,13 @@ export type Action =
   | { type: "visual" }
   | { type: "undo" }
   | { type: "redo" }
-  | { type: "help_close" };
+  | { type: "help_close" }
+  | { type: "copy_report" };
 
 /** The modes with a keymap; the text modes (command, quick-add, prompts, search) take their keys from the line editor. */
-export type KeymapMode = "normal" | "help";
+export type KeymapMode = "normal" | "help" | "report";
 
-export type Section = "Navigation" | "Views" | "Items" | "Marks" | "Undo" | "App" | "Help";
+export type Section = "Navigation" | "Views" | "Items" | "Marks" | "Undo" | "App" | "Help" | "Report";
 
 export interface Binding {
   /** Stable snake_case id, e.g. "set_priority_1". */
@@ -157,6 +158,12 @@ export const BINDINGS: readonly Binding[] = [
   { id: "help_top", keys: ["g g", "home"], action: { type: "top" }, modes: ["help"], section: "Help", help: "Top" },
   { id: "help_bottom", keys: ["G", "end"], action: { type: "bottom" }, modes: ["help"], section: "Help", help: "Bottom" },
   { id: "help_close", keys: ["esc", "q", "?", "fkey", "ctrl+c"], action: { type: "help_close" }, modes: ["help"], section: "Help", help: "Close" },
+
+  // :l48's panel (design 6.6).
+  { id: "report_down", keys: ["j", "down"], action: { type: "move", by: 1 }, modes: ["report"], section: "Report", help: "Scroll down" },
+  { id: "report_up", keys: ["k", "up"], action: { type: "move", by: -1 }, modes: ["report"], section: "Report", help: "Scroll up" },
+  { id: "report_copy", keys: ["y"], action: { type: "copy_report" }, modes: ["report"], section: "Report", help: "Copy the report" },
+  { id: "report_close", keys: ["esc", "q", "ctrl+c"], action: { type: "help_close" }, modes: ["report"], section: "Report", help: "Close" },
 ];
 
 export const isAvailable = (b: Binding): boolean => b.available?.() ?? true;

@@ -21,6 +21,7 @@ import {
   captureItem,
   deleteItem,
   errorReason,
+  getActivityReport,
   getStatusCounts,
   listViews,
   parseDate,
@@ -228,6 +229,32 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
       run(async () => {
         const { views: all } = await listViews(views);
         return all.map((v) => ({ name: v.name, ...(v.seed !== undefined && { seed: v.seed }) }));
+      }),
+  );
+
+  server.registerTool(
+    "todo_l48",
+    {
+      title: "L48 / N48 report",
+      description:
+        "The scrum report: L48, what moved in the last two working days (completed, started, edited; not captures or triage), " +
+        "and N48, what is planned for the next two (in progress, due, follow-ups, this week's focus). `text` is ready to paste; " +
+        "rewrite it in the user's own style only if they ask.",
+      inputSchema: {
+        since: z.string().optional().describe('Count L48 from this day instead, back from today: "thu" (last Thursday), "-3d", "oct29", "2026-10-29"'),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    ({ since }) =>
+      run(async () => {
+        const res = await getActivityReport(items, since === undefined ? {} : { since });
+        return {
+          since: isoDate(res.since),
+          until: isoDate(res.until),
+          last: res.last.map((l) => ({ id: shortId(l.itemId), text: l.text })),
+          next: res.next.map((l) => ({ id: shortId(l.itemId), text: l.text })),
+          text: res.text,
+        };
       }),
   );
 

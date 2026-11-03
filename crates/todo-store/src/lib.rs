@@ -10,6 +10,7 @@ mod export;
 mod hierarchy;
 mod query;
 mod relation;
+mod report;
 mod restore;
 mod schema;
 mod summary;
@@ -39,6 +40,7 @@ use ulid::Ulid;
 
 use codec::{SqlEnum, is_overdue, load_item, rev_from_sql, rev_to_sql, ts_to_sql};
 pub use export::{EventRecord, EventValue, Export, ExportRow, ImportOutput, OpRecord};
+pub use report::{MAX_NEXT, Report, ReportInput, ReportLine};
 pub use restore::{DbInfo, backup_file, inspect, prepare_restored};
 pub use schema::{SCHEMA_VERSION, free_backup_path};
 use summary::Action;
@@ -907,6 +909,11 @@ impl Store {
     /// would: a view's tab count.
     pub async fn count_items(&self, filter: todo_core::Resolved) -> Result<u32> {
         self.read(move |conn| query::count_tx(conn, &filter)).await
+    }
+
+    /// The L48 / N48 report (design 6.6), both halves read at one revision.
+    pub async fn activity_report(&self, input: ReportInput) -> Result<Report> {
+        self.read(move |conn| report::report_tx(conn, input)).await
     }
 
     /// The status counts on `today` and, with `include_views`, the count of
@@ -2143,7 +2150,7 @@ fn today_local() -> jiff::civil::Date {
     jiff::Zoned::now().date()
 }
 
-fn current_revision_in(conn: &Connection) -> Result<Revision> {
+pub(crate) fn current_revision_in(conn: &Connection) -> Result<Revision> {
     rev_from_sql(conn.query_row("SELECT revision FROM meta", [], |r| r.get(0))?)
 }
 

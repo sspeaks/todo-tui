@@ -39,6 +39,7 @@ import {
   type CaptureDraft,
   type CaptureItemRequest,
   type GetStatusCountsRequest,
+  GetActivityReportResponseSchema,
   type GetStatusCountsResponseSchema,
   ItemService,
   type ListItemsRequest,
@@ -358,6 +359,8 @@ export interface FakeDaemonOptions {
  *   moves with a revision and a Change. A view's query text is the
  *   daemon's printer's, which the fake does not have: it knows the default
  *   views' and what defineQuery gives, and is empty otherwise.
+ * - GetActivityReport answers what setActivityReport gave (an empty
+ *   report until then): the report's rules are the daemon's alone.
  * - An op log ({@link ops}): each touched Item gets one revision and one
  *   Change, and each changed field one event. BatchMutate applies its
  *   mutations in order as one op, all or nothing, under the single-item
@@ -452,7 +455,7 @@ export class FakeDaemon {
   maxPageSize = MAX_PAGE_SIZE;
   /** Runs before every ListItems; throw from it to fail that call. */
   onListItems: ((req: ListItemsRequest) => void) | undefined;
-  apiMinor = 14;
+  apiMinor = 15;
   /** What Export streams, as one batch; unset, Export is UNIMPLEMENTED (the format is the daemon's). */
   exportLines: string[] | undefined;
   /** What GetConfig serves; change it with {@link setConfig}. */
@@ -466,6 +469,8 @@ export class FakeDaemon {
   private readonly requests = new Map<string, Recorded>();
   /** Captures by spool_id (upper case), for replays. */
   private readonly spools = new Map<string, Recorded>();
+  /** What GetActivityReport answers: setActivityReport's. */
+  private activityReport: MessageInitShape<typeof GetActivityReportResponseSchema> = { text: "L48:\n- (nothing)\nN48:\n- (nothing)\n" };
   /** What ParseQuery reads, by text: the default views' and defineQuery's. */
   private readonly queries = new Map<string, { filter: Filter; sort: SortKey[]; showCount: boolean }>();
   /** Every relation, by relationKey. */
@@ -563,6 +568,10 @@ export class FakeDaemon {
         parseRecurrence: (req) => {
           this.check();
           return this.parseRecurrence(req);
+        },
+        getActivityReport: () => {
+          this.check();
+          return create(GetActivityReportResponseSchema, { ...this.activityReport, today: create(DateSchema, protoDate(this.today())), revision: this.revision });
         },
         archiveItem: (req) => this.single("ArchiveItem", OpKind.ARCHIVE, req.requestId, () => planItemOp("archive", req, "")),
         unarchiveItem: (req) => this.single("UnarchiveItem", OpKind.UNARCHIVE, req.requestId, () => planItemOp("unarchive", req, "")),
@@ -790,6 +799,11 @@ export class FakeDaemon {
       this.views.set(view.id, view);
       this.publish({ revision: view.revision, topic: Topic.VIEW, id: view.id, resource: { case: "view", value: view } });
     }
+  }
+
+  /** What GetActivityReport answers from now on; the revision and today are the fake's. */
+  setActivityReport(report: MessageInitShape<typeof GetActivityReportResponseSchema>): void {
+    this.activityReport = report;
   }
 
   /**

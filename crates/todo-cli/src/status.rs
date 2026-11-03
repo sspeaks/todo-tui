@@ -83,7 +83,7 @@ pub(crate) async fn status(paths: &Paths) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn failed(status: Status) -> anyhow::Error {
+pub(crate) fn failed(status: Status) -> anyhow::Error {
     if is_transport(&status) {
         anyhow::anyhow!("daemon unavailable ({})", describe(&status))
     } else {

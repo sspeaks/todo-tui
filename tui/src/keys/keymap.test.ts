@@ -10,7 +10,7 @@ const vocabulary = JSON.parse(
 
 describe("the daemon's copy of the keymap vocabulary", () => {
   it("lists every action id, by mode", () => {
-    const byMode: Record<string, string[]> = { normal: [], help: [] };
+    const byMode: Record<string, string[]> = { normal: [], help: [], report: [] };
     for (const b of BINDINGS) for (const m of bindingModes(b)) byMode[m]!.push(b.id);
     expect(vocabulary.actions).toEqual(byMode);
   });

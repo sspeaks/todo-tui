@@ -27,6 +27,8 @@ function modeLabel(s: UiState): string {
       return s.visual ? "VISUAL" : "NORMAL";
     case "help":
       return "HELP";
+    case "report":
+      return "L48";
     case "command":
       return "COMMAND";
     case "quickAdd":
@@ -61,6 +63,8 @@ function hints(s: UiState): string {
   switch (s.mode.kind) {
     case "help":
       return joined(pair(s, "help_down", "help_up", "scroll"), hint(s, "help_close", "close"));
+    case "report":
+      return joined(hint(s, "report_copy", "copy"), pair(s, "report_down", "report_up", "scroll"), hint(s, "report_close", "close"));
     case "command":
       return "enter run · tab complete · esc cancel";
     case "quickAdd":

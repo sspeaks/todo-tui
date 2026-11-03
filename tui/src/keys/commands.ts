@@ -2,7 +2,7 @@
 // completion over them, and a pointer to the milestone that brings each
 // planned one.
 
-export type CommandName = "quit" | "help" | "refresh" | "search" | "config" | "view" | "export";
+export type CommandName = "quit" | "help" | "refresh" | "search" | "config" | "view" | "export" | "l48";
 
 interface CommandSpec {
   readonly name: string;
@@ -21,6 +21,7 @@ export const COMMANDS: readonly CommandSpec[] = [
   { name: "search", help: "Search everything, done, archived and deferred too", runs: "search", args: "<query>" },
   { name: "config", help: "The config file and what is wrong with it", runs: "config" },
   { name: "view", help: "Views: new <name> [query], edit, rename, delete, move", runs: "view", args: "<sub> …" },
+  { name: "l48", help: "The L48 / N48 report for your scrum; y copies it", runs: "l48", args: "[since]" },
   { name: "export", help: "Write every record to a file (~/todo-export-….jsonl)", runs: "export", args: "[path]" },
 ];
 

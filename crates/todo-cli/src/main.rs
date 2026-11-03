@@ -5,6 +5,7 @@ mod backup;
 mod config;
 mod export;
 mod launch;
+mod report;
 mod rpc;
 mod spawn;
 mod status;
@@ -49,6 +50,17 @@ enum Command {
         /// is not running or does not answer within 40 ms; never starts it.
         #[arg(long)]
         short: bool,
+    },
+    /// Print the L48 / N48 report for a scrum: what moved in the last two
+    /// working days, and what is planned for the next two.
+    L48 {
+        /// Count from this day instead, back from today: thu, -3d, oct29,
+        /// yesterday or 2026-10-29.
+        #[arg(long, allow_hyphen_values = true)]
+        since: Option<String>,
+        /// Also copy it to the clipboard (pbcopy, wl-copy or xclip).
+        #[arg(long)]
+        copy: bool,
     },
     /// Serve the MCP tools on stdio, for Claude Code: `claude mcp add todo -- todo mcp`.
     Mcp {
@@ -161,6 +173,7 @@ async fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
         Command::Redo => return undo::undo(&paths, undo::Direction::Redo).await,
         // `--short` is run by main.
         Command::Status { .. } => return status::status(&paths).await,
+        Command::L48 { since, copy } => return report::l48(&paths, since, copy).await,
         Command::Export { out, no_history } => {
             return export::export(&paths, out, no_history).await;
         }

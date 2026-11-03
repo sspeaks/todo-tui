@@ -150,6 +150,18 @@ describe("the shell", () => {
     expect(line("No energy").indexOf("No energy")).toBe(line("Write tests").indexOf("Write tests"));
   });
 
+  it(":l48 shows the report in place of the list, with its keys in the status bar", async () => {
+    const fd = fakeDaemon([item("a")], { now: clock, timeZone: "UTC" });
+    fd.daemon.setActivityReport({ text: "L48:\n- Ship the release\nN48:\n- Write the memo; waiting on Sam\n" });
+    const t = renderTui({ daemon: fd, columns: 100, rows: 12, now: clock });
+    await t.live();
+    t.type(":l48\r");
+    await t.waitFrame((f) => expect(f).toContain("- Ship the release"));
+    const lines = t.lines();
+    expect(lines.slice(1, 5)).toEqual(["L48:", "- Ship the release", "N48:", "- Write the memo; waiting on Sam"].map((l) => expect.stringMatching(new RegExp(`^${l.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*$`))));
+    expect(t.frame()).toMatch(/L48 · ● live .*y copy · j\/k scroll · esc close/);
+  });
+
   it("dims archived rows and marks deferred ones (Archive)", async () => {
     const fd = fakeDaemon(
       [

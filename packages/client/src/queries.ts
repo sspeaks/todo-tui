@@ -7,7 +7,7 @@ import type { MessageInitShape } from "@bufbuild/protobuf";
 import { type Timestamp, timestampFromDate } from "@bufbuild/protobuf/wkt";
 import type { CallOptions, Client } from "@connectrpc/connect";
 import type { DateSchema } from "./gen/google/type/date_pb.js";
-import type { GetStatusCountsResponse, ParseCaptureResponse, ParseDateResponse, ParseRecurrenceResponse } from "./gen/todo/v1/item_service_pb.js";
+import type { GetActivityReportResponse, GetStatusCountsResponse, ParseCaptureResponse, ParseDateResponse, ParseRecurrenceResponse } from "./gen/todo/v1/item_service_pb.js";
 import type { ListViewsResponse, ParseQueryResponse, ViewService } from "./gen/todo/v1/view_service_pb.js";
 import type { ItemsClient } from "./mutations.js";
 
@@ -40,6 +40,17 @@ export function getStatusCounts(
   const { includeViews, ...rest } = opts;
   const [fields, call] = reference(rest);
   return client.getStatusCounts({ ...fields, includeViews: includeViews ?? false }, call);
+}
+
+/**
+ * The L48 / N48 report (design 6.6) over the [l48] window, or from
+ * `since`, counted back from today ("thu", "-3d", "oct29"): what moved
+ * and what is planned, as lines and as `text` to paste.
+ */
+export function getActivityReport(client: ItemsClient, opts: ReferenceOptions & { since?: string } = {}): Promise<GetActivityReportResponse> {
+  const { since, ...rest } = opts;
+  const [fields, call] = reference(rest);
+  return client.getActivityReport({ ...fields, since: since ?? "" }, call);
 }
 
 /**

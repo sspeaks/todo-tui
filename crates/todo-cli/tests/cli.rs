@@ -1023,6 +1023,35 @@ fn status_counts_the_inbox_due_and_each_view() {
 }
 
 #[test]
+fn l48_prints_the_report() {
+    let h = Home::new();
+    assert_eq!(h.ok(&["l48"]), "L48:\n- (nothing)\nN48:\n- (nothing)\n");
+    h.ok(&["add", "ship the release"]);
+    h.ok(&["add", "overdue thing ^2020-01-01"]);
+    let id = h.ok(&["add", "write the memo"]);
+    let id = id.split_whitespace().next().unwrap().to_owned();
+    assert!(id.len() == 8, "{id}");
+    h.ok(&["add", "retro >next"]);
+    // A capture is not work; an overdue one is planned.
+    assert_eq!(h.ok(&["l48"]), "L48:\n- (nothing)\nN48:\n- overdue thing\n");
+    assert_eq!(
+        h.ok(&["l48", "--since", "2020-01-01"]),
+        "L48:\n- (nothing)\nN48:\n- overdue thing\n"
+    );
+    let out = h.todo(&["l48", "--since", "someday"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out.stderr).contains("since: not a date"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(
+        h.ok(&["l48", "--since", "-3d"]),
+        "L48:\n- (nothing)\nN48:\n- overdue thing\n"
+    );
+}
+
+#[test]
 fn status_short_without_a_daemon_prints_nothing_and_starts_none() {
     use std::os::unix::fs::PermissionsExt;
     let h = Home::new();

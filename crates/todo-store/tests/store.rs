@@ -13,8 +13,8 @@ use todo_core::{
 };
 use todo_store::{
     AutoArchiveInput, AutoArchiveOutput, CaptureInput, ChangesSinceError, EndProblem, Expired,
-    ListInput, MutateInput, MutateOutput, OpKind, RelationInput, RelationOutput, Resource,
-    SCHEMA_VERSION, Store, StoreError, UndoInput, UndoOutput, UndoSkipRow, UndoState,
+    ListInput, MutateInput, MutateOutput, OpKind, RelationInput, RelationOutput, ReportInput,
+    Resource, SCHEMA_VERSION, Store, StoreError, UndoInput, UndoOutput, UndoSkipRow, UndoState,
 };
 use tokio::sync::broadcast::error::TryRecvError;
 use ulid::Ulid;
@@ -5461,4 +5461,296 @@ async fn migrates_an_m1_database() {
     )
     .await;
     assert_eq!(get(&db, id).await.relations.len(), 1);
+}
+
+// ---- the L48 / N48 report (design 6.6) ----
+
+/// The report from `since` on, N48 two days ahead of today(). Events are
+/// stamped with the wall clock, so a window starts at an instant read
+/// between ops.
+async fn report(db: &Db, since: Timestamp) -> (Vec<String>, Vec<String>, String) {
+    let r = db
+        .store
+        .activity_report(ReportInput {
+            since,
+            today: today(),
+            days_ahead: 2,
+        })
+        .await
+        .unwrap();
+    let texts = |lines: &[todo_store::ReportLine]| lines.iter().map(|l| l.text.clone()).collect();
+    (texts(&r.last), texts(&r.next), r.text)
+}
+
+#[tokio::test]
+async fn l48_lists_the_work_in_the_window_and_not_triage() {
+    let db = open();
+    let done = capture_op(&db, "ship the release").await.0;
+    let started = capture_op(&db, "write the memo").await.0;
+    let renamed = capture_op(&db, "old title").await.0;
+    let triaged = capture_op(&db, "relabelled").await.0;
+    let before = capture_op(&db, "done last week").await.0;
+    let _captured = capture_op(&db, "only captured").await.0;
+    let gone = capture_op(&db, "deleted after").await.0;
+    let by_system = capture_op(&db, "archived by the scheduler").await.0;
+    run(
+        &db,
+        Actor::User,
+        50,
+        OpKind::SetStatus,
+        vec![status(before.id, Status::Done)],
+    )
+    .await;
+    let since = Timestamp::now();
+    run(
+        &db,
+        Actor::User,
+        100,
+        OpKind::SetStatus,
+        vec![status(done.id, Status::Done)],
+    )
+    .await;
+    run(
+        &db,
+        Actor::User,
+        110,
+        OpKind::SetStatus,
+        vec![status(started.id, Status::InProgress)],
+    )
+    .await;
+    run(
+        &db,
+        Actor::User,
+        120,
+        OpKind::Update,
+        vec![title(renamed.id, "new title")],
+    )
+    .await;
+    run(
+        &db,
+        Actor::User,
+        130,
+        OpKind::Update,
+        vec![update(
+            triaged.id,
+            &[
+                (ItemField::Labels, FieldValue::StringSet(vec!["x".into()])),
+                (ItemField::Priority, FieldValue::Priority(Priority::High)),
+            ],
+        )],
+    )
+    .await;
+    run(
+        &db,
+        Actor::User,
+        140,
+        OpKind::Update,
+        vec![title(gone.id, "deleted now")],
+    )
+    .await;
+    run(
+        &db,
+        Actor::User,
+        141,
+        OpKind::Delete,
+        vec![mutation(gone.id, MutationOp::Delete)],
+    )
+    .await;
+    run(
+        &db,
+        Actor::System,
+        150,
+        OpKind::Update,
+        vec![title(by_system.id, "renamed by the system")],
+    )
+    .await;
+    let (last, _, text) = report(&db, since).await;
+    // Newest first; the capture, the triage, the system's change, the
+    // deleted Item and what came before the window are left out.
+    assert_eq!(last, ["new title", "write the memo", "ship the release"]);
+    assert!(
+        text.starts_with("L48:\n- new title\n- write the memo\n- ship the release\nN48:\n"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn l48_leaves_out_an_undone_change() {
+    let db = open();
+    let since = Timestamp::now();
+    let item = capture_op(&db, "kept").await.0;
+    run(
+        &db,
+        Actor::User,
+        100,
+        OpKind::SetStatus,
+        vec![status(item.id, Status::Done)],
+    )
+    .await;
+    undo(&db).await;
+    assert_eq!(report(&db, since).await.0, Vec::<String>::new());
+    redo(&db).await;
+    assert_eq!(report(&db, since).await.0, ["kept"]);
+}
+
+#[tokio::test]
+async fn l48_folds_subtasks_under_their_top_level_item() {
+    let db = open();
+    let since = Timestamp::now();
+    let parent = capture_op(&db, "MR-3 prep").await.0;
+    let a = capture_under(&db, "a", parent.id).await;
+    let b = capture_under(&db, "b", parent.id).await;
+    let _c = capture_under(&db, "c", parent.id).await;
+    run(
+        &db,
+        Actor::User,
+        100,
+        OpKind::SetStatus,
+        vec![status(a.id, Status::Done)],
+    )
+    .await;
+    run(
+        &db,
+        Actor::User,
+        110,
+        OpKind::SetStatus,
+        vec![status(b.id, Status::Done)],
+    )
+    .await;
+    assert_eq!(
+        report(&db, since).await.0,
+        ["MR-3 prep: 2 of 3 subtasks done"]
+    );
+}
+
+#[tokio::test]
+async fn l48_lists_a_series_once() {
+    let db = open();
+    let since = Timestamp::now();
+    let mut req = input("water plants", 1);
+    req.draft.recurrence = Some(Rule::Daily);
+    req.draft.recurrence_first = Some(today());
+    req.draft.due_date = Some(today());
+    let first = db.store.capture(req).await.unwrap().0;
+    let out = run(
+        &db,
+        Actor::User,
+        100,
+        OpKind::SetStatus,
+        vec![status(first.id, Status::Done)],
+    )
+    .await;
+    let next = out.generated[0].id;
+    run(
+        &db,
+        Actor::User,
+        200,
+        OpKind::SetStatus,
+        vec![status(next, Status::Done)],
+    )
+    .await;
+    assert_eq!(report(&db, since).await.0, ["water plants"]);
+}
+
+#[tokio::test]
+async fn n48_lists_the_planned_open_top_level_items_as_today_orders_them() {
+    let db = open();
+    let due_soon = capture_op(&db, "due soon").await.0;
+    let due_later = capture_op(&db, "due later").await.0;
+    let started = capture_op(&db, "in progress").await.0;
+    let parent = capture_op(&db, "parent").await.0;
+    let child = capture_under(&db, "child in progress", parent.id).await;
+    let _idle = capture_op(&db, "idle").await.0;
+    let set_due = |id, d| update(id, &[(ItemField::DueDate, FieldValue::Date(d))]);
+    run(
+        &db,
+        Actor::User,
+        10,
+        OpKind::Update,
+        vec![
+            set_due(due_soon.id, date(2026, 3, 2)),
+            set_due(due_later.id, date(2026, 3, 9)),
+        ],
+    )
+    .await;
+    run(
+        &db,
+        Actor::User,
+        20,
+        OpKind::SetStatus,
+        vec![
+            status(started.id, Status::InProgress),
+            status(child.id, Status::InProgress),
+        ],
+    )
+    .await;
+    run(
+        &db,
+        Actor::User,
+        30,
+        OpKind::Update,
+        vec![update(
+            started.id,
+            &[(ItemField::Priority, FieldValue::Priority(Priority::High))],
+        )],
+    )
+    .await;
+    assert_eq!(
+        report(&db, Timestamp::UNIX_EPOCH).await.1,
+        ["in progress", "due soon"]
+    );
+}
+
+#[tokio::test]
+async fn l48_counts_only_direct_subtasks_done_now() {
+    let db = open();
+    let since = Timestamp::now();
+    let root = capture_op(&db, "root").await.0;
+    let a = capture_under(&db, "a", root.id).await;
+    let b = capture_under(&db, "b", root.id).await;
+    let c = capture_under(&db, "c", root.id).await;
+    let deep = capture_under(&db, "deep", a.id).await;
+    // Cancelled, reopened and a grandchild: none of them counts.
+    run(
+        &db,
+        Actor::User,
+        100,
+        OpKind::SetStatus,
+        vec![status(b.id, Status::Cancelled)],
+    )
+    .await;
+    run(
+        &db,
+        Actor::User,
+        110,
+        OpKind::SetStatus,
+        vec![status(c.id, Status::Done)],
+    )
+    .await;
+    run(
+        &db,
+        Actor::User,
+        120,
+        OpKind::SetStatus,
+        vec![status(c.id, Status::Next)],
+    )
+    .await;
+    run(
+        &db,
+        Actor::User,
+        130,
+        OpKind::SetStatus,
+        vec![status(deep.id, Status::Done)],
+    )
+    .await;
+    assert_eq!(report(&db, since).await.0, ["root"]);
+    run(
+        &db,
+        Actor::User,
+        140,
+        OpKind::SetStatus,
+        vec![status(a.id, Status::Done)],
+    )
+    .await;
+    assert_eq!(report(&db, since).await.0, ["root: 1 of 2 subtasks done"]);
 }

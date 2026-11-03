@@ -12,13 +12,14 @@ pub mod mutation;
 pub mod query;
 pub mod recurrence;
 pub mod relation;
+pub mod report;
 pub mod status;
 pub mod value;
 pub mod view;
 
 pub use capture::{CaptureDraft, CaptureToken, CaptureTokenKind, MAX_CAPTURE_BYTES, parse_capture};
 pub use change::{MutationResult, Topic};
-pub use date::{DateError, parse_date};
+pub use date::{DateError, parse_date, parse_past_date};
 pub use field::ItemField;
 pub use filter::{Filter, FilterError, FilterErrorKind, Resolved, SortKey};
 pub use ids::{ItemId, PersonId, Revision, new_ulid};

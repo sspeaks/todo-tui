@@ -65,6 +65,12 @@
       "help_top",
       "help_bottom",
       "help_close"
+    ],
+    "report": [
+      "report_down",
+      "report_up",
+      "report_copy",
+      "report_close"
     ]
   },
   "named_tokens": [

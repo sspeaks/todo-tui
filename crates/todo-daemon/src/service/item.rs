@@ -14,10 +14,11 @@ use todo_proto::v1::item_service_server::ItemService;
 use todo_proto::v1::{
     self, AddRelationRequest, AddRelationResponse, ArchiveItemRequest, ArchiveItemResponse,
     BatchMutateRequest, BatchMutateResponse, CaptureItemRequest, CaptureItemResponse,
-    DeleteItemRequest, DeleteItemResponse, GetItemRequest, GetItemResponse, GetStatusCountsRequest,
-    GetStatusCountsResponse, GetUndoStateRequest, GetUndoStateResponse, ListItemsRequest,
-    ListItemsResponse, ParseCaptureRequest, ParseCaptureResponse, ParseDateRequest,
-    ParseDateResponse, ParseRecurrenceRequest, ParseRecurrenceResponse, RedoRequest, RedoResponse,
+    DeleteItemRequest, DeleteItemResponse, GetActivityReportRequest, GetActivityReportResponse,
+    GetItemRequest, GetItemResponse, GetStatusCountsRequest, GetStatusCountsResponse,
+    GetUndoStateRequest, GetUndoStateResponse, ListItemsRequest, ListItemsResponse,
+    ParseCaptureRequest, ParseCaptureResponse, ParseDateRequest, ParseDateResponse,
+    ParseRecurrenceRequest, ParseRecurrenceResponse, RedoRequest, RedoResponse,
     RemoveRelationRequest, RemoveRelationResponse, SetRecurrenceRequest, SetRecurrenceResponse,
     SetStatusRequest, SetStatusResponse, UnarchiveItemRequest, UnarchiveItemResponse,
     UndeleteItemRequest, UndeleteItemResponse, UndoRequest, UndoResponse, UpdateItemRequest,
@@ -25,7 +26,7 @@ use todo_proto::v1::{
 };
 use todo_store::{
     CaptureInput, EndProblem, ListInput, MutateInput, MutateOutput, OpKind, OpSummaryRow,
-    RelationInput, RelationOutput, StoreError, UndoInput, UndoSkipRow,
+    RelationInput, RelationOutput, ReportInput, StoreError, UndoInput, UndoSkipRow,
 };
 use tonic::{Request, Response, Status};
 use ulid::Ulid;
@@ -368,6 +369,61 @@ impl ItemService for Items {
             items: page.items.into_iter().map(v1::Item::from).collect(),
             next_page_token: page.next_page_token.unwrap_or_default(),
             revision: page.revision,
+        }))
+    }
+
+    async fn get_activity_report(
+        &self,
+        request: Request<GetActivityReportRequest>,
+    ) -> Result<Response<GetActivityReportResponse>, Status> {
+        let req = request.into_inner();
+        let now = reference_time(req.reference_time.as_ref(), &Zoned::now())?;
+        let today = now.date();
+        let since = match req.since.trim() {
+            "" => None,
+            text => Some(
+                todo_core::parse_past_date(text, today)
+                    .map_err(|e| error::bad_request("since", e.reason))?,
+            ),
+        };
+        let window = self.0.config.current().l48.window(today, since);
+        // L48 counts from the start of its first day, in the daemon's zone;
+        // the store keeps i64 nanoseconds, from 1677 on.
+        let start = window
+            .since
+            .to_zoned(now.time_zone().clone())
+            .map(|z| z.timestamp())
+            .ok()
+            .filter(|&t| storable(t))
+            .ok_or_else(|| error::bad_request("since", "must be after 1677-09-22"))?;
+        let days_ahead = (window.until - today).get_days();
+        let report = self
+            .0
+            .store
+            .activity_report(ReportInput {
+                since: start,
+                today,
+                days_ahead,
+            })
+            .await
+            .map_err(error::store)?;
+        let lines = |lines: Vec<todo_store::ReportLine>| {
+            lines
+                .into_iter()
+                .map(|l| v1::ReportLine {
+                    item_id: l.item_id.to_string(),
+                    text: l.text,
+                })
+                .collect()
+        };
+        Ok(Response::new(GetActivityReportResponse {
+            last: lines(report.last),
+            next: lines(report.next),
+            text: report.text,
+            since: Some(date_to_proto(window.since)),
+            until: Some(date_to_proto(window.until)),
+            today: Some(date_to_proto(today)),
+            revision: report.revision,
         }))
     }
 

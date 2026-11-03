@@ -16,6 +16,7 @@ import {
   create,
   envFromProcess,
   equals,
+  getActivityReport,
   resolvePaths,
 } from "@todo-tui/client";
 import type { Key } from "ink";
@@ -42,6 +43,8 @@ import { stopSelf } from "./job.js";
 import { DEFAULT_TIMING, Pipeline, type Timing } from "./pipeline.js";
 import { Prompts } from "./prompts.js";
 import { type ExportFs, Exporter } from "./export.js";
+import { type Clipboard, systemClipboard } from "./clipboard.js";
+import { errorText } from "./messages.js";
 import { Views } from "./views.js";
 import { QuickAdd, typedLines } from "./quick-add.js";
 import { type Input, InputQueue } from "./queue.js";
@@ -72,6 +75,8 @@ export interface ControllerOptions {
   views?: ViewsClient;
   /** Where :export writes (tests). */
   exportFs?: ExportFs;
+  /** :l48's y (default: pbcopy, wl-copy or xclip, else OSC 52). */
+  clipboard?: Clipboard;
 }
 
 /** How a toast is cut when it does not fit (Toast.keepEnd). */
@@ -86,6 +91,12 @@ const NAVIGATION: ReadonlySet<Action["type"]> = new Set(["move", "top", "bottom"
 const TEXT_MODES: ReadonlySet<Mode["kind"]> = new Set(["quickAdd", "prompt", "command", "search", "query"]);
 
 const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n));
+
+const triesOf = (bindings: readonly Binding[]): Readonly<Record<KeymapMode, TrieNode>> => ({
+  normal: buildTrie(bindings, "normal"),
+  help: buildTrie(bindings, "help"),
+  report: buildTrie(bindings, "report"),
+});
 
 /** Keys of a which-key group: "1–5" for a run of consecutive digits, else each ("1 2 4 5", "1 6"). */
 function keyRange(keys: readonly string[]): string {
@@ -117,6 +128,7 @@ export class Controller {
   private readonly narrowing: Narrowing;
   private readonly editor: DescriptionEditor;
   private readonly stopProcess: () => Promise<boolean>;
+  private readonly clipboard: Clipboard;
   private readonly now: () => Date;
   private readonly queue: InputQueue;
   private readonly defaults: readonly Binding[];
@@ -141,7 +153,7 @@ export class Controller {
     this.now = opts.now ?? (() => new Date());
     this.timing = { ...DEFAULT_TIMING, ...opts.timing };
     this.defaults = opts.bindings ?? BINDINGS;
-    this.tries = { normal: buildTrie(this.defaults, "normal"), help: buildTrie(this.defaults, "help") };
+    this.tries = triesOf(this.defaults);
     this.ui.setState((s) => ({ ...s, keymap: { bindings: this.defaults, warnings: [] } }));
     this.queue = new InputQueue(
       (input) => this.handle(input),
@@ -166,6 +178,7 @@ export class Controller {
       () => stateDir ?? resolvePaths(envFromProcess()).logs,
     );
     this.stopProcess = opts.stopProcess ?? (() => stopSelf());
+    this.clipboard = opts.clipboard ?? systemClipboard();
   }
 
   /** Observes the store: the tabs, the current view, the counts and the undo state; starts the midnight poll. */
@@ -609,7 +622,8 @@ export class Controller {
       case "normal":
         return this.normalKey(mode.pending, input);
       case "help":
-        return this.helpKey(mode, input);
+      case "report":
+        return this.overlayKey(mode, input);
       case "command":
         return this.commandKey(mode.line, input);
       case "quickAdd":
@@ -639,12 +653,12 @@ export class Controller {
     return this.runBinding(r.binding);
   }
 
-  /** Help's keys, through its own trie: a prefix (g) waits for the next key, and esc drops it. */
-  private helpKey(mode: Extract<Mode, { kind: "help" }>, key: KeyToken): void | Promise<void> {
+  /** Help's and the report's keys, through their own trie: a prefix (g) waits for the next key, and esc drops it. */
+  private overlayKey(mode: Extract<Mode, { kind: "help" | "report" }>, key: KeyToken): void | Promise<void> {
     const pending = mode.pending ?? [];
-    const settled: Mode = { kind: "help", scroll: mode.scroll };
+    const settled: Mode = { ...mode, pending: undefined };
     if (pending.length && (key === "esc" || key === "ctrl+c")) return this.setMode(settled);
-    const r = step(this.tries.help, pending, key);
+    const r = step(this.tries[mode.kind], pending, key);
     if (r.kind === "pending") return this.setMode({ ...settled, pending: r.pending });
     if (pending.length) this.setMode(settled);
     if (r.kind === "run") return this.runBinding(r.binding);
@@ -702,7 +716,7 @@ export class Controller {
     if (from === this.keymapFrom || (from && this.keymapFrom && equals(ConfigSnapshotSchema, from, this.keymapFrom))) return;
     this.keymapFrom = from;
     const effective = applyOverrides(this.defaults, config?.keymap ?? {});
-    this.tries = { normal: buildTrie(effective.bindings, "normal"), help: buildTrie(effective.bindings, "help") };
+    this.tries = triesOf(effective.bindings);
     this.ui.setState((s) => ({
       ...s,
       keymap: effective,
@@ -750,7 +764,31 @@ export class Controller {
         return this.viewEdits.run(r.args);
       case "export":
         return this.exporter.run(r.args);
+      case "l48":
+        return this.openReport(r.args);
     }
+  }
+
+  /** :l48 [since]: the daemon's L48 / N48 report in a panel (design 6.6). */
+  private async openReport(args: string): Promise<void> {
+    const typed = args.trim();
+    let report;
+    try {
+      report = await this.pipeline.call(({ timeoutMs }) =>
+        getActivityReport(this.items, { ...(timeoutMs !== undefined && { timeoutMs }), since: typed }),
+      );
+    } catch (err) {
+      return this.failed(`No report: ${errorText(err)}`);
+    }
+    this.setMode({ kind: "report", scroll: 0, text: report.text });
+  }
+
+  /** y in the report: the text on the clipboard. */
+  private copyReport(): void {
+    const { mode } = this.state;
+    if (mode.kind !== "report") return;
+    const how = this.clipboard(mode.text);
+    this.toast(how ? "info" : "error", how ? `Copied L48 / N48 (${how})` : "Could not copy: no pbcopy, wl-copy or xclip");
   }
 
   /**
@@ -804,6 +842,8 @@ export class Controller {
         return this.setMode({ kind: "help", scroll: 0 });
       case "help_close":
         return this.setMode(normalMode);
+      case "copy_report":
+        return this.copyReport();
       case "command":
         return this.setMode({ kind: "command", line: emptyLine });
       case "quit":
@@ -853,6 +893,10 @@ export class Controller {
     if (mode.kind === "help") {
       const max = Math.max(0, helpLines(this.state.keymap.bindings).length - this.height);
       return this.setMode({ kind: "help", scroll: clamp(scroll(mode.scroll, max), 0, max) });
+    }
+    if (mode.kind === "report") {
+      const max = Math.max(0, mode.text.trimEnd().split("\n").length - this.height);
+      return this.setMode({ ...mode, scroll: clamp(scroll(mode.scroll, max), 0, max) });
     }
     if (this.state.focus === "detail") {
       const id = this.selectedId();

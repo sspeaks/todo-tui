@@ -58,6 +58,60 @@ pub fn parse_date(expr: &str, today: Date) -> Result<Date, DateError> {
     })
 }
 
+/// A day on or before `today`, for a report's start (design 6.6): `today`,
+/// `yesterday`, a weekday (its last occurrence strictly before today),
+/// `-Nd` / `-Nw`, `YYYY-MM-DD`, or a month and day (the last such date on
+/// or before today). A date after today is refused.
+pub fn parse_past_date(expr: &str, today: Date) -> Result<Date, DateError> {
+    let s = expr.trim().to_ascii_lowercase();
+    let err = |reason: String| DateError {
+        expr: expr.to_owned(),
+        reason,
+    };
+    let out_of_range = |_| err(OUT_OF_RANGE.to_owned());
+    let date = match s.as_str() {
+        "yesterday" | "yes" => today.yesterday().map_err(out_of_range)?,
+        _ if s.starts_with('+') => return Err(err("count back with -N, e.g. -3d".to_owned())),
+        _ if s.starts_with('-') => {
+            let back = relative(&s[1..], Date::MIN).map_err(|r| err(r.replace("+N", "-N")))?;
+            let span = Date::MIN.until(back).map_err(out_of_range)?;
+            today.checked_sub(span).map_err(out_of_range)?
+        }
+        _ => {
+            let letters = s
+                .find(|c: char| !c.is_ascii_alphabetic())
+                .unwrap_or(s.len());
+            let (name, digits) = s.split_at(letters);
+            let weekday = (name.len() >= MIN_PREFIX && digits.is_empty())
+                .then(|| WEEKDAYS.iter().find(|(full, _)| full.starts_with(name)))
+                .flatten();
+            match (weekday, month_index(name)) {
+                (Some(&(_, wd)), _) => today.nth_weekday(-1, wd).map_err(out_of_range)?,
+                (None, Some(index))
+                    if name.len() >= MIN_PREFIX
+                        && (1..=2).contains(&digits.len())
+                        && digits.bytes().all(|b| b.is_ascii_digit()) =>
+                {
+                    let day: i8 = digits.parse().map_err(|_| err(NOT_A_DATE.to_owned()))?;
+                    // Checks the day, as the forward form does.
+                    month_day(index, day, today).map_err(err)?;
+                    // This year's, else the latest before (leap years can
+                    // be 8 years apart).
+                    (0..=8)
+                        .filter_map(|n| Date::new(today.year() - n, index as i8 + 1, day).ok())
+                        .find(|&d| d <= today)
+                        .ok_or_else(|| err(OUT_OF_RANGE.to_owned()))?
+                }
+                _ => resolve(&s, today).map_err(err)?,
+            }
+        }
+    };
+    if date > today {
+        return Err(err("must be on or before today".to_owned()));
+    }
+    Ok(date)
+}
+
 fn resolve(s: &str, today: Date) -> Result<Date, String> {
     let out_of_range = |_| OUT_OF_RANGE.to_owned();
     match s {
@@ -408,5 +462,39 @@ mod tests {
             err.to_string(),
             "invalid date \"feb30\": february has no day 30"
         );
+    }
+}
+
+#[cfg(test)]
+mod past_tests {
+    use super::*;
+    use jiff::civil::date;
+
+    /// Tuesday 2026-11-03.
+    const TUE: Date = date(2026, 11, 3);
+
+    #[test]
+    fn past_dates_count_back() {
+        let ok = |e: &str| parse_past_date(e, TUE).unwrap_or_else(|err| panic!("{e}: {err}"));
+        assert_eq!(ok("today"), TUE);
+        assert_eq!(ok("yesterday"), date(2026, 11, 2));
+        assert_eq!(ok("thu"), date(2026, 10, 29));
+        assert_eq!(ok("Tuesday"), date(2026, 10, 27));
+        assert_eq!(ok("-3d"), date(2026, 10, 31));
+        assert_eq!(ok("-1w"), date(2026, 10, 27));
+        assert_eq!(ok("oct29"), date(2026, 10, 29));
+        assert_eq!(ok("nov3"), TUE);
+        assert_eq!(ok("dec1"), date(2025, 12, 1));
+        assert_eq!(ok("2026-10-01"), date(2026, 10, 1));
+        assert_eq!(parse_past_date("feb29", TUE).unwrap(), date(2024, 2, 29));
+        for (bad, why) in [
+            ("tomorrow", "must be on or before today"),
+            ("2026-11-04", "must be on or before today"),
+            ("+3d", "count back with -N, e.g. -3d"),
+            ("-3x", "expected -N followed by d, w or m"),
+            ("someday", NOT_A_DATE),
+        ] {
+            assert_eq!(parse_past_date(bad, TUE).unwrap_err().reason, why, "{bad}");
+        }
     }
 }

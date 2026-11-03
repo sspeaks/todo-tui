@@ -12,6 +12,7 @@ use std::sync::{Arc, LazyLock};
 use jiff::{SignedDuration, Timestamp};
 use serde::Deserialize;
 use todo_core::Weekday;
+use todo_core::report::ReportConfig;
 use todo_proto::convert::{EnumField as _, timestamp_to_proto};
 use todo_proto::v1;
 use tokio::sync::{Mutex, watch};
@@ -25,6 +26,9 @@ pub const ARCHIVE_DONE_AFTER_DAYS: u32 = 7;
 /// [`Backup::retain_days`] by default.
 pub const RETAIN_DAYS: u32 = 14;
 
+/// The longest `[l48] window_days`: a month of working days.
+pub const MAX_WINDOW_DAYS: u32 = 31;
+
 /// The config the daemon runs with: the file's values, defaults for the
 /// rest, and what was wrong with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +40,7 @@ pub struct Config {
     /// Key sequence → action id; `""` unbinds.
     pub keymap: BTreeMap<String, String>,
     pub backup: Backup,
+    pub l48: ReportConfig,
     pub warnings: Vec<Warning>,
     pub loaded_at: Timestamp,
 }
@@ -110,6 +115,7 @@ impl Config {
                 interval: Interval::Daily,
                 retain_days: RETAIN_DAYS,
             },
+            l48: ReportConfig::default(),
             warnings: Vec::new(),
             loaded_at: Timestamp::now(),
         }
@@ -187,6 +193,10 @@ impl From<&Config> for v1::ConfigSnapshot {
                 interval: c.backup.interval.name().to_owned(),
                 retain_days: c.backup.retain_days,
             }),
+            l48: Some(v1::L48Config {
+                window_days: c.l48.window_days,
+                working_days: c.l48.working_days.iter().map(|d| d.to_i32()).collect(),
+            }),
             warnings: c
                 .warnings
                 .iter()
@@ -240,6 +250,7 @@ impl<'a> Reader<'a> {
                 "ui" => self.section("ui", value, Reader::ui),
                 "keymap" => self.section("keymap", value, Reader::keymap),
                 "backup" => self.section("backup", value, Reader::backup),
+                "l48" => self.section("l48", value, Reader::l48),
                 "instances" => self.warn(key, "not used until Jira sync (P2)"),
                 "assistant" => self.warn(key, "not used until the Claude assistant (P3)"),
                 "stale" => self.warn(key, "not used until stale reviews (P4)"),
@@ -326,6 +337,40 @@ impl<'a> Reader<'a> {
         // After the loop, so an `enabled = true` written later cannot undo it.
         if retain_invalid {
             self.config.backup.enabled = false;
+        }
+    }
+
+    fn l48(&mut self, table: toml::Table) {
+        for (key, value) in table {
+            let path = format!("l48.{}", quote_key(&key));
+            match key.as_str() {
+                "window_days" => match days(&value).filter(|&d| d <= MAX_WINDOW_DAYS) {
+                    Some(days) => self.config.l48.window_days = days,
+                    None => self.warn(
+                        path,
+                        format!("must be a whole number from 1 to {MAX_WINDOW_DAYS}; using 2"),
+                    ),
+                },
+                "working_days" => {
+                    let days: Option<Vec<Weekday>> = value.as_array().and_then(|days| {
+                        days.iter()
+                            .map(|d| d.as_str().and_then(Weekday::from_name))
+                            .collect()
+                    });
+                    match days {
+                        Some(mut days) if !days.is_empty() => {
+                            days.sort();
+                            days.dedup();
+                            self.config.l48.working_days = days;
+                        }
+                        _ => self.warn(
+                            path,
+                            "must be a list of weekdays, e.g. [\"mon\", \"tue\"]; using monday to friday",
+                        ),
+                    }
+                }
+                _ => self.warn(path, "unknown key; ignored"),
+            }
         }
     }
 
@@ -601,9 +646,17 @@ mod tests {
             enabled = false
             interval = "daily"
             retain_days = 30
+            [l48]
+            window_days = 3
+            working_days = ["sun", "Monday", "tue", "mon"]
             "#,
         );
         assert_eq!(config.warnings, vec![]);
+        assert_eq!(config.l48.window_days, 3);
+        assert_eq!(
+            config.l48.working_days,
+            [Weekday::Monday, Weekday::Tuesday, Weekday::Sunday]
+        );
         assert_eq!(config.ui.review_day, Weekday::Friday);
         assert_eq!(config.ui.archive_done_after_days, 3);
         assert!(!config.backup.enabled);
@@ -614,6 +667,24 @@ mod tests {
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
         assert_eq!(keymap, [("K", "move_up"), ("g d", "delete"), ("x", "")]);
+    }
+
+    #[test]
+    fn a_bad_l48_value_warns_and_falls_back() {
+        assert_eq!(
+            warnings("[l48]\nwindow_days = 0\nworking_days = []\nlater = 1"),
+            [
+                "l48.window_days: must be a whole number from 1 to 31; using 2",
+                "l48.working_days: must be a list of weekdays, e.g. [\"mon\", \"tue\"]; using monday to friday",
+                "l48.later: unknown key; ignored",
+            ]
+        );
+        assert_eq!(
+            warnings("[l48]\nworking_days = [\"mon\", \"funday\"]").len(),
+            1
+        );
+        let config = parse("[l48]\nwindow_days = 99\nworking_days = \"mon\"");
+        assert_eq!(config.l48, todo_core::report::ReportConfig::default());
     }
 
     #[test]

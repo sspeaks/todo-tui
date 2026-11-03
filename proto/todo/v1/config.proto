@@ -27,6 +27,15 @@ message ConfigSnapshot {
   repeated ConfigWarning warnings = 7;
   // When the daemon read the file.
   google.protobuf.Timestamp loaded_at = 8;
+  L48Config l48 = 9;
+}
+
+// [l48] (design 6.6): the L48 / N48 report's window.
+message L48Config {
+  // Working days each half covers.
+  uint32 window_days = 1;
+  // The working days, Monday first.
+  repeated Weekday working_days = 2;
 }
 
 // [ui].
