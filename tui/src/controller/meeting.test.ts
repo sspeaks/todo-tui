@@ -61,3 +61,15 @@ describe("M and :meet", () => {
     await vi.waitFor(() => expect(t.toast()).toBe("Could not open Teams (xdg-open: spawn xdg-open ENOENT): https://teams.microsoft.com/l/meeting/new?subject=a"));
   });
 });
+
+describe("[meetings] off", () => {
+  it("unbinds M without a warning, also with M unbound in [keymap]", async () => {
+    const fd = fakeDaemon([item("a")]);
+    const t = await setup(fd);
+    fd.daemon.setConfig({ meetings: { provider: "none" }, keymap: { M: "" } });
+    await vi.waitFor(() => expect(t.store.getConfig().config?.meetings?.provider).toBe("none"));
+    expect(t.state().keymap.warnings).toEqual([]);
+    await t.c.press("M");
+    expect(t.toast()).toBe("M: not bound · ? for help");
+  });
+});

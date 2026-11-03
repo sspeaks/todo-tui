@@ -1,6 +1,6 @@
 import { type Item, errorReason, useConnection, useViews } from "@todo-tui/client";
 import { Box, Text } from "ink";
-import { type RowCells, fitWaiting, priorityLabel, rowCells, statusGlyph, titleCell } from "../format/item.js";
+import { type RowCells, energyGlyph, fitWaiting, priorityLabel, rowCells, statusGlyph, titleCell } from "../format/item.js";
 import { displayWidth, fit, singleLine } from "../format/text.js";
 import { ENERGY_PREFIX, GAP, type RowColumns, rowColumns } from "../state/layout.js";
 import { reconcile } from "../state/selection.js";
@@ -62,7 +62,9 @@ export function ListPane({ tab, width, height }: { tab: TabId; width: number; he
     // The energy slot is there only when a row shown has energy. Columns
     // drop before the title gets narrower than MIN_TITLE, so at any width
     // the TUI runs in (MIN_COLUMNS) the slot leaves the title room.
-    const energySlot = cells.some((c) => c.energy);
+    // Over every row loaded, not the window, so titles never shift as rows
+    // with energy scroll in and out.
+    const energySlot = snap.items.some((i) => energyGlyph(i.energy));
     const cols = rowColumns(
       width - 1,
       {

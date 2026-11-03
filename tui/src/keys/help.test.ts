@@ -15,7 +15,7 @@ describe("help", () => {
     }
     expect(text.find((t) => t.includes("Mark done"))).toMatch(/^ {2}x /);
     expect(text.find((t) => t.includes("Mark a range"))).toMatch(/^ {2}V /);
-    expect(text.find((t) => t.includes("act on every marked Item"))).toMatch(/^ {2}x X s p \^ @ D w W /);
+    expect(text.find((t) => t.includes("act on every marked Item"))).toMatch(/^ {2}x X s p e \^ @ D w W /);
     expect(text.find((t) => t.includes("Go to view N"))).toMatch(/1–9/);
     expect(text.find((t) => t.includes("First row"))).toMatch(/gg home/);
   });

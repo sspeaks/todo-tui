@@ -18,7 +18,8 @@ export interface Meeting {
 /** Rust's char::is_whitespace (Unicode White_Space), which JS \s is not: it has U+0085 and not U+FEFF. */
 const WHITESPACE = /[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+/;
 
-const singleLine = (s: string) => s.split(WHITESPACE).filter(Boolean).join(" ");
+/** Whitespace collapsed, control characters (Rust's char::is_control: Cc) as spaces. */
+const singleLine = (s: string) => s.replace(/\p{Cc}/gu, " ").split(WHITESPACE).filter(Boolean).join(" ");
 
 /** Rust's eq_ignore_ascii_case. */
 const asciiLower = (s: string) => s.replace(/[A-Z]/g, (c) => c.toLowerCase());

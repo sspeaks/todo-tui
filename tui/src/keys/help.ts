@@ -20,7 +20,8 @@ const row = (keys: string, text: string): HelpLine => ({ text: `  ${keys.padEnd(
 /** Lines after a section's bindings, for what no single binding says. */
 const NOTES: Partial<Record<Section, readonly [string, string][]>> = {
   Marks: [
-    ["x X s p ^ @ D w W", "with marks: act on every marked Item, one undo"],
+    ["x X s p e ^ @ D w W", "with marks: act on every marked Item, one undo"],
+    ["M", "with marks: one meeting about all of them"],
     ["t z dd", "the same; t then takes +a -b (labels to add, remove)"],
     ["esc", "clears the marks (after the detail, V and /)"],
   ],

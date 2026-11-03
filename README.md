@@ -20,7 +20,11 @@ edit and complete items; see [Claude Code](#claude-code). Milestone M6 is done: 
 config file with key remaps, views you make and edit with `:view` and query text,
 daily backups and `todo restore`, and `todo export` / `todo import`; see
 [Views](#views-of-your-own), [Configuration](#configuration) and
-[Backups and export](#backups-and-export). The CLI captures, undoes and counts;
+[Backups and export](#backups-and-export). Milestone M8 is done: an energy level
+on items (`%low`, `e`), `h` / `l` between views, the L48 / N48 scrum report
+(`todo l48`, `:l48`), and Teams meeting links (`M`); see
+[Your scrum report: L48 / N48](#your-scrum-report-l48--n48) and
+[Meetings](#meetings). The CLI captures, undoes and counts;
 listing, editing and completing items happen in the TUI or through Claude Code.
 
 ## Quick start
@@ -147,6 +151,7 @@ the inner quotes.
 | `#<label>` | Label; repeat for more | `#home #errand` |
 | `~<person>` | Waiting on someone | `~dana`, `~"the vendor"` |
 | `>next`, `>someday` | Status instead of the default `inbox` | `>someday` |
+| `%low`, `%med`, `%high` | Energy: how much focus it takes, so `energy:low` finds what you can still do tired | `%low` |
 | `@<rule>` | Repeats ([Recurring items](#recurring-items)) | `@daily`, `@mon,thu`, `@15th`, `@2w` |
 | `\` | Escapes a sigil so it stays in the title | `fix \#1 fan` |
 
@@ -325,6 +330,7 @@ key hints) and a message line for prompts and results.
 | `i` | Edit the title |
 | `E` | Edit the description in `$EDITOR` |
 | `p` then `1`–`5`, `p0` | Set the priority; clear it |
+| `e` then `l` `m` `h`, `e0` | Set the energy (low, medium, high: `▁ ▄ █` after the priority); clear it |
 | `^`, `D` | Set the due date; defer until a date |
 | `w`, `W` | Set who you are waiting on (and when to follow up); clear it |
 | `s` | Set the status: `i` inbox, `n` next, `p` in progress, `s` someday, `d` done, `c` cancelled |
@@ -333,17 +339,18 @@ key hints) and a message line for prompts and results.
 | `@` | Set the repeat rule; empty stops it |
 | `z` | Archive / unarchive |
 | `dd` | Delete, with its subtasks (asks first: `y` deletes) |
+| `M` | Schedule a Teams meeting about it ([Meetings](#meetings)) |
 | **Marks and bulk** | |
 | `m` | Mark or unmark the item, and move down |
 | `V` | Mark the rows you move over; `V` or `esc` ends it |
-| `x X s p ^ D w W t z dd @` | With marks: act on every marked item at once, as one undo step (`t` then takes `+a -b` to add and remove labels) |
+| `x X s p e ^ D w W t z dd @` | With marks: act on every marked item at once, as one undo step (`t` then takes `+a -b` to add and remove labels); `M` makes one meeting about all of them |
 | **Search** | |
 | `/` | Narrow this view as you type; `enter` keeps it, `esc` clears it |
 | `:search <words>` | Search everything, done, archived and deferred items too, in a `Search:` tab |
 | **Undo** | |
 | `u`, `ctrl-r` | Undo, redo: the same history as `todo undo` |
 | **Commands** | |
-| `:` | Command line: `:q`, `:help`, `:search <words>`, `:refresh`, `:view …` ([Views](#views-of-your-own)), `:config`, `:export [path]`; `tab` completes |
+| `:` | Command line: `:q`, `:help`, `:search <words>`, `:refresh`, `:view …` ([Views](#views-of-your-own)), `:config`, `:export [path]`, `:l48 [since]`, `:meet`; `tab` completes |
 | `?`, F1, `:help` | Help: every key, the capture syntax and the dates |
 | `ctrl-z` | Suspend to the shell; `fg` comes back |
 | `q`, `ctrl-c` | Quit |
@@ -501,11 +508,53 @@ archive_done_after_days = 7   # done items move to the Archive after this many d
 [backup]
 enabled = true
 retain_days = 14
+
+[l48]                         # the scrum report's window
+window_days = 2               # working days back (L48) and ahead (N48)
+working_days = ["mon", "tue", "wed", "thu", "fri"]
+
+[meetings]
+provider = "teams"            # "none" turns M and :meet off
 ```
 
 A remap that would make one key both a whole binding and the start of another (`p`
 is the start of `p 1`) is skipped with a warning. The help and the hints show the
 keys in effect.
+
+### Your scrum report: L48 / N48
+
+`todo l48` prints what you worked on in the last two working days and what is
+planned for the next two, ready to paste:
+
+```
+L48:
+- Release 2.3 prep: 3 of 5 subtasks done
+- Fix the flaky login test (PLAT-412)
+N48:
+- Write the planning memo
+- Close out the database migration; waiting on Sam
+```
+
+- **L48** is the items you completed, started or edited in the window, newest
+  first, one line per top-level item, with its subtasks done in the window counted.
+  Capturing an item is not work, and nor is triage (labels, priority, energy, the
+  focus week); undone changes do not count.
+- **N48** is the open items in progress, due by the end of the next two working
+  days, waiting with a follow-up by then, or in this week's focus, ordered as Today.
+- The window counts working days, so Monday's L48 covers Thursday and Friday.
+  `--since thu` (or `-3d`, `oct29`, `yesterday`, a date) starts it elsewhere;
+  `[l48]` changes the window.
+- `--copy` also puts it on the clipboard (`pbcopy`, else `wl-copy` or `xclip`).
+  In the TUI, `:l48` shows it and `y` copies it; Claude Code has `todo_l48`.
+
+### Meetings
+
+`M` (or `:meet`) opens Microsoft Teams' new-meeting form, filled in from the item:
+the title as the subject (edit it in the prompt first), the description's first
+paragraph and Jira link as the content, and who it waits on as the attendee when
+that is an email address (`~dana@example.com`). With marks it is one meeting about
+all of them. You pick the time and send it in Teams; todo-tui creates nothing and
+needs no login. `[meetings] provider = "none"` turns it off.
 
 ### Backups and export
 
@@ -533,8 +582,10 @@ claude mcp add --scope user todo -- todo mcp
 |---|---|
 | `todo_list` | Items in a view (`today`, `next`, `waiting`, …), narrowed by text or labels |
 | `todo_get`, `todo_status`, `todo_views` | One item in full; the counts; the views |
+| `todo_l48` | The L48 / N48 report, as `todo l48` prints it |
+| `todo_meeting_link` | A Teams new-meeting link for items, prefilled as `M` fills it |
 | `todo_capture` | A capture, as `todo add` takes it (tokens and all) |
-| `todo_update` | Title, description, priority, local priority, due, defer, labels, waiting, private notes |
+| `todo_update` | Title, description, priority, local priority, energy, due, defer, labels, waiting, private notes |
 | `todo_set_status` | `inbox`, `next`, `someday`, `in_progress`, `done`, `cancelled`; completing a repeating item returns the next one |
 | `todo_set_repeat` | Sets or clears the repeat rule |
 | `todo_archive`, `todo_unarchive`, `todo_delete`, `todo_undelete` | As named |
@@ -542,8 +593,8 @@ claude mcp add --scope user todo -- todo mcp
 
 Tools take the full id or the 8-character short id `todo add` prints. Their captures
 are `created_via = mcp`, and every change is yours, so `todo undo` or `u` undoes it.
-`todo mcp --read-only` offers only `todo_list`, `todo_get`, `todo_status` and
-`todo_views`. Like the TUI, it runs a bundle with Node (`share/todo-tui/mcp.js`, or
+`todo mcp --read-only` offers only the tools that change nothing: `todo_list`,
+`todo_get`, `todo_status`, `todo_views`, `todo_l48` and `todo_meeting_link`. Like the TUI, it runs a bundle with Node (`share/todo-tui/mcp.js`, or
 `mcp/dist/mcp.js` in a checkout; `TODO_MCP_ENTRY` overrides it) and starts the daemon
 if needed.
 

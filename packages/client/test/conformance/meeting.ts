@@ -63,6 +63,8 @@ export function meetingConformance(open: () => Promise<MeetingTarget>): void {
       await updateItem(items, { id: c.id, waiting: { on: { ref: { case: "freeText", value: "dana@example.com\u0085" } }, reason: "" } }, ["waiting"]);
       const m = await buildMeetingLink(items, [a.id, b.id, c.id]);
       expect(m.subject).toBe("Plan offsite + 2 more");
+      const esc = await capture(items, "Ship\u001b]0;x\u0007 it");
+      expect((await buildMeetingLink(items, [esc.id])).subject).toBe("Ship ]0;x it");
       expect(m.content.split("\n\n")[1]).toBe("Kick\ufeffoff");
       expect(m.attendees).toEqual(["JOSÉ@example.com", "josé@example.com", "dana@example.com"]);
     });

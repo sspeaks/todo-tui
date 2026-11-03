@@ -1,5 +1,5 @@
 // Bulk actions (Decision 8): with marks in the tab, the mark-aware keys
-// x X s p ^ D w W t z dd @ act on every marked Item through one BatchMutate,
+// x X s p e ^ D w W t z dd @ act on every marked Item through one BatchMutate,
 // in list order and without expected_revision (they are absolute): one op,
 // so one undo entry, toasted with its OpSummary. An Item deleted elsewhere
 // meanwhile is dropped and the rest retried once.

@@ -125,8 +125,14 @@ fn first_paragraph(markdown: &str) -> String {
         .join(" ")
 }
 
+/// Whitespace collapsed, control characters (which a title may hold) as
+/// spaces.
 fn single_line(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    let printable: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    printable.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// RFC 3986 percent-encoding of everything but the unreserved characters.

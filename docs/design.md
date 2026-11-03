@@ -94,7 +94,7 @@ Future capture surfaces (Raycast, macOS Shortcuts, mobile) are just more gRPC cl
 ```
 
 - **Tab bar**: the views (2.4). A view with `show_count` set (every default but Someday and Archive) shows its count, a COUNT over the same query its list runs, so the badge always equals the rows (`GetStatusCounts(include_views)`). `1`–`9` jump to a view; `[` / `]` (and `h` / `l`, M8) go to the previous / next view.
-- **List**: one dense row per Item: status glyph (`○` todo, `◐` in progress, `●` done, `⊘` cancelled), *effective* priority (`*` suffix = local override, 3.2), title, Jira key, due, waiting (person + age), and markers: `✦` pending suggestions, `↑` pending push, `!` sync conflict / push failure, `🔁` recurring. From M8 a one-cell energy glyph follows the priority (`▁` low, `▄` medium, `█` high); it goes with the markers when the title runs short.
+- **List**: one dense row per Item: status glyph (`○` todo, `◐` in progress, `●` done, `⊘` cancelled), *effective* priority (`*` suffix = local override, 3.2), title, Jira key, due, waiting (person + age), and markers: `✦` pending suggestions, `↑` pending push, `!` sync conflict / push failure, `🔁` recurring. From M8 a one-cell energy glyph follows the priority (`▁` low, `▄` medium, `█` high), in a slot the list has while any of its loaded rows has an energy, so titles stay put as rows scroll. Columns drop before the title gets short (2.2's layout), so the slot never needs to move.
 - **Detail pane** shows the Jira status *name* when linked (e.g. "In Review") with the category glyph; the local status otherwise.
 - **Right pane**: shows either the **detail** of the selected Item, or the **Suggestions** drawer (`S` toggles). It follows the list selection.
 - **Status bar**: mode, per-instance sync state (5.11), pending outbox count, global suggestion count, key hints.
@@ -273,6 +273,7 @@ Some todos are really "get these people in a room". `M` (and `:meet`) opens Micr
 - **Feasibility**: the link opens the form only for an account whose Teams can schedule meetings, and an organisation can block deep links; then the browser shows Teams' own error. Opening the URL is the whole integration, so there is nothing to keep in sync.
 - **Claude (P4)**: with a provider configured, `space m` drafts the agenda for the `content` from the Item, its subtasks and recent events, shown in the prompt for you to edit first, as a `comment_draft` is (6.2).
 - **Config** (8.2): `[meetings] provider = "teams"`, the only provider; `"none"` unbinds `M`. Outlook (`outlook.office.com/calendar/deeplink/compose`) and Google Calendar links take the same fields, so another provider is just another link builder.
+- **As built (M8)**: `BuildMeetingLink(ids, subject)` returns the URL, subject, content and attendees; with meetings off it fails `FAILED_PRECONDITION` / `MEETINGS_OFF`, and `:meet` says so. The content is cut at 2000 bytes (long links fail in some browsers), attendees are deduplicated ignoring ASCII case, and control characters become spaces. The prompt is a `meeting` PromptKind with no preview; when `open` / `xdg-open` cannot start, the error toast carries the link. There is no CLI command; MCP has `todo_meeting_link`, read-only since it writes nothing. FakeDaemon builds the same link (`packages/client/src/meeting.ts`, Rust's whitespace and case rules), checked by a suite both daemons run.
 
 ## 3. Domain Model
 
@@ -966,10 +967,11 @@ N48:
 
 It is the standup over a fixed window, so it shares the standup's builder. `todo l48` prints it, `:l48` shows it in a transient panel with `y` to copy, and `ItemService.GetActivityReport(window)` serves both, plus MCP (`todo_l48`). It is on `ItemService` because `ReviewService` does not exist until P4; the standup reuses it then.
 
-- **The window** is two **working days**, not 48 clock hours, so Monday's L48 covers Thursday and Friday: `[l48] working_days = ["mon", …, "fri"]` and `window_days = 2` (8.2). Holidays are not modelled; `--since DATE` overrides the start.
+- **The window** is two **working days**, not 48 clock hours, so Monday's L48 covers Thursday and Friday (from the start of Thursday in the daemon's zone) and its N48 runs through Wednesday: `[l48] working_days = ["mon", …, "fri"]` and `window_days = 2` (1 to 31, 8.2). Holidays are not modelled. `--since` overrides the start, counting back from today (`todo_core::parse_past_date`): `thu` is the last Thursday, `oct29` the last October 29, `-3d`, `yesterday`, or an ISO date; one after today is refused.
 - **L48 lines** are the Items with a user Event in the window (3.10): completed, moved to `in_progress`, edited, or given a subtask that was completed. One line per top-level Item, its subtasks folded under it (`MR-3 prep: 3 of 5 subtasks done`); a completed recurring instance is one line, not one per day. Sync, system and scheduler Events do not count, so an auto-archive is not work. An Item whose only changes in the window are to labels, priority, the override, energy or `focus_week` is left out: triage is not work.
 - **N48 lines** are the open Items that are `in_progress`, due within the next window, waiting with a follow-up in it, or in this week's focus (`focus_week`), ordered like Today: the planned work, not the whole backlog.
-- **Each line** is the Item's title, then `; waiting on <person>` when it waits. Linked Items get their Jira key in parentheses. Without Claude that is the whole text, and you add the colour ("we're slightly behind schedule") after copying.
+- **Each line** is the Item's title, then `; waiting on <person>` when it waits. Linked Items get their Jira key in parentheses. Without Claude that is the whole text, and you add the colour ("we're slightly behind schedule") after copying. Control and bidi formatting characters are dropped, since the text goes to terminals and clipboards as it is.
+- **As built (M8)**: `GetActivityReport(reference_time, since)` returns both halves as lines (`item_id`, `text`) and as the text to paste, with `since`, `until` and `today`. An L48 Item counts when a user or an applied suggestion wrote a `set` event on it in the window, outside undo and redo ops and undone or discarded entries, on a field other than the triage ones; captures (and so a generated next instance) are not work. The subtask note counts the line's direct subtasks completed in the window and done now (`2 of 5 subtasks done`). N48 lists at most 15. FakeDaemon answers from a fixture (`setActivityReport`): the rules are tested on the daemon. `todo l48 --copy` tries `pbcopy`, `wl-copy`, then `xclip` (2 s each); `:l48`'s `y` falls back to OSC 52, which most terminals turn into a clipboard write.
 - **With Claude (P4)**: an `l48` task kind (6.2, Sonnet) rewrites the same lines into the style of your past reports. Each report you copy after editing is kept as an example (6.8), so it picks up your phrasing. It runs only on request, never posts anywhere, and the text is shown for you to edit before it is copied.
 - **Automation** (both stages): `todo l48 --copy` for a shell alias, and with the daemon running a reminder is just a recurring Item (`todo add "send L48/N48 @mon,thu"`). Sending to Teams or email is out of scope: you paste it.
 
@@ -1179,7 +1181,7 @@ Each phase ends usable. Later phases must not require reworking earlier contract
 | M5 | Recurrence and the scheduler (incl. the `auto_done` archive, 3.7): `@` in capture and as a key, `SetRecurrence`, the next instance generated on completion (3.8), the supervisor (4.5) | done |
 | M6 | Config (incl. keymap overrides), export/import, backups, view CRUD (`:view`) | done: P1 is complete, but for what moved to P2 (People, 3.5) |
 | M7 | The MCP server | done, ahead of M6: it needed nothing from M6, and Claude Code could then manage todos |
-| M8 | Personal workflow, after M6: the `energy` field (`%`, `e`, the glyph, a filter and sort target, 3.2, 4.8); `h` / `l` for the previous / next view (2.5); the L48 / N48 report without Claude (`todo l48`, `:l48`, 6.6); `M` / `:meet` for a prefilled Teams meeting form (2.9) | planned |
+| M8 | Personal workflow, after M6: the `energy` field (`%`, `e`, the glyph, a filter and sort target, 3.2, 4.8); `h` / `l` for the previous / next view (2.5); the L48 / N48 report without Claude (`todo l48`, `:l48`, 6.6); `M` / `:meet` for a prefilled Teams meeting form (2.9) | done |
 
 M4 left these for later: keymap overrides and `:view` to M6 (config and view CRUD); the relation and reparent UI to P3, where `relate` and `split` first create relations (nothing in P1 does); the detail pane's field editor, and with it editing the local priority override and private notes, to P2, where they matter (every field P1 edits has a key); `✦`, sync state and the outbox count to P2; the Ask bar to P4. The contract did not change in M4 (`api_minor` is still 5).
 
@@ -1200,6 +1202,14 @@ M6 built config, view editing, backups and export/import, in seven phases (`api_
 - **Export and import** (7.4): `todo.export.v1`, `todo export` / `todo import`, `:export`.
 
 M6 left these for later: MCP tools that edit views (`todo_views` lists them; a view is found by name before its seed key, since a default can be renamed); a query-text parser in FakeDaemon, which answers `ParseQuery` only for the text it is given; export and import in FakeDaemon; the keymap's warnings listed in the help overlay (`:config` shows the first). `todo-proto` depends on `todo-store` for the export rows (4.5).
+
+M8 built the personal-workflow pieces, in five phases (`api_minor` 14–16, 4.2):
+- **`h` / `l`** step to the previous / next view beside `[` / `]` (2.5); `"h" = ""` in `[keymap]` takes either off.
+- **Energy** (3.2, 4.8; `api_minor` 14): `Item.energy` (48), `ITEM_FIELD_ENERGY`, `FieldValue.energy`; migration `0005_energy` (a `NOT NULL DEFAULT 'none'` column, 7.2). The `%low` / `%med` / `%high` capture token, `e l|m|h|0` (mark-aware), the row glyph and the detail's Energy row; query text takes `energy:low`, `energy>=medium`. An Item written before 14 (an older export) reads as none. MCP shows and sets it.
+- **L48 / N48** (6.6; `api_minor` 15): `GetActivityReport`, `[l48]`, `todo l48 [--since] [--copy]`, `:l48` in a panel of its own keymap mode (`report`: `j`/`k`, `y`, `esc`), and the read-only MCP tool `todo_l48`.
+- **Meetings** (2.9; `api_minor` 16): `BuildMeetingLink`, `[meetings]`, `M` and `:meet`, and the read-only MCP tool `todo_meeting_link`.
+
+M8 left these for later: Teams attendees from People (P2; until then only a `waiting.on` that is an email address); the Claude `l48` and `meeting_agenda` task kinds (P4); the standup (P4), which is to reuse the report's builder; an energy field in the detail pane's editor (P2, with the editor).
 
 ### 9.2 Open questions
 

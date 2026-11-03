@@ -156,8 +156,16 @@ pub fn render(last: &[String], next: &[String]) -> String {
     out
 }
 
+/// One line of plain text: whitespace collapsed, and control and bidi
+/// formatting characters dropped, since the report goes to terminals and
+/// clipboards as it is (a title may hold ESC).
 fn single_line(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    let printable: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .filter(|c| !matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'))
+        .collect();
+    printable.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
@@ -259,6 +267,17 @@ mod tests {
             line_text(&item, Some("3 of 5 subtasks done")),
             "Ship the migration (PLAT-412): 3 of 5 subtasks done; waiting on Sam"
         );
+    }
+
+    #[test]
+    fn lines_drop_control_and_bidi_characters() {
+        let item = Item::new_capture(
+            crate::new_ulid(),
+            "Ship it\u{1b}]52;c;ZXZpbA==\u{7} \u{202E}now".into(),
+            CreatedVia::Tui,
+            Timestamp::UNIX_EPOCH,
+        );
+        assert_eq!(line_text(&item, None), "Ship it ]52;c;ZXZpbA== now");
     }
 
     #[test]

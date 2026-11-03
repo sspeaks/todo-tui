@@ -162,6 +162,17 @@ describe("the shell", () => {
     expect(t.frame()).toMatch(/L48 · ● live .*y copy · j\/k scroll · esc close/);
   });
 
+  it(":l48 draws no escape sequence a line holds", async () => {
+    const fd = fakeDaemon([item("a")], { now: clock, timeZone: "UTC" });
+    fd.daemon.setActivityReport({ text: "L48:\n- Ship\x1b]52;c;ZXZpbA==\x07 it\x1b[2J\nN48:\n- (nothing)\n" });
+    const t = renderTui({ daemon: fd, columns: 100, rows: 12, now: clock });
+    await t.live();
+    t.type(":l48\r");
+    await t.waitFrame((f) => expect(f).toContain("- Ship"));
+    expect(t.raw()).not.toContain("\x1b]52");
+    expect(t.raw()).not.toContain("\x1b[2J");
+  });
+
   it("dims archived rows and marks deferred ones (Archive)", async () => {
     const fd = fakeDaemon(
       [

@@ -720,10 +720,13 @@ export class Controller {
     const from = config && create(ConfigSnapshotSchema, { ...config, loadedAt: undefined });
     if (from === this.keymapFrom || (from && this.keymapFrom && equals(ConfigSnapshotSchema, from, this.keymapFrom))) return;
     this.keymapFrom = from;
-    // [meetings] provider = "none" unbinds M (design 2.9); :meet says why.
+    const applied = applyOverrides(this.defaults, config?.keymap ?? {});
+    // [meetings] provider = "none" unbinds M (design 2.9), after the
+    // overrides, so an `"M" = ""` there is no warning; :meet says why.
     const meetingsOff = config?.meetings?.provider === "none";
-    const defaults = meetingsOff ? this.defaults.map((b) => (b.id === "schedule_meeting" ? { ...b, keys: [] } : b)) : this.defaults;
-    const effective = applyOverrides(defaults, config?.keymap ?? {});
+    const effective = meetingsOff
+      ? { ...applied, bindings: applied.bindings.map((b) => (b.id === "schedule_meeting" ? { ...b, keys: [] } : b)) }
+      : applied;
     this.tries = triesOf(effective.bindings);
     this.ui.setState((s) => ({
       ...s,
