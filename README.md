@@ -4,7 +4,7 @@ A keyboard-driven, local-first todo manager for the terminal. A Rust daemon owns
 state in SQLite and serves a gRPC API (`todo.v1`) over a Unix socket; an Ink TUI, the
 `todo` CLI and an MCP server are clients. See [docs/design.md](docs/design.md).
 
-Status: P1 in progress, and its daily-driver TUI is done. Milestone M1 (capture) is
+Status: P1 is done (its People tools moved to P2, with Jira sync). Milestone M1 (capture) is
 done: `todo add` with inline tokens, batch capture from stdin, and an offline spool.
 Milestone M2 (undo) is done: `todo undo` and `todo redo`, relations between items in
 the API, and deleting an item together with its subtasks. Milestone M3 (views) is
@@ -16,9 +16,12 @@ Milestone M5 (recurring items) is done: repeat rules with `@`, in captures and a
 a TUI key, the next instance created when you complete one, and done items archived
 after a week; see [Recurring items](#recurring-items). Milestone M7 (the MCP
 server) is done, ahead of M6: `todo mcp` gives Claude Code tools to list, capture,
-edit and complete items; see [Claude Code](#claude-code). Next comes M6 (config,
-export/import, backups, editing views). The CLI captures, undoes and counts; listing,
-editing and completing items happen in the TUI or through Claude Code.
+edit and complete items; see [Claude Code](#claude-code). Milestone M6 is done: a
+config file with key remaps, views you make and edit with `:view` and query text,
+daily backups and `todo restore`, and `todo export` / `todo import`; see
+[Views](#views-of-your-own), [Configuration](#configuration) and
+[Backups and export](#backups-and-export). The CLI captures, undoes and counts;
+listing, editing and completing items happen in the TUI or through Claude Code.
 
 ## Quick start
 
@@ -340,7 +343,7 @@ key hints) and a message line for prompts and results.
 | **Undo** | |
 | `u`, `ctrl-r` | Undo, redo: the same history as `todo undo` |
 | **Commands** | |
-| `:` | Command line: `:q`, `:help`, `:search <words>`, `:refresh`; `tab` completes |
+| `:` | Command line: `:q`, `:help`, `:search <words>`, `:refresh`, `:view …` ([Views](#views-of-your-own)), `:config`, `:export [path]`; `tab` completes |
 | `?`, F1, `:help` | Help: every key, the capture syntax and the dates |
 | `ctrl-z` | Suspend to the shell; `fg` comes back |
 | `q`, `ctrl-c` | Quit |
@@ -442,7 +445,81 @@ completed keep theirs. `@` on a done or cancelled item is refused: reopen it fir
 Done and cancelled items, recurring or not, show in the Archive tab straight away,
 and the daemon archives them 7 days after they closed. A `z` after closing one
 sticks: unarchived, it is not archived again until you close it again. Reopening an
-item it archived takes it out of the archive.
+item it archived takes it out of the archive. The 7 days are
+`[ui] archive_done_after_days` in the [config](#configuration).
+
+### Views of your own
+
+The tabs are saved views, and `:view` makes, edits, renames, moves and deletes them.
+A view's filter is query text: words that are ANDed, previewed as you type with the
+number of items they match (or the first error, coloured where it is).
+
+```text
+:view new Urgent is:next,in_progress priority>=high sort:-priority
+:view new Deferred has:defer_until include:deferred sort:defer_until
+:view new Work #work any:(is:next has:waiting) count:off
+:view edit Urgent             # opens with the view's query; enter saves
+:view rename Urgent Hot       # :view rename <new> renames the current tab
+:view move Hot first          # or a tab number, left, right, last
+:view delete Hot              # asks first
+```
+
+| Term | Means |
+|---|---|
+| `is:next,in_progress` | status is one of these |
+| `#work` | has the label |
+| `priority>=high`, `due_date<=today+3d` | compare a field: `:` (one of), `:=`, `!=`, `<`, `<=`, `>`, `>=` |
+| `has:waiting`, `no:due_date` | the field is set, or unset |
+| `milk`, `"two words"`, `description~notes` | title (or another text field) contains the words |
+| `-is:done`, `-has:waiting` | not (only for `:` and `has:`/`no:`) |
+| `any:( … )`, `( … )` | one of the terms inside, or all of them |
+| `include:done,archived,deferred` | lift the rules that hide those items |
+| `sort:-priority,due_date` | sort, `-` for descending |
+| `count:off` | no count on the tab |
+
+Field names are the item's fields (`due_date`, `waiting.on`, `effective_priority`,
+`focus_week`, …); dates take `today`, `week_start` and `week_end`, each with
+`+3d` or `-2w`. `:view edit Today` shows how a default view is written. The full
+grammar is design 4.8, "Query text".
+
+### Configuration
+
+`config.toml` is optional (`todo config path` prints where it goes). Only the daemon
+reads it: at start, on `todo config reload`, and on SIGHUP. A bad value is a warning
+that names its key, and the default is used; `todo config check` prints the
+warnings without the daemon, and `:config` in the TUI shows them.
+
+```toml
+[ui]
+archive_done_after_days = 7   # done items move to the Archive after this many days
+
+[keymap]                      # a key sequence and the action it runs
+"K" = "move_up"               # action ids: the help (?) lists the keys; design 2.5 the ids
+"g d" = "mark_done"           # keys separated by spaces; ctrl+x, enter, esc, tab, …
+"x" = ""                      # an empty action unbinds the key
+
+[backup]
+enabled = true
+retain_days = 14
+```
+
+A remap that would make one key both a whole binding and the start of another (`p`
+is the start of `p 1`) is skipped with a warning. The help and the hints show the
+keys in effect.
+
+### Backups and export
+
+The daemon backs up the database when it starts and once a day after, to
+`backups/` in the data directory, and deletes backups older than `retain_days`.
+It also backs up before it migrates the database to a new schema.
+
+| Command | What it does |
+|---|---|
+| `todo backup now` | Backs up at once, also when automatic backups are off |
+| `todo backup list` | Lists the backups |
+| `todo restore FILE [--yes]` | Puts a backup in place: it asks first, saves the current database as `todo-prerestore-….db`, and restarts the daemon. Close other TUIs first. Restoring that `prerestore` file undoes it |
+| `todo export [--out FILE] [--no-history]` | Every record as JSON Lines (`--no-history` leaves out the undo history); `:export [path]` in the TUI |
+| `todo import FILE` | Loads an export into an empty database, as on a new machine |
 
 ### Claude Code
 
@@ -497,7 +574,8 @@ CLI and TUI restart it on their own only when it is too old for their API versio
 
 | What | Linux | macOS |
 |---|---|---|
-| Database `todo.db`, `daemon.lock`, `spool.jsonl` | `$XDG_DATA_HOME/todo-tui/`, default `~/.local/share/todo-tui/` | `~/Library/Application Support/todo-tui/` |
+| Database `todo.db`, `daemon.lock`, `spool.jsonl`, `backups/` | `$XDG_DATA_HOME/todo-tui/`, default `~/.local/share/todo-tui/` | `~/Library/Application Support/todo-tui/` |
+| `config.toml` | `$XDG_CONFIG_HOME/todo-tui/`, default `~/.config/todo-tui/` | the same |
 | `daemon.log` | `$XDG_STATE_HOME/todo-tui/`, default `~/.local/state/todo-tui/` | `~/Library/Logs/todo-tui/` |
 | Socket `daemon.sock` | `$XDG_RUNTIME_DIR/todo-tui/`, or `/tmp/todo-tui-$UID/` | `$TMPDIR/todo-tui/` |
 
