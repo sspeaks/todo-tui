@@ -252,6 +252,11 @@ describe("tabs", () => {
     expect(t.tabIs("inbox")).toBe(true);
     await t.c.press("[");
     expect(t.tabIs("archive")).toBe(true);
+    // h and l step as [ and ] do.
+    await t.c.press("l");
+    expect(t.tabIs("inbox")).toBe(true);
+    await t.c.press("h");
+    expect(t.tabIs("archive")).toBe(true);
   });
 
   it("observes only the current tab's view", async () => {

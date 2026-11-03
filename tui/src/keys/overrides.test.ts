@@ -49,6 +49,15 @@ describe("[keymap] overrides", () => {
     expect(runs(bindings, ["esc"], "help")).toBe("help_close");
   });
 
+  it("unbinds h and l, keeping [ and ]", () => {
+    const { bindings, warnings } = applyOverrides(BINDINGS, { h: "", l: "" });
+    expect(warnings).toEqual([]);
+    expect(runs(bindings, ["h"])).toBe("unbound");
+    expect(runs(bindings, ["l"])).toBe("unbound");
+    expect(runs(bindings, ["["])).toBe("view_prev");
+    expect(runs(bindings, ["]"])).toBe("view_next");
+  });
+
   it("skips an override that breaks the keymap, keeping the others", () => {
     const { bindings, warnings } = applyOverrides(BINDINGS, { p: "quit", K: "move_up", "d d d": "quit" });
     expect(warnings).toEqual([

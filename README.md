@@ -317,7 +317,7 @@ key hints) and a message line for prompts and results.
 | `j` `k`, `↓` `↑` | Next / previous row (in the focused detail: scroll) |
 | `gg` `G`, `home` `end` | First / last row |
 | `ctrl-d` `ctrl-u`, `pgdn` `pgup` | Half a page down / up |
-| `1`–`9`, `[` `]` | Go to view N; previous / next view |
+| `1`–`9`, `[` / `h`, `]` / `l` | Go to view N; previous / next view |
 | `enter`, `tab` | Open the detail; switch focus between the list and the detail |
 | `esc` | Back one step: close the detail, end `V`, clear `/`, clear the marks |
 | **Items** | |

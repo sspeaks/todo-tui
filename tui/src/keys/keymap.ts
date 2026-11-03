@@ -87,8 +87,8 @@ export const BINDINGS: readonly Binding[] = [
     help: "Go to view N",
     helpKeys: "1–9",
   })),
-  { id: "view_prev", keys: ["["], action: { type: "view_step", by: -1 }, section: "Views", help: "Previous view" },
-  { id: "view_next", keys: ["]"], action: { type: "view_step", by: 1 }, section: "Views", help: "Next view" },
+  { id: "view_prev", keys: ["[", "h"], action: { type: "view_step", by: -1 }, section: "Views", help: "Previous view" },
+  { id: "view_next", keys: ["]", "l"], action: { type: "view_step", by: 1 }, section: "Views", help: "Next view" },
   { id: "narrow", keys: ["/"], action: { type: "narrow" }, section: "Views", help: "Narrow this view (enter keeps, esc clears)" },
 
   { id: "quick_add", keys: ["a"], action: { type: "quick_add", child: false }, section: "Items", help: "Quick-add" },
