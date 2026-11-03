@@ -302,7 +302,7 @@ async fn handshake_reports_version_and_api_minor() {
         .into_inner();
     assert_eq!(info.daemon_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(info.api_minor, todo_proto::API_MINOR);
-    assert_eq!(info.api_minor, 13);
+    assert_eq!(info.api_minor, 14);
     d.stop().await;
 }
 
@@ -2306,6 +2306,17 @@ async fn update_item_errors_name_the_request_field() {
             ),
             "item.local_priority_override",
             "remove the override with cleared",
+        ),
+        (
+            with(
+                Item {
+                    energy: 9,
+                    ..Default::default()
+                },
+                &["energy"],
+            ),
+            "item.energy",
+            "unknown enum value 9",
         ),
     ];
     for (req, field, description) in cases {
@@ -4953,7 +4964,7 @@ async fn rich(d: &TestDaemon) {
         .into_inner()
         .item
         .unwrap();
-    let water = capture(&mut items, "water plants @mon,thu").await;
+    let water = capture(&mut items, "water plants %low @mon,thu").await;
     let gone = capture(&mut items, "gone").await;
     items
         .add_relation(AddRelationRequest {
@@ -5031,6 +5042,13 @@ async fn export_import_export_round_trips() {
         assert_eq!(out.records as usize, first.len() - 1);
         let second = export_lines(&b, no_history).await;
         assert_eq!(first[1..], second[1..], "no_history {no_history}");
+        // Energy travels, as proto3 JSON's enum name.
+        assert!(
+            first
+                .iter()
+                .any(|l| l.contains("\"energy\":\"ENERGY_LOW\"")),
+            "no_history {no_history}"
+        );
         // What the import holds works: the views, search, and undo.
         let views = ViewServiceClient::new(b.channel().await)
             .list_views(ListViewsRequest {})

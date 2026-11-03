@@ -24,7 +24,7 @@ pub use filter::{Filter, FilterError, FilterErrorKind, Resolved, SortKey};
 pub use ids::{ItemId, PersonId, Revision, new_ulid};
 pub use inverse::{EventBody, InverseStep, RecordedEvent, inverse};
 pub use item::{
-    ArchiveReason, Archived, CoreFields, CreatedVia, DerivedFields, Item, ItemRecurrence,
+    ArchiveReason, Archived, CoreFields, CreatedVia, DerivedFields, Energy, Item, ItemRecurrence,
     LinkState, OverlayFields, PersonRef, Priority, RemoteLink, StalenessSignals, Waiting,
 };
 pub use mutation::{

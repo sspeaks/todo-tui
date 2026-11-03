@@ -17,12 +17,12 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, params_from_iter};
 use todo_core::filter::{
     Anchor, Clause, Filter, FilterErrorKind, Group, Operand, Operator, Predicate, RelativeDate,
-    ResolvedOperand, SortKey, ValueClass, enum_number, priority_rank, target, validate_sort,
-    value_of,
+    ResolvedOperand, SortKey, ValueClass, energy_rank, enum_number, priority_rank, target,
+    validate_sort, value_of,
 };
 use todo_core::view::{View, ViewId};
 use todo_core::{
-    ArchiveReason, CreatedVia, FieldValue, Item, ItemField, LinkState, PersonRef, Priority,
+    ArchiveReason, CreatedVia, Energy, FieldValue, Item, ItemField, LinkState, PersonRef, Priority,
     ResolutionKind, Resolved, Status, StatusCategory, TodoRefinement,
 };
 
@@ -152,6 +152,7 @@ fn col(field: ItemField) -> Col {
         F::PrivateNotes => V("private_notes"),
         F::FocusWeek => V("focus_week"),
         F::LocalPriorityOverride => V("local_priority_override"),
+        F::Energy => V("energy"),
         F::Archived => Presence("archived_at IS NOT NULL"),
         F::Recurrence => Presence("recurrence_series_id IS NOT NULL"),
         F::RemoteExtras => Unbuilt,
@@ -251,12 +252,13 @@ fn value(sql: &mut Sql, field: ItemField, today: Date) {
     };
 }
 
-/// Writes `field`'s sort expression: priorities as their rank (NULL for
-/// PRIORITY_NONE), other enums as their proto number, anything else as its
+/// Writes `field`'s sort expression: priorities and energies as their rank
+/// (NULL for PRIORITY_NONE and ENERGY_NONE), other enums as their proto number, anything else as its
 /// value. Strings compare BINARY, which is code-point order in UTF-8.
 fn sort_expr(sql: &mut Sql, field: ItemField, today: Date) {
     let ranks = match target(field).class {
         ValueClass::Priority => priority_ranks(),
+        ValueClass::Energy => energy_ranks(),
         ValueClass::Enum => enum_numbers(field),
         _ => return value(sql, field, today),
     };
@@ -277,6 +279,14 @@ fn priority_ranks() -> Vec<(&'static str, u32)> {
     Priority::VALUES
         .iter()
         .filter_map(|&(p, name)| Some((name, u32::from(priority_rank(p)?))))
+        .collect()
+}
+
+/// Each energy's stored name and rank, without ENERGY_NONE.
+fn energy_ranks() -> Vec<(&'static str, u32)> {
+    Energy::VALUES
+        .iter()
+        .filter_map(|&(e, name)| Some((name, u32::from(energy_rank(e)?))))
         .collect()
 }
 
@@ -318,6 +328,7 @@ fn bind_value(v: &FieldValue) -> Value {
         V::Duration(d) => Value::Integer(ns(d.as_nanos())),
         V::ItemId(id) => Value::Text(id.to_string()),
         V::Priority(p) => Value::Text(p.as_sql().into()),
+        V::Energy(e) => Value::Text(e.as_sql().into()),
         V::Status(s) => Value::Text(s.as_sql().into()),
         V::StatusCategory(c) => Value::Text(c.as_sql().into()),
         V::ResolutionKind(r) => Value::Text(r.as_sql().into()),
@@ -331,7 +342,7 @@ fn bind_value(v: &FieldValue) -> Value {
 
 /// A sort key's value as its [`sort_expr`] reads, in the same storage
 /// class (SQLite orders INTEGER before TEXT, so a mistyped value would
-/// misplace the cursor): `Cleared` and PRIORITY_NONE are NULL. `None` when
+/// misplace the cursor): `Cleared`, PRIORITY_NONE and ENERGY_NONE are NULL. `None` when
 /// `v` is not a value of `field`.
 fn bind_key(field: ItemField, v: &FieldValue) -> Option<Value> {
     use FieldValue as V;
@@ -342,6 +353,9 @@ fn bind_key(field: ItemField, v: &FieldValue) -> Option<Value> {
         (_, V::Cleared) => Value::Null,
         (C::Priority, V::Priority(p)) => {
             priority_rank(*p).map_or(Value::Null, |r| Value::Integer(r.into()))
+        }
+        (C::Energy, V::Energy(e)) => {
+            energy_rank(*e).map_or(Value::Null, |r| Value::Integer(r.into()))
         }
         (C::Enum, v) => {
             let fits = matches!(
@@ -581,8 +595,8 @@ fn equals(sql: &mut Sql, field: ItemField, values: &[&FieldValue], today: Date) 
     }
 }
 
-/// LT, LE, GT or GE; priorities compare by rank, where PRIORITY_NONE has
-/// none and so never matches.
+/// LT, LE, GT or GE; priorities and energies compare by rank, where
+/// PRIORITY_NONE and ENERGY_NONE have none and so never match.
 fn compare(
     sql: &mut Sql,
     field: ItemField,
@@ -601,10 +615,14 @@ fn compare(
         _ => " >= ",
     };
     sql.push("COALESCE(");
-    if target(field).class == ValueClass::Priority {
+    if matches!(
+        target(field).class,
+        ValueClass::Priority | ValueClass::Energy
+    ) {
         sort_expr(sql, field, today);
         let rank = match v {
             FieldValue::Priority(p) => priority_rank(*p).map_or(Value::Null, |r| r.into()),
+            FieldValue::Energy(e) => energy_rank(*e).map_or(Value::Null, |r| r.into()),
             _ => Value::Null,
         };
         sql.push(sign).bind(rank);
@@ -842,7 +860,7 @@ struct TokenEmpty {}
 struct TokenValue {
     #[prost(
         oneof = "TokenKind",
-        tags = "1, 2, 4, 5, 6, 7, 8, 9, 12, 13, 20, 21, 22, 23, 24, 25, 26, 27"
+        tags = "1, 2, 4, 5, 6, 7, 8, 9, 12, 13, 20, 21, 22, 23, 24, 25, 26, 27, 29"
     )]
     kind: Option<TokenKind>,
 }
@@ -886,6 +904,8 @@ enum TokenKind {
     ArchiveReason(i32),
     #[prost(int32, tag = "27")]
     LinkState(i32),
+    #[prost(int32, tag = "29")]
+    Energy(i32),
 }
 
 impl TokenDate {
@@ -913,6 +933,11 @@ impl TokenDate {
 /// PRIORITY_NONE 1, LOWEST 2, ..., HIGHEST 6.
 fn priority_number(p: Priority) -> u32 {
     priority_rank(p).map_or(1, |r| u32::from(r) + 1)
+}
+
+/// ENERGY_NONE 1, LOW 2, MEDIUM 3, HIGH 4.
+fn energy_number(e: Energy) -> u32 {
+    energy_rank(e).map_or(1, |r| u32::from(r) + 1)
 }
 
 /// The value of the enum `T` whose proto number is `n`.
@@ -950,6 +975,7 @@ impl TokenKind {
             V::ItemId(id) => TokenKind::ItemId(id.to_string()),
             V::IsoWeek(w) => TokenKind::IsoWeek(w.clone()),
             V::Priority(p) => TokenKind::Priority(priority_number(*p).try_into().ok()?),
+            V::Energy(e) => TokenKind::Energy(energy_number(*e).try_into().ok()?),
             V::Status(_) => TokenKind::Status(number(v)?),
             V::StatusCategory(_) => TokenKind::StatusCategory(number(v)?),
             V::ResolutionKind(_) => TokenKind::ResolutionKind(number(v)?),
@@ -982,6 +1008,10 @@ impl TokenKind {
                 .iter()
                 .find(|&&(p, _)| i32::try_from(priority_number(p)).ok() == Some(*n))
                 .map(|&(p, _)| V::Priority(p))?,
+            TokenKind::Energy(n) => Energy::VALUES
+                .iter()
+                .find(|&&(e, _)| i32::try_from(energy_number(e)).ok() == Some(*n))
+                .map(|&(e, _)| V::Energy(e))?,
             TokenKind::Status(n) => from_number::<Status>(*n, V::Status)?,
             TokenKind::StatusCategory(n) => from_number::<StatusCategory>(*n, V::StatusCategory)?,
             TokenKind::ResolutionKind(n) => from_number::<ResolutionKind>(*n, V::ResolutionKind)?,
@@ -1001,9 +1031,15 @@ impl PageToken {
             .iter()
             .filter(|k| k.key != ItemField::Id)
             .map(|k| {
-                // As the comparator reads it: PRIORITY_NONE is unset.
+                // As the comparator reads it: PRIORITY_NONE and ENERGY_NONE
+                // are unset.
                 let value = value_of(last, k.key, today)
-                    .filter(|v| !matches!(v, FieldValue::Priority(Priority::None)))
+                    .filter(|v| {
+                        !matches!(
+                            v,
+                            FieldValue::Priority(Priority::None) | FieldValue::Energy(Energy::None)
+                        )
+                    })
                     .unwrap_or(FieldValue::Cleared);
                 let kind = TokenKind::new(&value).ok_or_else(|| {
                     StoreError::Corrupt(format!("sort key {:?} holds {value:?}", k.key))
@@ -1311,6 +1347,8 @@ mod tests {
             FieldValue::IsoWeek("2026-W43".into()),
             FieldValue::Priority(Priority::None),
             FieldValue::Priority(Priority::Highest),
+            FieldValue::Energy(Energy::None),
+            FieldValue::Energy(Energy::High),
             FieldValue::Status(Status::Cancelled),
             FieldValue::StatusCategory(StatusCategory::InProgress),
             FieldValue::ResolutionKind(ResolutionKind::Done),

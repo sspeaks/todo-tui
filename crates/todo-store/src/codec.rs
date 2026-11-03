@@ -6,10 +6,10 @@ use jiff::civil::Date;
 use jiff::{SignedDuration, Timestamp};
 use rusqlite::{Connection, OptionalExtension, Row, ToSql, named_params};
 use todo_core::{
-    Actor, ArchiveReason, Archived, CoreFields, CreatedVia, DerivedFields, FieldValue, Item,
-    ItemField, ItemId, ItemRecurrence, LinkState, OverlayFields, PersonRef, Priority, Relation,
-    RelationKind, RemoteLink, ResolutionKind, Rule, StalenessSignals, Status, StatusCategory,
-    TodoRefinement, Topic, Waiting,
+    Actor, ArchiveReason, Archived, CoreFields, CreatedVia, DerivedFields, Energy, FieldValue,
+    Item, ItemField, ItemId, ItemRecurrence, LinkState, OverlayFields, PersonRef, Priority,
+    Relation, RelationKind, RemoteLink, ResolutionKind, Rule, StalenessSignals, Status,
+    StatusCategory, TodoRefinement, Topic, Waiting,
 };
 
 use crate::{OpKind, Result, StoreError};
@@ -90,6 +90,12 @@ sql_enum!(Priority, "priority", {
     Priority::Medium => "medium",
     Priority::High => "high",
     Priority::Highest => "highest",
+});
+sql_enum!(Energy, "energy", {
+    Energy::None => "none",
+    Energy::Low => "low",
+    Energy::Medium => "medium",
+    Energy::High => "high",
 });
 sql_enum!(ArchiveReason, "archived_reason", {
     ArchiveReason::User => "user",
@@ -241,7 +247,7 @@ pub(crate) const ITEM_COLUMNS: &str = "\
     todo_refinement, waiting_on_person_id, waiting_on_text, waiting_reason, waiting_since, \
     waiting_follow_up_on, defer_until, private_notes, focus_week, local_priority_override, \
     archived_at, archived_reason, recurrence_series_id, recurrence_occurrence_date, \
-    recurrence_rule, \
+    recurrence_rule, energy, \
     remote_extras, is_mine, pending_fields, has_conflict, has_push_failure, \
     description_lossy, description_dirty, last_user_touch_at, last_remote_change_at, \
     status_entered_at, staleness_waiting_since, scopes, deleted_at, merged_into";
@@ -353,6 +359,7 @@ pub(crate) fn item_from_row(row: &Row<'_>, today: Option<Date>) -> Result<Item> 
     let series_id = opt_ulid_from_sql(col!())?;
     let occurrence_date = opt_date_from_sql(col!())?;
     let rule = rule_from_sql(col!())?;
+    let energy = en!(Energy);
     // A legacy row with a series id and no rule reads back without one, and
     // so never generates another instance.
     let recurrence = series_id.map(|series_id| ItemRecurrence {
@@ -427,6 +434,7 @@ pub(crate) fn item_from_row(row: &Row<'_>, today: Option<Date>) -> Result<Item> 
             local_priority_override,
             archived,
             recurrence,
+            energy,
         },
         remote_extras,
         derived: DerivedFields {
@@ -535,6 +543,7 @@ fn with_item_params<T>(
         ":recurrence_series_id": ov.recurrence.as_ref().map(|r| r.series_id.to_string()),
         ":recurrence_occurrence_date": ov.recurrence.as_ref().and_then(|r| r.occurrence_date).map(date_to_sql),
         ":recurrence_rule": rule_to_sql(ov.recurrence.as_ref().and_then(|r| r.rule.as_ref()))?,
+        ":energy": ov.energy.as_sql(),
         ":remote_extras": serde_json::to_string(&item.remote_extras).map_err(corrupt)?,
         ":is_mine": d.is_mine,
         ":pending_fields": serde_json::Value::from(pending).to_string(),

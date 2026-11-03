@@ -788,7 +788,7 @@ fn operand(field: ItemField, text: &str, quoted: bool) -> Result<Operand, String
     let class = target(field).class;
     let value = |v: FieldValue| Ok(Operand::Value(v));
     match class {
-        C::Enum | C::Priority => enum_value(field, text).map(Operand::Value),
+        C::Enum | C::Priority | C::Energy => enum_value(field, text).map(Operand::Value),
         C::String | C::Set => value(FieldValue::String(text.to_owned())),
         C::Markdown => value(FieldValue::Markdown(text.to_owned())),
         C::Id => text
@@ -897,7 +897,7 @@ fn parse_offset(s: &str) -> Option<i32> {
 
 /// The enum value named `name` for `field`, by its serde name.
 fn enum_value(field: ItemField, name: &str) -> Result<FieldValue, String> {
-    use crate::item::{ArchiveReason, CreatedVia, LinkState, Priority};
+    use crate::item::{ArchiveReason, CreatedVia, Energy, LinkState, Priority};
     use crate::status::{ResolutionKind, StatusCategory, TodoRefinement};
     use ItemField as F;
     let name = name.to_ascii_lowercase();
@@ -915,6 +915,7 @@ fn enum_value(field: ItemField, name: &str) -> Result<FieldValue, String> {
         F::Priority | F::EffectivePriority | F::LocalPriorityOverride => {
             named::<Priority>(&name).map(FieldValue::Priority)
         }
+        F::Energy => named::<Energy>(&name).map(FieldValue::Energy),
         _ => None,
     };
     value.ok_or_else(|| {
@@ -953,6 +954,7 @@ fn enum_names(field: ItemField) -> Vec<&'static str> {
         ],
         F::ArchivedReason => vec!["user", "left_scope", "remote_unavailable", "auto_done"],
         F::RemoteLinkLinkState => vec!["pending", "ok", "broken"],
+        F::Energy => vec!["none", "low", "medium", "high"],
         _ => vec!["none", "lowest", "low", "medium", "high", "highest"],
     }
 }
@@ -1170,6 +1172,7 @@ fn print_value(v: &FieldValue) -> String {
         },
         V::Duration(d) => format!("{d:#}").replace(' ', ""),
         V::Priority(p) => serde_name(p),
+        V::Energy(e) => serde_name(e),
         V::Status(s) => serde_name(s),
         V::StatusCategory(s) => serde_name(s),
         V::ResolutionKind(s) => serde_name(s),
@@ -1313,6 +1316,22 @@ mod tests {
                 ),
             ),
             (
+                "energy:low",
+                Predicate::new(
+                    F::Energy,
+                    O::In,
+                    vec![v(V::Energy(crate::item::Energy::Low))],
+                ),
+            ),
+            (
+                "energy>=medium",
+                Predicate::new(
+                    F::Energy,
+                    O::Ge,
+                    vec![v(V::Energy(crate::item::Energy::Medium))],
+                ),
+            ),
+            (
                 "due_date<today+3d",
                 Predicate::new(
                     F::DueDate,
@@ -1439,6 +1458,18 @@ mod tests {
         assert_eq!(
             errors("is:next dew:today"),
             [(8, 17, "unknown field \"dew\"".to_owned())]
+        );
+        assert_eq!(
+            errors("energy:huge"),
+            [(
+                0,
+                11,
+                "\"huge\" is not a energy: use none, low, medium, high".to_owned()
+            )]
+        );
+        assert_eq!(
+            errors("energy>none"),
+            [(0, 11, "ENERGY_NONE is outside the energy order".to_owned())]
         );
         assert_eq!(
             errors("priority:urgent"),
@@ -1707,7 +1738,7 @@ mod tests {
     /// each operator and operand kind it takes.
     #[test]
     fn printed_queries_parse_back() {
-        use crate::item::{ArchiveReason, Priority};
+        use crate::item::{ArchiveReason, Energy, Priority};
         use FieldValue as V;
         use Operator as O;
         let values = |field: ItemField| -> Vec<Operand> {
@@ -1721,6 +1752,7 @@ mod tests {
                     _ => vec![],
                 },
                 C::Priority => vec![V::Priority(Priority::Lowest).into()],
+                C::Energy => vec![V::Energy(Energy::Medium).into()],
                 C::String | C::Set => vec![
                     V::String("a b,c\"d".into()).into(),
                     V::String("x".into()).into(),

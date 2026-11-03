@@ -74,7 +74,9 @@ message Item {
   optional Priority local_priority_override = 45;
   Archived archived = 46;
   ItemRecurrence recurrence = 47;
-  // 48-59 reserved for future Overlay fields.
+  // How much focus the Item takes (3.2). ENERGY_NONE when unset.
+  Energy energy = 48;
+  // 49-59 reserved for future Overlay fields.
 
   // Remote extras: tracker field id -> raw value. Read-only.
   map<string, google.protobuf.Value> remote_extras = 60;
@@ -224,6 +226,17 @@ enum Priority {
   PRIORITY_MEDIUM = 4;
   PRIORITY_HIGH = 5;
   PRIORITY_HIGHEST = 6;
+}
+
+// The GTD energy context (3.2): how much focus an Item takes. "No energy"
+// is always ENERGY_NONE, never FieldValue.cleared. It orders as Priority
+// does, LOW lowest, with ENERGY_NONE outside the order (filter.proto).
+enum Energy {
+  ENERGY_UNSPECIFIED = 0;
+  ENERGY_NONE = 1;
+  ENERGY_LOW = 2;
+  ENERGY_MEDIUM = 3;
+  ENERGY_HIGH = 4;
 }
 
 // The derived 6-value status (3.4).

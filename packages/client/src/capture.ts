@@ -5,12 +5,12 @@
 import { create } from "@bufbuild/protobuf";
 import { DateSchema } from "./gen/google/type/date_pb.js";
 import { PersonRefSchema } from "./gen/todo/v1/common_pb.js";
-import { Priority, Status } from "./gen/todo/v1/item_pb.js";
+import { Energy, Priority, Status } from "./gen/todo/v1/item_pb.js";
 import { type CaptureDraft, CaptureDraftSchema, CaptureTokenKind, CaptureTokenSchema } from "./gen/todo/v1/item_service_pb.js";
 import { parseDateExpr, protoDate, rustTrim } from "./dates.js";
 import { type RuleSpec, firstOccurrence, parseRule, resolve, ruleToProto } from "./recurrence.js";
 
-const SIGILS = ["+", "^", "#", "~", ">", "@"];
+const SIGILS = ["+", "^", "#", "~", ">", "@", "%"];
 
 const WHITESPACE = /^\p{White_Space}$/u;
 const WHITESPACE_RUNS = /\p{White_Space}+/u;
@@ -23,6 +23,7 @@ type Effect =
   | { set: "label"; label: string }
   | { set: "waiting"; name: string }
   | { set: "status"; status: Status }
+  | { set: "energy"; energy: Energy }
   /** Resolved once the due date is known. */
   | { set: "recurrence"; spec: RuleSpec };
 
@@ -45,7 +46,7 @@ interface Word {
  */
 export function parseCaptureText(text: string, today: number): CaptureDraft {
   const chars = Array.from(text);
-  const draft = create(CaptureDraftSchema, { priority: Priority.NONE, status: Status.INBOX });
+  const draft = create(CaptureDraftSchema, { priority: Priority.NONE, status: Status.INBOX, energy: Energy.NONE });
   const title: string[] = [];
   const typed: string[] = [];
   const parsed: [number, Effect][] = [];
@@ -106,6 +107,9 @@ function applyEffects(draft: CaptureDraft, parsed: readonly [number, Effect][], 
     switch (effect.set) {
       case "priority":
         draft.priority = effect.priority;
+        break;
+      case "energy":
+        draft.energy = effect.energy;
         break;
       case "dueDate":
         due = effect.day;
@@ -191,6 +195,8 @@ function classify(word: string, quoted: boolean, today: number): Piece {
       return { kind: CaptureTokenKind.WAITING, result: waiting(rest, quoted) };
     case ">":
       return { kind: CaptureTokenKind.STATUS, result: status(rest) };
+    case "%":
+      return { kind: CaptureTokenKind.ENERGY, result: energy(rest) };
     default: {
       // The whole word, so that `@@daily` is not a rule, as `^^fri` is not a date.
       const rule = parseRule(word);
@@ -226,6 +232,15 @@ function status(word: string): Effect | string {
   if (lower === "next") return { set: "status", status: Status.NEXT };
   if (lower === "someday") return { set: "status", status: Status.SOMEDAY };
   return "status must be >next or >someday";
+}
+
+const ENERGIES: Record<string, Energy> = { low: Energy.LOW, med: Energy.MEDIUM, medium: Energy.MEDIUM, high: Energy.HIGH };
+
+function energy(word: string): Effect | string {
+  // Rust's to_ascii_lowercase.
+  const lower = word.replace(/[A-Z]/g, (c) => c.toLowerCase());
+  const e = Object.hasOwn(ENERGIES, lower) ? ENERGIES[lower] : undefined;
+  return e === undefined ? "not an energy level: use %low, %med or %high" : { set: "energy", energy: e };
 }
 
 function isWhitespace(c: string): boolean {

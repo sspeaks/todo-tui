@@ -6,10 +6,10 @@ use jiff::{SignedDuration, Timestamp};
 use rusqlite::{Connection, params};
 use todo_core::filter::{Operand, Operator, Predicate};
 use todo_core::{
-    Actor, ArchiveReason, Archived, CaptureDraft, CreatedVia, FieldChange, FieldUpdate, FieldValue,
-    Filter, Item, ItemField, ItemId, Mutation, MutationError, MutationOp, PersonRef, Priority,
-    Relation, RelationKind, ResolutionKind, Revision, Rule, SkipReason, StalenessSignals, Status,
-    StatusCategory, StatusFields, TodoRefinement, Topic, Waiting, Weekday, new_ulid,
+    Actor, ArchiveReason, Archived, CaptureDraft, CreatedVia, Energy, FieldChange, FieldUpdate,
+    FieldValue, Filter, Item, ItemField, ItemId, Mutation, MutationError, MutationOp, PersonRef,
+    Priority, Relation, RelationKind, ResolutionKind, Revision, Rule, SkipReason, StalenessSignals,
+    Status, StatusCategory, StatusFields, TodoRefinement, Topic, Waiting, Weekday, new_ulid,
 };
 use todo_store::{
     AutoArchiveInput, AutoArchiveOutput, CaptureInput, ChangesSinceError, EndProblem, Expired,
@@ -702,6 +702,7 @@ async fn capture_stores_every_draft_field() {
         labels: vec!["home".into(), "errands".into()],
         waiting: Some(waiting.clone()),
         status: Status::Someday,
+        energy: Energy::Low,
         ..CaptureDraft::from_title("call the vendor")
     };
     let (item, result) = db.store.capture(capture).await.unwrap();
@@ -712,6 +713,7 @@ async fn capture_stores_every_draft_field() {
     assert_eq!(item.core.labels, ["home", "errands"]);
     assert_eq!(item.overlay.waiting, Some(waiting));
     assert_eq!(item.status(), Status::Someday);
+    assert_eq!(item.overlay.energy, Energy::Low);
     assert_eq!(
         item.derived.staleness,
         StalenessSignals {
@@ -5434,6 +5436,8 @@ async fn migrates_an_m1_database() {
         (back.core.title.as_str(), back.core.priority),
         ("renamed", Priority::High)
     );
+    // A column added since reads its default.
+    assert_eq!(back.overlay.energy, Energy::None);
     assert_eq!(back.relations, []);
     assert_eq!(
         rows("SELECT id, seq, undo_state FROM ops ORDER BY seq")

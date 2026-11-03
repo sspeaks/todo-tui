@@ -16,7 +16,7 @@ use jiff::civil::Date;
 use serde::{Deserialize, Serialize};
 
 use crate::field::ItemField;
-use crate::item::{ArchiveReason, CreatedVia, Item, LinkState, PersonRef, Priority};
+use crate::item::{ArchiveReason, CreatedVia, Energy, Item, LinkState, PersonRef, Priority};
 use crate::mutation::is_iso_week;
 use crate::status::{ResolutionKind, Status, StatusCategory, TodoRefinement};
 use crate::value::{FieldValue, duration_in_range, timestamp_in_range};
@@ -303,6 +303,8 @@ pub enum ValueClass {
     Enum,
     /// Priority-typed: ordered by rank, PRIORITY_NONE outside the order.
     Priority,
+    /// Energy: ordered by rank as priority is, ENERGY_NONE outside the order.
+    Energy,
     /// Compared by exact code point; no ordering operators.
     String,
     /// An Item id (`item_id` operands).
@@ -335,6 +337,7 @@ impl ValueClass {
         match self {
             ValueClass::Enum => "enum",
             ValueClass::Priority => "priority",
+            ValueClass::Energy => "energy",
             ValueClass::String => "string",
             ValueClass::Id => "id",
             ValueClass::Markdown => "Markdown",
@@ -358,6 +361,7 @@ impl ValueClass {
         matches!(
             self,
             ValueClass::Priority
+                | ValueClass::Energy
                 | ValueClass::Date
                 | ValueClass::FocusWeek
                 | ValueClass::Instant
@@ -417,6 +421,7 @@ pub fn target(field: ItemField) -> Target {
         F::Description | F::PrivateNotes => (C::Markdown, false, false),
         F::Priority | F::EffectivePriority => (C::Priority, false, true),
         F::LocalPriorityOverride => (C::Priority, true, true),
+        F::Energy => (C::Energy, false, true),
         F::Assignee | F::Reporter | F::WaitingOn => (C::Person, true, false),
         F::Labels | F::Components | F::FixVersions | F::Scopes => (C::Set, false, false),
         F::DueDate
@@ -496,6 +501,7 @@ fn value_kind(field: ItemField) -> Option<&'static str> {
         | F::Scopes => "string",
         F::Description | F::PrivateNotes => "markdown",
         F::Priority | F::EffectivePriority | F::LocalPriorityOverride => "priority",
+        F::Energy => "energy",
         F::Assignee | F::Reporter | F::WaitingOn => "person",
         F::DueDate
         | F::DeferUntil
@@ -827,6 +833,7 @@ fn value_problem(field: ItemField, op: Operator, value: &FieldValue) -> Option<S
         V::Priority(Priority::None) if op.is_ordering() => {
             "PRIORITY_NONE is outside the priority order"
         }
+        V::Energy(Energy::None) if op.is_ordering() => "ENERGY_NONE is outside the energy order",
         V::Timestamp(t) if !timestamp_in_range(*t) => {
             "must be between 1677-09-21T00:12:44Z and 2262-04-11T23:47:16Z"
         }
@@ -1096,8 +1103,12 @@ pub fn compare(a: &Item, b: &Item, sort: &[SortKey], today: Date) -> Ordering {
 
 fn compare_key(a: &Item, b: &Item, key: SortKey, today: Date) -> Ordering {
     let value = |item| {
-        value_of(item, key.key, today)
-            .filter(|v| !matches!(v, FieldValue::Priority(Priority::None)))
+        value_of(item, key.key, today).filter(|v| {
+            !matches!(
+                v,
+                FieldValue::Priority(Priority::None) | FieldValue::Energy(Energy::None)
+            )
+        })
     };
     match (value(a), value(b)) {
         (None, None) => Ordering::Equal,
@@ -1110,13 +1121,14 @@ fn compare_key(a: &Item, b: &Item, key: SortKey, today: Date) -> Ordering {
     }
 }
 
-/// How two values of one target order: priorities by rank, enums by proto
-/// number, false before true, strings by code point. `None` when they have
-/// no order (and for PRIORITY_NONE).
+/// How two values of one target order: priorities and energies by rank,
+/// enums by proto number, false before true, strings by code point. `None`
+/// when they have no order (and for PRIORITY_NONE and ENERGY_NONE).
 fn order(a: &FieldValue, b: &FieldValue) -> Option<Ordering> {
     use FieldValue as V;
     match (a, b) {
         (V::Priority(a), V::Priority(b)) => Some(priority_rank(*a)?.cmp(&priority_rank(*b)?)),
+        (V::Energy(a), V::Energy(b)) => Some(energy_rank(*a)?.cmp(&energy_rank(*b)?)),
         (V::String(a), V::String(b)) | (V::IsoWeek(a), V::IsoWeek(b)) => Some(a.cmp(b)),
         (V::Bool(a), V::Bool(b)) => Some(a.cmp(b)),
         (V::Number(a), V::Number(b)) => a.partial_cmp(b),
@@ -1143,8 +1155,19 @@ pub fn priority_rank(priority: Priority) -> Option<u8> {
     }
 }
 
+/// LOW 1 to HIGH 3; `None` for ENERGY_NONE, which is outside the order.
+pub fn energy_rank(energy: Energy) -> Option<u8> {
+    match energy {
+        Energy::None => None,
+        Energy::Low => Some(1),
+        Energy::Medium => Some(2),
+        Energy::High => Some(3),
+    }
+}
+
 /// The proto enum number of an enum value, which sorts enums; `None` for
-/// any other value, priority included (it sorts by [`priority_rank`]).
+/// any other value, priority and energy included (they sort by
+/// [`priority_rank`] and [`energy_rank`]).
 pub fn enum_number(value: &FieldValue) -> Option<u32> {
     use FieldValue as V;
     Some(match value {
@@ -1283,6 +1306,7 @@ mod tests {
             overlay.defer_until = Some(date(2026, 11, 1));
             overlay.focus_week = Some("2026-W43".into());
             overlay.local_priority_override = Some(Priority::Lowest);
+            overlay.energy = crate::item::Energy::High;
             overlay.archived = Some(Archived {
                 at: ts(6_000),
                 reason: ArchiveReason::AutoDone,
@@ -1402,7 +1426,9 @@ mod tests {
                 assert_eq!(order(&value, &value), Some(Ordering::Equal), "{field:?}");
             }
             assert_eq!(
-                t.class.is_ordered() && t.class != ValueClass::Priority,
+                t.class.is_ordered()
+                    && t.class != ValueClass::Priority
+                    && t.class != ValueClass::Energy,
                 {
                     matches!(
                         value,
@@ -1495,6 +1521,24 @@ mod tests {
             ),
             (p(F::Priority, O::IsSet, vec![]), Some((I, ".op"))),
             (p(F::LocalPriorityOverride, O::IsUnset, vec![]), None),
+            // energy
+            (
+                p(F::Energy, O::Ge, vec![val(V::Energy(Energy::Medium))]),
+                None,
+            ),
+            (
+                p(F::Energy, O::Gt, vec![val(V::Energy(Energy::None))]),
+                Some((I, ".operands[0]")),
+            ),
+            (
+                p(F::Energy, O::Eq, vec![val(V::Energy(Energy::None))]),
+                None,
+            ),
+            (p(F::Energy, O::IsUnset, vec![]), Some((I, ".op"))),
+            (
+                p(F::Energy, O::Eq, vec![prio(Priority::High)]),
+                Some((I, ".operands[0]")),
+            ),
             // string
             (p(F::Title, O::Eq, vec![s("x")]), None),
             (p(F::Title, O::Lt, vec![s("x")]), Some((I, ".op"))),
@@ -2572,6 +2616,35 @@ mod tests {
             sorted(&items, &[SortKey::desc(F::LocalPriorityOverride)], SUN),
             [6, 1, 2, 3, 4, 5]
         );
+    }
+
+    #[test]
+    fn energy_sorts_by_rank_with_none_last() {
+        let energized = |n, e| with(n, |i| i.overlay.energy = e);
+        let items = [
+            energized(1, Energy::None),
+            energized(2, Energy::High),
+            energized(3, Energy::Low),
+            energized(4, Energy::Medium),
+        ];
+        assert_eq!(
+            sorted(&items, &[SortKey::asc(F::Energy)], SUN),
+            [3, 4, 2, 1]
+        );
+        assert_eq!(
+            sorted(&items, &[SortKey::desc(F::Energy)], SUN),
+            [2, 4, 3, 1]
+        );
+        let ge = Filter {
+            all_of: vec![p(F::Energy, O::Ge, vec![val(V::Energy(Energy::Medium))])],
+            ..Filter::default()
+        };
+        assert_eq!(ids(&items, &ge, SUN), [2, 4]);
+        let lt = Filter {
+            all_of: vec![p(F::Energy, O::Lt, vec![val(V::Energy(Energy::High))])],
+            ..Filter::default()
+        };
+        assert_eq!(ids(&items, &lt, SUN), [3, 4]);
     }
 
     #[test]

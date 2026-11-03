@@ -4,7 +4,7 @@ import { parseCaptureText } from "../src/capture.js";
 import { dayNumber } from "../src/dates.js";
 import { DateSchema } from "../src/gen/google/type/date_pb.js";
 import { PersonRefSchema } from "../src/gen/todo/v1/common_pb.js";
-import { Priority, Status, Weekday } from "../src/gen/todo/v1/item_pb.js";
+import { Energy, Priority, Status, Weekday } from "../src/gen/todo/v1/item_pb.js";
 import { type CaptureDraft, CaptureDraftSchema, CaptureTokenKind as K, CaptureTokenSchema } from "../src/gen/todo/v1/item_service_pb.js";
 import { type Rule, ruleToProto } from "../src/recurrence.js";
 
@@ -18,7 +18,7 @@ const TODAY = dayNumber(2026, 10, 22);
 const parse = (text: string) => parseCaptureText(text, TODAY);
 
 /** A draft of plain title text: default fields and no tokens. */
-const fromTitle = (title: string) => create(CaptureDraftSchema, { title, priority: Priority.NONE, status: Status.INBOX });
+const fromTitle = (title: string) => create(CaptureDraftSchema, { title, priority: Priority.NONE, status: Status.INBOX, energy: Energy.NONE });
 
 const token = (start: number, end: number, kind: K) => create(CaptureTokenSchema, { start, end, kind, applied: true, warning: "" });
 const failed = (start: number, end: number, kind: K, warning: string) => create(CaptureTokenSchema, { start, end, kind, applied: false, warning });
@@ -34,9 +34,31 @@ describe("parseCaptureText", () => {
         dueDate: date(2026, 10, 23),
         labels: ["home"],
         status: Status.INBOX,
+        energy: Energy.NONE,
         tokens: [token(13, 17, K.DUE_DATE), token(18, 20, K.PRIORITY), token(21, 26, K.LABEL)],
       }),
     );
+  });
+
+  it("parses %energy, case-insensitive, keeping anything else in the title", () => {
+    for (const [text, want] of [
+      ["x %low", Energy.LOW],
+      ["x %MED", Energy.MEDIUM],
+      ["x %medium", Energy.MEDIUM],
+      ["x %High", Energy.HIGH],
+    ] as const) {
+      const d = parse(text);
+      expect(d.energy, text).toBe(want);
+      expect(d.title, text).toBe("x");
+      expect(d.tokens, text).toEqual([token(2, text.length, K.ENERGY)]);
+    }
+    const huge = parse("x %huge");
+    expect(huge.energy).toBe(Energy.NONE);
+    expect(huge.title).toBe("x %huge");
+    expect(huge.warnings).toEqual(["%huge: not an energy level: use %low, %med or %high"]);
+    expect(parse("x %low %high").energy).toBe(Energy.HIGH);
+    expect(parse("grow 100% % done").tokens).toEqual([]);
+    expect(parse("x \\%low").title).toBe("x %low");
   });
 
   it("parses each sigil", () => {

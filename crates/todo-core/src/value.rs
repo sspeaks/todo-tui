@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use crate::field::ItemField;
 use crate::ids::ItemId;
 use crate::item::{
-    ArchiveReason, Archived, CreatedVia, Item, ItemRecurrence, LinkState, PersonRef, Priority,
-    RemoteLink, StalenessSignals, Waiting,
+    ArchiveReason, Archived, CreatedVia, Energy, Item, ItemRecurrence, LinkState, PersonRef,
+    Priority, RemoteLink, StalenessSignals, Waiting,
 };
 use crate::status::{ResolutionKind, Status, StatusCategory, TodoRefinement};
 
@@ -36,6 +36,7 @@ pub enum FieldValue {
     /// `YYYY-Www`.
     IsoWeek(String),
     Priority(Priority),
+    Energy(Energy),
     Status(Status),
     StatusCategory(StatusCategory),
     ResolutionKind(ResolutionKind),
@@ -101,6 +102,7 @@ impl FieldValue {
             F::LocalPriorityOverride => opt(overlay.local_priority_override, V::Priority),
             F::Archived => opt(archived.copied(), V::Archived),
             F::Recurrence => opt(recurrence.cloned(), V::Recurrence),
+            F::Energy => V::Energy(overlay.energy),
             F::RemoteExtras => return None,
             F::Status => V::Status(item.status()),
             F::EffectivePriority => V::Priority(item.effective_priority()),
@@ -170,6 +172,7 @@ impl FieldValue {
             FieldValue::ItemId(_) => "item_id",
             FieldValue::IsoWeek(_) => "iso_week",
             FieldValue::Priority(_) => "priority",
+            FieldValue::Energy(_) => "energy",
             FieldValue::Status(_) => "status",
             FieldValue::StatusCategory(_) => "status_category",
             FieldValue::ResolutionKind(_) => "resolution_kind",
@@ -273,6 +276,7 @@ mod tests {
         overlay.private_notes = "notes".into();
         overlay.focus_week = Some("2026-W43".into());
         overlay.local_priority_override = Some(Priority::Lowest);
+        overlay.energy = Energy::High;
         overlay.archived = Some(Archived {
             at: ts(6_000),
             reason: ArchiveReason::AutoDone,
@@ -363,6 +367,7 @@ mod tests {
             (F::PrivateNotes, V::Markdown("notes".into())),
             (F::FocusWeek, V::IsoWeek("2026-W43".into())),
             (F::LocalPriorityOverride, V::Priority(Priority::Lowest)),
+            (F::Energy, V::Energy(Energy::High)),
             (F::Archived, V::Archived(item.overlay.archived.unwrap())),
             (
                 F::Recurrence,

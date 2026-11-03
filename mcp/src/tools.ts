@@ -7,6 +7,7 @@ import {
   Code,
   ConnectError,
   CreatedVia,
+  Energy,
   type FilterSchema,
   type Item,
   ItemField,
@@ -33,7 +34,7 @@ import {
   updateItem,
 } from "@todo-tui/client/core";
 import { z } from "zod";
-import { PRIORITY_LEVELS, STATUS_NAMES, isoDate, project, shortId } from "./project.js";
+import { ENERGY_LEVELS, PRIORITY_LEVELS, STATUS_NAMES, isoDate, project, shortId } from "./project.js";
 
 export interface ToolOptions {
   /** Register only the tools that read (`todo mcp --read-only`). */
@@ -240,7 +241,7 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
       title: "Capture a todo",
       description:
         "Create an item from capture text, exactly as `todo add` does. Fields go in inline tokens: +1..+5 priority (1 highest), " +
-        "^date due, #label, ~person or ~\"two words\" waiting on, >next or >someday status (default inbox), @rule repeat " +
+        "^date due, #label, ~person or ~\"two words\" waiting on, >next or >someday status (default inbox), %low / %med / %high energy, @rule repeat " +
         "(@daily, @weekdays, @mon,thu, @weekly, @monthly, @15th, @3d, @2w), \\ escapes a sigil. A token that does not parse stays in the title and comes back in warnings.",
       inputSchema: {
         text: z.string().min(1).describe('e.g. "Send Priya the Q4 deck +2 ^fri #work"'),
@@ -262,13 +263,14 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
       description:
         "Change fields of an item; only the fields given change. Empty string (or null) clears a field. " +
         "Status, repeat, archive and delete have their own tools. On a Jira-linked item, prefer the local fields " +
-        "(defer_until, waiting, private_notes, local_priority): the rest are Jira's and are pushed there.",
+        "(defer_until, waiting, private_notes, local_priority, energy): the rest are Jira's and are pushed there.",
       inputSchema: {
         id: ID,
         title: z.string().optional(),
         description: z.string().optional().describe("Markdown"),
         priority: z.number().int().min(0).max(5).optional().describe("1 (highest) to 5 (lowest); 0 for none"),
         local_priority: z.number().int().min(0).max(5).optional().describe("A local override of priority, never pushed to Jira; 0 clears it"),
+        energy: z.enum(["low", "medium", "high", ""]).optional().describe("How much focus it takes, local only; empty clears it"),
         due: DATE.optional(),
         defer_until: DATE.optional().describe("Hide the item from views until this date"),
         labels: z.array(z.string()).optional().describe("The whole new label set (replaces the old one)"),
@@ -293,6 +295,7 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
         if (args.local_priority !== undefined) {
           set("local_priority_override", args.local_priority === 0 ? undefined : PRIORITY_LEVELS[args.local_priority], "localPriorityOverride");
         }
+        if (args.energy !== undefined) set("energy", args.energy === "" ? Energy.NONE : ENERGY_LEVELS[args.energy]);
         if (args.due !== undefined) set("due_date", await date(args.due), "dueDate");
         if (args.defer_until !== undefined) set("defer_until", await date(args.defer_until), "deferUntil");
         if (args.labels !== undefined) set("labels", args.labels.map((l) => l.replace(/^#/, "")));

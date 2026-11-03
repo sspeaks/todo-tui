@@ -414,6 +414,7 @@ export function nextInstance(completed: Item, id: string, today: number, now: Ti
     ...(completed.remainingEstimate !== undefined && { remainingEstimate: clone(DurationSchema, completed.remainingEstimate) }),
     dueDate: protoDate(next),
     ...(completed.localPriorityOverride !== undefined && { localPriorityOverride: completed.localPriorityOverride }),
+    energy: completed.energy,
     ...(next > today && { deferUntil: protoDate(next) }),
     recurrence: { seriesId: recurrence.seriesId, occurrenceDate: protoDate(next), rule: ruleToProto(rule) },
     staleness: { statusEnteredAt: at(), lastUserTouchAt: at() },

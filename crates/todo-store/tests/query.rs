@@ -13,7 +13,7 @@ use todo_core::filter::{
 };
 use todo_core::view::{View, defaults};
 use todo_core::{
-    ArchiveReason, CaptureDraft, CreatedVia, FieldValue, Filter, Item, ItemField, ItemId,
+    ArchiveReason, CaptureDraft, CreatedVia, Energy, FieldValue, Filter, Item, ItemField, ItemId,
     LinkState, PersonRef, Priority, ResolutionKind, Revision, Status, StatusCategory,
     TodoRefinement, Topic, new_ulid,
 };
@@ -1777,6 +1777,8 @@ fn random_columns(rng: &mut Rng, n: usize, earlier: &[ItemId]) -> Columns {
     ]);
     let o = opt(rng, 40, |rng| *rng.pick(PRIORITIES));
     sets.push(("local_priority_override", opt_text(o)));
+    let energy = *rng.pick(&["none", "none", "low", "medium", "high"]);
+    sets.push(("energy", text(energy)));
     let members: Vec<&str> = MEMBERS.iter().copied().filter(|_| rng.chance(30)).collect();
     sets.push(("labels", text(&serde_json::to_string(&members).unwrap())));
     let scopes: Vec<&str> = MEMBERS.iter().copied().filter(|_| rng.chance(10)).collect();
@@ -1888,6 +1890,11 @@ fn random_operand(rng: &mut Rng, field: ItemField, op: Operator, ids: &[ItemId])
         V::Priority(all[from + rng.below(all.len() - from)])
     };
     let v = match (class, field) {
+        (ValueClass::Energy, _) => {
+            let all = [Energy::None, Energy::Low, Energy::Medium, Energy::High];
+            let from = usize::from(op.is_ordering());
+            V::Energy(all[from + rng.below(all.len() - from)])
+        }
         (ValueClass::Date, _) if rng.chance(30) => {
             let anchor = *rng.pick(&[Anchor::Today, Anchor::StartOfWeek, Anchor::EndOfWeek]);
             return rel(anchor, rng.below(3) as i32 - 1);

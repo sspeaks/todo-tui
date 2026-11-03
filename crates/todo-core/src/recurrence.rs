@@ -417,6 +417,7 @@ pub fn next_instance(completed: &Item, id: ItemId, today: Date, now: Timestamp) 
     item.set_status_fields(StatusFields::from_status(status));
     let overlay = &mut item.overlay;
     overlay.local_priority_override = completed.overlay.local_priority_override;
+    overlay.energy = completed.overlay.energy;
     overlay.defer_until = (next > today).then_some(next);
     overlay.recurrence = Some(ItemRecurrence {
         series_id: recurrence.series_id,

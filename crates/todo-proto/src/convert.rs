@@ -282,6 +282,9 @@ enum_map!(core::Topic, v1::Topic, "topic", {
 enum_map!(core::Priority, v1::Priority, "priority", {
     None => None, Lowest => Lowest, Low => Low, Medium => Medium, High => High, Highest => Highest,
 });
+enum_map!(core::Energy, v1::Energy, "energy", {
+    None => None, Low => Low, Medium => Medium, High => High,
+});
 enum_map!(core::Status, v1::Status, "status", {
     Inbox => Inbox, Next => Next, Someday => Someday, InProgress => InProgress,
     Done => Done, Cancelled => Cancelled,
@@ -307,7 +310,7 @@ enum_map!(core::LinkState, v1::LinkState, "link_state", {
 });
 enum_map!(core::CaptureTokenKind, v1::CaptureTokenKind, "capture_token_kind", {
     Priority => Priority, DueDate => DueDate, Label => Label, Waiting => Waiting, Status => Status,
-    Recurrence => Recurrence,
+    Recurrence => Recurrence, Energy => Energy,
 });
 enum_map!(core::Weekday, v1::Weekday, "weekday", {
     Monday => Monday, Tuesday => Tuesday, Wednesday => Wednesday, Thursday => Thursday,
@@ -683,6 +686,7 @@ impl From<&core::Item> for v1::Item {
             local_priority_override: o.local_priority_override.map(EnumField::to_i32),
             archived: o.archived.as_ref().map(Into::into),
             recurrence: o.recurrence.as_ref().map(Into::into),
+            energy: o.energy.to_i32(),
 
             remote_extras: item
                 .remote_extras
@@ -790,6 +794,12 @@ impl TryFrom<&v1::Item> for core::Item {
                     .transpose()?,
                 archived: p.archived.as_ref().map(TryInto::try_into).transpose()?,
                 recurrence: p.recurrence.as_ref().map(TryInto::try_into).transpose()?,
+                // Added in M8: an Item written before it (an older export)
+                // has none, which reads as ENERGY_NONE.
+                energy: match p.energy {
+                    0 => core::Energy::None,
+                    e => EnumField::from_i32("energy", e)?,
+                },
             },
             remote_extras: p
                 .remote_extras
@@ -864,6 +874,7 @@ impl From<&core::FieldValue> for v1::FieldValue {
             V::ItemId(id) => K::ItemId(id.to_string()),
             V::IsoWeek(w) => K::IsoWeek(w.clone()),
             V::Priority(p) => K::Priority(p.to_i32()),
+            V::Energy(e) => K::Energy(e.to_i32()),
             V::Status(s) => K::Status(s.to_i32()),
             V::StatusCategory(c) => K::StatusCategory(c.to_i32()),
             V::ResolutionKind(r) => K::ResolutionKind(r.to_i32()),
@@ -910,6 +921,7 @@ fn field_value(v: &v1::FieldValue) -> Result<core::FieldValue> {
         K::ItemId(id) => V::ItemId(parse_id("item_id", id)?),
         K::IsoWeek(w) => V::IsoWeek(iso_week_from_proto("iso_week", w)?),
         K::Priority(p) => V::Priority(EnumField::from_i32("priority", *p)?),
+        K::Energy(e) => V::Energy(EnumField::from_i32("energy", *e)?),
         K::Status(s) => V::Status(EnumField::from_i32("status", *s)?),
         K::StatusCategory(c) => V::StatusCategory(EnumField::from_i32("status_category", *c)?),
         K::ResolutionKind(r) => V::ResolutionKind(EnumField::from_i32("resolution_kind", *r)?),
@@ -1279,6 +1291,7 @@ impl From<&core::CaptureDraft> for v1::CaptureDraft {
             warnings: d.warnings.clone(),
             recurrence: d.recurrence.as_ref().map(Into::into),
             recurrence_first: d.recurrence_first.map(date_to_proto),
+            energy: d.energy.to_i32(),
         }
     }
 }
@@ -1640,6 +1653,19 @@ mod tests {
         assert_eq!(
             core::Item::try_from(&p),
             Err(ConvertError::Unspecified("priority".into()))
+        );
+
+        // An Item from before energy existed reads as ENERGY_NONE.
+        let mut p = good.clone();
+        p.energy = 0;
+        assert_eq!(
+            core::Item::try_from(&p).unwrap().overlay.energy,
+            core::Energy::None
+        );
+        p.energy = 99;
+        assert_eq!(
+            core::Item::try_from(&p),
+            Err(ConvertError::UnknownEnum("energy".into(), 99))
         );
 
         let mut p = good.clone();
@@ -2040,6 +2066,7 @@ mod tests {
             V::ItemId(new_ulid()),
             V::IsoWeek("2026-W53".into()),
             V::Priority(core::Priority::None),
+            V::Energy(core::Energy::High),
             V::Status(Status::InProgress),
             V::StatusCategory(core::StatusCategory::Done),
             V::ResolutionKind(core::ResolutionKind::Cancelled),
@@ -2241,6 +2268,7 @@ mod tests {
                 title: "call dentist".into(),
                 priority: v1::Priority::None as i32,
                 status: v1::Status::Inbox as i32,
+                energy: v1::Energy::None as i32,
                 ..Default::default()
             }
         );

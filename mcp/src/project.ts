@@ -3,6 +3,7 @@
 // once an Item is linked (P2), so nothing here changes when sync lands.
 
 import {
+  Energy,
   type Item,
   ItemField,
   Priority,
@@ -39,6 +40,11 @@ export const PRIORITY_LEVELS: Record<number, Priority> = {
 
 const LEVEL_OF = new Map(Object.entries(PRIORITY_LEVELS).map(([n, p]) => [p, Number(n)]));
 
+/** Capture's %low / %medium / %high. */
+export const ENERGY_LEVELS: Record<string, Energy> = { low: Energy.LOW, medium: Energy.MEDIUM, high: Energy.HIGH };
+
+const ENERGY_OF = new Map(Object.entries(ENERGY_LEVELS).map(([name, e]) => [e, name]));
+
 /** `YYYY-MM-DD`. */
 export function isoDate(d: ProtoDate | undefined): string | undefined {
   if (d === undefined) return undefined;
@@ -71,6 +77,7 @@ export function project(item: Item, opts: ProjectOptions = {}): Record<string, u
     priority: LEVEL_OF.get(item.effectivePriority),
     // With an override, priority above is the override and this is the item's own (Jira's, when linked).
     own_priority: item.localPriorityOverride !== undefined ? (LEVEL_OF.get(item.priority) ?? 0) : undefined,
+    energy: ENERGY_OF.get(item.energy),
     due: date(item.dueDate),
     overdue: item.isOverdue || undefined,
     defer_until: date(item.deferUntil),

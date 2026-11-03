@@ -81,6 +81,8 @@ fn update_value(item: &v1::Item, field: core::ItemField, today: Date) -> Result<
             V::Priority(core::Priority::None)
         }
         F::Priority => V::Priority(EnumField::from_i32(path, item.priority)?),
+        F::Energy if item.energy == v1::Energy::Unspecified as i32 => V::Energy(core::Energy::None),
+        F::Energy => V::Energy(EnumField::from_i32(path, item.energy)?),
         F::Assignee => person(item.assignee.as_ref())?,
         F::Labels => V::StringSet(item.labels.clone()),
         F::Components => V::StringSet(item.components.clone()),
@@ -360,6 +362,7 @@ mod tests {
             private_notes: "notes".into(),
             focus_week: Some("2026-W43".into()),
             local_priority_override: Some(v1::Priority::Highest as i32),
+            energy: v1::Energy::Medium as i32,
             ..Default::default()
         }
     }
@@ -411,6 +414,11 @@ mod tests {
                 "local_priority_override",
                 V::Priority(core::Priority::Highest),
                 V::Cleared,
+            ),
+            (
+                "energy",
+                V::Energy(core::Energy::Medium),
+                V::Energy(core::Energy::None),
             ),
             (
                 "waiting.on",

@@ -574,6 +574,11 @@ fn set_field(item: &mut Item, field: ItemField, value: &FieldValue) -> Result<()
             V::Cleared => return Err(invalid("no priority is priority none, never cleared")),
             _ => return Err(wrong_type()),
         },
+        F::Energy => match value {
+            V::Energy(energy) => item.overlay.energy = *energy,
+            V::Cleared => return Err(invalid("no energy is energy none, never cleared")),
+            _ => return Err(wrong_type()),
+        },
         F::LocalPriorityOverride => {
             item.overlay.local_priority_override = match value {
                 V::Priority(Priority::None) => {
@@ -964,6 +969,7 @@ mod tests {
         F::PrivateNotes,
         F::FocusWeek,
         F::LocalPriorityOverride,
+        F::Energy,
         F::WaitingOn,
         F::WaitingReason,
         F::WaitingSince,
@@ -1194,6 +1200,25 @@ mod tests {
         let cleared = set(&applied.item, F::LocalPriorityOverride, V::Cleared).unwrap();
         assert_eq!(cleared.item.overlay.local_priority_override, None);
         invalid(F::LocalPriorityOverride, V::Priority(Priority::None));
+    }
+
+    #[test]
+    fn energy_is_a_value_never_cleared() {
+        use crate::item::Energy;
+        let applied = set(&item(), F::Energy, V::Energy(Energy::Low)).unwrap();
+        assert_eq!(applied.item.overlay.energy, Energy::Low);
+        assert_eq!(
+            applied.changes,
+            [change(
+                F::Energy,
+                V::Energy(Energy::None),
+                V::Energy(Energy::Low)
+            )]
+        );
+        let none = set(&applied.item, F::Energy, V::Energy(Energy::None)).unwrap();
+        assert_eq!(none.item.overlay.energy, Energy::None);
+        invalid(F::Energy, V::Cleared);
+        assert!(set(&item(), F::Energy, V::Priority(Priority::High)).is_err());
     }
 
     #[test]

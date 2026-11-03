@@ -17,6 +17,7 @@ import { updateItem } from "../src/mutations.js";
 import { resolvePaths, envFromProcess } from "../src/paths.js";
 import { ulid } from "../src/ulid.js";
 import { CAPTURE_ZONE, captureConformance } from "./conformance/capture.js";
+import { energyConformance } from "./conformance/energy.js";
 import { configConformance } from "./conformance/config.js";
 import { queryConformance } from "./conformance/query.js";
 import { viewEditsConformance } from "./conformance/view-edits.js";
@@ -276,6 +277,15 @@ describe.skipIf(!TODO_BIN)("capture syntax and waiting against $TODO_BIN", { tim
     const h = await home({ TZ: CAPTURE_ZONE }, false);
     const conn = await h.open();
     return { items: conn.items, timeZone: CAPTURE_ZONE, close: h.close };
+  });
+});
+
+describe.skipIf(!TODO_BIN)("energy against $TODO_BIN", { timeout: 60_000 }, () => {
+  // The suite FakeDaemon runs too, each test on a fresh daemon.
+  energyConformance(async () => {
+    const h = await home();
+    const conn = await h.open();
+    return { items: conn.items };
   });
 });
 

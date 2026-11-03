@@ -238,6 +238,8 @@ message CaptureDraft {
   // today), which is also the stored due date when no ^ token set one; for
   // an after-completion rule the due date, if any.
   google.type.Date recurrence_first = 10;
+  // ENERGY_NONE without a % token.
+  Energy energy = 11;
 }
 
 message CaptureToken {
@@ -267,6 +269,8 @@ enum CaptureTokenKind {
   CAPTURE_TOKEN_KIND_STATUS = 5;
   // @daily, @weekdays, @weekly, @mon,thu, @monthly, @15th, @3d, @2w
   CAPTURE_TOKEN_KIND_RECURRENCE = 6;
+  // %low, %med / %medium, %high
+  CAPTURE_TOKEN_KIND_ENERGY = 7;
 }
 
 message GetItemRequest {

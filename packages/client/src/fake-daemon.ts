@@ -22,7 +22,9 @@ import {
   CreatedVia,
   type Item,
   ItemRecurrenceSchema,
+  Energy,
   ItemSchema,
+  Priority,
   RecurrenceRuleSchema,
   ResolutionKind,
   Status,
@@ -418,7 +420,8 @@ export interface FakeDaemonOptions {
  * never an undo stack entry and leaving the redo stack alone, so a later
  * Undo skips what they changed. remove is a hard removal.
  *
- * What it does not model: other field values are not checked (enums, dates,
+ * What it does not model: other field values are not checked (enums other
+ * than priority and energy, dates,
  * numbers, estimates, focus_week, people, and the tracker-only fields of an
  * unlinked Item are taken as given). An op records a changed top-level
  * field as one event, so a nested waiting path records, and its undo
@@ -449,7 +452,7 @@ export class FakeDaemon {
   maxPageSize = MAX_PAGE_SIZE;
   /** Runs before every ListItems; throw from it to fail that call. */
   onListItems: ((req: ListItemsRequest) => void) | undefined;
-  apiMinor = 13;
+  apiMinor = 14;
   /** What Export streams, as one batch; unset, Export is UNIMPLEMENTED (the format is the daemon's). */
   exportLines: string[] | undefined;
   /** What GetConfig serves; change it with {@link setConfig}. */
@@ -1194,6 +1197,7 @@ export class FakeDaemon {
       updatedAt: now,
       itemType: "task",
       priority: draft.priority,
+      energy: draft.energy,
       labels: draft.labels,
       ...withStatus(INBOX_TRIPLE, draft.status),
       status: draft.status,
@@ -2101,6 +2105,11 @@ function patchOf(p: Planned, item: Item, now: Timestamp): Fields {
           if (overCaptureLimit(value as string)) throw badRequest(where, TOO_LONG);
           if (LINE_BREAK.test(value as string)) throw badRequest(where, "must be a single line");
         }
+        // As the daemon reads them: an unset energy or priority is NONE,
+        // and a number that names no value is refused.
+        if ((field === "energy" || field === "priority") && !value) value = field === "energy" ? Energy.NONE : Priority.NONE;
+        const known = field === "energy" ? Energy : field === "priority" || field === "localPriorityOverride" ? Priority : undefined;
+        if (known && typeof value === "number" && (value === 0 || !(value in known))) throw badRequest(where, value === 0 ? "is unspecified" : `unknown enum value ${value}`);
         if (field === "parentId" && value === item.id) throw badRequest(where, "an Item cannot be its own parent");
         if (field === "labels" && Array.isArray(value)) {
           if (value.some((l: string) => l === "" || BAD_LABEL.test(l))) {
@@ -2752,6 +2761,7 @@ const WRITABLE = new Set([
   "private_notes",
   "focus_week",
   "local_priority_override",
+  "energy",
 ]);
 
 /** What todo_core takes for a line break, which a title must not have. */

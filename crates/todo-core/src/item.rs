@@ -28,6 +28,21 @@ pub enum Priority {
     Highest,
 }
 
+/// The GTD energy context (design 3.2): how much focus an Item takes. As
+/// with [`Priority`], `None` sorts after `Low` in views; the derived `Ord`
+/// is by rank (`None` lowest) and is not a sort order.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Energy {
+    #[default]
+    None,
+    Low,
+    Medium,
+    High,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CreatedVia {
@@ -189,6 +204,7 @@ pub struct OverlayFields {
     pub local_priority_override: Option<Priority>,
     pub archived: Option<Archived>,
     pub recurrence: Option<ItemRecurrence>,
+    pub energy: Energy,
 }
 
 /// Derived and sync-state fields maintained by the daemon. `status` and

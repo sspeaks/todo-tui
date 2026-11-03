@@ -11,7 +11,7 @@ use todo_daemon::spool::{self, SpoolEntry};
 use todo_proto::convert::rule_from_proto;
 use todo_proto::v1::item_service_client::ItemServiceClient;
 use todo_proto::v1::{
-    CaptureDraft, CaptureItemRequest, CaptureItemResponse, CreatedVia, Priority,
+    CaptureDraft, CaptureItemRequest, CaptureItemResponse, CreatedVia, Energy, Priority,
     Status as ItemStatus, person_ref,
 };
 use tonic::transport::Channel;
@@ -266,7 +266,7 @@ fn captured_line(id: &str, title: &str, draft: &CaptureDraft) -> String {
 }
 
 /// The fields `draft` sets, as tokens: priority, due date, labels, waiting,
-/// a status other than inbox and the repeat rule.
+/// energy, a status other than inbox and the repeat rule.
 fn parsed_fields(draft: &CaptureDraft) -> Vec<String> {
     let mut fields = Vec::new();
     let priority = match draft.priority() {
@@ -279,6 +279,12 @@ fn parsed_fields(draft: &CaptureDraft) -> Vec<String> {
     };
     if let Some(n) = priority {
         fields.push(format!("+{n}"));
+    }
+    match draft.energy() {
+        Energy::Low => fields.push("%low".into()),
+        Energy::Medium => fields.push("%med".into()),
+        Energy::High => fields.push("%high".into()),
+        Energy::None | Energy::Unspecified => {}
     }
     // A repeat rule without a ^ date stores its first occurrence as the due
     // date, so print that.

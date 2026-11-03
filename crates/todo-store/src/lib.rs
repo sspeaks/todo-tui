@@ -1250,6 +1250,7 @@ fn capture_tx(tx: &mut WriteTx<'_>, input: CaptureInput) -> Result<(Item, Mutati
     item.core.priority = draft.priority;
     item.core.due_date = draft.due_date;
     item.core.labels = draft.labels;
+    item.overlay.energy = draft.energy;
     item.set_status_fields(StatusFields::from_status(draft.status));
     if let Some(rule) = draft.recurrence {
         // A rule on an Item without recurrence (design 3.8): a new series,

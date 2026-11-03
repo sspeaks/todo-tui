@@ -22,7 +22,7 @@ import {
   type SortKey,
   SortKeySchema,
 } from "./gen/todo/v1/filter_pb.js";
-import { ArchiveReason, CreatedVia, type Item, LinkState, Priority, ResolutionKind, Status, StatusCategory, TodoRefinement } from "./gen/todo/v1/item_pb.js";
+import { ArchiveReason, CreatedVia, Energy, type Item, LinkState, Priority, ResolutionKind, Status, StatusCategory, TodoRefinement } from "./gen/todo/v1/item_pb.js";
 import type { View } from "./gen/todo/v1/view_pb.js";
 import { dayNumber, dayOf, isDate, isIsoWeek, isoWeek, weekday } from "./dates.js";
 import { MAX_GROUP_DEPTH, MAX_MATCHES_BYTES, MAX_OPERANDS, MAX_PREDICATE_OPERANDS, MAX_PREDICATES, MAX_SORT_KEYS } from "./limits.js";
@@ -41,6 +41,7 @@ export interface FilterProblem {
 type ValueClass =
   | "enum"
   | "priority"
+  | "energy"
   | "string"
   | "id"
   | "markdown"
@@ -115,6 +116,7 @@ add("string", true, false, F.RECURRENCE_SERIES_ID);
 add("markdown", false, false, F.DESCRIPTION, F.PRIVATE_NOTES);
 add("priority", false, true, F.PRIORITY, F.EFFECTIVE_PRIORITY);
 add("priority", true, true, F.LOCAL_PRIORITY_OVERRIDE);
+add("energy", false, true, F.ENERGY);
 add("person", true, false, F.ASSIGNEE, F.REPORTER, F.WAITING_ON);
 add("set", false, false, F.LABELS, F.COMPONENTS, F.FIX_VERSIONS, F.SCOPES);
 add("date", true, true, F.DUE_DATE, F.DEFER_UNTIL, F.WAITING_SINCE, F.WAITING_FOLLOW_UP_ON, F.RECURRENCE_OCCURRENCE_DATE);
@@ -127,13 +129,14 @@ add("presence", true, false, F.REMOTE_LINK, F.WAITING, F.ARCHIVED, F.RECURRENCE,
 add("pending_fields", false, false, F.PENDING_FIELDS);
 add("remote_extras", false, false, F.REMOTE_EXTRAS);
 
-const ORDERED = new Set<ValueClass>(["priority", "date", "focus_week", "instant", "number", "duration", "uint"]);
+const ORDERED = new Set<ValueClass>(["priority", "energy", "date", "focus_week", "instant", "number", "duration", "uint"]);
 
 type ValueCase = NonNullable<FieldValue["kind"]["case"]>;
 
 /** The enums a value can hold, by FieldValue case: valid numbers are known and not UNSPECIFIED. */
 const ENUMS: Partial<Record<ValueCase, object>> = {
   priority: Priority,
+  energy: Energy,
   status: Status,
   statusCategory: StatusCategory,
   resolutionKind: ResolutionKind,
@@ -171,6 +174,8 @@ function valueCase(field: ItemField): ValueCase | undefined {
       return "markdownValue";
     case "priority":
       return "priority";
+    case "energy":
+      return "energy";
     case "person":
       return "person";
     case "date":
@@ -447,6 +452,8 @@ function valueProblem(field: ItemField, op: Operator, v: FieldValue): string | u
   switch (k.case) {
     case "priority":
       return k.value === Priority.NONE && isOrdering(op) ? "PRIORITY_NONE is outside the priority order" : undefined;
+    case "energy":
+      return k.value === Energy.NONE && isOrdering(op) ? "ENERGY_NONE is outside the energy order" : undefined;
     case "timestampValue":
       return inI64(nanosOf(k.value)) ? undefined : "must be between 1677-09-21T00:12:44Z and 2262-04-11T23:47:16Z";
     case "durationValue":
@@ -508,6 +515,7 @@ export type Value =
   | { readonly k: "bool"; readonly v: boolean }
   | { readonly k: "enum"; readonly v: number }
   | { readonly k: "prio"; readonly v: Priority }
+  | { readonly k: "energy"; readonly v: Energy }
   | { readonly k: "set"; readonly v: readonly string[] }
   | { readonly k: "person"; readonly id?: string; readonly text?: string }
   | { readonly k: "fields"; readonly v: readonly number[] }
@@ -538,6 +546,9 @@ function person(p: PersonRef | undefined): Value | undefined {
 export function isOverdue(item: Item, today: number): boolean {
   return item.dueDate !== undefined && dayOf(item.dueDate) < today && item.status !== Status.DONE && item.status !== Status.CANCELLED;
 }
+
+/** A stored energy; an Item put without one (UNSPECIFIED) has none. */
+const energy = (v: Energy | undefined): Value | undefined => (v === undefined ? undefined : { k: "energy", v: v || Energy.NONE });
 
 /** The priority that orders an Item: its override if set. */
 export function effectivePriority(item: Item): Priority {
@@ -614,6 +625,8 @@ export function valueOf(item: Item, field: ItemField, today: number): Value | un
       return str(item.focusWeek);
     case F.LOCAL_PRIORITY_OVERRIDE:
       return prio(item.localPriorityOverride);
+    case F.ENERGY:
+      return energy(item.energy);
     case F.ARCHIVED:
       return present(archived);
     case F.RECURRENCE:
@@ -715,6 +728,8 @@ function operandValue(v: FieldValue): Value {
       return { k: "bool", v: k.value };
     case "priority":
       return { k: "prio", v: k.value };
+    case "energy":
+      return { k: "energy", v: k.value };
     case "person":
       return person(k.value)!;
     default:
@@ -744,11 +759,20 @@ function rank(p: Priority): number | undefined {
   return p >= Priority.LOWEST && p <= Priority.HIGHEST ? p - 1 : undefined;
 }
 
-/** How two values of one target order (-1, 0, 1); undefined when they have no order, PRIORITY_NONE included. */
+/** LOW 1 to HIGH 3; undefined for ENERGY_NONE, which is outside the order. */
+function energyRank(e: Energy): number | undefined {
+  return e >= Energy.LOW && e <= Energy.HIGH ? e - 1 : undefined;
+}
+
+/** How two values of one target order (-1, 0, 1); undefined when they have no order, PRIORITY_NONE and ENERGY_NONE included. */
 function order(a: Value, b: Value): number | undefined {
   const sign = (n: number | bigint) => (n < 0 ? -1 : n > 0 ? 1 : 0);
   if (a.k === "prio" && b.k === "prio") {
     const [x, y] = [rank(a.v), rank(b.v)];
+    return x === undefined || y === undefined ? undefined : sign(x - y);
+  }
+  if (a.k === "energy" && b.k === "energy") {
+    const [x, y] = [energyRank(a.v), energyRank(b.v)];
     return x === undefined || y === undefined ? undefined : sign(x - y);
   }
   if (a.k === "str" && b.k === "str") return compareCodePoints(a.v, b.v);
@@ -950,13 +974,14 @@ export function sortKeys(sort: readonly SortKey[]): SortKey[] {
   return keys;
 }
 
-/** A row's place in a sort: its value of each key, undefined when unset (PRIORITY_NONE too). */
+/** A row's place in a sort: its value of each key, undefined when unset (PRIORITY_NONE and ENERGY_NONE too). */
 export type SortTuple = readonly (Value | undefined)[];
 
 export function sortTuple(item: Item, keys: readonly SortKey[], today: number): SortTuple {
   return keys.map((k) => {
     const v = valueOf(item, k.key, today);
-    return v?.k === "prio" && rank(v.v) === undefined ? undefined : v;
+    if (v?.k === "prio" && rank(v.v) === undefined) return undefined;
+    return v?.k === "energy" && energyRank(v.v) === undefined ? undefined : v;
   });
 }
 

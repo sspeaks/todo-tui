@@ -40,5 +40,6 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
 /// 9 added the config: GetConfig, ReloadConfig and Change.config. 10 added
 /// query text: ViewService.ParseQuery and View.query. 11 added the view
 /// edits: CreateView, UpdateView, DeleteView and MoveView. 12 added
-/// SystemService.Backup. 13 added Export and Import.
-pub const API_MINOR: u32 = 13;
+/// SystemService.Backup. 13 added Export and Import. 14 added the
+/// Item's energy.
+pub const API_MINOR: u32 = 14;

@@ -5,11 +5,11 @@ use std::collections::{HashMap, HashSet};
 use jiff::civil::Date;
 
 use crate::date::parse_date;
-use crate::item::{PersonRef, Priority, Waiting};
+use crate::item::{Energy, PersonRef, Priority, Waiting};
 use crate::recurrence::{Rule, RuleSpec, first_on_or_after, parse_rule, resolve};
 use crate::status::Status;
 
-const SIGILS: [char; 6] = ['+', '^', '#', '~', '>', '@'];
+const SIGILS: [char; 7] = ['+', '^', '#', '~', '>', '@', '%'];
 
 /// The most capture text the API takes, in bytes of UTF-8 (design 2.3):
 /// `CaptureItem`, `ParseCapture` and the spool import refuse longer text,
@@ -41,6 +41,8 @@ pub struct CaptureDraft {
     /// `due_date` (else today), which also becomes the due date when no `^`
     /// token set one; for an after-completion rule, `due_date`.
     pub recurrence_first: Option<Date>,
+    /// `Energy::None` without a `%` token.
+    pub energy: Energy,
 }
 
 /// One sigil token of capture text.
@@ -73,6 +75,8 @@ pub enum CaptureTokenKind {
     Status,
     /// `@daily`, `@mon,thu`, `@15th`, `@3d`, ... (design 2.3)
     Recurrence,
+    /// `%low`, `%med` / `%medium`, `%high`
+    Energy,
 }
 
 impl CaptureDraft {
@@ -89,6 +93,7 @@ impl CaptureDraft {
             warnings: Vec::new(),
             recurrence: None,
             recurrence_first: None,
+            energy: Energy::None,
         }
     }
 }
@@ -102,6 +107,7 @@ enum Effect {
     Status(Status),
     /// Resolved once the due date is known.
     Recurrence(RuleSpec),
+    Energy(Energy),
 }
 
 enum Piece {
@@ -224,6 +230,7 @@ fn apply_effects(
             }
             Effect::Status(s) => draft.status = s,
             Effect::Recurrence(spec) => recurrence = Some(spec),
+            Effect::Energy(e) => draft.energy = e,
         }
     }
     if let Some(spec) = recurrence {
@@ -294,6 +301,7 @@ fn classify(word: &str, quoted: bool, today: Date) -> Piece {
         '#' => Piece::Token(CaptureTokenKind::Label, label(rest)),
         '~' => Piece::Token(CaptureTokenKind::Waiting, waiting(rest, quoted)),
         '>' => Piece::Token(CaptureTokenKind::Status, status(rest)),
+        '%' => Piece::Token(CaptureTokenKind::Energy, energy(rest)),
         _ => Piece::Token(
             CaptureTokenKind::Recurrence,
             // The whole word, so that `@@daily` is not a rule, as `^^fri`
@@ -348,6 +356,16 @@ fn status(word: &str) -> Result<Effect, String> {
     } else {
         Err("status must be >next or >someday".to_owned())
     }
+}
+
+fn energy(word: &str) -> Result<Effect, String> {
+    let energy = match word.to_ascii_lowercase().as_str() {
+        "low" => Energy::Low,
+        "med" | "medium" => Energy::Medium,
+        "high" => Energy::High,
+        _ => return Err("not an energy level: use %low, %med or %high".to_owned()),
+    };
+    Ok(Effect::Energy(energy))
 }
 
 fn collapse_whitespace(s: &str) -> String {
@@ -416,8 +434,40 @@ mod tests {
                 warnings: vec![],
                 recurrence: None,
                 recurrence_first: None,
+                energy: Energy::None,
             }
         );
+    }
+
+    #[test]
+    fn energy_tokens() {
+        for (sigil, want) in [
+            ("%low", Energy::Low),
+            ("%LOW", Energy::Low),
+            ("%med", Energy::Medium),
+            ("%Medium", Energy::Medium),
+            ("%high", Energy::High),
+        ] {
+            let draft = parse(&format!("x {sigil}"));
+            assert_eq!(draft.energy, want, "{sigil}");
+            assert_eq!(draft.title, "x");
+            let end = 2 + sigil.chars().count();
+            assert_eq!(draft.tokens, [token(2, end, CaptureTokenKind::Energy)]);
+        }
+        // Anything else stays in the title; a later token wins; % alone
+        // and 100% are title text.
+        let draft = parse("x %huge");
+        assert_eq!(draft.energy, Energy::None);
+        assert_eq!(draft.title, "x %huge");
+        assert_eq!(
+            draft.warnings,
+            ["%huge: not an energy level: use %low, %med or %high"]
+        );
+        assert_eq!(parse("x %low %high").energy, Energy::High);
+        let draft = parse("grow 100% % done");
+        assert_eq!(draft.title, "grow 100% % done");
+        assert!(draft.tokens.is_empty());
+        assert_eq!(parse("x \\%low").title, "x %low");
     }
 
     #[test]

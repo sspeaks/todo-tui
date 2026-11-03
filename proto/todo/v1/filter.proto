@@ -75,7 +75,8 @@ message ClauseGroup {
 // Priority (priority, effective_priority, local_priority_override) orders by
 // rank, LOWEST lowest and HIGHEST highest. PRIORITY_NONE is outside the
 // order: it never matches LT, LE, GT or GE and is invalid as their operand,
-// while EQ, IN and NE treat it as a value.
+// while EQ, IN and NE treat it as a value. Energy orders the same way, LOW
+// lowest and HIGH highest, with ENERGY_NONE outside the order.
 //
 // Strings compare by exact code point. The ordering operators are invalid
 // on strings, except on focus_week, whose "YYYY-Www" form orders by week.
@@ -150,7 +151,7 @@ message RelativeDate {
 
 // Sort key; keys apply in order, each in its own direction, and unset values
 // sort last in both directions. Priority-typed keys sort by rank with
-// PRIORITY_NONE last in both directions, enums by enum number, false before
+// PRIORITY_NONE last in both directions (energy likewise, ENERGY_NONE last), enums by enum number, false before
 // true, strings by code point. Markdown, set, person, message-presence,
 // pending_fields and remote_extras targets cannot be sort keys, nor can
 // references to other records (parent_id, merged_into,

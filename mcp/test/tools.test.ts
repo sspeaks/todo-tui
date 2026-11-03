@@ -90,6 +90,9 @@ describe("todo mcp tools", () => {
     const cleared = await call("todo_update", { id: item.id, due: "", priority: 0 });
     expect(cleared.due).toBeUndefined();
     expect(cleared.priority).toBeUndefined();
+    expect((await call("todo_update", { id: item.id, energy: "low" })).energy).toBe("low");
+    expect((await call("todo_update", { id: item.id, energy: "" })).energy).toBeUndefined();
+    expect((await call("todo_capture", { text: "Stretch %high" })).item.energy).toBe("high");
     await expect(call("todo_update", { id: item.id, due: "someday-ish" })).rejects.toThrow(/someday-ish/);
     await expect(call("todo_update", { id: item.id })).rejects.toThrow("give at least one field to change");
   });

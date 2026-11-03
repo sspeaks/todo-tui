@@ -156,11 +156,11 @@ home=$root/parsed
 new_home "$home"
 export TODO_TUI_HOME=$home
 start_watcher "$root/watch3.out"
-out=$("$TODO_BIN" add "call dentist ^2026-10-24 +2 #home")
-re='^[0-9A-Z]{8}  call dentist  \+2 \^2026-10-24 #home$'
+out=$("$TODO_BIN" add "call dentist ^2026-10-24 +2 %high #home")
+re='^[0-9A-Z]{8}  call dentist  \+2 %high \^2026-10-24 #home$'
 [[ $out =~ $re ]] || fail "unexpected add output: $out"
 wait_watcher_sees "$root/watch3.out" "call dentist"
-for field in '"priority":"PRIORITY_HIGH"' '"dueDate":{"year":2026,"month":10,"day":24}' '"labels":["home"]'; do
+for field in '"priority":"PRIORITY_HIGH"' '"energy":"ENERGY_HIGH"' '"dueDate":{"year":2026,"month":10,"day":24}' '"labels":["home"]'; do
   grep -qF "$field" "$root/watch3.out" || { cat "$root/watch3.out" >&2; fail "watcher item lacks $field"; }
 done
 "$TODO_BIN" daemon stop >/dev/null

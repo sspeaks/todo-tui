@@ -42,6 +42,7 @@ message FieldValue {
     ArchiveReason archive_reason = 26;
     LinkState link_state = 27;
     ItemFieldSet item_field_set = 28;
+    Energy energy = 29;
 
     Waiting waiting = 40;
     Archived archived = 41;
