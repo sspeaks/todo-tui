@@ -1,4 +1,4 @@
-import { ClientsProvider, type LiveStore, LiveStoreProvider, type TodoClients } from "@todo-tui/client";
+import { ClientsProvider, type LiveStore, LiveStoreProvider, type TodoClients, useViews } from "@todo-tui/client";
 import { Box, Text, useApp, useInput, usePaste, useWindowSize } from "ink";
 import { useEffect, useSyncExternalStore } from "react";
 import { Calendar } from "./components/Calendar.js";
@@ -78,8 +78,16 @@ function Body({ shape }: { shape: Layout }) {
   const overlay = useUi((s) => s.overlay.kind === "detail");
   const focused = useUi((s) => s.focus === "detail");
   const height = shape.bodyHeight;
+  const views = useViews();
+  const noViews = views.status === "ready" && !views.views.length;
   if (help) return <HelpOverlay width={shape.columns} height={height} />;
-  if (tab === undefined) return <Box height={height} />;
+  if (tab === undefined) {
+    return (
+      <Box height={height}>
+        {noViews ? <Text dimColor>No views · :view new &lt;name&gt; [query] makes one</Text> : null}
+      </Box>
+    );
+  }
   if (shape.wide) {
     return (
       <Box height={height}>

@@ -162,6 +162,15 @@ describe(":view", () => {
     await vi.waitFor(() => expect(t.mode()).toMatchObject({ kind: "query", error: undefined, preview: { warn: true } }));
   });
 
+  it("deleting every view leaves no tab", async () => {
+    const t = await withNext();
+    for (let n = 6; n > 0; n--) {
+      await t.c.press(":view delete<enter>y");
+      await vi.waitFor(() => expect(names(t)).toHaveLength(n - 1));
+    }
+    await vi.waitFor(() => expect(t.state().tab).toBeUndefined());
+  });
+
   it("says how :view is used", async () => {
     const t = await withNext();
     await t.c.press(":view<enter>");

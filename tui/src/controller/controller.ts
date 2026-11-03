@@ -551,6 +551,10 @@ export class Controller {
     if (first && (tab === undefined || (searchQuery(tab) === undefined && !views.some((v) => v.id === tab)))) {
       this.narrowing.release();
       this.ui.setState((s) => ({ ...s, ...leftTab(s), tab: first.id }));
+    } else if (!first && this.store.getViews().status === "ready" && tab !== undefined && searchQuery(tab) === undefined) {
+      // Every view deleted: no tab, until :view new makes one.
+      this.narrowing.release();
+      this.ui.setState((s) => ({ ...s, ...leftTab(s), tab: undefined }));
     }
     const current = this.state.tab;
     if (this.watched?.tab !== current) {
@@ -681,7 +685,7 @@ export class Controller {
         return this.setMode(normalMode);
       case "normal":
         // Never keys: a pasted "xxdd" must not run.
-        return this.toast("info", "Paste ignored: press a to add");
+        return this.toast("info", `Paste ignored${this.keyFor("quick_add") ? `: press ${this.keyFor("quick_add")} to add` : ""}`);
     }
   }
 

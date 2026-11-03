@@ -101,6 +101,7 @@ export function StatusBar({ width }: { width: number }) {
   const state = useUi((s) => s);
   const connection = useConnection();
   const undo = useUndoState().undo;
+  const undoKey = keyFor(state.keymap.bindings, "undo", sequenceLabel);
   const listed = useOptionalView(state.tab === undefined ? undefined : tabQuery(state.tab, state.narrow?.shown));
   const mode = modeLabel(state);
   const conn = connectionState(connection);
@@ -127,7 +128,7 @@ export function StatusBar({ width }: { width: number }) {
           {pending ? <Text color="cyan"> · {pending}</Text> : null}
           {narrow ? <Text color="cyan"> · {narrow}</Text> : null}
           {error ? <Text color="yellow">{error}</Text> : null}
-          {undo ? <Text dimColor> · u: {singleLine(undo.description)}</Text> : null}
+          {undo && undoKey ? <Text dimColor> · {undoKey}: {singleLine(undo.description)}</Text> : null}
         </Text>
       </Box>
       {showKeys ? (

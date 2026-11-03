@@ -106,8 +106,25 @@ impl ViewService for Views {
                 count: None,
             }));
         }
-        // A relative date out of range for today is the one error left; it
-        // has no span, so it is the whole text's.
+        // What a view refuses that the text cannot show: a relative date
+        // too far for a view, or one out of range today. It has no span, so
+        // it is the whole text's.
+        let whole = |message: String| {
+            Response::new(ParseQueryResponse {
+                filter: None,
+                sort: Vec::new(),
+                show_count: query.show_count,
+                errors: vec![QueryError {
+                    start: 0,
+                    end: u32::try_from(req.text.chars().count()).unwrap_or(u32::MAX),
+                    message,
+                }],
+                count: None,
+            })
+        };
+        if let Err(e) = check_view_filter(&query.filter) {
+            return Ok(whole(e.reason));
+        }
         let resolved = match query.filter.resolve(today) {
             Ok(resolved) => resolved,
             Err(e) => {

@@ -346,7 +346,7 @@ impl<'a> Reader<'a> {
             if !action.is_empty() && !VOCABULARY.is_action(action) {
                 self.warn(
                     path,
-                    format!("{action:?} is not an action id; see the help (?)"),
+                    format!("{action:?} is not an action id (design 2.5 lists them)"),
                 );
                 continue;
             }
@@ -736,7 +736,7 @@ mod tests {
         assert_eq!(
             got,
             [
-                "keymap.K: \"set_priority\" is not an action id; see the help (?)".to_owned(),
+                "keymap.K: \"set_priority\" is not an action id (design 2.5 lists them)".to_owned(),
                 format!("keymap.\"ctrl+X\": \"ctrl+X\" {not_a_key}"),
                 "keymap.\"g  g\": separate the keys of a sequence with single spaces, e.g. \"g g\""
                     .to_owned(),

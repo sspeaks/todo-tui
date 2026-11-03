@@ -315,7 +315,9 @@ pub(crate) fn import_tx(
         put(conn, row, &mut items).map_err(at)?;
     }
     // Inside the writer's transaction, so the next write numbers after it.
-    let revision = current_revision_in(conn)?.max(export_revision) + 1;
+    // One revision skipped, so that even past an export older than this
+    // database there is a gap for every client to see.
+    let revision = current_revision_in(conn)?.max(export_revision) + 2;
     let _ = conn;
     tx.skip_to(revision);
     // The config change: harmless to every client, which reads the config

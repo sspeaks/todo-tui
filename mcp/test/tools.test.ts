@@ -42,6 +42,19 @@ describe("todo mcp tools", () => {
     expect(tagged.items).toHaveLength(1);
   });
 
+  it("finds a view by name before a renamed default's seed", async () => {
+    const { daemon, call } = await harness();
+    const views = createClients(daemon.transport).views;
+    const today = (await views.listViews({})).views.find((v) => v.seed === "today")!;
+    await views.updateView({ requestId: "01J00000000000000000000001", view: { id: today.id, name: "Focus" }, updateMask: { paths: ["name"] } });
+    await views.createView({ requestId: "01J00000000000000000000002", name: "Today", filter: {}, sort: [], showCount: true });
+    await call("todo_capture", { text: "open one >next" });
+    const listed = await call("todo_list", { view: "Today" });
+    expect(listed.items.map((i: { title: string }) => i.title)).toEqual(["open one"]);
+    // The seed still finds the renamed default.
+    await call("todo_list", { view: "today" });
+  });
+
   it("reports parse warnings and an unknown view", async () => {
     const { call } = await harness();
     const { item, warnings } = await call("todo_capture", { text: "Call home @home" });

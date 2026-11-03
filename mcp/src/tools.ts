@@ -123,11 +123,15 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
     return res.date;
   }
 
-  /** The id of the view named `name` (case-insensitive) or its seed ("today"). */
+  /**
+   * The id of the view named `name` (case-insensitive), else of the default
+   * seeded as it ("today"), else with that id: a name wins, since views can
+   * be renamed and a user's view can take a default's old name.
+   */
   async function viewId(name: string): Promise<string> {
     const { views: all } = await listViews(views);
     const key = name.trim().toLowerCase();
-    const view = all.find((v) => v.name.toLowerCase() === key || v.seed === key || v.id === name);
+    const view = all.find((v) => v.name.toLowerCase() === key) ?? all.find((v) => v.seed === key) ?? all.find((v) => v.id === name);
     if (!view) throw new ToolError(`no view named ${name}; the views are ${all.map((v) => v.name).join(", ")}`);
     return view.id;
   }

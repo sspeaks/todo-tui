@@ -5187,3 +5187,50 @@ async fn an_import_resyncs_live_subscribers() {
     a.stop().await;
     b.stop().await;
 }
+
+/// Even an export older than the database it goes into leaves a gap: the
+/// target restarted more often than the source ever wrote.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_import_resyncs_a_subscriber_ahead_of_the_export() {
+    let a = start().await;
+    let lines = export_lines(&a, false).await;
+    a.stop().await;
+    let mut home = TempDir::new().unwrap();
+    for _ in 0..3 {
+        home = start_in(home).await.stop().await;
+    }
+    let b = start_in(home).await;
+    let mut stream = b
+        .subscribe(SubscribeRequest {
+            since_revision: None,
+            topics: vec![],
+        })
+        .await;
+    assert!(matches!(next(&mut stream).await, Message::CaughtUp(_)));
+    let out = import_lines(&b, lines).await.unwrap();
+    loop {
+        match next(&mut stream).await {
+            Message::ResyncRequired(r) => {
+                assert_eq!(r.current_revision, out.revision);
+                break;
+            }
+            Message::Change(c) => panic!("taken as an ordinary change: {c:?}"),
+            _ => {}
+        }
+    }
+    b.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn parse_query_refuses_an_offset_a_view_would() {
+    let d = start().await;
+    let res = parse_query(&d, "due_date<=today+40000d", true).await;
+    assert_eq!(res.filter, None);
+    assert_eq!(res.errors.len(), 1);
+    assert!(
+        res.errors[0].message.contains("36525"),
+        "{}",
+        res.errors[0].message
+    );
+    d.stop().await;
+}
