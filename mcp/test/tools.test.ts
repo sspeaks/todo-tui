@@ -193,10 +193,21 @@ describe("todo mcp tools", () => {
     expect(r.text).toBe("L48:\n- Ship the release\nN48:\n- (nothing)\n");
   });
 
+  it("todo_meeting_link builds the Teams link from short ids", async () => {
+    const { call } = await harness();
+    const { item } = await call("todo_capture", { text: "Plan the offsite ~dana@example.com" });
+    const r = await call("todo_meeting_link", { ids: [item.short_id] });
+    expect(r).toEqual({
+      url: "https://teams.microsoft.com/l/meeting/new?subject=Plan%20the%20offsite&attendees=dana%40example.com",
+      subject: "Plan the offsite",
+      attendees: ["dana@example.com"],
+    });
+  });
+
   it("registers only the read tools when read-only", async () => {
     const { client } = await harness({ readOnly: true });
     const { tools } = await client.listTools();
-    expect(tools.map((t) => t.name).sort()).toEqual(["todo_get", "todo_l48", "todo_list", "todo_status", "todo_views"]);
+    expect(tools.map((t) => t.name).sort()).toEqual(["todo_get", "todo_l48", "todo_list", "todo_meeting_link", "todo_status", "todo_views"]);
     expect(tools.every((t) => t.annotations?.readOnlyHint)).toBe(true);
   });
 });

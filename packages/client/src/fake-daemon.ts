@@ -75,6 +75,7 @@ import {
 } from "./gen/todo/v1/view_service_pb.js";
 import { type Change, ChangeSchema, type SubscribeResponse, SubscribeResponseSchema, WatchService } from "./gen/todo/v1/watch_service_pb.js";
 import { parseCaptureText } from "./capture.js";
+import { meeting, teamsUrl } from "./meeting.js";
 import { civil, dayIn, dayOf, epochMs, isDate, parseDateExpr, protoDate, rustTrim, weekday } from "./dates.js";
 import { DEFAULT_QUERIES, defaultViews } from "./default-views.js";
 import {
@@ -455,7 +456,7 @@ export class FakeDaemon {
   maxPageSize = MAX_PAGE_SIZE;
   /** Runs before every ListItems; throw from it to fail that call. */
   onListItems: ((req: ListItemsRequest) => void) | undefined;
-  apiMinor = 15;
+  apiMinor = 16;
   /** What Export streams, as one batch; unset, Export is UNIMPLEMENTED (the format is the daemon's). */
   exportLines: string[] | undefined;
   /** What GetConfig serves; change it with {@link setConfig}. */
@@ -568,6 +569,20 @@ export class FakeDaemon {
         parseRecurrence: (req) => {
           this.check();
           return this.parseRecurrence(req);
+        },
+        buildMeetingLink: (req) => {
+          this.check();
+          if (this.config.meetings?.provider === "none") {
+            throw errorInfo(Code.FailedPrecondition, "MEETINGS_OFF", 'meetings are off: [meetings] provider = "none"', {});
+          }
+          if (req.ids.length < 1 || req.ids.length > MAX_BATCH) throw badRequest("ids", `must hold 1 to ${MAX_BATCH} ids`);
+          const items = req.ids.map((id, i) => {
+            const item = this.items.get(idOf(`ids[${i}]`, id));
+            if (!item || item.deletedAt !== undefined) throw notFound(idOf(`ids[${i}]`, id));
+            return item;
+          });
+          const m = meeting(items, req.subject);
+          return { url: teamsUrl(m), ...m };
         },
         getActivityReport: () => {
           this.check();

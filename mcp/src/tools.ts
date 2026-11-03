@@ -20,6 +20,7 @@ import {
   archiveItem,
   captureItem,
   deleteItem,
+  buildMeetingLink,
   errorReason,
   getActivityReport,
   getStatusCounts,
@@ -255,6 +256,29 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
           next: res.next.map((l) => ({ id: shortId(l.itemId), text: l.text })),
           text: res.text,
         };
+      }),
+  );
+
+  server.registerTool(
+    "todo_meeting_link",
+    {
+      title: "Teams meeting link",
+      description:
+        "A link that opens Microsoft Teams' new-meeting form prefilled from the items: the subject (the first title, '+ N more'), " +
+        "their descriptions and Jira links as the content, and the email addresses they wait on. It creates nothing: " +
+        "give the link to the user to open and send from Teams.",
+      inputSchema: {
+        ids: z.array(ID).min(1).max(1000),
+        subject: z.string().optional().describe("Instead of the first item's title"),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    ({ ids, subject }) =>
+      run(async () => {
+        const resolved: string[] = [];
+        for (const id of ids) resolved.push((await resolve(id)).id);
+        const res = await buildMeetingLink(items, resolved, subject === undefined ? {} : { subject });
+        return { url: res.url, subject: res.subject, attendees: res.attendees };
       }),
   );
 

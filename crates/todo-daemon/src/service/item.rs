@@ -13,16 +13,16 @@ use todo_proto::request;
 use todo_proto::v1::item_service_server::ItemService;
 use todo_proto::v1::{
     self, AddRelationRequest, AddRelationResponse, ArchiveItemRequest, ArchiveItemResponse,
-    BatchMutateRequest, BatchMutateResponse, CaptureItemRequest, CaptureItemResponse,
-    DeleteItemRequest, DeleteItemResponse, GetActivityReportRequest, GetActivityReportResponse,
-    GetItemRequest, GetItemResponse, GetStatusCountsRequest, GetStatusCountsResponse,
-    GetUndoStateRequest, GetUndoStateResponse, ListItemsRequest, ListItemsResponse,
-    ParseCaptureRequest, ParseCaptureResponse, ParseDateRequest, ParseDateResponse,
-    ParseRecurrenceRequest, ParseRecurrenceResponse, RedoRequest, RedoResponse,
-    RemoveRelationRequest, RemoveRelationResponse, SetRecurrenceRequest, SetRecurrenceResponse,
-    SetStatusRequest, SetStatusResponse, UnarchiveItemRequest, UnarchiveItemResponse,
-    UndeleteItemRequest, UndeleteItemResponse, UndoRequest, UndoResponse, UpdateItemRequest,
-    UpdateItemResponse,
+    BatchMutateRequest, BatchMutateResponse, BuildMeetingLinkRequest, BuildMeetingLinkResponse,
+    CaptureItemRequest, CaptureItemResponse, DeleteItemRequest, DeleteItemResponse,
+    GetActivityReportRequest, GetActivityReportResponse, GetItemRequest, GetItemResponse,
+    GetStatusCountsRequest, GetStatusCountsResponse, GetUndoStateRequest, GetUndoStateResponse,
+    ListItemsRequest, ListItemsResponse, ParseCaptureRequest, ParseCaptureResponse,
+    ParseDateRequest, ParseDateResponse, ParseRecurrenceRequest, ParseRecurrenceResponse,
+    RedoRequest, RedoResponse, RemoveRelationRequest, RemoveRelationResponse, SetRecurrenceRequest,
+    SetRecurrenceResponse, SetStatusRequest, SetStatusResponse, UnarchiveItemRequest,
+    UnarchiveItemResponse, UndeleteItemRequest, UndeleteItemResponse, UndoRequest, UndoResponse,
+    UpdateItemRequest, UpdateItemResponse,
 };
 use todo_store::{
     CaptureInput, EndProblem, ListInput, MutateInput, MutateOutput, OpKind, OpSummaryRow,
@@ -424,6 +424,52 @@ impl ItemService for Items {
             until: Some(date_to_proto(window.until)),
             today: Some(date_to_proto(today)),
             revision: report.revision,
+        }))
+    }
+
+    async fn build_meeting_link(
+        &self,
+        request: Request<BuildMeetingLinkRequest>,
+    ) -> Result<Response<BuildMeetingLinkResponse>, Status> {
+        let req = request.into_inner();
+        if !self.0.config.current().meetings {
+            return Err(error::error_info(
+                tonic::Code::FailedPrecondition,
+                "MEETINGS_OFF",
+                "meetings are off: [meetings] provider = \"none\"",
+                [],
+            ));
+        }
+        if req.ids.is_empty() || req.ids.len() > MAX_BATCH {
+            return Err(error::bad_request(
+                "ids",
+                format!("must hold 1 to {MAX_BATCH} ids"),
+            ));
+        }
+        let today = Zoned::now().date();
+        let mut items = Vec::with_capacity(req.ids.len());
+        for (i, id) in req.ids.iter().enumerate() {
+            let id = id
+                .parse::<ItemId>()
+                .map_err(|_| error::bad_request(&format!("ids[{i}]"), "must be a ULID"))?;
+            let item = self
+                .0
+                .store
+                .get_item(id, today)
+                .await
+                .map_err(error::store)?
+                .item;
+            if item.is_deleted() {
+                return Err(error::store(todo_store::StoreError::NotFound(id)));
+            }
+            items.push(item);
+        }
+        let m = todo_core::meeting::meeting(&items, req.subject.as_deref());
+        Ok(Response::new(BuildMeetingLinkResponse {
+            url: m.teams_url(),
+            subject: m.subject,
+            content: m.content,
+            attendees: m.attendees,
         }))
     }
 

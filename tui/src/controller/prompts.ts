@@ -61,6 +61,7 @@ export const PROMPT_LABELS: Readonly<Record<PromptKind, string>> = {
   defer: "Defer until",
   waiting: "Waiting on",
   repeat: "Repeats",
+  meeting: "Meeting",
 };
 
 /** How many times a derived edit rebases silently before it shows the conflict. */
@@ -175,6 +176,7 @@ export class Prompts {
    * right after it completes.
    */
   open(kind: PromptKind): void | Promise<void> {
+    if (kind === "meeting") return this.c.meetings.start();
     // The title is the selected Item's own; the rest act on the marks when there are some.
     const target = this.c.target(kind !== "title");
     const item = target && this.c.store.getItem(target.ids[0] ?? "");
@@ -253,7 +255,7 @@ export class Prompts {
   /** Asks for the preview of the current text: at once when no request is in flight, else after it. */
   private preview(): void {
     const { mode } = this.c.state;
-    if (mode.kind !== "prompt" || mode.prompt === "title" || mode.prompt === "labels") return;
+    if (mode.kind !== "prompt" || mode.prompt === "title" || mode.prompt === "labels" || mode.prompt === "meeting") return;
     if (mode.prompt === "repeat") {
       const query = this.repeatQuery(mode);
       this.repeatAsked = query.key;
@@ -386,6 +388,7 @@ export class Prompts {
   // --- enter ---
 
   private submit(mode: Prompt): void | Promise<void> {
+    if (mode.prompt === "meeting") return this.c.meetings.submit(mode);
     if (mode.target.bulk) return this.saveBulk(mode);
     const id = mode.target.ids[0] ?? "";
     const item = this.c.store.getItem(id);
@@ -579,6 +582,7 @@ export class Prompts {
     let describe = (done: readonly BulkStep[]) => bulkText("edit", done);
     switch (mode.prompt) {
       case "title":
+      case "meeting":
         return;
       case "labels": {
         const edits = parseLabelEdits(mode.line.text);

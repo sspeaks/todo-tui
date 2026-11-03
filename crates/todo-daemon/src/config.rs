@@ -41,6 +41,8 @@ pub struct Config {
     pub keymap: BTreeMap<String, String>,
     pub backup: Backup,
     pub l48: ReportConfig,
+    /// `[meetings] provider`: false for "none" (design 2.9).
+    pub meetings: bool,
     pub warnings: Vec<Warning>,
     pub loaded_at: Timestamp,
 }
@@ -116,6 +118,7 @@ impl Config {
                 retain_days: RETAIN_DAYS,
             },
             l48: ReportConfig::default(),
+            meetings: true,
             warnings: Vec::new(),
             loaded_at: Timestamp::now(),
         }
@@ -193,6 +196,9 @@ impl From<&Config> for v1::ConfigSnapshot {
                 interval: c.backup.interval.name().to_owned(),
                 retain_days: c.backup.retain_days,
             }),
+            meetings: Some(v1::MeetingsConfig {
+                provider: if c.meetings { "teams" } else { "none" }.to_owned(),
+            }),
             l48: Some(v1::L48Config {
                 window_days: c.l48.window_days,
                 working_days: c.l48.working_days.iter().map(|d| d.to_i32()).collect(),
@@ -251,6 +257,7 @@ impl<'a> Reader<'a> {
                 "keymap" => self.section("keymap", value, Reader::keymap),
                 "backup" => self.section("backup", value, Reader::backup),
                 "l48" => self.section("l48", value, Reader::l48),
+                "meetings" => self.section("meetings", value, Reader::meetings),
                 "instances" => self.warn(key, "not used until Jira sync (P2)"),
                 "assistant" => self.warn(key, "not used until the Claude assistant (P3)"),
                 "stale" => self.warn(key, "not used until stale reviews (P4)"),
@@ -337,6 +344,18 @@ impl<'a> Reader<'a> {
         // After the loop, so an `enabled = true` written later cannot undo it.
         if retain_invalid {
             self.config.backup.enabled = false;
+        }
+    }
+
+    fn meetings(&mut self, table: toml::Table) {
+        for (key, value) in table {
+            let path = format!("meetings.{}", quote_key(&key));
+            match (key.as_str(), value.as_str()) {
+                ("provider", Some("teams")) => self.config.meetings = true,
+                ("provider", Some("none")) => self.config.meetings = false,
+                ("provider", _) => self.warn(path, "must be \"teams\" or \"none\"; using teams"),
+                _ => self.warn(path, "unknown key; ignored"),
+            }
         }
     }
 
@@ -649,9 +668,16 @@ mod tests {
             [l48]
             window_days = 3
             working_days = ["sun", "Monday", "tue", "mon"]
+            [meetings]
+            provider = "none"
             "#,
         );
         assert_eq!(config.warnings, vec![]);
+        assert!(!config.meetings);
+        assert_eq!(
+            warnings("[meetings]\nprovider = \"zoom\""),
+            ["meetings.provider: must be \"teams\" or \"none\"; using teams"]
+        );
         assert_eq!(config.l48.window_days, 3);
         assert_eq!(
             config.l48.working_days,

@@ -95,6 +95,10 @@ service ItemService {
   // The L48 / N48 report (design 6.6): what moved in the last working days
   // and what is planned for the next, over the [l48] window of the config.
   rpc GetActivityReport(GetActivityReportRequest) returns (GetActivityReportResponse);
+  // The Teams new-meeting form prefilled from Items (design 2.9): a link
+  // the client opens; nothing is written. FAILED_PRECONDITION (ErrorInfo
+  // MEETINGS_OFF) when [meetings] provider is "none".
+  rpc BuildMeetingLink(BuildMeetingLinkRequest) returns (BuildMeetingLinkResponse);
   rpc ArchiveItem(ArchiveItemRequest) returns (ArchiveItemResponse);
   rpc UnarchiveItem(UnarchiveItemRequest) returns (UnarchiveItemResponse);
   // Soft delete (design 3.7): the Item stays as a tombstone with deleted_at
@@ -371,6 +375,24 @@ message GetActivityReportResponse {
   google.type.Date until = 5;
   google.type.Date today = 6;
   uint64 revision = 7;
+}
+
+message BuildMeetingLinkRequest {
+  // The Items, at least one and at most 1000, in order; deleted ones are
+  // NOT_FOUND. Done and cancelled ones are fine.
+  repeated string ids = 1;
+  // Replaces the subject (the first title, "+ N more" for the rest).
+  optional string subject = 2;
+}
+
+message BuildMeetingLinkResponse {
+  // https://teams.microsoft.com/l/meeting/new?subject=…&content=…&attendees=…
+  string url = 1;
+  string subject = 2;
+  // Each Item's first description paragraph and Jira link.
+  string content = 3;
+  // The email addresses of waiting.on (People come in P2).
+  repeated string attendees = 4;
 }
 
 message ReportLine {

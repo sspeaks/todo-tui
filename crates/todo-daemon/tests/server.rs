@@ -19,18 +19,18 @@ use todo_proto::v1::view_service_client::ViewServiceClient;
 use todo_proto::v1::watch_service_client::WatchServiceClient;
 use todo_proto::v1::{
     AddRelationRequest, ArchiveItemRequest, ArchiveReason, BackupRequest, BatchMutateRequest,
-    CaptureItemRequest, CaptureTokenKind, Clause, ClauseGroup, ClientKind, ConfigSnapshot,
-    CreateViewRequest, CreatedVia, DeleteItemRequest, DeleteViewRequest, ExportRequest, FieldValue,
-    Filter, GetActivityReportRequest, GetConfigRequest, GetItemRequest, GetServerInfoRequest,
-    GetStatusCountsRequest, GetUndoStateRequest, ImportRequest, Item, ItemField, ListItemsRequest,
-    ListViewsRequest, MoveViewRequest, Mutation, MutationResult, OpKind, Operand, Operator,
-    ParseCaptureRequest, ParseDateRequest, ParseQueryRequest, ParseRecurrenceRequest, PersonRef,
-    Predicate, Priority, RecurrenceRule, RedoRequest, RedoResponse, Relation, RelationKind,
-    ReloadConfigRequest, RemoveRelationRequest, SetRecurrenceRequest, SetStatusRequest,
-    ShutdownRequest, SortKey, Status, SubscribeRequest, SubscribeResponse, Topic,
-    UnarchiveItemRequest, UndeleteItemRequest, UndoRequest, UndoResponse, UndoSkip, UndoSkipReason,
-    UpdateItemRequest, UpdateViewRequest, View, Weekday, clause, field_value, mutation, operand,
-    person_ref, recurrence_rule, subscribe_response::Message,
+    BuildMeetingLinkRequest, CaptureItemRequest, CaptureTokenKind, Clause, ClauseGroup, ClientKind,
+    ConfigSnapshot, CreateViewRequest, CreatedVia, DeleteItemRequest, DeleteViewRequest,
+    ExportRequest, FieldValue, Filter, GetActivityReportRequest, GetConfigRequest, GetItemRequest,
+    GetServerInfoRequest, GetStatusCountsRequest, GetUndoStateRequest, ImportRequest, Item,
+    ItemField, ListItemsRequest, ListViewsRequest, MoveViewRequest, Mutation, MutationResult,
+    OpKind, Operand, Operator, ParseCaptureRequest, ParseDateRequest, ParseQueryRequest,
+    ParseRecurrenceRequest, PersonRef, Predicate, Priority, RecurrenceRule, RedoRequest,
+    RedoResponse, Relation, RelationKind, ReloadConfigRequest, RemoveRelationRequest,
+    SetRecurrenceRequest, SetStatusRequest, ShutdownRequest, SortKey, Status, SubscribeRequest,
+    SubscribeResponse, Topic, UnarchiveItemRequest, UndeleteItemRequest, UndoRequest, UndoResponse,
+    UndoSkip, UndoSkipReason, UpdateItemRequest, UpdateViewRequest, View, Weekday, clause,
+    field_value, mutation, operand, person_ref, recurrence_rule, subscribe_response::Message,
 };
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -302,7 +302,7 @@ async fn handshake_reports_version_and_api_minor() {
         .into_inner();
     assert_eq!(info.daemon_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(info.api_minor, todo_proto::API_MINOR);
-    assert_eq!(info.api_minor, 15);
+    assert_eq!(info.api_minor, 16);
     d.stop().await;
 }
 
@@ -5322,5 +5322,76 @@ async fn activity_report_covers_the_working_day_window() {
         let err = items.get_activity_report(start_req(bad)).await.unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument, "{bad}");
     }
+    d.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn build_meeting_link_prefills_teams_and_writes_nothing() {
+    let d = start().await;
+    let mut items = d.items().await;
+    let a = capture(&mut items, "plan the offsite ~dana@example.com").await;
+    let b = capture(&mut items, "budget").await;
+    let before = items
+        .get_undo_state(GetUndoStateRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let res = items
+        .build_meeting_link(BuildMeetingLinkRequest {
+            ids: vec![a.id.clone(), b.id.clone()],
+            subject: None,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(res.subject, "plan the offsite + 1 more");
+    assert_eq!(res.attendees, ["dana@example.com"]);
+    assert!(
+        res.url.starts_with(
+            "https://teams.microsoft.com/l/meeting/new?subject=plan%20the%20offsite%20%2B%201%20more&"
+        ),
+        "{}",
+        res.url
+    );
+    assert!(
+        res.url.ends_with("&attendees=dana%40example.com"),
+        "{}",
+        res.url
+    );
+    let after = items
+        .get_undo_state(GetUndoStateRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(before, after, "nothing is written");
+    // A deleted Item, no ids, and meetings turned off.
+    items.delete_item(delete_req(&b.id)).await.unwrap();
+    let err = items
+        .build_meeting_link(BuildMeetingLinkRequest {
+            ids: vec![b.id.clone()],
+            subject: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::NotFound);
+    let err = items
+        .build_meeting_link(BuildMeetingLinkRequest::default())
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument);
+    write_config(&d, "[meetings]\nprovider = \"none\"\n");
+    SystemServiceClient::new(d.channel().await)
+        .reload_config(ReloadConfigRequest {})
+        .await
+        .unwrap();
+    let err = items
+        .build_meeting_link(BuildMeetingLinkRequest {
+            ids: vec![a.id.clone()],
+            subject: Some("x".into()),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert_eq!(err.get_details_error_info().unwrap().reason, "MEETINGS_OFF");
     d.stop().await;
 }

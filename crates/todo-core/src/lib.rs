@@ -8,6 +8,7 @@ pub mod filter;
 pub mod ids;
 pub mod inverse;
 pub mod item;
+pub mod meeting;
 pub mod mutation;
 pub mod query;
 pub mod recurrence;

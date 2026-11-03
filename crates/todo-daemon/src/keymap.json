@@ -47,6 +47,7 @@
       "mark_cancelled",
       "edit_labels",
       "toggle_archive",
+      "schedule_meeting",
       "delete",
       "mark",
       "visual_mark",

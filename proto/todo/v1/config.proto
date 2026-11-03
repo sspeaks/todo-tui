@@ -28,6 +28,13 @@ message ConfigSnapshot {
   // When the daemon read the file.
   google.protobuf.Timestamp loaded_at = 8;
   L48Config l48 = 9;
+  MeetingsConfig meetings = 10;
+}
+
+// [meetings] (design 2.9).
+message MeetingsConfig {
+  // "teams", the only provider, or "none", which turns M and :meet off.
+  string provider = 1;
 }
 
 // [l48] (design 6.6): the L48 / N48 report's window.

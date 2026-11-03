@@ -6,7 +6,7 @@
 import { Energy, Priority, Status } from "@todo-tui/client";
 import type { KeyToken } from "./tokenize.js";
 
-export type PromptKind = "title" | "labels" | "due" | "defer" | "waiting" | "repeat";
+export type PromptKind = "title" | "labels" | "due" | "defer" | "waiting" | "repeat" | "meeting";
 
 export type Action =
   | { type: "move"; by: 1 | -1 }
@@ -137,6 +137,7 @@ export const BINDINGS: readonly Binding[] = [
   { id: "mark_cancelled", keys: ["X"], action: { type: "set_status", status: Status.CANCELLED }, markAware: true, section: "Items", help: "Mark cancelled" },
   { id: "edit_labels", keys: ["t"], action: { type: "prompt", prompt: "labels" }, markAware: true, section: "Items", help: "Edit the labels" },
   { id: "toggle_archive", keys: ["z"], action: { type: "archive_toggle" }, markAware: true, section: "Items", help: "Archive / unarchive" },
+  { id: "schedule_meeting", keys: ["M"], action: { type: "prompt", prompt: "meeting" }, markAware: true, section: "Items", help: "Schedule a Teams meeting about it (Teams opens, prefilled)" },
   { id: "delete", keys: ["d d"], action: { type: "delete" }, markAware: true, section: "Items", help: "Delete (confirm)" },
 
   { id: "mark", keys: ["m"], action: { type: "mark" }, section: "Marks", help: "Mark / unmark, and move down" },

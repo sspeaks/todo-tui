@@ -7,7 +7,7 @@ import type { MessageInitShape } from "@bufbuild/protobuf";
 import { type Timestamp, timestampFromDate } from "@bufbuild/protobuf/wkt";
 import type { CallOptions, Client } from "@connectrpc/connect";
 import type { DateSchema } from "./gen/google/type/date_pb.js";
-import type { GetActivityReportResponse, GetStatusCountsResponse, ParseCaptureResponse, ParseDateResponse, ParseRecurrenceResponse } from "./gen/todo/v1/item_service_pb.js";
+import type { BuildMeetingLinkResponse, GetActivityReportResponse, GetStatusCountsResponse, ParseCaptureResponse, ParseDateResponse, ParseRecurrenceResponse } from "./gen/todo/v1/item_service_pb.js";
 import type { ListViewsResponse, ParseQueryResponse, ViewService } from "./gen/todo/v1/view_service_pb.js";
 import type { ItemsClient } from "./mutations.js";
 
@@ -51,6 +51,15 @@ export function getActivityReport(client: ItemsClient, opts: ReferenceOptions & 
   const { since, ...rest } = opts;
   const [fields, call] = reference(rest);
   return client.getActivityReport({ ...fields, since: since ?? "" }, call);
+}
+
+/**
+ * The Teams new-meeting link for `ids` (design 2.9), prefilled; nothing
+ * is written. FAILED_PRECONDITION (MEETINGS_OFF) when [meetings] is off.
+ */
+export function buildMeetingLink(client: ItemsClient, ids: readonly string[], opts: CallOptions & { subject?: string } = {}): Promise<BuildMeetingLinkResponse> {
+  const { subject, ...call } = opts;
+  return client.buildMeetingLink({ ids: [...ids], ...(subject !== undefined && { subject }) }, call);
 }
 
 /**

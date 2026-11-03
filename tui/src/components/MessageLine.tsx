@@ -114,6 +114,7 @@ const PROMPT_HINTS: Readonly<Record<Extract<Mode, { kind: "prompt" }>["prompt"],
   defer: "a date: fri, +3d, eow, nov2, 2026-11-02 · empty clears",
   waiting: "<person> [^date] · tab completes the person · empty clears",
   repeat: "a rule: daily, weekdays, mon,thu, 15th, 3d, 2w · empty stops it",
+  meeting: "the subject · enter opens Teams, prefilled · esc cancels",
 };
 
 /** The hints of a prompt acting on marks, where they differ. */
