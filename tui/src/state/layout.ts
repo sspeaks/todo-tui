@@ -65,6 +65,8 @@ export function layout(columns: number, rows: number, mode?: ModeKind): Layout {
 
 /** The cells before a row's title: "› ○ +3* ". */
 export const ROW_PREFIX = 8;
+/** With the energy slot after the priority: "› ○ +3*▄ ". */
+export const ENERGY_PREFIX = ROW_PREFIX + 1;
 /** The narrowest a title gets before other columns are dropped. */
 export const MIN_TITLE = 20;
 /** Space between columns. */
@@ -96,10 +98,10 @@ export const MIN_WAITING = 12;
  * cell, and the title gets the rest, at least MIN_TITLE while columns can
  * be narrowed (waiting) or dropped to make room.
  */
-export function rowColumns(width: number, natural: Readonly<Record<Column, number>>): RowColumns {
+export function rowColumns(width: number, natural: Readonly<Record<Column, number>>, prefix = ROW_PREFIX): RowColumns {
   const shown: Record<Column, number> = { ...natural };
   const used = () => (Object.values(shown) as number[]).reduce((sum, w) => sum + (w ? w + GAP : 0), 0);
-  const short = () => MIN_TITLE - (width - ROW_PREFIX - used());
+  const short = () => MIN_TITLE - (width - prefix - used());
   for (const col of DROP_ORDER) {
     if (short() <= 0) break;
     if (col === "waiting" && shown.waiting > MIN_WAITING) {
@@ -108,7 +110,7 @@ export function rowColumns(width: number, natural: Readonly<Record<Column, numbe
     }
     shown[col] = 0;
   }
-  return { ...shown, title: Math.max(0, width - ROW_PREFIX - used()) };
+  return { ...shown, title: Math.max(0, width - prefix - used()) };
 }
 
 export interface TabLabel {

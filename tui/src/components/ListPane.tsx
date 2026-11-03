@@ -2,7 +2,7 @@ import { type Item, errorReason, useConnection, useViews } from "@todo-tui/clien
 import { Box, Text } from "ink";
 import { type RowCells, fitWaiting, priorityLabel, rowCells, statusGlyph, titleCell } from "../format/item.js";
 import { displayWidth, fit, singleLine } from "../format/text.js";
-import { GAP, type RowColumns, rowColumns } from "../state/layout.js";
+import { ENERGY_PREFIX, GAP, type RowColumns, rowColumns } from "../state/layout.js";
 import { reconcile } from "../state/selection.js";
 import { searchQuery } from "../state/tabs.js";
 import type { TabId } from "../state/types.js";
@@ -59,13 +59,21 @@ export function ListPane({ tab, width, height }: { tab: TabId; width: number; he
     const widest = (pick: (c: RowCells) => string) => Math.max(0, ...cells.map((c) => displayWidth(pick(c))));
     // A cell of margin on the right, before the detail's separator.
     // The parent fills what the title leaves: it never widens a column.
-    const cols = rowColumns(width - 1, {
-      progress: widest((c) => c.progress),
-      key: widest((c) => c.key),
-      due: widest((c) => c.due),
-      waiting: widest((c) => c.waiting),
-      markers: widest((c) => c.markers),
-    });
+    // The energy slot is there only when a row shown has energy. Columns
+    // drop before the title gets narrower than MIN_TITLE, so at any width
+    // the TUI runs in (MIN_COLUMNS) the slot leaves the title room.
+    const energySlot = cells.some((c) => c.energy);
+    const cols = rowColumns(
+      width - 1,
+      {
+        progress: widest((c) => c.progress),
+        key: widest((c) => c.key),
+        due: widest((c) => c.due),
+        waiting: widest((c) => c.waiting),
+        markers: widest((c) => c.markers),
+      },
+      energySlot ? ENERGY_PREFIX : undefined,
+    );
     body = rows.map((item, i) => (
       <Row
         key={item.id}
@@ -77,6 +85,7 @@ export function ListPane({ tab, width, height }: { tab: TabId; width: number; he
         active={focus === "list"}
         fresh={fresh.has(item.id)}
         dim={!live}
+        energySlot={energySlot}
       />
     ));
   }
@@ -101,10 +110,12 @@ interface RowProps {
   fresh: boolean;
   /** Not live: the rows may be out of date. */
   dim: boolean;
+  /** A cell after the priority for the energy glyph. */
+  energySlot: boolean;
 }
 
-/** One row: "› ○ +3  title  ↳ parent  2/5  ^Fri  ⧗dana 3d  ⏸Nov 3" ("›•○" when marked), archived rows dimmed. */
-function Row({ item, cells, cols, selected, marked, active, fresh, dim }: RowProps) {
+/** One row: "› ○ +3▄ title  ↳ parent  2/5  ^Fri  ⧗dana 3d  ⏸Nov 3" ("›•○" when marked), archived rows dimmed. */
+function Row({ item, cells, cols, selected, marked, active, fresh, dim, energySlot }: RowProps) {
   const archived = item.archived !== undefined;
   const title = titleCell(singleLine(item.title), cells.parent, cols.title);
   return (
@@ -117,7 +128,8 @@ function Row({ item, cells, cols, selected, marked, active, fresh, dim }: RowPro
     >
       {selected ? "›" : " "}
       {marked ? "•" : " "}
-      {statusGlyph(item.status)} {fit(priorityLabel(item), 3)} {title.title}
+      {statusGlyph(item.status)} {fit(priorityLabel(item), 3)}
+      {energySlot ? fit(cells.energy, 1) : ""} {title.title}
       {title.parent ? <Text dimColor>{title.parent}</Text> : null}
       {cell(cells.progress, cols.progress)}
       {cell(cells.key, cols.key)}

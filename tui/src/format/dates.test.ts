@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { dayLabel, dayNumber, isoDay, localDay, longDay, relativeDays, shortDay } from "./dates.js";
 import { fitWaiting, rowCells, titleCell } from "./item.js";
-import { create, ItemSchema, Status } from "@todo-tui/client";
+import { create, Energy, ItemSchema, Status } from "@todo-tui/client";
 
 const today = dayNumber(2026, 10, 26); // a Monday
 
@@ -42,6 +42,7 @@ describe("date labels", () => {
       subtasksTotal: 5,
       subtasksDone: 2,
       parentTitle: "Ship\nauth",
+      energy: Energy.MEDIUM,
     });
     expect(rowCells(item, today)).toEqual({
       parent: "Ship auth",
@@ -53,6 +54,7 @@ describe("date labels", () => {
       waitingAge: " 3d",
       followUpDue: true,
       markers: "⏸Nov 3 ↑ ! 🔁",
+      energy: "▄",
     });
     expect(rowCells(create(ItemSchema, { deferUntil: { year: 2026, month: 10, day: 26 } }), today)).toMatchObject({
       parent: "",
@@ -60,6 +62,7 @@ describe("date labels", () => {
       due: "",
       waiting: "",
       markers: "",
+      energy: "",
     });
   });
 

@@ -64,7 +64,7 @@ describe("quick-add on screen", () => {
     const t = renderTui({ daemon: dated(), columns: 100, rows: 12, now: clock });
     await t.live();
     await t.press("a");
-    await t.waitFrame((f) => expect(f).toMatch(/\n\+1–5 priority · \^date due/));
+    await t.waitFrame((f) => expect(f).toMatch(/\n\+1–5 priority · %low %med %high energy · \^date due/));
     t.controller.paste("y".repeat(MAX_CAPTURE_BYTES + 10));
     await t.waitFrame((f) => expect(f).toContain(`${(MAX_CAPTURE_BYTES + 10).toLocaleString("en")}/65,536 bytes: too long to add`));
     expect(t.raw().split("\n")[2]).toContain(RED);

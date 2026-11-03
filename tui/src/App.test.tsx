@@ -2,6 +2,7 @@ import {
   ArchiveReason,
   Code,
   ConnectError,
+  Energy,
   Priority,
   RelationKind,
   Status,
@@ -128,6 +129,25 @@ describe("the shell", () => {
     expect(line("check invoice")).toMatch(/\^Fri\s+⧗the account manager.*… 3d/);
     // The column lines up across rows.
     expect(line("passport").indexOf("⧗")).toBe(line("check invoice").indexOf("⧗"));
+  });
+
+  it("shows energy in a cell after the priority, the titles still lined up", async () => {
+    const fd = fakeDaemon(
+      [
+        item("Write tests", { priority: Priority.MEDIUM, energy: Energy.LOW }),
+        item("Plan the quarter", { energy: Energy.HIGH }),
+        item("No energy", {}),
+      ],
+      { now: clock, timeZone: "UTC" },
+    );
+    const t = renderTui({ daemon: fd, columns: 100, rows: 12, now: clock });
+    await t.live();
+    await t.waitFrame((f) => expect(f).toContain("Write tests"));
+    const line = (title: string) => t.lines().find((l) => l.includes(title)) ?? "";
+    expect(line("Write tests")).toMatch(/○ \+3 ▁ Write tests/);
+    expect(line("Plan the quarter")).toMatch(/○    █ Plan the quarter/);
+    // The titles line up, with energy or without.
+    expect(line("No energy").indexOf("No energy")).toBe(line("Write tests").indexOf("Write tests"));
   });
 
   it("dims archived rows and marks deferred ones (Archive)", async () => {

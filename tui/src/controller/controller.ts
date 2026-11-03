@@ -828,6 +828,8 @@ export class Controller {
         return this.actions.setStatus(action.status);
       case "set_priority":
         return this.actions.setPriority(action.priority);
+      case "set_energy":
+        return this.actions.setEnergy(action.energy);
       case "clear_waiting":
         return this.actions.clearWaiting();
       case "archive_toggle":

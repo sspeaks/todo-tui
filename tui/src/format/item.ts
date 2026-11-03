@@ -1,6 +1,6 @@
 // How an Item reads in a list row and in the detail pane (design 2.2).
 
-import { CreatedVia, type Item, type PersonRef, Priority, Status } from "@todo-tui/client";
+import { CreatedVia, Energy, type Item, type PersonRef, Priority, Status } from "@todo-tui/client";
 import { dayOf, shortDay } from "./dates.js";
 import { displayWidth, fit, singleLine, truncate } from "./text.js";
 
@@ -38,6 +38,18 @@ const priorityNames: Partial<Record<Priority, string>> = {
   [Priority.LOWEST]: "lowest",
 };
 
+const energyGlyphs: Partial<Record<Energy, string>> = {
+  [Energy.LOW]: "▁",
+  [Energy.MEDIUM]: "▄",
+  [Energy.HIGH]: "█",
+};
+
+const energyNames: Partial<Record<Energy, string>> = {
+  [Energy.LOW]: "low",
+  [Energy.MEDIUM]: "medium",
+  [Energy.HIGH]: "high",
+};
+
 const createdVia: Partial<Record<CreatedVia, string>> = {
   [CreatedVia.TUI]: "tui",
   [CreatedVia.CLI]: "cli",
@@ -60,6 +72,14 @@ export function priorityLabel(item: Item): string {
   const label = priorities[item.effectivePriority] ?? "";
   return item.localPriorityOverride === undefined || !label ? label : `${label}*`;
 }
+
+/** The one-cell energy glyph of the row (design 2.2): ▁ low, ▄ medium, █ high; "" for none. */
+export function energyGlyph(energy: Energy): string {
+  return energyGlyphs[energy] ?? "";
+}
+
+/** "low", "medium", "high", or "none". */
+export const energyName = (e: Energy): string => energyNames[e] ?? "none";
 
 /** "+3 medium", or "none". */
 export const priorityName = (p: Priority): string => (priorities[p] ? `${priorities[p]} ${priorityNames[p]}` : "none");
@@ -92,6 +112,8 @@ export interface RowCells {
   followUpDue: boolean;
   /** ⏸date when deferred, ↑ pending push, ! conflict or push failure, 🔁 recurring. */
   markers: string;
+  /** The energy glyph (▁ ▄ █) after the priority; "" for none. */
+  energy: string;
 }
 
 export function rowCells(item: Item, today: number): RowCells {
@@ -117,6 +139,7 @@ export function rowCells(item: Item, today: number): RowCells {
     waitingAge: age,
     followUpDue: waiting?.followUpOn !== undefined && dayOf(waiting.followUpOn) <= today,
     markers: markers.join(" "),
+    energy: energyGlyph(item.energy),
   };
 }
 

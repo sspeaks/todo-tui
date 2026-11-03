@@ -1,4 +1,4 @@
-import { type ItemsClient, Priority, Status, archiveItem, deleteItem, setStatus, updateItem } from "@todo-tui/client";
+import { Energy, type ItemsClient, Priority, Status, archiveItem, deleteItem, setStatus, updateItem } from "@todo-tui/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fakeDaemon, item, rows } from "../fake.test-util.js";
 import { holding, setup, stopControllers } from "./setup.test-util.js";
@@ -221,6 +221,16 @@ describe("bulk actions", () => {
     await t.c.press("n");
     expect(t.toast()).toBe("move to next (2 items) · u undo");
     expect(t.titles()).toEqual(["c"]);
+  });
+
+  it("e acts on every marked Item in one op, and says when none changes", async () => {
+    const t = await setup(fakeDaemon([item("a"), item("b", { energy: Energy.MEDIUM }), item("c")]));
+    await t.c.press("mmmem");
+    expect(t.userOps().map((o) => o.summary)).toEqual(["edit 2 items"]);
+    expect(["a", "b", "c"].map((x) => t.byTitle(x)?.energy)).toEqual([Energy.MEDIUM, Energy.MEDIUM, Energy.MEDIUM]);
+    await t.c.press("ggmmmem");
+    expect(t.toast()).toBe("Energy unchanged");
+    expect(t.userOps()).toHaveLength(1);
   });
 
   it("x on marks already done says so and sends nothing", async () => {

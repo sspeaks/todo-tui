@@ -1,4 +1,4 @@
-import { Code, ConnectError, OpKind, Priority, Status, captureItem, CreatedVia, deleteItem, setStatus, updateItem } from "@todo-tui/client";
+import { Code, ConnectError, Energy, OpKind, Priority, Status, captureItem, CreatedVia, deleteItem, setStatus, updateItem } from "@todo-tui/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fakeDaemon, item, rows } from "../fake.test-util.js";
 import { holding, setup, stopControllers } from "./setup.test-util.js";
@@ -274,6 +274,22 @@ describe("s p z W", () => {
     await t.c.press("p0");
     expect(t.byTitle("row 0")?.priority).toBe(Priority.NONE);
     expect(t.userOps().map((o) => o.summary)).toEqual(['edit "row 0"', 'edit "row 0"']);
+  });
+
+  it("e l / e m / e h and e 0 set the energy without a toast; e x sends nothing", async () => {
+    const t = await setup(fakeDaemon(rows(2)));
+    await t.c.press("ex");
+    expect(t.toast()).toBe("e x: not bound · ? for help");
+    expect(t.userOps()).toEqual([]);
+    await t.c.press("el");
+    expect(t.byTitle("row 0")?.energy).toBe(Energy.LOW);
+    await t.c.press("eh");
+    expect(t.byTitle("row 0")?.energy).toBe(Energy.HIGH);
+    await t.c.press("e0");
+    expect(t.byTitle("row 0")?.energy).toBe(Energy.NONE);
+    expect(t.userOps().map((o) => o.summary)).toEqual(['edit "row 0"', 'edit "row 0"', 'edit "row 0"']);
+    // E still edits the description: e is a prefix of its own.
+    expect(t.mode()).toEqual({ kind: "normal", pending: [] });
   });
 
   it("p that moves the Item out of the tab toasts, and the selection follows it within the tab (hard case 15)", async () => {

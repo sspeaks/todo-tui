@@ -3,7 +3,7 @@
 // offsets in code points; JS strings index UTF-16 units, so an emoji
 // before a token would shift every span after it without the conversion.
 
-import { CaptureTokenKind, type CaptureDraft, type CaptureToken, Priority, Status } from "@todo-tui/client";
+import { CaptureTokenKind, type CaptureDraft, type CaptureToken, Energy, Priority, Status } from "@todo-tui/client";
 import { type LineState, lineWindow } from "../keys/line-editor.js";
 import { dayLabel, dayOf } from "./dates.js";
 import { personName } from "./item.js";
@@ -58,6 +58,8 @@ export function tokenColor(span: Pick<Span, "kind" | "applied">): string {
       return "yellow";
     case CaptureTokenKind.RECURRENCE:
       return "cyanBright";
+    case CaptureTokenKind.ENERGY:
+      return "magentaBright";
     default:
       return "blue";
   }
@@ -71,8 +73,14 @@ const priorities: Partial<Record<Priority, string>> = {
   [Priority.LOWEST]: "+5",
 };
 
+const energies: Partial<Record<Energy, string>> = {
+  [Energy.LOW]: "%low",
+  [Energy.MEDIUM]: "%med",
+  [Energy.HIGH]: "%high",
+};
+
 /**
- * `→ title · +2 · ^Fri Oct 30 · repeats every Fri · #a #b · ⧗dana · >next`:
+ * `→ title · +2 · %low · ^Fri Oct 30 · repeats every Fri · #a #b · ⧗dana · >next`:
  * what enter would capture. A rule without a ^ date is due on its first
  * date, as the capture stores it; one whose first date is not the due date
  * says when it is.
@@ -81,6 +89,8 @@ export function captureSummary(draft: CaptureDraft, today: number): string {
   const parts = [`→ ${singleLine(draft.title)}`];
   const priority = priorities[draft.priority];
   if (priority) parts.push(priority);
+  const energy = energies[draft.energy];
+  if (energy) parts.push(energy);
   const due = draft.dueDate ?? draft.recurrenceFirst;
   if (due) parts.push(`^${dayLabel(dayOf(due), today)}`);
   if (draft.recurrence) {

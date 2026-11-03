@@ -3,7 +3,7 @@
 // dispatcher compiles it to a trie per mode and the help overlay is
 // generated from it, so the two cannot disagree.
 
-import { Priority, Status } from "@todo-tui/client";
+import { Energy, Priority, Status } from "@todo-tui/client";
 import type { KeyToken } from "./tokenize.js";
 
 export type PromptKind = "title" | "labels" | "due" | "defer" | "waiting" | "repeat";
@@ -27,6 +27,7 @@ export type Action =
   | { type: "prompt"; prompt: PromptKind }
   | { type: "edit_description" }
   | { type: "set_priority"; priority: Priority }
+  | { type: "set_energy"; energy: Energy }
   | { type: "status_picker" }
   | { type: "set_status"; status: Status }
   | { type: "clear_waiting" }
@@ -69,6 +70,12 @@ const priorities: readonly [string, Priority][] = [
   ["5", Priority.LOWEST],
 ];
 
+const energies: readonly [string, string, Energy][] = [
+  ["l", "low", Energy.LOW],
+  ["m", "medium", Energy.MEDIUM],
+  ["h", "high", Energy.HIGH],
+];
+
 export const BINDINGS: readonly Binding[] = [
   { id: "move_down", keys: ["j", "down"], action: { type: "move", by: 1 }, section: "Navigation", help: "Next row (detail focused: scroll)" },
   { id: "move_up", keys: ["k", "up"], action: { type: "move", by: -1 }, section: "Navigation", help: "Previous row (detail focused: scroll)" },
@@ -107,6 +114,18 @@ export const BINDINGS: readonly Binding[] = [
     }),
   ),
   { id: "clear_priority", keys: ["p 0"], action: { type: "set_priority", priority: Priority.NONE }, markAware: true, section: "Items", help: "Clear the priority" },
+  ...energies.map(
+    ([key, name, energy]): Binding => ({
+      id: `set_energy_${name}`,
+      keys: [`e ${key}`],
+      action: { type: "set_energy", energy },
+      markAware: true,
+      section: "Items",
+      help: "Set the energy: low, medium, high",
+      helpKeys: "el em eh",
+    }),
+  ),
+  { id: "clear_energy", keys: ["e 0"], action: { type: "set_energy", energy: Energy.NONE }, markAware: true, section: "Items", help: "Clear the energy" },
   { id: "set_due", keys: ["^"], action: { type: "prompt", prompt: "due" }, markAware: true, section: "Items", help: "Set the due date" },
   { id: "set_repeat", keys: ["@"], action: { type: "prompt", prompt: "repeat" }, markAware: true, section: "Items", help: "Set or stop the repeat rule" },
   { id: "defer", keys: ["D"], action: { type: "prompt", prompt: "defer" }, markAware: true, section: "Items", help: "Defer until…" },

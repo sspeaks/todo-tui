@@ -10,7 +10,7 @@ import {
 import { type DOMElement, Box, Text, useBoxMetrics } from "ink";
 import { type ReactNode, useEffect, useRef } from "react";
 import { dayOf, localTime, longDay, relativeDays, shortDay } from "../format/dates.js";
-import { createdViaName, personName, priorityName, shortId, statusGlyph, statusName } from "../format/item.js";
+import { createdViaName, energyGlyph, energyName, personName, priorityName, shortId, statusGlyph, statusName } from "../format/item.js";
 import { repeatsLine } from "../format/recurrence.js";
 import { sanitize, singleLine } from "../format/text.js";
 import { useController, useDebounced, useOptionalView, useToday, useUi } from "./hooks.js";
@@ -143,6 +143,9 @@ export function DetailPane({ id, width, height, focused }: { id: string | undefi
         <Field label="Priority">
           {priorityName(item.effectivePriority)}
           {override !== undefined ? ` (local override; field ${priorityName(item.priority)})` : ""}
+        </Field>
+        <Field label="Energy" dim={!energyGlyph(item.energy)}>
+          {energyGlyph(item.energy) ? `${energyGlyph(item.energy)} ${energyName(item.energy)}` : "—"}
         </Field>
         <Field label="Due" dim={!item.dueDate}>
           <Text color={item.isOverdue ? "red" : undefined}>{day(item.dueDate, item.isOverdue)}</Text>

@@ -1,11 +1,12 @@
 // The one-key actions on the selected Item (Decision 5): x X, the s picker,
-// p 1–5/0, z, W, dd with its confirm, and u / ctrl-r. Each runs through the
+// p 1–5/0, e l/m/h/0, z, W, dd with its confirm, and u / ctrl-r. Each runs through the
 // pipeline; the toasts follow design 2.8 (only what moves or removes a row,
 // and undo), the errors m4_arch §3.2. With marks in the tab, all but u and
 // ctrl-r act on every marked Item through one BatchMutate (bulk.ts).
 
 import {
   type ArchiveItemResponse,
+  Energy,
   type Item,
   ItemField,
   Operator,
@@ -130,6 +131,22 @@ export class ItemActions {
     const item = this.itemOf(target);
     if (!item) return;
     const out = await this.c.pipeline.run({ call: (opts) => updateItem(this.c.items, { id: item.id, priority }, ["priority"], opts), items: single });
+    if (!out.ok) return this.c.failed(errorText(out.err, item.title));
+    this.c.toastIfLeft(item.id, out.res.result?.opId, opText("edit", item.title));
+  }
+
+  /** e l / e m / e h, e 0: a plain edit, as p is. */
+  async setEnergy(energy: Energy): Promise<void> {
+    const target = this.c.target(true);
+    if (target?.bulk) {
+      const steps = stepsOf(this.bulk.items(target), (i) => ((i.energy || Energy.NONE) === energy ? undefined : updateStep({ id: i.id, energy }, ["energy"])));
+      if (!steps.length) return this.c.toast("info", "Energy unchanged");
+      await this.bulk.run(steps, (done) => bulkText("edit", done));
+      return;
+    }
+    const item = this.itemOf(target);
+    if (!item) return;
+    const out = await this.c.pipeline.run({ call: (opts) => updateItem(this.c.items, { id: item.id, energy }, ["energy"], opts), items: single });
     if (!out.ok) return this.c.failed(errorText(out.err, item.title));
     this.c.toastIfLeft(item.id, out.res.result?.opId, opText("edit", item.title));
   }

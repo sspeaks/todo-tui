@@ -288,14 +288,14 @@ else
 
   keys a
   see '^ADD · ' "quick-add"
-  keys -l 'smoke item +2 ^fri'
-  see '^→ smoke item · \+2 · \^Fri ' "the capture preview"
+  keys -l 'smoke item +2 %low ^fri'
+  see '^→ smoke item · \+2 · %low · \^Fri ' "the capture preview"
   keys Enter
-  see '^› ○ \+2 +smoke item' "the captured row"
+  see '^› ○ \+2 ▁ smoke item' "the captured row, its energy glyph after the priority"
   keys Escape
   see '^NORMAL · ' "normal mode"
   list_items >"$root/tui.items" || fail "listing items failed"
-  for field in '"title":"smoke item"' '"priority":"PRIORITY_HIGH"' '"dueDate":{' '"createdVia":"CREATED_VIA_TUI"' '"status":"STATUS_INBOX"'; do
+  for field in '"title":"smoke item"' '"priority":"PRIORITY_HIGH"' '"energy":"ENERGY_LOW"' '"dueDate":{' '"createdVia":"CREATED_VIA_TUI"' '"status":"STATUS_INBOX"'; do
     grep -qF "$field" "$root/tui.items" || { cat "$root/tui.items" >&2; fail "the TUI's capture lacks $field"; }
   done
 
@@ -307,7 +307,7 @@ else
   grep -qF '"title":"smoke item"' "$root/tui.items" && { cat "$root/tui.items" >&2; fail "x did not mark it done"; }
   keys u
   see '^Undid: mark done "smoke item"' "the undo toast"
-  see '^› ○ \+2 +smoke item' "the row back in the Inbox"
+  see '^› ○ \+2 ▁ smoke item' "the row back in the Inbox"
   list_items >"$root/tui.items" || fail "listing items failed"
   grep -qF '"status":"STATUS_INBOX"' "$root/tui.items" || { cat "$root/tui.items" >&2; fail "u did not bring it back"; }
 
@@ -359,7 +359,7 @@ else
   keys Enter
   see '^Created view “Urgent”' "the :view new toast"
   see 'Urgent 1' "the new tab with its count"
-  see '^› ○ \+2 +smoke item' "the high-priority row in the new tab"
+  see '^› ○ \+2 ▁ smoke item' "the high-priority row in the new tab"
   # A query with an error keeps the prompt open, the error said under it.
   keys :
   keys -l 'view new Bad dew:1'

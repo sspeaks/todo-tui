@@ -44,6 +44,7 @@ export function helpBindings(bindings: readonly Binding[] = BINDINGS): Binding[]
 
 const CAPTURE: readonly [string, string][] = [
   ["+1 … +5", "priority, +1 highest"],
+  ["%low %med %high", "energy: how much focus it takes"],
   ["^<date>", "due date (dates below)"],
   ["@<rule>", "repeats (rules below)"],
   ["#label", "label"],
