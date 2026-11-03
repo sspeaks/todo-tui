@@ -1,5 +1,6 @@
 //! The todo-tui daemon: tonic services, scheduler and watch fan-out.
 
+mod backup;
 pub mod client;
 pub mod config;
 mod conn;

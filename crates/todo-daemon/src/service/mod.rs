@@ -20,4 +20,6 @@ pub(crate) struct Ctx {
     /// Poked after every user op, which may give the scheduler work.
     pub(crate) wake: Wake,
     pub(crate) config: ConfigHandle,
+    /// Where backups go (`data/backups`).
+    pub(crate) backups: std::path::PathBuf,
 }

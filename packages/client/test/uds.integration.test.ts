@@ -326,3 +326,21 @@ describe.skipIf(!TODO_BIN)("view edits against $TODO_BIN", { timeout: 60_000 }, 
     return { transport: conn.transport };
   });
 });
+
+describe.skipIf(!TODO_BIN)("todo restore against $TODO_BIN", { timeout: 60_000 }, () => {
+  it("sends a live store to resync onto the restored database", async () => {
+    const h = await home();
+    const conn = await h.open(ClientKind.ONESHOT);
+    await h.add("kept");
+    const backup = (await run(TODO_BIN!, ["backup", "now"], { env: h.env })).stdout.split("  ")[0]!;
+    await h.add("gone after the restore");
+    // A oneshot client, so restore's shutdown is not refused for it.
+    const store = track(createLiveStore(conn, { backoff: { initialMs: 20, maxMs: 200 } }));
+    const view = store.view();
+    const unobserve = view.subscribe(() => {});
+    await waitFor(() => view.getSnapshot().items.length === 2);
+    await run(TODO_BIN!, ["restore", backup, "--yes"], { env: h.env });
+    await waitFor(() => view.getSnapshot().items.map((i) => i.title).join() === "kept", 15_000);
+    unobserve();
+  });
+});

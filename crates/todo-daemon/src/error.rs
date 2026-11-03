@@ -176,6 +176,7 @@ pub(crate) fn store(e: StoreError) -> Status {
             [],
         ),
         StoreError::Closed => error_info(Code::Unavailable, "SHUTTING_DOWN", e.to_string(), []),
+        StoreError::Backup(_) => error_info(Code::Internal, "BACKUP_FAILED", e.to_string(), []),
         StoreError::Sqlite(_) | StoreError::Corrupt(_) | StoreError::NotAMutation(_) => {
             tracing::error!(error = %e, "store failure");
             error_info(Code::Internal, "STORE", e.to_string(), [])

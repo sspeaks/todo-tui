@@ -1,8 +1,8 @@
 use todo_proto::v1::system_service_server::SystemService;
 use todo_proto::v1::{
-    self, ClientKind, GetConfigRequest, GetConfigResponse, GetServerInfoRequest,
-    GetServerInfoResponse, ReloadConfigRequest, ReloadConfigResponse, ShutdownRequest,
-    ShutdownResponse,
+    self, BackupRequest, BackupResponse, ClientKind, GetConfigRequest, GetConfigResponse,
+    GetServerInfoRequest, GetServerInfoResponse, ReloadConfigRequest, ReloadConfigResponse,
+    ShutdownRequest, ShutdownResponse,
 };
 use tonic::{Code, Request, Response, Status};
 
@@ -81,6 +81,26 @@ impl SystemService for System {
         Ok(Response::new(ReloadConfigResponse {
             config: Some(v1::ConfigSnapshot::from(&*config)),
             changed,
+        }))
+    }
+
+    async fn backup(
+        &self,
+        _request: Request<BackupRequest>,
+    ) -> Result<Response<BackupResponse>, Status> {
+        let backup = &self.0.config.current().backup;
+        let retain = backup.enabled.then_some(backup.retain_days);
+        let run = crate::backup::run_once(&self.0.store, &self.0.backups, retain)
+            .await
+            .map_err(error::store)?;
+        Ok(Response::new(BackupResponse {
+            path: run.path.display().to_string(),
+            bytes: run.bytes,
+            removed: run
+                .removed
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
         }))
     }
 }

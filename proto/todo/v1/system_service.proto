@@ -17,6 +17,10 @@ service SystemService {
   // fails with INVALID_ARGUMENT and the running config stays. A changed
   // snapshot is streamed as a TOPIC_CONFIG change.
   rpc ReloadConfig(ReloadConfigRequest) returns (ReloadConfigResponse);
+  // Backs up the database now (design 7.5), as `todo backup now`, also when
+  // automatic backups are off. Old backups are cleaned up only while they
+  // are on.
+  rpc Backup(BackupRequest) returns (BackupResponse);
 }
 
 enum ClientKind {
@@ -62,4 +66,14 @@ message ReloadConfigResponse {
   ConfigSnapshot config = 1;
   // Whether the snapshot differs from the one it replaced (loaded_at aside).
   bool changed = 2;
+}
+
+message BackupRequest {}
+
+message BackupResponse {
+  // The backup file.
+  string path = 1;
+  uint64 bytes = 2;
+  // The old backups it deleted.
+  repeated string removed = 3;
 }

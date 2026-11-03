@@ -1,6 +1,7 @@
 //! The `todo` binary.
 
 mod add;
+mod backup;
 mod config;
 mod launch;
 mod rpc;
@@ -59,6 +60,20 @@ enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Back up the database, or list the backups (design 7.5).
+    Backup {
+        #[command(subcommand)]
+        action: BackupAction,
+    },
+    /// Put a backup in place of the database: the current one is backed
+    /// up first, and the daemon restarted.
+    Restore {
+        /// The backup file.
+        path: std::path::PathBuf,
+        /// Do not ask first.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Run the daemon (in the foreground unless --detach).
     Daemon {
         /// Start the daemon in the background and return once it is listening.
@@ -67,6 +82,14 @@ enum Command {
         #[command(subcommand)]
         action: Option<DaemonAction>,
     },
+}
+
+#[derive(Subcommand)]
+enum BackupAction {
+    /// Take a backup now, also when automatic backups are off.
+    Now,
+    /// List the backups, oldest first.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -123,6 +146,13 @@ async fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
         Command::Redo => return undo::undo(&paths, undo::Direction::Redo).await,
         // `--short` is run by main.
         Command::Status { .. } => return status::status(&paths).await,
+        Command::Backup { action } => {
+            return match action {
+                BackupAction::Now => backup::now(&paths).await,
+                BackupAction::List => backup::list(&paths),
+            };
+        }
+        Command::Restore { path, yes } => return backup::restore(&paths, &path, yes).await,
         Command::Config { action } => {
             return match action {
                 ConfigAction::Path => Ok(config::path(&paths)),

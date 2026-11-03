@@ -206,6 +206,7 @@ mod tests {
             shutdown: ShutdownHandle::new(),
             wake: Wake::default(),
             config: ConfigHandle::new(Config::defaults("/c/config.toml".into())),
+            backups: "/c/backups".into(),
         });
         let mut stream = watch
             .subscribe(Request::new(SubscribeRequest::default()))
@@ -239,6 +240,7 @@ mod tests {
             shutdown: ShutdownHandle::new(),
             wake: Wake::default(),
             config: ConfigHandle::new(Config::defaults("/c/config.toml".into())),
+            backups: "/c/backups".into(),
         });
         let subscribe = async |since_revision| {
             let req = SubscribeRequest {

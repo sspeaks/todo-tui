@@ -204,6 +204,11 @@ impl Paths {
         self.data.join("todo.db")
     }
 
+    /// The backups (design 7.5), in [`Paths::data`].
+    pub fn backups(&self) -> PathBuf {
+        self.data.join("backups")
+    }
+
     /// The daemon log file in [`Paths::logs`].
     pub fn daemon_log(&self) -> PathBuf {
         self.logs.join("daemon.log")

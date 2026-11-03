@@ -9,6 +9,7 @@ mod codec;
 mod hierarchy;
 mod query;
 mod relation;
+mod restore;
 mod schema;
 mod summary;
 mod undo;
@@ -16,7 +17,7 @@ mod view;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
@@ -36,7 +37,8 @@ use tokio::sync::{Semaphore, broadcast, oneshot};
 use ulid::Ulid;
 
 use codec::{SqlEnum, is_overdue, load_item, rev_from_sql, rev_to_sql, ts_to_sql};
-pub use schema::SCHEMA_VERSION;
+pub use restore::{DbInfo, backup_file, inspect, prepare_restored};
+pub use schema::{SCHEMA_VERSION, free_backup_path};
 use summary::Action;
 pub use view::{
     CreateViewInput, MAX_VIEW_NAME_CHARS, MAX_VIEW_OFFSET_DAYS, MoveViewInput, UpdateViewInput,
@@ -49,6 +51,10 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("database schema version {found} is newer than this build supports ({supported})")]
     SchemaTooNew { found: u32, supported: u32 },
+    /// A backup could not be written; before a migration, the migration
+    /// does not run.
+    #[error("{0}")]
+    Backup(String),
     #[error("item {0} not found")]
     NotFound(ItemId),
     #[error("item {id}: revision conflict: expected {expected}, found {actual}")]
@@ -583,7 +589,14 @@ impl Store {
     /// one transaction, a revision each), starts the writer thread and read
     /// pool. Fails with [`StoreError::SchemaTooNew`] for a newer database.
     pub fn open(path: &Path) -> Result<Store> {
-        let mut writer_conn = schema::open_writer(path)?;
+        let backups = path.parent().map(|dir| dir.join("backups"));
+        Store::open_with(path, backups.as_deref())
+    }
+
+    /// [`Store::open`], with a migration's backup taken into `backup_dir`
+    /// (none: no backup).
+    pub fn open_with(path: &Path, backup_dir: Option<&Path>) -> Result<Store> {
+        let mut writer_conn = schema::open_writer(path, backup_dir)?;
         let revision = current_revision_in(&writer_conn)?;
         let readers = (0..READ_POOL_SIZE)
             .map(|_| schema::open_reader(path))
@@ -617,6 +630,17 @@ impl Store {
                 }),
             }),
         })
+    }
+
+    /// Writes a consistent copy of the database to `to` (design 7.5), from
+    /// a read connection, so writes go on meanwhile. Returns its size.
+    pub async fn backup_to(&self, to: PathBuf) -> Result<u64> {
+        self.read(move |conn| {
+            schema::backup_into(conn, &to)
+                .map_err(|e| StoreError::Backup(format!("{}: {e}", to.display())))?;
+            Ok(std::fs::metadata(&to).map(|m| m.len()).unwrap_or(0))
+        })
+        .await
     }
 
     /// Runs `f` on the writer thread inside one transaction. On `Ok` the

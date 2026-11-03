@@ -1140,3 +1140,102 @@ fn config_path_check_and_reload() {
         text(&out.stderr)
     );
 }
+
+#[test]
+fn backup_now_list_and_restore() {
+    let h = Home::new();
+    h.ok(&["add", "kept"]);
+    let out = h.ok(&["backup", "now"]);
+    let backup = out.split("  ").next().unwrap().to_owned();
+    assert!(backup.ends_with(".db"), "{out}");
+    assert!(h.ok(&["backup", "list"]).contains(&backup));
+
+    h.ok(&["add", "after the backup"]);
+    assert_eq!(h.items().len(), 2);
+    let out = h.ok(&["restore", &backup, "--yes"]);
+    assert!(out.starts_with("restored "), "{out}");
+    assert!(out.contains("todo-prerestore-"), "{out}");
+    let titles: Vec<_> = h.items().into_iter().map(|i| i.title).collect();
+    assert_eq!(titles, ["kept"]);
+    // The database it replaced is a backup of its own.
+    let prerestore = out
+        .lines()
+        .last()
+        .unwrap()
+        .rsplit(' ')
+        .next()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        todo_store::inspect(std::path::Path::new(&prerestore))
+            .unwrap()
+            .items,
+        2
+    );
+}
+
+#[test]
+fn restore_refuses_what_is_not_a_todo_database() {
+    let h = Home::new();
+    let notes = h.home.join("notes.txt");
+    std::fs::create_dir_all(&h.home).unwrap();
+    std::fs::write(&notes, "hello").unwrap();
+    let out = h.todo(&["restore", notes.to_str().unwrap(), "--yes"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out.stderr).contains("not a todo database"),
+        "{}",
+        text(&out.stderr)
+    );
+    // Without --yes and no terminal, it asks for one.
+    let out = h.todo(&["restore", notes.to_str().unwrap()]);
+    assert!(!out.status.success());
+}
+
+/// A restore is undone by restoring its prerestore copy, at once: no
+/// restore ever replaces another backup, and a read-only source is fine.
+#[test]
+fn restores_in_one_minute_keep_every_previous_database() {
+    let h = Home::new();
+    h.ok(&["add", "A"]);
+    let b1 = h
+        .ok(&["backup", "now"])
+        .split("  ")
+        .next()
+        .unwrap()
+        .to_owned();
+    h.ok(&["add", "PRECIOUS"]);
+    let saved = |out: &str| {
+        out.lines()
+            .last()
+            .unwrap()
+            .rsplit(' ')
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+
+    // A read-only backup restores to a writable database.
+    std::fs::set_permissions(&b1, std::os::unix::fs::PermissionsExt::from_mode(0o444)).unwrap();
+    let first = saved(&h.ok(&["restore", &b1, "--yes"]));
+    let titles = |h: &Home| h.items().into_iter().map(|i| i.title).collect::<Vec<_>>();
+    assert_eq!(titles(&h), ["A"]);
+    h.ok(&["add", "writable"]);
+
+    // Undo it with its prerestore copy, within the same minute.
+    let second = saved(&h.ok(&["restore", &first, "--yes"]));
+    assert_ne!(first, second);
+    assert_eq!(titles(&h), ["A", "PRECIOUS"]);
+    assert_eq!(
+        todo_store::inspect(std::path::Path::new(&first))
+            .unwrap()
+            .items,
+        2
+    );
+    assert_eq!(
+        todo_store::inspect(std::path::Path::new(&second))
+            .unwrap()
+            .items,
+        2
+    );
+}

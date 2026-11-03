@@ -2,9 +2,10 @@
 //! change is a new migration, as databases have applied the earlier ones
 //! (design 7.2).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use jiff::Zoned;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 
 use crate::{Result, StoreError};
@@ -21,7 +22,10 @@ pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub(crate) fn open_writer(path: &Path) -> Result<Connection> {
+/// Opens the writer, migrating the schema; a database that needs migrating
+/// is first backed up into `backup_dir` (design 7.2), and a migration never
+/// runs without its backup.
+pub(crate) fn open_writer(path: &Path, backup_dir: Option<&Path>) -> Result<Connection> {
     let mut conn = Connection::open(path)?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
     let mode: String = conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))?;
@@ -32,6 +36,16 @@ pub(crate) fn open_writer(path: &Path) -> Result<Connection> {
     }
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", true)?;
+    let found = user_version(&conn)?;
+    if found > 0
+        && found < SCHEMA_VERSION
+        && let Some(dir) = backup_dir
+    {
+        let to = premigrate_path(dir, found);
+        backup_into(&conn, &to)
+            .map_err(|e| StoreError::Backup(format!("{}: {e}", to.display())))?;
+        tracing::info!(path = %to.display(), "backed up the database before migrating");
+    }
     migrate(&mut conn)?;
     Ok(conn)
 }
@@ -70,4 +84,58 @@ pub(crate) fn migrate(conn: &mut Connection) -> Result<()> {
         tracing::info!(version = to, "applied migration");
     }
     Ok(())
+}
+
+/// `backups/todo-premigrate-v{found}-YYYYMMDD-HHMMSS.db`, local time.
+fn premigrate_path(dir: &Path, found: u32) -> PathBuf {
+    let at = Zoned::now().strftime("%Y%m%d-%H%M%S").to_string();
+    free_backup_path(dir, &format!("todo-premigrate-v{found}"), &at)
+}
+
+/// A consistent copy of the database `conn` is open on (its WAL included),
+/// through `VACUUM INTO`, at `to`, which must not exist: an existing
+/// backup is never replaced. It is written to a temporary file of its own
+/// first and moved into place only whole, so a file named `.db` is never
+/// half written, and a failed copy leaves nothing behind.
+pub(crate) fn backup_into(conn: &Connection, to: &Path) -> std::io::Result<()> {
+    if let Some(dir) = to.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    if to.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "a file of that name exists",
+        ));
+    }
+    let tmp = to.with_extension(format!("db.{}.tmp", ulid::Ulid::generate()));
+    let remove_tmp = || {
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp.with_extension("tmp-journal"));
+    };
+    let result = (|| {
+        let target = tmp
+            .to_str()
+            .ok_or_else(|| std::io::Error::other("the backup path is not UTF-8"))?;
+        conn.execute("VACUUM INTO ?1", [target])
+            .map_err(std::io::Error::other)?;
+        std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+        // A hard link fails when `to` exists, unlike a rename, so a backup
+        // made meanwhile under the same name is kept.
+        std::fs::hard_link(&tmp, to)
+    })();
+    remove_tmp();
+    result
+}
+
+/// A path in `dir` for `{prefix}-{stamp}.db` that no file has: `-2`, `-3`,
+/// … after the stamp when it is taken.
+pub fn free_backup_path(dir: &Path, prefix: &str, stamp: &str) -> PathBuf {
+    let mut path = dir.join(format!("{prefix}-{stamp}.db"));
+    for n in 2.. {
+        if !path.exists() {
+            break;
+        }
+        path = dir.join(format!("{prefix}-{stamp}-{n}.db"));
+    }
+    path
 }

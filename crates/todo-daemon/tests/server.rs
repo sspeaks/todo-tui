@@ -18,14 +18,14 @@ use todo_proto::v1::system_service_client::SystemServiceClient;
 use todo_proto::v1::view_service_client::ViewServiceClient;
 use todo_proto::v1::watch_service_client::WatchServiceClient;
 use todo_proto::v1::{
-    AddRelationRequest, ArchiveItemRequest, ArchiveReason, BatchMutateRequest, CaptureItemRequest,
-    CaptureTokenKind, Clause, ClauseGroup, ClientKind, ConfigSnapshot, CreateViewRequest,
-    CreatedVia, DeleteItemRequest, DeleteViewRequest, FieldValue, Filter, GetConfigRequest,
-    GetItemRequest, GetServerInfoRequest, GetStatusCountsRequest, GetUndoStateRequest, Item,
-    ItemField, ListItemsRequest, ListViewsRequest, MoveViewRequest, Mutation, MutationResult,
-    OpKind, Operand, Operator, ParseCaptureRequest, ParseDateRequest, ParseQueryRequest,
-    ParseRecurrenceRequest, PersonRef, Predicate, Priority, RecurrenceRule, RedoRequest,
-    RedoResponse, Relation, RelationKind, ReloadConfigRequest, RemoveRelationRequest,
+    AddRelationRequest, ArchiveItemRequest, ArchiveReason, BackupRequest, BatchMutateRequest,
+    CaptureItemRequest, CaptureTokenKind, Clause, ClauseGroup, ClientKind, ConfigSnapshot,
+    CreateViewRequest, CreatedVia, DeleteItemRequest, DeleteViewRequest, FieldValue, Filter,
+    GetConfigRequest, GetItemRequest, GetServerInfoRequest, GetStatusCountsRequest,
+    GetUndoStateRequest, Item, ItemField, ListItemsRequest, ListViewsRequest, MoveViewRequest,
+    Mutation, MutationResult, OpKind, Operand, Operator, ParseCaptureRequest, ParseDateRequest,
+    ParseQueryRequest, ParseRecurrenceRequest, PersonRef, Predicate, Priority, RecurrenceRule,
+    RedoRequest, RedoResponse, Relation, RelationKind, ReloadConfigRequest, RemoveRelationRequest,
     SetRecurrenceRequest, SetStatusRequest, ShutdownRequest, SortKey, Status, SubscribeRequest,
     SubscribeResponse, Topic, UnarchiveItemRequest, UndeleteItemRequest, UndoRequest, UndoResponse,
     UndoSkip, UndoSkipReason, UpdateItemRequest, UpdateViewRequest, View, Weekday, clause,
@@ -301,7 +301,7 @@ async fn handshake_reports_version_and_api_minor() {
         .into_inner();
     assert_eq!(info.daemon_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(info.api_minor, todo_proto::API_MINOR);
-    assert_eq!(info.api_minor, 11);
+    assert_eq!(info.api_minor, 12);
     d.stop().await;
 }
 
@@ -4802,5 +4802,108 @@ async fn view_edits_stream_on_the_view_topic_and_map_their_errors() {
     // None of it reached the undo stack.
     let (top, _) = undo_state(&mut d.items().await).await;
     assert_eq!(top, None);
+    d.stop().await;
+}
+
+fn backups_in(d: &TestDaemon) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(d.paths.backups())
+        .map(|dir| {
+            dir.map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// A new daemon takes its first automatic backup at start; Backup takes one
+/// now, cleaning up old ones while automatic backups are on.
+#[tokio::test(flavor = "multi_thread")]
+async fn backups_at_start_on_request_and_cleaned_up() {
+    let d = start().await;
+    let first = timeout(WAIT, async {
+        loop {
+            // Finished backups only: one being written is a .db.tmp.
+            let names: Vec<_> = backups_in(&d)
+                .into_iter()
+                .filter(|n| n.ends_with(".db"))
+                .collect();
+            if !names.is_empty() {
+                return names;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("no backup at start");
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert!(
+        first[0].starts_with("todo-") && first[0].ends_with(".db"),
+        "{first:?}"
+    );
+
+    // Old ones by the name's date, and only backups, go.
+    let dir = d.paths.backups();
+    for name in [
+        "todo-20200101-0000.db",
+        "todo-premigrate-v1-20200101-000000.db",
+        "keep-me.db",
+    ] {
+        std::fs::write(dir.join(name), "x").unwrap();
+    }
+    let mut items = d.items().await;
+    capture(&mut items, "after the first").await;
+    let res = SystemServiceClient::new(d.channel().await)
+        .backup(BackupRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(res.bytes > 0);
+    let removed: Vec<_> = res
+        .removed
+        .iter()
+        .map(|p| {
+            std::path::Path::new(p)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        removed,
+        [
+            "todo-20200101-0000.db",
+            "todo-premigrate-v1-20200101-000000.db"
+        ]
+    );
+    let names = backups_in(&d);
+    assert!(names.contains(&"keep-me.db".to_owned()));
+    // Two this minute: the second has a suffix, and holds the new Item.
+    let latest = std::path::Path::new(&res.path);
+    assert_eq!(todo_store::inspect(latest).unwrap().items, 1);
+    d.stop().await;
+}
+
+/// With automatic backups off, none is taken at start, and Backup still
+/// works but deletes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn backups_off_take_none_and_keep_old_ones() {
+    let home = TempDir::new().unwrap();
+    let paths = paths_for(&home);
+    std::fs::write(&paths.config, "[backup]\nenabled = false\n").unwrap();
+    std::fs::create_dir_all(paths.backups()).unwrap();
+    std::fs::write(paths.backups().join("todo-20200101-0000.db"), "x").unwrap();
+    let d = start_in(home).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(backups_in(&d), ["todo-20200101-0000.db"]);
+    let res = SystemServiceClient::new(d.channel().await)
+        .backup(BackupRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(res.removed.is_empty());
+    assert_eq!(backups_in(&d).len(), 2);
     d.stop().await;
 }

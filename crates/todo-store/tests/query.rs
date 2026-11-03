@@ -1601,6 +1601,21 @@ async fn migrates_an_m2_database() {
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
     assert_eq!(version, SCHEMA_VERSION);
+    // Backed up first (design 7.2): the M2 database, as it was.
+    let backups: Vec<_> = std::fs::read_dir(db.path.parent().unwrap().join("backups"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    let [backup] = &backups[..] else {
+        panic!("{backups:?}");
+    };
+    let name = backup.file_name().unwrap().to_str().unwrap();
+    assert!(
+        name.starts_with("todo-premigrate-v2-") && name.ends_with(".db"),
+        "{name}"
+    );
+    let info = todo_store::inspect(backup).unwrap();
+    assert_eq!((info.schema_version, info.revision, info.items), (2, 3, 2));
     // The views are seeded after the M2 revisions.
     let (views, revision) = db.store.list_views().await.unwrap();
     assert_eq!(views.len(), 6);

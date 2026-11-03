@@ -449,7 +449,7 @@ export class FakeDaemon {
   maxPageSize = MAX_PAGE_SIZE;
   /** Runs before every ListItems; throw from it to fail that call. */
   onListItems: ((req: ListItemsRequest) => void) | undefined;
-  apiMinor = 11;
+  apiMinor = 12;
   /** What GetConfig serves; change it with {@link setConfig}. */
   config: ConfigSnapshot = defaultConfig();
   readonly calls = { listItems: 0, listViews: 0, getStatusCounts: 0, subscribe: [] as (bigint | undefined)[] };
@@ -502,6 +502,11 @@ export class FakeDaemon {
         reloadConfig: () => {
           this.check();
           return { config: this.config, changed: false };
+        },
+        // There is no file to copy: the daemon's backups are its own.
+        backup: () => {
+          this.check();
+          throw new ConnectError("FakeDaemon takes no backups", Code.Unimplemented);
         },
       });
       service(ItemService, {

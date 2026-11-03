@@ -51,6 +51,9 @@ pub struct DaemonOptions {
     /// restart (1 s). The wait doubles after each panic that follows, up
     /// to 60 s or this, whichever is longer.
     pub restart_after: Duration,
+    /// How often the backup task looks whether a backup is due, between
+    /// config changes (1 h).
+    pub backup_check: Duration,
     /// Test hook: the scheduler's first this many runs panic at once.
     #[doc(hidden)]
     pub scheduler_panics: u32,
@@ -63,6 +66,7 @@ impl Default for DaemonOptions {
             archive_done_after: None,
             spool_interval: spool::INTERVAL,
             restart_after: Backoff::default().first,
+            backup_check: crate::backup::CHECK,
             scheduler_panics: 0,
         }
     }
@@ -117,7 +121,8 @@ impl Daemon {
         }
 
         let db = paths.database();
-        let store = tokio::task::spawn_blocking(move || Store::open(&db))
+        let backups = paths.backups();
+        let store = tokio::task::spawn_blocking(move || Store::open_with(&db, Some(&backups)))
             .await?
             .with_context(|| format!("opening {}", paths.database().display()))?;
 
@@ -228,7 +233,25 @@ impl Daemon {
                 }
             })
         };
+        let backups = {
+            let (store, dir, config, stop) = (
+                store.clone(),
+                paths.backups(),
+                config.subscribe(),
+                shutdown.signal(),
+            );
+            spawn_supervised("backup", shutdown.signal(), backoff, move || {
+                crate::backup::run(
+                    store.clone(),
+                    dir.clone(),
+                    config.clone(),
+                    stop.clone(),
+                    options.backup_check,
+                )
+            })
+        };
         let ctx = Ctx {
+            backups: paths.backups(),
             store,
             clients: clients.clone(),
             shutdown: shutdown.clone(),
@@ -275,7 +298,7 @@ impl Daemon {
         // has been dropped, so the last clone (dropped here) joins the
         // writer thread before the lock is released: a daemon that takes
         // the lock next sees every commit.
-        for task in [spool, scheduler] {
+        for task in [spool, scheduler, backups] {
             task.abort().await;
         }
         let _ = fs::remove_file(&paths.socket);
