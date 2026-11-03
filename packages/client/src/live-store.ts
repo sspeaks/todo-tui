@@ -167,6 +167,11 @@ export class LiveStore {
     this.undoState = new LiveUndoState(this);
   }
 
+  /** The transport the store reads through, for clients beside it. */
+  get transport(): Transport {
+    return this.opts.transport;
+  }
+
   get started(): boolean {
     return this.abort !== undefined && !this.abort.signal.aborted;
   }

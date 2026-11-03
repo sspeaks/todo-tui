@@ -2,7 +2,7 @@
 // completion over them, and a pointer to the milestone that brings each
 // planned one.
 
-export type CommandName = "quit" | "help" | "refresh" | "search" | "config";
+export type CommandName = "quit" | "help" | "refresh" | "search" | "config" | "view";
 
 interface CommandSpec {
   readonly name: string;
@@ -20,11 +20,11 @@ export const COMMANDS: readonly CommandSpec[] = [
   { name: "refresh", help: "Re-read every view and the counts", runs: "refresh" },
   { name: "search", help: "Search everything, done, archived and deferred too", runs: "search", args: "<query>" },
   { name: "config", help: "The config file and what is wrong with it", runs: "config" },
+  { name: "view", help: "Views: new <name> [query], edit, rename, delete, move", runs: "view", args: "<sub> …" },
 ];
 
 /** Commands from the design that a later milestone brings, and where they arrive. */
 const PLANNED: Readonly<Record<string, string>> = {
-  view: "with view editing in M6",
   export: "in M6",
   sync: "with Jira sync in P2",
   promote: "with Jira sync in P2",
@@ -61,8 +61,16 @@ export function resolveCommand(line: string): CommandResult {
   return { kind: "run", command: command.runs, args };
 }
 
-/** Tab completion: the first word extended to the longest prefix all matching commands share. */
-export function completeCommand(line: string): string {
+/**
+ * Tab completion: the first word extended to the longest prefix all
+ * matching commands share; after `view`, its subcommand, then a view name
+ * from `views` (quoted when it has a space).
+ */
+export function completeCommand(line: string, views: readonly string[] = []): string {
+  const sub = /^(\s*view\s+)(\S*)$/.exec(line);
+  if (sub) return completeFrom(line, sub[1] ?? "", sub[2] ?? "", VIEW_SUBS, true);
+  const named = /^(\s*view\s+(?:edit|rename|delete|move)\s+)("?[^"\s]*)$/.exec(line);
+  if (named) return completeFrom(line, named[1] ?? "", (named[2] ?? "").replace(/^"/, ""), views, false, true);
   if (/\s/.test(line.trimStart())) return line;
   const word = line.trim();
   const found = matching(word).map((c) => c.name);
@@ -72,4 +80,23 @@ export function completeCommand(line: string): string {
   let common = first;
   for (const n of found) while (!n.startsWith(common)) common = common.slice(0, -1);
   return common.length > word.length ? common : line;
+}
+
+const VIEW_SUBS = ["new", "edit", "rename", "delete", "move"];
+
+/**
+ * `head` then `word` completed from `options` (ignoring case, for names): a
+ * unique one whole (quoted when it has a space; with a space after, for a
+ * subcommand), else as far as they all agree.
+ */
+function completeFrom(line: string, head: string, word: string, options: readonly string[], space: boolean, ignoreCase = false): string {
+  const norm = (s: string) => (ignoreCase ? s.toLowerCase() : s);
+  const found = options.filter((o) => norm(o).startsWith(norm(word)));
+  const [first] = found;
+  if (first === undefined) return line;
+  const quote = (s: string) => (/[\s"\\]/.test(s) ? `"${s.replace(/["\\]/g, "\\$&")}"` : s);
+  if (found.length === 1) return `${head}${quote(first)}${space ? " " : ""}`;
+  let common = first;
+  for (const o of found) while (!norm(o).startsWith(norm(common))) common = common.slice(0, -1);
+  return common.length > word.length && !/\s/.test(common) ? `${head}${common}` : line;
 }

@@ -4,7 +4,8 @@
 # and the capture spool round trip (P1 M1), undo/redo of a capture (P1 M2),
 # `todo status` and the seeded Today view (P1 M3), the TUI driven in a
 # private tmux server (P1 M4; skipped without tmux), and x in the TUI on an
-# @daily capture making the next instance (P1 M5).
+# @daily capture making the next instance (P1 M5), and :view new with query
+# text (P1 M6).
 # Usage: scripts/smoke.sh   (TODO_BIN overrides the binary; default: cargo build;
 # TODO_TUI_ENTRY the TUI bundle; default: pnpm -C tui build)
 set -euo pipefail
@@ -350,6 +351,22 @@ else
   see '^Cannot suspend: no job control here' "the ctrl-z toast"
   keys j
   see '^› ○ +second item' "the TUI taking keys after ctrl-z"
+
+  # :view new with a query: ParseQuery and CreateView on the real daemon;
+  # the tab appears with its count, and the TUI goes to it.
+  keys :
+  keys -l 'view new Urgent priority>=high'
+  keys Enter
+  see '^Created view “Urgent”' "the :view new toast"
+  see 'Urgent 1' "the new tab with its count"
+  see '^› ○ \+2 +smoke item' "the high-priority row in the new tab"
+  # A query with an error keeps the prompt open, the error said under it.
+  keys :
+  keys -l 'view new Bad dew:1'
+  keys Enter
+  see 'col 1: unknown field "dew"' "the query error"
+  keys Escape
+  see '^NORMAL · ' "normal mode"
 
   keys q
   see '^the tui exited 0$' "a clean exit"

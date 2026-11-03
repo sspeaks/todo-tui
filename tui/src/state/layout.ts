@@ -24,7 +24,7 @@ export const MIN_DETAIL_ROWS = 10;
 
 /** The rows a mode takes from the body. */
 export const modeRows = (mode: ModeKind | undefined): number =>
-  mode === "quickAdd" ? QUICK_ADD_ROWS : mode === "prompt" ? PROMPT_ROWS : 0;
+  mode === "quickAdd" ? QUICK_ADD_ROWS : mode === "prompt" || mode === "query" ? PROMPT_ROWS : 0;
 
 export interface Layout {
   readonly columns: number;

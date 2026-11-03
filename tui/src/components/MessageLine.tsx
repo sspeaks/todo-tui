@@ -1,8 +1,8 @@
 import { Box, Text } from "ink";
 import { STATUS_CHOICES, sharedStatus } from "../controller/actions.js";
 import { PROMPT_LABELS } from "../controller/prompts.js";
-import { sanitize, singleLine, truncate } from "../format/text.js";
-import { type LineState, visibleLine } from "../keys/line-editor.js";
+import { displayWidth, sanitize, singleLine, truncate } from "../format/text.js";
+import { type LineState, lineWindow, visibleLine } from "../keys/line-editor.js";
 import type { Mode } from "../state/types.js";
 import { useController, useUi } from "./hooks.js";
 
@@ -15,6 +15,32 @@ function Editor({ label, line, width }: { label: string; line: LineState; width:
       {sanitize(before)}
       <Text inverse>{sanitize(under) || " "}</Text>
       {sanitize(after)}
+    </Text>
+  );
+}
+
+/** A query line after its label, the span of its first error in red. */
+function QueryEditor({ label, line, width, span }: { label: string; line: LineState; width: number; span?: { start: number; end: number } }) {
+  const cps = [...line.text];
+  const { start, end } = lineWindow(line, width - displayWidth(label) - 1);
+  const runs: { text: string; red: boolean; cursor: boolean }[] = [];
+  for (let i = start; i < Math.max(end, line.cursor + 1); i++) {
+    const cursor = i === line.cursor;
+    const text = sanitize(cps[i] ?? " ") || (cursor ? " " : "");
+    if (!text) continue;
+    const red = span !== undefined && i >= span.start && i < span.end;
+    const last = runs.at(-1);
+    if (last && !cursor && !last.cursor && last.red === red) last.text += text;
+    else runs.push({ text, red, cursor });
+  }
+  return (
+    <Text wrap="truncate-end">
+      <Text bold>{label}</Text>
+      {runs.map((r, i) => (
+        <Text key={i} color={r.red ? "red" : undefined} inverse={r.cursor}>
+          {r.text}
+        </Text>
+      ))}
     </Text>
   );
 }
@@ -53,6 +79,9 @@ export function MessageLine({ width }: { width: number }) {
     content = <Editor label="/" line={mode.line} width={width} />;
   } else if (mode.kind === "prompt") {
     content = <Editor label={`${PROMPT_LABELS[mode.prompt]}${marked(mode.target)}: `} line={mode.line} width={width} />;
+  } else if (mode.kind === "query") {
+    const span = mode.preview?.for === mode.line.text ? mode.preview.span : undefined;
+    content = <QueryEditor label={`View “${truncate(singleLine(mode.name), 24)}”: `} line={mode.line} width={width} {...(span && { span })} />;
   } else if (mode.kind === "picker") {
     content = <Picker mode={mode} />;
   } else if (mode.kind === "confirm") {
@@ -129,6 +158,46 @@ export function PromptPreviewLine({ width }: { width: number }) {
     content = (
       <Text dimColor wrap="truncate-end">
         {(mode.target.bulk && BULK_HINTS[mode.prompt]) || PROMPT_HINTS[mode.prompt]}
+      </Text>
+    );
+  }
+  return (
+    <Box width={width} height={1} flexShrink={0}>
+      {content}
+    </Box>
+  );
+}
+
+const QUERY_HINT = "#label is:next priority>=high due_date<=today+3d any:( … ) sort:-priority count:off · enter saves";
+
+/** Above the status bar while a :view prompt is open: why enter did not save, a conflict, the preview, or a hint. */
+export function QueryPreviewLine({ width }: { width: number }) {
+  const mode = useUi((s) => (s.mode.kind === "query" ? s.mode : undefined));
+  const toast = useUi((s) => s.toast);
+  if (!mode) return null;
+  let content;
+  if (toast?.level === "error" || mode.error !== undefined) {
+    content = (
+      <Text color="red" wrap="truncate-end">
+        {singleLine(mode.error ?? toast?.text ?? "")}
+      </Text>
+    );
+  } else if (mode.conflict !== undefined) {
+    content = (
+      <Text color="yellow" wrap="truncate-end">
+        Changed elsewhere to “{truncate(singleLine(mode.conflict), Math.max(10, width - 45))}” — enter overwrites · esc discards
+      </Text>
+    );
+  } else if (mode.preview && mode.preview.for === mode.line.text) {
+    content = (
+      <Text color={mode.preview.warn ? "red" : "cyan"} wrap="truncate-end">
+        {singleLine(mode.preview.text)}
+      </Text>
+    );
+  } else {
+    content = (
+      <Text dimColor wrap="truncate-end">
+        {QUERY_HINT}
       </Text>
     );
   }

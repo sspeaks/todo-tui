@@ -28,6 +28,16 @@ export interface PromptPreview {
   readonly warn: boolean;
 }
 
+/** What a :view prompt's text parses to, shown under it. */
+export interface QueryPreview {
+  readonly for: string;
+  /** "→ 12 items", or the first error. */
+  readonly text: string;
+  readonly warn: boolean;
+  /** The first error's span, in code points, coloured in the line. */
+  readonly span?: { readonly start: number; readonly end: number };
+}
+
 /** One input mode at a time owns the keys (m4_arch §1.1). */
 export type Mode =
   /** `pending`: a prefix typed so far, such as ["g"] or ["d"]. */
@@ -66,6 +76,29 @@ export type Mode =
   | { readonly kind: "picker"; readonly picker: "status"; readonly target: Target; readonly index: number }
   /** `dd`: y confirms, any other key cancels and is swallowed. */
   | { readonly kind: "confirm"; readonly text: string; readonly action: "delete"; readonly target: Target }
+  /** `:view delete`: as dd's, for a view. */
+  | { readonly kind: "confirm"; readonly text: string; readonly action: "delete_view"; readonly viewId: string; readonly name: string }
+  /**
+   * `:view new` / `:view edit`: query text (design 4.8) for a view, its
+   * ParseQuery preview below it.
+   */
+  | {
+      readonly kind: "query";
+      /** The view edited; unset for a new one. */
+      readonly viewId?: string;
+      readonly name: string;
+      /** The view's revision as the edit started from it, sent as expected_revision. */
+      readonly revision?: bigint;
+      /** The text the edit started from: what the view held. */
+      readonly base?: string;
+      readonly line: LineState;
+      /** ParseQuery's answer for `for`: the match count, or the first error and its span. */
+      readonly preview?: QueryPreview;
+      /** Why enter did not save. */
+      readonly error?: string;
+      /** The view's query on the server after a conflict, which the next enter overwrites. */
+      readonly conflict?: string;
+    }
   | { readonly kind: "command"; readonly line: LineState }
   /** `/`: the text narrowing the tab, live as it is typed. */
   | { readonly kind: "search"; readonly line: LineState }

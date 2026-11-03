@@ -32,6 +32,7 @@ function modeLabel(s: UiState): string {
     case "quickAdd":
       return "ADD";
     case "prompt":
+    case "query":
       return "EDIT";
     case "picker":
       return "STATUS";
@@ -72,6 +73,8 @@ function hints(s: UiState): string {
       return "y yes · any other key no";
     case "search":
       return "enter keep · esc clear";
+    case "query":
+      return "enter save · esc cancel";
     default:
       if (s.visual) return "move to mark · V or esc ends";
       return s.focus === "detail"

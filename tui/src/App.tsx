@@ -6,7 +6,7 @@ import { DetailPane } from "./components/DetailPane.js";
 import { HelpOverlay } from "./components/HelpOverlay.js";
 import { ControllerContext, useRows, useUi } from "./components/hooks.js";
 import { ListPane } from "./components/ListPane.js";
-import { MessageLine, PromptPreviewLine } from "./components/MessageLine.js";
+import { MessageLine, PromptPreviewLine, QueryPreviewLine } from "./components/MessageLine.js";
 import { QuickAddBar } from "./components/QuickAddBar.js";
 import { StatusBar } from "./components/StatusBar.js";
 import { TabBar } from "./components/TabBar.js";
@@ -60,6 +60,7 @@ export function App({ controller }: { controller: Controller }) {
           {mode === "quickAdd" ? <QuickAddBar width={columns} /> : null}
           <Body shape={shape} />
           {mode === "prompt" ? <PromptPreviewLine width={columns} /> : null}
+          {mode === "query" ? <QueryPreviewLine width={columns} /> : null}
           <StatusBar width={columns} />
           <MessageLine width={columns} />
         </Box>

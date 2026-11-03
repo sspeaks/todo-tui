@@ -24,7 +24,7 @@ export interface SetupOptions {
   /** The ItemService client actions call (default: the daemon's), e.g. one that holds or fails calls. */
   items?: (items: ItemsClient) => ItemsClient;
   /** E's editor, the state dir, ctrl-z's stop. */
-  controller?: Pick<ControllerOptions, "editor" | "stateDir" | "stopProcess">;
+  controller?: Pick<ControllerOptions, "editor" | "stateDir" | "stopProcess" | "views">;
 }
 
 /** A started controller over FakeDaemon, 100×30 (a 27-row list), on the first tab with its rows loaded. */

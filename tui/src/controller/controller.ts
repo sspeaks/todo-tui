@@ -12,6 +12,7 @@ import {
   type LiveStore,
   type LiveView,
   type ViewSnapshot,
+  type ViewsClient,
   create,
   envFromProcess,
   equals,
@@ -40,6 +41,7 @@ import { Narrowing } from "./narrow.js";
 import { stopSelf } from "./job.js";
 import { DEFAULT_TIMING, Pipeline, type Timing } from "./pipeline.js";
 import { Prompts } from "./prompts.js";
+import { Views } from "./views.js";
 import { QuickAdd, typedLines } from "./quick-add.js";
 import { type Input, InputQueue } from "./queue.js";
 
@@ -65,6 +67,8 @@ export interface ControllerOptions {
   stopProcess?: () => Promise<boolean>;
   /** The default bindings, before config's [keymap] (default: BINDINGS). */
   bindings?: readonly Binding[];
+  /** The ViewService client :view calls (default: one over the store's transport). */
+  views?: ViewsClient;
 }
 
 /** How a toast is cut when it does not fit (Toast.keepEnd). */
@@ -76,7 +80,7 @@ export interface ToastOptions {
 const NAVIGATION: ReadonlySet<Action["type"]> = new Set(["move", "top", "bottom", "half_page", "view", "view_step"]);
 
 /** The modes that edit a line of text, where alt+X can be a word edit. */
-const TEXT_MODES: ReadonlySet<Mode["kind"]> = new Set(["quickAdd", "prompt", "command", "search"]);
+const TEXT_MODES: ReadonlySet<Mode["kind"]> = new Set(["quickAdd", "prompt", "command", "search", "query"]);
 
 const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n));
 
@@ -93,6 +97,7 @@ const describe = (err: unknown) => (err instanceof Error ? err.message : String(
 export class Controller {
   readonly store: LiveStore;
   readonly items: ItemsClient;
+  readonly views: ViewsClient | undefined;
   readonly ui: UiStore;
   readonly timing: Timing;
   /** Runs actions: the RPC, the response into the store, the reload. */
@@ -103,6 +108,7 @@ export class Controller {
   suspendTerminal: Suspend | undefined;
   private readonly actions: ItemActions;
   private readonly prompts: Prompts;
+  private readonly viewEdits: Views;
   private readonly quickAdd: QuickAdd;
   private readonly narrowing: Narrowing;
   private readonly editor: DescriptionEditor;
@@ -126,6 +132,7 @@ export class Controller {
   constructor(opts: ControllerOptions) {
     this.store = opts.store;
     this.items = opts.items;
+    this.views = opts.views;
     this.ui = opts.ui ?? new UiStore();
     this.now = opts.now ?? (() => new Date());
     this.timing = { ...DEFAULT_TIMING, ...opts.timing };
@@ -144,6 +151,7 @@ export class Controller {
     );
     this.actions = new ItemActions(this);
     this.prompts = new Prompts(this);
+    this.viewEdits = new Views(this);
     this.quickAdd = new QuickAdd(this);
     this.narrowing = new Narrowing(this);
     const stateDir = opts.stateDir;
@@ -201,7 +209,7 @@ export class Controller {
 
   /** Resolves once the quick-add and prompt previews, and `/`'s rows, have caught up with the text (tests). */
   async previewIdle(): Promise<void> {
-    await Promise.all([this.quickAdd.previewIdle(), this.prompts.previewIdle(), this.narrowing.idle()]);
+    await Promise.all([this.quickAdd.previewIdle(), this.prompts.previewIdle(), this.narrowing.idle(), this.viewEdits.previewIdle()]);
   }
 
   /**
@@ -602,7 +610,9 @@ export class Controller {
       case "picker":
         return this.actions.pickerKey(mode, input);
       case "confirm":
-        return this.actions.confirmKey(mode, input);
+        return mode.action === "delete_view" ? this.viewEdits.confirmKey(mode, input) : this.actions.confirmKey(mode, input);
+      case "query":
+        return this.viewEdits.key(mode, input);
       case "search":
         return this.narrowing.key(mode, input);
     }
@@ -640,7 +650,7 @@ export class Controller {
         this.setMode(normalMode);
         return this.runCommand(line.text);
       case "tab":
-        return this.setMode({ kind: "command", line: lineOf(completeCommand(line.text)) });
+        return this.setMode({ kind: "command", line: lineOf(completeCommand(line.text, this.store.getViews().views.map((v) => v.name))) });
       case "backspace":
         // As in vim, backspace on an empty command line leaves it.
         if (line.text === "") return this.setMode(normalMode);
@@ -657,6 +667,8 @@ export class Controller {
         return this.quickAdd.paste(mode, text);
       case "prompt":
         return this.prompts.paste(mode, text);
+      case "query":
+        return this.viewEdits.paste(mode, text);
       case "search":
         return this.narrowing.paste(mode, text);
       case "confirm":
@@ -725,6 +737,8 @@ export class Controller {
         return this.openSearch(r.args);
       case "config":
         return this.showConfig();
+      case "view":
+        return this.viewEdits.run(r.args);
     }
   }
 
@@ -919,6 +933,16 @@ export class Controller {
       return { ...s, ...left, lists, tab, focus: "list", overlay: { kind: "none" }, search };
     });
     this.sync();
+  }
+
+  /**
+   * Goes to the saved view `id` (a view just created), waiting up to a
+   * second for the change stream to bring it.
+   */
+  async goToView(id: string | undefined): Promise<void> {
+    if (id === undefined) return;
+    for (let waited = 0; !this.store.getSavedView(id) && waited < 1_000; waited += 20) await new Promise((r) => setTimeout(r, 20));
+    if (this.store.getSavedView(id)) this.switchTab(id);
   }
 
   /** The tabs, in order: the views, then the Search tab while open. */

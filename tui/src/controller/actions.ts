@@ -70,7 +70,7 @@ export const childrenFilter = (...ids: string[]) => ({
 });
 
 type Picker = Extract<Mode, { kind: "picker" }>;
-type Confirm = Extract<Mode, { kind: "confirm" }>;
+type Confirm = Extract<Mode, { kind: "confirm"; action: "delete" }>;
 
 /** The marked Items without those a marked ancestor's delete takes along anyway. */
 function withoutMarkedAncestors(items: readonly Item[], getItem: (id: string) => Item | undefined): Item[] {
