@@ -171,8 +171,11 @@ export function AddTodo({ visible, today, onClose }: { visible: boolean; today: 
                 <QuickDate title="Due" value={choices.due} today={today} onChange={(due) => choose({ due })} />
               </PillGroup>
               <Divider />
-              <PillGroup label="Priority and status" icon="flag-outline">
+              <PillGroup label="Priority" icon="flag-outline">
                 <QuickPriority value={choices.priority} onChange={(priority) => choose({ priority })} />
+              </PillGroup>
+              <Divider />
+              <PillGroup label="Status" icon="albums-outline">
                 <Pill
                   icon="arrow-forward-circle-outline"
                   label="Next"
