@@ -3,20 +3,20 @@ import { useClients, useConnection, useStatusCounts, useView, useViews, useLiveS
 import { tabQuery } from "@todo-tui/present";
 import { Stack, router } from "expo-router";
 import { useCallback, useEffect, useState } from "react";
-import { ActivityIndicator, Alert, FlatList, KeyboardAvoidingView, Platform, Pressable, RefreshControl, StyleSheet, Text, View } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { ActivityIndicator, Alert, FlatList, Pressable, RefreshControl, StyleSheet, Text, View } from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { describeError, isUnauthenticated } from "../errors";
 import { useSnack } from "../snack";
 import { type Theme, useTheme } from "../theme";
 import { useToday } from "../today";
 import { Banner } from "./Banner";
-import { Composer } from "./Composer";
+import { AddTodo } from "./AddTodo";
 import { ItemRow } from "./ItemRow";
 import { TabStrip } from "./TabStrip";
 
 const closed = (s: Status) => s === Status.DONE || s === Status.CANCELLED;
 
-/** The tabs, the selected tab's list, and adding; a row opens its item. */
+/** The tabs, the selected tab's list, and the + button that adds; a row opens its item. */
 export function Home({ onUnpair }: { onUnpair: (message?: string) => Promise<void> }) {
   const t = useTheme();
   const s = styles(t);
@@ -28,6 +28,8 @@ export function Home({ onUnpair }: { onUnpair: (message?: string) => Promise<voi
   const today = useToday();
   const [tab, setTab] = useState<string>();
   const [refreshing, setRefreshing] = useState(false);
+  const [adding, setAdding] = useState(false);
+  const insets = useSafeAreaInsets();
 
   const selected = tab !== undefined && views.views.some((v) => v.id === tab) ? tab : views.views[0]?.id;
 
@@ -77,14 +79,20 @@ export function Home({ onUnpair }: { onUnpair: (message?: string) => Promise<voi
       />
       <Banner />
       <TabStrip views={views.views} counts={counts.views} selected={selected} onSelect={setTab} />
-      <KeyboardAvoidingView style={s.page} behavior={Platform.OS === "ios" ? "padding" : undefined} keyboardVerticalOffset={100}>
-        {selected ? (
-          <List tab={selected} today={today} onToggle={toggle} onOpen={openItem} refreshing={refreshing} onRefresh={onRefresh} />
-        ) : (
-          <View style={s.center}>{views.status === "loading" ? <ActivityIndicator color={t.accent} /> : <Text style={s.message}>No views.</Text>}</View>
-        )}
-        <Composer today={today} />
-      </KeyboardAvoidingView>
+      {selected ? (
+        <List tab={selected} today={today} onToggle={toggle} onOpen={openItem} refreshing={refreshing} onRefresh={onRefresh} />
+      ) : (
+        <View style={s.center}>{views.status === "loading" ? <ActivityIndicator color={t.accent} /> : <Text style={s.message}>No views.</Text>}</View>
+      )}
+      <Pressable
+        style={({ pressed }) => [s.fab, { bottom: insets.bottom + 20 }, pressed && s.fabPressed]}
+        onPress={() => setAdding(true)}
+        accessibilityRole="button"
+        accessibilityLabel="New todo"
+      >
+        <Text style={s.fabPlus}>+</Text>
+      </Pressable>
+      <AddTodo visible={adding} today={today} onClose={() => setAdding(false)} />
     </SafeAreaView>
   );
 }
@@ -123,6 +131,8 @@ function List({
       refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={t.dim} />}
       ListEmptyComponent={<Text style={[s.message, s.empty]}>{view.status === "error" ? describeError(view.error) : "Nothing here."}</Text>}
       keyboardShouldPersistTaps="handled"
+      // Room to scroll the last row out from under the + button.
+      contentContainerStyle={s.listEnd}
     />
   );
 }
@@ -135,4 +145,22 @@ const styles = (t: Theme) =>
     empty: { marginTop: 48 },
     headerLink: { color: t.accent, fontSize: 15 },
     sep: { height: StyleSheet.hairlineWidth, backgroundColor: t.border, marginLeft: 52 },
+    listEnd: { paddingBottom: 96 },
+    fab: {
+      position: "absolute",
+      right: 20,
+      width: 60,
+      height: 60,
+      borderRadius: 30,
+      backgroundColor: t.accent,
+      alignItems: "center",
+      justifyContent: "center",
+      shadowColor: "#000",
+      shadowOpacity: 0.25,
+      shadowRadius: 8,
+      shadowOffset: { width: 0, height: 3 },
+      elevation: 6,
+    },
+    fabPressed: { opacity: 0.8, transform: [{ scale: 0.96 }] },
+    fabPlus: { color: t.onAccent, fontSize: 34, lineHeight: 38, fontWeight: "300" },
   });

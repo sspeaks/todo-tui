@@ -26,9 +26,8 @@ test("shows the views as tabs and the first one's items", async () => {
 test("adds with one tap per choice: due, priority, a label in use, a status", async () => {
   const { daemon } = await setup();
   await screen.findByText("buy milk");
-  const input = screen.getByPlaceholderText("Add a todo");
-  await fireEvent(input, "focus");
-  await fireEvent.changeText(input, "call dentist");
+  await fireEvent.press(screen.getByLabelText("New todo"));
+  await fireEvent.changeText(await screen.findByLabelText("Title"), "call dentist");
 
   await fireEvent.press(screen.getByLabelText("Due: Today"));
   await fireEvent.press(screen.getByLabelText("Priority +2"));
@@ -44,14 +43,28 @@ test("adds with one tap per choice: due, priority, a label in use, a status", as
   const captured = [...daemon.items.values()].find((i) => i.title === "call dentist");
   expect(captured).toMatchObject({ createdVia: CreatedVia.MOBILE, priority: Priority.HIGH, labels: ["errand"], status: Status.SOMEDAY });
   expect(captured?.dueDate).toBeDefined();
+  // The sheet closed, and the + button opens it empty again.
+  await waitFor(() => expect(screen.queryByLabelText("Title")).toBeNull());
+  await fireEvent.press(screen.getByLabelText("New todo"));
+  expect((await screen.findByLabelText("Title")).props.value).toBe("");
+});
+
+test("Cancel closes the sheet and drops what was typed", async () => {
+  await setup();
+  await screen.findByText("buy milk");
+  await fireEvent.press(screen.getByLabelText("New todo"));
+  await fireEvent.changeText(await screen.findByLabelText("Title"), "never mind");
+  await fireEvent.press(screen.getByText("Cancel"));
+  await waitFor(() => expect(screen.queryByLabelText("Title")).toBeNull());
+  await fireEvent.press(screen.getByLabelText("New todo"));
+  expect((await screen.findByLabelText("Title")).props.value).toBe("");
 });
 
 test("a repeat preset is one tap", async () => {
   const { daemon } = await setup();
   await screen.findByText("buy milk");
-  const input = screen.getByPlaceholderText("Add a todo");
-  await fireEvent(input, "focus");
-  await fireEvent.changeText(input, "water plants");
+  await fireEvent.press(screen.getByLabelText("New todo"));
+  await fireEvent.changeText(await screen.findByLabelText("Title"), "water plants");
   await fireEvent.press(screen.getByLabelText("Repeat Weekdays"));
   expect(await screen.findByText(/repeats every weekday/)).toBeTruthy();
   await fireEvent.press(screen.getByLabelText("Add"));
