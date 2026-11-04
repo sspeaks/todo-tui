@@ -42,5 +42,6 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
 /// edits: CreateView, UpdateView, DeleteView and MoveView. 12 added
 /// SystemService.Backup. 13 added Export and Import. 14 added the
 /// Item's energy. 15 added GetActivityReport and the [l48] config. 16
-/// added BuildMeetingLink and the [meetings] config.
-pub const API_MINOR: u32 = 16;
+/// added BuildMeetingLink and the [meetings] config. 17 added the
+/// [[instances]] of the config (P2, ADR-0006).
+pub const API_MINOR: u32 = 17;

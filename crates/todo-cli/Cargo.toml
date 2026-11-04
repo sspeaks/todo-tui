@@ -17,6 +17,8 @@ todo-proto.workspace = true
 todo-daemon.workspace = true
 todo-core.workspace = true
 todo-store.workspace = true
+todo-sync.workspace = true
+todo-jira.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 futures-util.workspace = true
@@ -31,6 +33,7 @@ tracing.workspace = true
 ulid.workspace = true
 
 [dev-dependencies]
+todo-jira = { workspace = true, features = ["testing"] }
 rusqlite.workspace = true
 rustix = { workspace = true, features = ["pty"] }
 serde_json.workspace = true

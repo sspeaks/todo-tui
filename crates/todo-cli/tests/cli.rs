@@ -1310,3 +1310,77 @@ fn export_then_import_into_a_fresh_home() {
         text(&out.stderr)
     );
 }
+
+/// `todo sync check` against a fake Jira on 127.0.0.1: the token named by
+/// the config, a bad one, and none configured. No daemon starts.
+#[test]
+fn sync_check_reads_who_the_token_is() {
+    // The fake serves from the runtime's own threads while `todo` runs.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let fake = rt.block_on(todo_jira::fake::FakeJira::start("good-token"));
+    let h = Home::new();
+    let none = h.todo(&["sync", "check"]);
+    assert!(!none.status.success());
+    assert!(
+        text(&none.stderr).contains("no [[instances]] to sync"),
+        "{}",
+        text(&none.stderr)
+    );
+    let config = h.home.join("config.toml");
+    let write = |token_env: &str| {
+        std::fs::write(
+            &config,
+            format!(
+                "[[instances]]\nid = \"work-jira\"\nkind = \"jira-dc\"\nbase_url = \"{}\"\ncredential = \"env:{token_env}\"\n",
+                fake.base_url()
+            ),
+        )
+        .unwrap();
+    };
+    write("TODO_TEST_PAT");
+    let ok = h
+        .command(&["sync", "check"])
+        .env("TODO_TEST_PAT", "good-token")
+        .output()
+        .unwrap();
+    assert!(ok.status.success(), "{}", text(&ok.stderr));
+    assert_eq!(
+        text(&ok.stdout),
+        "work-jira: ok as Dana Example (JIRAUSER10100), time zone America/Los_Angeles\n"
+    );
+    let bad = h
+        .command(&["sync", "check"])
+        .env("TODO_TEST_PAT", "wrong")
+        .output()
+        .unwrap();
+    assert!(!bad.status.success());
+    assert!(
+        text(&bad.stdout).contains("the token was refused (401)"),
+        "{}",
+        text(&bad.stdout)
+    );
+    let unset = h
+        .command(&["sync", "check"])
+        .env_remove("TODO_TEST_PAT")
+        .output()
+        .unwrap();
+    assert!(
+        text(&unset.stdout).contains("work-jira: credential env:TODO_TEST_PAT: not found"),
+        "{}",
+        text(&unset.stdout)
+    );
+    // A file that is not TOML says so, rather than "no instances".
+    std::fs::write(&config, "[[instances]]\nid = \"unclosed\n").unwrap();
+    let broken = h.todo(&["sync", "check"]);
+    assert!(
+        text(&broken.stderr).contains("line "),
+        "{}",
+        text(&broken.stderr)
+    );
+    assert!(!socket_in(&h.home.join("run")), "check needs no daemon");
+    drop(fake);
+}

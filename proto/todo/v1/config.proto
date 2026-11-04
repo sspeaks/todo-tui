@@ -29,6 +29,27 @@ message ConfigSnapshot {
   google.protobuf.Timestamp loaded_at = 8;
   L48Config l48 = 9;
   MeetingsConfig meetings = 10;
+  // [[instances]] (design 8.2): the tracker connections that sync, without
+  // their credentials.
+  repeated InstanceConfig instances = 11;
+}
+
+// One [[instances]] entry (ADR-0006).
+message InstanceConfig {
+  string id = 1;
+  // "jira-dc".
+  string kind = 2;
+  string base_url = 3;
+  repeated ScopeConfig scopes = 4;
+  // Between pulls with a TUI connected, and otherwise.
+  uint32 poll_seconds = 5;
+  uint32 idle_poll_seconds = 6;
+}
+
+message ScopeConfig {
+  string name = 1;
+  // Tracker-native (JQL).
+  string query = 2;
 }
 
 // [meetings] (design 2.9).

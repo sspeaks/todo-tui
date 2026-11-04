@@ -9,6 +9,7 @@ mod report;
 mod rpc;
 mod spawn;
 mod status;
+mod sync;
 mod undo;
 
 use std::fmt::Display;
@@ -68,6 +69,11 @@ enum Command {
         #[arg(long)]
         read_only: bool,
     },
+    /// Jira sync (design 5): check an instance's token.
+    Sync {
+        #[command(subcommand)]
+        action: SyncAction,
+    },
     /// The config file: where it is, what is wrong with it, and reloading it.
     Config {
         #[command(subcommand)]
@@ -117,6 +123,12 @@ enum BackupAction {
     Now,
     /// List the backups, oldest first.
     List,
+}
+
+#[derive(Subcommand)]
+enum SyncAction {
+    /// Check each Jira instance's config and token, reading only: no daemon needed.
+    Check,
 }
 
 #[derive(Subcommand)]
@@ -185,6 +197,11 @@ async fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
             };
         }
         Command::Restore { path, yes } => return backup::restore(&paths, &path, yes).await,
+        Command::Sync { action } => {
+            return match action {
+                SyncAction::Check => sync::check(&paths).await,
+            };
+        }
         Command::Config { action } => {
             return match action {
                 ConfigAction::Path => Ok(config::path(&paths)),

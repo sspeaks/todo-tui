@@ -15,6 +15,10 @@ use todo_core::Weekday;
 use todo_core::report::ReportConfig;
 use todo_proto::convert::{EnumField as _, timestamp_to_proto};
 use todo_proto::v1;
+use todo_sync::instance::{
+    POLL_IDLE, POLL_INTERACTIVE, default_cancelled_resolutions, default_scopes, tracker_base_url,
+};
+use todo_sync::{CredentialRef, Instance, Scope, TrackerKind};
 use tokio::sync::{Mutex, watch};
 
 /// The config file format this build reads.
@@ -43,6 +47,8 @@ pub struct Config {
     pub l48: ReportConfig,
     /// `[meetings] provider`: false for "none" (design 2.9).
     pub meetings: bool,
+    /// `[[instances]]` (design 8.2, ADR-0006): at most one is used in M9.
+    pub instances: Vec<Instance>,
     pub warnings: Vec<Warning>,
     pub loaded_at: Timestamp,
 }
@@ -119,6 +125,7 @@ impl Config {
             },
             l48: ReportConfig::default(),
             meetings: true,
+            instances: Vec::new(),
             warnings: Vec::new(),
             loaded_at: Timestamp::now(),
         }
@@ -196,6 +203,25 @@ impl From<&Config> for v1::ConfigSnapshot {
                 interval: c.backup.interval.name().to_owned(),
                 retain_days: c.backup.retain_days,
             }),
+            instances: c
+                .instances
+                .iter()
+                .map(|i| v1::InstanceConfig {
+                    id: i.id.clone(),
+                    kind: i.kind.name().to_owned(),
+                    base_url: i.base_url.clone(),
+                    scopes: i
+                        .scopes
+                        .iter()
+                        .map(|s| v1::ScopeConfig {
+                            name: s.name.clone(),
+                            query: s.query.clone(),
+                        })
+                        .collect(),
+                    poll_seconds: u32::try_from(i.poll_interactive.as_secs()).unwrap_or(u32::MAX),
+                    idle_poll_seconds: u32::try_from(i.poll_idle.as_secs()).unwrap_or(u32::MAX),
+                })
+                .collect(),
             meetings: Some(v1::MeetingsConfig {
                 provider: if c.meetings { "teams" } else { "none" }.to_owned(),
             }),
@@ -258,7 +284,7 @@ impl<'a> Reader<'a> {
                 "backup" => self.section("backup", value, Reader::backup),
                 "l48" => self.section("l48", value, Reader::l48),
                 "meetings" => self.section("meetings", value, Reader::meetings),
-                "instances" => self.warn(key, "not used until Jira sync (P2)"),
+                "instances" => self.instances(value),
                 "assistant" => self.warn(key, "not used until the Claude assistant (P3)"),
                 "stale" => self.warn(key, "not used until stale reviews (P4)"),
                 _ => self.warn(quote_key(&key), "unknown key; ignored"),
@@ -345,6 +371,192 @@ impl<'a> Reader<'a> {
         if retain_invalid {
             self.config.backup.enabled = false;
         }
+    }
+
+    /// `[[instances]]`: each checked, one with an error skipped (its warnings
+    /// say why); only the first good one is used for now.
+    fn instances(&mut self, value: toml::Value) {
+        let toml::Value::Array(entries) = value else {
+            return self.warn("instances", "must be a list of tables ([[instances]])");
+        };
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|h| h.is_absolute());
+        for (i, entry) in entries.into_iter().enumerate() {
+            let at = format!("instances[{i}]");
+            let toml::Value::Table(table) = entry else {
+                self.warn(at, "must be a table");
+                continue;
+            };
+            let Some(instance) = self.instance(&at, table, home.as_deref()) else {
+                continue;
+            };
+            if self.config.instances.iter().any(|o| o.id == instance.id) {
+                self.warn(
+                    format!("{at}.id"),
+                    format!("{:?} is used twice; this one is skipped", instance.id),
+                );
+            } else if !self.config.instances.is_empty() {
+                self.warn(at, "only one instance syncs for now; this one is skipped");
+            } else {
+                self.config.instances.push(instance);
+            }
+        }
+    }
+
+    fn instance(&mut self, at: &str, table: toml::Table, home: Option<&Path>) -> Option<Instance> {
+        let mut ok = true;
+        let given: Vec<String> = table.keys().cloned().collect();
+        let (mut id, mut kind, mut base_url, mut credential) = (None, None, None, None);
+        let mut scopes = default_scopes();
+        let mut poll = POLL_INTERACTIVE;
+        let mut cancelled = default_cancelled_resolutions();
+        for (key, value) in table {
+            let path = format!("{at}.{}", quote_key(&key));
+            let text = value.as_str().map(str::trim);
+            match key.as_str() {
+                "id" => match text {
+                    Some(s)
+                        if !s.is_empty()
+                            && s.chars()
+                                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') =>
+                    {
+                        id = Some(s.to_owned());
+                    }
+                    _ => {
+                        ok = false;
+                        self.warn(
+                            path,
+                            "must be a name of letters, digits, - and _, e.g. \"work-jira\"",
+                        );
+                    }
+                },
+                "kind" => {
+                    match text.and_then(TrackerKind::from_name) {
+                        Some(k) => kind = Some(k),
+                        None => {
+                            ok = false;
+                            self.warn(path, "must be \"jira-dc\" (Jira Data Center); Jira Cloud is not built yet");
+                        }
+                    }
+                }
+                "base_url" => match text.map(tracker_base_url) {
+                    Some(Ok(url)) => base_url = Some(url),
+                    Some(Err(why)) => {
+                        ok = false;
+                        self.warn(path, why);
+                    }
+                    None => {
+                        ok = false;
+                        self.warn(path, "must be an https:// address, e.g. \"https://jira.example.com\" (http:// only to this machine)");
+                    }
+                },
+                "credential" => match text.map(|s| CredentialRef::parse(s, home)) {
+                    Some(Ok(r)) => credential = Some(r),
+                    Some(Err(why)) => {
+                        ok = false;
+                        self.warn(path, why);
+                    }
+                    None => {
+                        ok = false;
+                        self.warn(path, "must be keychain:…, env:… or file:…");
+                    }
+                },
+                "scopes" => match self.scopes(&path, value) {
+                    Some(s) => scopes = s,
+                    None => ok = false,
+                },
+                "poll_seconds" => match value.as_integer().and_then(|v| u64::try_from(v).ok()) {
+                    Some(s @ 15..=86_400) => poll = std::time::Duration::from_secs(s),
+                    _ => self.warn(
+                        path,
+                        "must be a whole number of seconds from 15 to 86400; using 60",
+                    ),
+                },
+                "cancelled_resolutions" => match value.as_array().and_then(|a| {
+                    a.iter()
+                        .map(|v| v.as_str().map(str::to_owned))
+                        .collect::<Option<Vec<_>>>()
+                }) {
+                    Some(names) => cancelled = names,
+                    None => self.warn(
+                        path,
+                        "must be a list of resolution names; using the defaults",
+                    ),
+                },
+                "email" | "promote_default" | "subtask_issue_type" | "priority_map"
+                | "assistant_enabled" => {
+                    self.warn(path, "not used until pushes and promote arrive");
+                }
+                _ => self.warn(path, "unknown key; ignored"),
+            }
+        }
+        let need = |name: &str, present: bool, this: &mut Self| {
+            // A key given with a bad value has said so already.
+            if !present && !given.iter().any(|k| k == name) {
+                this.warn(format!("{at}.{name}"), "is required");
+            }
+            present
+        };
+        ok &= need("id", id.is_some(), self)
+            & need("kind", kind.is_some(), self)
+            & need("base_url", base_url.is_some(), self)
+            & need("credential", credential.is_some(), self);
+        if !ok {
+            self.warn(
+                at,
+                "skipped: it does not sync until the errors above are fixed",
+            );
+            return None;
+        }
+        Some(Instance {
+            id: id?,
+            kind: kind?,
+            base_url: base_url?,
+            credential: credential?,
+            scopes,
+            poll_interactive: poll,
+            poll_idle: POLL_IDLE.max(poll),
+            cancelled_resolutions: cancelled,
+        })
+    }
+
+    /// `scopes = [{ name, query }]`, not empty, names unique.
+    fn scopes(&mut self, path: &str, value: toml::Value) -> Option<Vec<Scope>> {
+        let bad = |this: &mut Self| {
+            this.warn(
+                path,
+                "must be a list of { name = \"…\", query = \"<JQL>\" }",
+            );
+            None
+        };
+        let Some(list) = value.as_array().filter(|l| !l.is_empty()) else {
+            return bad(self);
+        };
+        let mut out: Vec<Scope> = Vec::new();
+        for entry in list {
+            let t = entry.as_table();
+            let name = t
+                .and_then(|t| t.get("name"))
+                .and_then(|v| v.as_str())
+                .map(str::trim);
+            let query = t
+                .and_then(|t| t.get("query"))
+                .and_then(|v| v.as_str())
+                .map(str::trim);
+            match (name, query) {
+                (Some(n), Some(q))
+                    if !n.is_empty() && !q.is_empty() && !out.iter().any(|s| s.name == n) =>
+                {
+                    out.push(Scope {
+                        name: n.to_owned(),
+                        query: q.to_owned(),
+                    });
+                }
+                _ => return bad(self),
+            }
+        }
+        Some(out)
     }
 
     fn meetings(&mut self, table: toml::Table) {
@@ -696,6 +908,90 @@ mod tests {
     }
 
     #[test]
+    fn reads_an_instance() {
+        let config = parse(
+            r#"
+            [[instances]]
+            id = "work-jira"
+            kind = "jira-dc"
+            base_url = "https://jira.example.com/"
+            credential = "env:TODO_JIRA_PAT"
+            scopes = [{ name = "mine", query = "assignee = currentUser()" }]
+            poll_seconds = 120
+            cancelled_resolutions = ["Won't Do"]
+            "#,
+        );
+        assert_eq!(config.warnings, vec![]);
+        let [i] = &config.instances[..] else {
+            panic!("{:?}", config.instances)
+        };
+        assert_eq!(
+            (i.id.as_str(), i.kind, i.base_url.as_str()),
+            (
+                "work-jira",
+                TrackerKind::JiraDataCenter,
+                "https://jira.example.com"
+            )
+        );
+        assert_eq!(i.credential, CredentialRef::Env("TODO_JIRA_PAT".into()));
+        assert_eq!(i.scopes[0].query, "assignee = currentUser()");
+        assert_eq!(i.poll_interactive, std::time::Duration::from_secs(120));
+        assert_eq!(i.poll_idle, POLL_IDLE);
+        assert_eq!(i.cancelled_resolutions, ["Won't Do"]);
+        // The defaults: the "mine" scope.
+        let plain = parse(
+            "[[instances]]\nid = \"j\"\nkind = \"jira-dc\"\nbase_url = \"https://j.example.com\"\ncredential = \"env:X\"\n",
+        );
+        assert_eq!(plain.instances[0].scopes, default_scopes());
+    }
+
+    #[test]
+    fn a_bad_instance_is_skipped_with_its_reasons() {
+        assert_eq!(
+            warnings(
+                "[[instances]]\nid = \"a b\"\nkind = \"jira-cloud\"\nbase_url = \"http://x\"\ncredential = \"vault:x\"\nemail = \"me@example.com\"\n"
+            ),
+            [
+                "instances[0].id: must be a name of letters, digits, - and _, e.g. \"work-jira\"",
+                "instances[0].kind: must be \"jira-dc\" (Jira Data Center); Jira Cloud is not built yet",
+                "instances[0].base_url: must be an https:// address, e.g. \"https://jira.example.com\" (http:// only to this machine)",
+                "instances[0].credential: vault: must be keychain:…, env:… or file:…",
+                "instances[0].email: not used until pushes and promote arrive",
+                "instances[0]: skipped: it does not sync until the errors above are fixed",
+            ]
+        );
+        assert_eq!(
+            warnings("[[instances]]\nid = \"j\"\n"),
+            [
+                "instances[0].kind: is required",
+                "instances[0].base_url: is required",
+                "instances[0].credential: is required",
+                "instances[0]: skipped: it does not sync until the errors above are fixed",
+            ]
+        );
+        let two = "[[instances]]\nid = \"a\"\nkind = \"jira-dc\"\nbase_url = \"https://a.example.com\"\ncredential = \"env:A\"\n\
+                   [[instances]]\nid = \"b\"\nkind = \"jira-dc\"\nbase_url = \"https://b.example.com\"\ncredential = \"env:B\"\n";
+        assert_eq!(
+            warnings(two),
+            ["instances[1]: only one instance syncs for now; this one is skipped"]
+        );
+        assert_eq!(parse(two).instances.len(), 1);
+        assert_eq!(
+            warnings(
+                "[[instances]]\nid = \"a\"\nkind = \"jira-dc\"\nbase_url = \"https://a.example.com\"\ncredential = \"env:A\"\nscopes = []\n"
+            ),
+            [
+                "instances[0].scopes: must be a list of { name = \"…\", query = \"<JQL>\" }",
+                "instances[0]: skipped: it does not sync until the errors above are fixed",
+            ]
+        );
+        assert_eq!(
+            warnings("instances = 3"),
+            ["instances: must be a list of tables ([[instances]])"]
+        );
+    }
+
+    #[test]
     fn a_bad_l48_value_warns_and_falls_back() {
         assert_eq!(
             warnings("[l48]\nwindow_days = 0\nworking_days = []\nlater = 1"),
@@ -787,13 +1083,10 @@ mod tests {
     #[test]
     fn unknown_and_future_keys_warn() {
         assert_eq!(
-            warnings(
-                "colour = 1\n[ui]\ntheme = \"dark\"\n[[instances]]\nid = \"w\"\n[assistant]\n[stale]\n"
-            ),
+            warnings("colour = 1\n[ui]\ntheme = \"dark\"\n[assistant]\n[stale]\n"),
             [
                 "colour: unknown key; ignored",
                 "ui.theme: unknown key; ignored",
-                "instances: not used until Jira sync (P2)",
                 "assistant: not used until the Claude assistant (P3)",
                 "stale: not used until stale reviews (P4)",
             ]
