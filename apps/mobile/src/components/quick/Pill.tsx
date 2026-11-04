@@ -1,10 +1,21 @@
 import { Ionicons } from "@expo/vector-icons";
-import type { ReactNode } from "react";
-import { Pressable, StyleSheet, Text, View } from "react-native";
+import { type ReactNode, createContext, useContext } from "react";
+import { Keyboard, Pressable, StyleSheet, Text, View } from "react-native";
 import { tick } from "../../haptics";
 import { type Theme, useTheme } from "../../theme";
 
 type Icon = keyof typeof Ionicons.glyphMap;
+
+/**
+ * How the pills inside look and behave: `compact` (squarer, shorter, for a
+ * sheet that must fit on one screen) and `dismissKeyboard` (a choice closes
+ * the keyboard, so every section is in sight). Off by default.
+ */
+export interface PillStyle {
+  compact: boolean;
+  dismissKeyboard: boolean;
+}
+export const PillStyleContext = createContext<PillStyle>({ compact: false, dismissKeyboard: false });
 
 /**
  * One tap: `on` shows it chosen (filled, with a check). `icon` leads the
@@ -27,12 +38,14 @@ export function Pill({
 }) {
   const t = useTheme();
   const s = styles(t);
+  const { compact, dismissKeyboard } = useContext(PillStyleContext);
   const fg = on ? t.onAccent : t.text;
   return (
     <Pressable
-      style={({ pressed }) => [s.pill, on && s.on, pressed && s.pressed]}
+      style={({ pressed }) => [s.pill, compact && s.compact, on && s.on, pressed && s.pressed]}
       onPress={() => {
         tick();
+        if (dismissKeyboard) Keyboard.dismiss();
         onPress();
       }}
       hitSlop={4}
@@ -41,7 +54,7 @@ export function Pill({
       accessibilityLabel={accessibilityLabel ?? label}
     >
       {on ? <Ionicons name="checkmark" size={15} color={fg} /> : dot ? <View style={[s.dot, { backgroundColor: dot }]} /> : icon ? <Ionicons name={icon} size={15} color={t.dim} /> : null}
-      <Text style={[s.text, { color: fg }, on && s.onText]} numberOfLines={1}>
+      <Text style={[s.text, compact && s.compactText, { color: fg }, on && s.onText]} numberOfLines={1}>
         {label}
       </Text>
     </Pressable>
@@ -58,8 +71,9 @@ export function PillRow({ children }: { children: ReactNode }) {
 export function PillGroup({ label, icon, children }: { label: string; icon: Icon; children: ReactNode }) {
   const t = useTheme();
   const s = styles(t);
+  const { compact } = useContext(PillStyleContext);
   return (
-    <View style={s.group}>
+    <View style={[s.group, compact && s.compactGroup]}>
       <View style={s.heading}>
         <Ionicons name={icon} size={14} color={t.dim} />
         <Text style={s.label}>{label}</Text>
@@ -86,6 +100,10 @@ const styles = (t: Theme) =>
       maxWidth: 240,
     },
     on: { backgroundColor: t.accent },
+    // Squarer and shorter: the add sheet fits on one screen.
+    compact: { borderRadius: 8, minHeight: 32, paddingHorizontal: 10, gap: 5 },
+    compactText: { fontSize: 14 },
+    compactGroup: { gap: 6, paddingVertical: 8, paddingHorizontal: 12 },
     pressed: { opacity: 0.7 },
     dot: { width: 9, height: 9, borderRadius: 5 },
     text: { fontSize: 15 },
