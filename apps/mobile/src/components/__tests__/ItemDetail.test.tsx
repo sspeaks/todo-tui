@@ -15,13 +15,15 @@ test("sets the priority, a due date and the status", async () => {
   const { daemon } = await setup();
   await screen.findByDisplayValue("buy milk");
 
-  await fireEvent.press(screen.getByLabelText("Priority"));
-  await fireEvent.press(await screen.findByText("Medium"));
+  await fireEvent.press(screen.getByLabelText("Priority +3"));
   expect(await screen.findByText("Priority +3 medium")).toBeTruthy();
   await waitFor(() => expect(daemon.items.get(ID)?.priority).toBe(Priority.MEDIUM));
+  // The chosen one again clears it.
+  await fireEvent.press(screen.getByLabelText("Priority +3"));
+  // No priority: NONE, or unset as FakeDaemon leaves it.
+  await waitFor(() => expect([Priority.UNSPECIFIED, Priority.NONE]).toContain(daemon.items.get(ID)?.priority));
 
-  await fireEvent.press(screen.getByLabelText("Due"));
-  await fireEvent.press(await screen.findByText("Tomorrow"));
+  await fireEvent.press(screen.getByLabelText("Due: Tomorrow"));
   await waitFor(() => expect(daemon.items.get(ID)?.dueDate).toBeDefined());
 
   await fireEvent.press(screen.getByText("Next"));
@@ -46,19 +48,32 @@ test("edits the title and saves notes", async () => {
   expect(screen.queryByText("Save notes")).toBeNull();
 });
 
-test("sets who it waits on, then clears labels", async () => {
+test("sets who it waits on, then takes a label off in one tap", async () => {
   const { daemon } = await setup();
   await screen.findByDisplayValue("buy milk");
-  await fireEvent.press(screen.getByLabelText("Waiting on"));
+  await fireEvent.press(screen.getByLabelText("Waiting on someone else"));
   const name = await screen.findByPlaceholderText(/Name/);
   await fireEvent.changeText(name, "the vendor");
   await fireEvent(name, "submitEditing");
   await waitFor(() => expect(daemon.items.get(ID)?.waiting?.on?.ref).toEqual({ case: "freeText", value: "the vendor" }));
-  expect(await screen.findByLabelText("Follow up")).toBeTruthy();
+  expect(await screen.findByText("Follow up")).toBeTruthy();
 
-  await fireEvent.press(screen.getByLabelText("Labels"));
-  await fireEvent.press(await screen.findByText("Clear"));
+  // A name in use is then one tap, and so is taking it off again.
+  await fireEvent.press(await screen.findByLabelText("Waiting on the vendor"));
+  await waitFor(() => expect(daemon.items.get(ID)?.waiting).toBeUndefined());
+
+  await fireEvent.press(screen.getByRole("button", { name: "#errand" }));
   await waitFor(() => expect(daemon.items.get(ID)?.labels).toEqual([]));
+});
+
+test("repeats daily in one tap, and stops in one more", async () => {
+  const { daemon } = await setup();
+  await screen.findByDisplayValue("buy milk");
+  await fireEvent.press(screen.getByLabelText("Repeat Daily"));
+  await waitFor(() => expect(daemon.items.get(ID)?.recurrence?.rule?.kind.case).toBe("daily"));
+  expect(await screen.findByText(/^every day/)).toBeTruthy();
+  await fireEvent.press(screen.getByLabelText("Repeat Daily"));
+  await waitFor(() => expect(daemon.items.get(ID)?.recurrence?.rule).toBeUndefined());
 });
 
 test("deletes after confirming, and goes back", async () => {

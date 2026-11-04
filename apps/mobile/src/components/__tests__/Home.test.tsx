@@ -9,7 +9,7 @@ import { renderOn, stopStores } from "./render";
 afterEach(stopStores);
 
 const items = [
-  { id: "01JB0000000000000000000001", title: "buy milk", status: Status.INBOX },
+  { id: "01JB0000000000000000000001", title: "buy milk", status: Status.INBOX, labels: ["errand"] },
   { id: "01JB0000000000000000000002", title: "plan trip", status: Status.NEXT },
 ];
 
@@ -23,29 +23,41 @@ test("shows the views as tabs and the first one's items", async () => {
   expect(await screen.findByText("plan trip")).toBeTruthy();
 });
 
-test("adds with the buttons: a priority and a new label become one MOBILE capture", async () => {
+test("adds with one tap per choice: due, priority, a label in use, a status", async () => {
   const { daemon } = await setup();
   await screen.findByText("buy milk");
-  await fireEvent.changeText(screen.getByPlaceholderText("Add a todo"), "call dentist");
+  const input = screen.getByPlaceholderText("Add a todo");
+  await fireEvent(input, "focus");
+  await fireEvent.changeText(input, "call dentist");
 
-  await fireEvent.press(screen.getByText("Priority"));
-  await fireEvent.press(await screen.findByText("High"));
-  expect(await screen.findByText("+2 High")).toBeTruthy();
+  await fireEvent.press(screen.getByLabelText("Due: Today"));
+  await fireEvent.press(screen.getByLabelText("Priority +2"));
+  await fireEvent.press(screen.getByRole("button", { name: "#errand" }));
+  await fireEvent.press(screen.getByRole("button", { name: "Next" }));
+  // The chosen one again clears it.
+  await fireEvent.press(screen.getByRole("button", { name: "Next" }));
+  await fireEvent.press(screen.getByRole("button", { name: "Someday" }));
 
-  await fireEvent.press(screen.getByText("# Labels"));
-  await fireEvent.changeText(await screen.findByPlaceholderText("New label"), "home");
-  await fireEvent(screen.getByPlaceholderText("New label"), "submitEditing");
-  await fireEvent.press(screen.getByText("Done"));
-  expect(await screen.findByText("#home")).toBeTruthy();
-
-  expect(await screen.findByText("→ call dentist · +2 · #home")).toBeTruthy();
+  expect(await screen.findByText(/^→ call dentist · \+2 · \^.* · #errand · >someday$/)).toBeTruthy();
   await fireEvent.press(screen.getByLabelText("Add"));
   expect(await screen.findByText("Added: call dentist")).toBeTruthy();
-  expect(await screen.findByText("+2 call dentist")).toBeTruthy();
   const captured = [...daemon.items.values()].find((i) => i.title === "call dentist");
-  expect(captured).toMatchObject({ createdVia: CreatedVia.MOBILE, priority: Priority.HIGH, labels: ["home"] });
-  // The buttons reset for the next one.
-  expect(screen.getByText("Priority")).toBeTruthy();
+  expect(captured).toMatchObject({ createdVia: CreatedVia.MOBILE, priority: Priority.HIGH, labels: ["errand"], status: Status.SOMEDAY });
+  expect(captured?.dueDate).toBeDefined();
+});
+
+test("a repeat preset is one tap", async () => {
+  const { daemon } = await setup();
+  await screen.findByText("buy milk");
+  const input = screen.getByPlaceholderText("Add a todo");
+  await fireEvent(input, "focus");
+  await fireEvent.changeText(input, "water plants");
+  await fireEvent.press(screen.getByLabelText("Repeat Weekdays"));
+  expect(await screen.findByText(/repeats every weekday/)).toBeTruthy();
+  await fireEvent.press(screen.getByLabelText("Add"));
+  await screen.findByText("Added: water plants");
+  const captured = [...daemon.items.values()].find((i) => i.title === "water plants");
+  expect(captured?.recurrence?.rule?.kind.case).toBe("weekly");
 });
 
 test("completes an item and undoes it from the snackbar", async () => {

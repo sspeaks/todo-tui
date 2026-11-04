@@ -481,8 +481,9 @@ items. To use it everywhere: `ln -s ~/todo-tui/claude/skills/todo ~/.claude/skil
 `apps/mobile` is an Expo (React Native) app that talks to the daemon on your
 computer over [Tailscale](https://tailscale.com) ([ADR-0004](docs/adr/0004-remote-transport.md)).
 It shows the views as tabs with the same rows as the TUI. To add an item, type a
-title and set the rest with the buttons under it (due, priority, labels, waiting on,
-status, repeat), or type the capture syntax; a preview shows what will be captured.
+title and set the rest with one tap each in the rows above it (due, priority, status,
+repeat, the labels and names you use), or type the capture syntax; a preview shows
+what will be captured. The item screen has the same one-tap choices.
 Tap ○ to complete an item and ● to reopen it. Tap an item to edit its title, status,
 priority, due date, repeat, labels, waiting on and follow-up, hide-until date and
 notes, or to delete it. Every change can be undone from the snackbar. It is a thin client: it shows nothing while your

@@ -9,6 +9,7 @@ import {
   Priority,
   Status,
   deleteItem,
+  parseRecurrence,
   setRecurrence,
   setStatus,
   updateItem,
@@ -23,14 +24,15 @@ import { useKnown } from "../known";
 import { useSnack } from "../snack";
 import { type Theme, useTheme } from "../theme";
 import { useToday } from "../today";
-import { DateSheet } from "./pickers/DateSheet";
-import { LabelsSheet } from "./pickers/LabelsSheet";
-import { PrioritySheet } from "./pickers/PrioritySheet";
-import { RepeatSheet } from "./pickers/RepeatSheet";
 import { ALL_STATUSES, StatusPicker } from "./pickers/StatusPicker";
-import { WaitingSheet } from "./pickers/WaitingSheet";
+import { PillRow } from "./quick/Pill";
+import { type RepeatPreset, presetOf } from "./quick/presets";
+import { QuickDate } from "./quick/QuickDate";
+import { QuickLabels } from "./quick/QuickLabels";
+import { QuickPriority } from "./quick/QuickPriority";
+import { QuickRepeat } from "./quick/QuickRepeat";
+import { QuickWaiting } from "./quick/QuickWaiting";
 
-type Open = "priority" | "due" | "repeat" | "labels" | "waiting" | "followUp" | "defer";
 type Patch = Omit<MessageInitShape<typeof ItemSchema>, "id" | "$typeName">;
 // The plain-object form of Waiting (not the message, which needs $typeName).
 type WaitingInit = Extract<NonNullable<Patch["waiting"]>, { $typeName?: undefined }>;
@@ -57,11 +59,16 @@ function Loaded({ item }: { item: Item }) {
   const snack = useSnack();
   const today = useToday();
   const known = useKnown();
-  const [open, setOpen] = useState<Open>();
   /** The title and notes while being edited; undefined shows the Item's. */
   const [title, setTitle] = useState<string>();
   const [notes, setNotes] = useState<string>();
-  const close = () => setOpen(undefined);
+
+  const due = item.dueDate ? dayOf(item.dueDate) : undefined;
+  const defer = item.deferUntil ? dayOf(item.deferUntil) : undefined;
+  const waitingOn = personName(item.waiting?.on);
+  const followUp = item.waiting?.followUpOn ? dayOf(item.waiting.followUpOn) : undefined;
+  const rule = item.recurrence?.rule;
+  const isClosed = closed(item.status);
 
   /** The Item's waiting with `change` applied, as an init: its fields copied, not the message spread. */
   const waitingWith = (change: Partial<WaitingInit>): WaitingInit => {
@@ -120,6 +127,18 @@ function Loaded({ item }: { item: Item }) {
     }
   };
 
+  /** A preset tapped: resolved against the due date, then set (undefined stops it). */
+  const repeatPreset = async (preset: RepeatPreset | undefined) => {
+    if (preset === undefined) return changeRepeat(undefined);
+    try {
+      const res = await parseRecurrence(clients.items, preset, { timeoutMs: 5_000, ...(due !== undefined && { anchor: protoDate(due) }) });
+      if (!res.rule) return snack.show(res.warning || "Not a repeat rule");
+      await changeRepeat({ rule: res.rule });
+    } catch (err) {
+      snack.fail(err);
+    }
+  };
+
   const confirmDelete = () =>
     Alert.alert("Delete this item?", item.subtasksTotal ? "Its subtasks are deleted with it. Undo brings them back." : "Undo brings it back.", [
       { text: "Cancel", style: "cancel" },
@@ -138,12 +157,6 @@ function Loaded({ item }: { item: Item }) {
       },
     ]);
 
-  const due = item.dueDate ? dayOf(item.dueDate) : undefined;
-  const defer = item.deferUntil ? dayOf(item.deferUntil) : undefined;
-  const waitingOn = personName(item.waiting?.on);
-  const followUp = item.waiting?.followUpOn ? dayOf(item.waiting.followUpOn) : undefined;
-  const rule = item.recurrence?.rule;
-  const isClosed = closed(item.status);
   const notesDirty = notes !== undefined && notes !== item.description;
 
   return (
@@ -165,27 +178,83 @@ function Loaded({ item }: { item: Item }) {
 
         <StatusPicker value={item.status} options={ALL_STATUSES} onChange={changeStatus} />
 
-        <View style={s.card}>
-          <Field label="Priority" value={item.priority === Priority.NONE ? undefined : priorityName(item.priority)} onPress={() => setOpen("priority")} />
-          <Field label="Due" value={due === undefined ? undefined : dayLabel(due, today)} danger={item.isOverdue} onPress={() => setOpen("due")} />
-          <Field
-            label="Repeats"
-            value={repeatsLine(item, today) ?? (rule ? describeRule(rule) : undefined)}
-            hint={isClosed && !rule ? "Reopen it to set a repeat" : undefined}
-            onPress={isClosed ? undefined : () => setOpen("repeat")}
+        <Section label="Priority">
+          <QuickPriority
+            value={item.priority === Priority.NONE ? undefined : item.priority}
+            onChange={(pr) => void update(pr === undefined ? {} : { priority: pr }, ["priority"], pr === undefined ? "Priority cleared" : `Priority ${priorityName(pr)}`)}
           />
-          <Field label="Labels" value={item.labels.length ? item.labels.map((l) => `#${l}`).join(" ") : undefined} onPress={() => setOpen("labels")} />
-          <Field label="Waiting on" value={waitingOn || undefined} onPress={() => setOpen("waiting")} />
-          {item.waiting ? (
-            <Field
-              label="Follow up"
-              value={followUp === undefined ? undefined : dayLabel(followUp, today)}
-              danger={followUp !== undefined && followUp <= today}
-              onPress={() => setOpen("followUp")}
+        </Section>
+        <Section label="Due" value={due === undefined ? undefined : dayLabel(due, today)} danger={item.isOverdue}>
+          <QuickDate
+            title="Due"
+            value={due}
+            today={today}
+            onChange={(d) => void update(d === undefined ? {} : { dueDate: protoDate(d) }, ["due_date"], d === undefined ? "Due date cleared" : `Due ${dayLabel(d, today)}`)}
+          />
+        </Section>
+        <Section label="Repeats" value={repeatsLine(item, today) ?? (isClosed ? "Reopen it to set a repeat" : undefined)}>
+          {isClosed ? null : (
+            <QuickRepeat
+              preset={presetOf(rule)}
+              custom={rule && !presetOf(rule) ? describeRule(rule) : undefined}
+              anchor={due}
+              current={rule ? ruleText(rule) : undefined}
+              onPreset={(preset) => void repeatPreset(preset)}
+              onChange={(c) => void changeRepeat(c)}
             />
-          ) : null}
-          <Field label="Hide until" value={defer === undefined ? undefined : dayLabel(defer, today)} onPress={() => setOpen("defer")} last />
-        </View>
+          )}
+        </Section>
+        <Section label="Labels">
+          <QuickLabels
+            value={item.labels}
+            known={known.labels}
+            onChange={(labels) => void update({ labels }, ["labels"], labels.length ? `Labels ${labels.map((l) => `#${l}`).join(" ")}` : "Labels cleared")}
+          />
+        </Section>
+        <Section label="Waiting on">
+          <QuickWaiting
+            value={waitingOn || undefined}
+            known={known.names}
+            onChange={(name) =>
+              void update(
+                name === undefined ? {} : { waiting: waitingWith({ on: { ref: { case: "freeText", value: name } } }) },
+                ["waiting"],
+                name === undefined ? "No longer waiting" : `Waiting on ${name}`,
+              )
+            }
+          />
+        </Section>
+        {item.waiting ? (
+          <Section label="Follow up" value={followUp === undefined ? undefined : dayLabel(followUp, today)} danger={followUp !== undefined && followUp <= today}>
+            <QuickDate
+              title="Follow up"
+              value={followUp}
+              today={today}
+              onChange={(d) =>
+                void update(
+                  {
+                    waiting:
+                      d === undefined
+                        ? (({ followUpOn: _, ...rest }) => rest)(waitingWith({}))
+                        : waitingWith({ followUpOn: protoDate(d) }),
+                  },
+                  ["waiting.follow_up_on"],
+                  d === undefined ? "Follow-up cleared" : `Follow up ${dayLabel(d, today)}`,
+                )
+              }
+            />
+          </Section>
+        ) : null}
+        <Section label="Hide until" value={defer === undefined ? undefined : dayLabel(defer, today)}>
+          <QuickDate
+            title="Hide until"
+            value={defer}
+            today={today}
+            onChange={(d) =>
+              void update(d === undefined ? {} : { deferUntil: protoDate(d) }, ["defer_until"], d === undefined ? "Shown again" : `Hidden until ${dayLabel(d, today)}`)
+            }
+          />
+        </Section>
 
         <Text style={s.section}>Notes</Text>
         <TextInput
@@ -237,111 +306,25 @@ function Loaded({ item }: { item: Item }) {
         </Pressable>
       </ScrollView>
 
-      {open === "priority" ? (
-        <PrioritySheet
-          visible
-          value={item.priority}
-          onChange={(p) => void update(p === undefined ? {} : { priority: p }, ["priority"], p === undefined ? "Priority cleared" : `Priority ${priorityName(p)}`)}
-          onClose={close}
-        />
-      ) : null}
-      {open === "due" ? (
-        <DateSheet
-          title="Due"
-          visible
-          value={due}
-          today={today}
-          onChange={(d) => void update(d === undefined ? {} : { dueDate: protoDate(d) }, ["due_date"], d === undefined ? "Due date cleared" : `Due ${dayLabel(d, today)}`)}
-          onClose={close}
-        />
-      ) : null}
-      {open === "defer" ? (
-        <DateSheet
-          title="Hide until"
-          visible
-          value={defer}
-          today={today}
-          onChange={(d) =>
-            void update(d === undefined ? {} : { deferUntil: protoDate(d) }, ["defer_until"], d === undefined ? "Shown again" : `Hidden until ${dayLabel(d, today)}`)
-          }
-          onClose={close}
-        />
-      ) : null}
-      {open === "followUp" ? (
-        <DateSheet
-          title="Follow up"
-          visible
-          value={followUp}
-          today={today}
-          onChange={(d) =>
-            void update(
-              {
-                waiting:
-                  d === undefined
-                    ? (({ followUpOn: _, ...rest }) => rest)(waitingWith({}))
-                    : waitingWith({ followUpOn: protoDate(d) }),
-              },
-              ["waiting.follow_up_on"],
-              d === undefined ? "Follow-up cleared" : `Follow up ${dayLabel(d, today)}`,
-            )
-          }
-          onClose={close}
-        />
-      ) : null}
-      {open === "repeat" ? (
-        <RepeatSheet visible value={rule ? ruleText(rule) : undefined} anchor={due} onChange={(c) => void changeRepeat(c)} onClose={close} />
-      ) : null}
-      {open === "labels" ? (
-        <LabelsSheet
-          visible
-          value={item.labels}
-          known={known.labels}
-          onChange={(labels) => void update({ labels }, ["labels"], labels.length ? `Labels ${labels.map((l) => `#${l}`).join(" ")}` : "Labels cleared")}
-          onClose={close}
-        />
-      ) : null}
-      {open === "waiting" ? (
-        <WaitingSheet
-          visible
-          value={waitingOn || undefined}
-          known={known.names}
-          onChange={(name) =>
-            void update(
-              name === undefined ? {} : { waiting: waitingWith({ on: { ref: { case: "freeText", value: name } } }) },
-              ["waiting"],
-              name === undefined ? "No longer waiting" : `Waiting on ${name}`,
-            )
-          }
-          onClose={close}
-        />
-      ) : null}
     </KeyboardAvoidingView>
   );
 }
 
-function Field({
-  label,
-  value,
-  hint,
-  danger,
-  onPress,
-  last,
-}: {
-  label: string;
-  value: string | undefined;
-  hint?: string | undefined;
-  danger?: boolean;
-  onPress: (() => void) | undefined;
-  last?: boolean;
-}): ReactNode {
+/** A field: its name and (when set) how it reads, then its one-tap choices. */
+function Section({ label, value, danger, children }: { label: string; value?: string | undefined; danger?: boolean; children?: ReactNode }) {
   const s = styles(useTheme());
   return (
-    <Pressable style={[s.field, !last && s.fieldSep]} onPress={onPress} disabled={!onPress} accessibilityRole="button" accessibilityLabel={label}>
-      <Text style={s.fieldLabel}>{label}</Text>
-      <Text style={[s.fieldValue, value === undefined && s.fieldEmpty, danger && s.danger]} numberOfLines={2}>
-        {value ?? hint ?? (onPress ? "Add" : "—")}
-      </Text>
-    </Pressable>
+    <View style={s.field}>
+      <View style={s.fieldHead}>
+        <Text style={s.fieldLabel}>{label}</Text>
+        {value ? (
+          <Text style={[s.fieldValue, danger && s.danger]} numberOfLines={2}>
+            {value}
+          </Text>
+        ) : null}
+      </View>
+      {children ? <PillRow>{children}</PillRow> : null}
+    </View>
   );
 }
 
@@ -352,12 +335,10 @@ const styles = (t: Theme) =>
     content: { padding: 16, gap: 14, paddingBottom: 48 },
     title: { color: t.text, fontSize: 22, fontWeight: "600", padding: 0 },
     closedTitle: { color: t.dim, textDecorationLine: "line-through" },
-    card: { backgroundColor: t.surface, borderRadius: 12, overflow: "hidden" },
-    field: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingHorizontal: 14, paddingVertical: 13, gap: 12 },
-    fieldSep: { borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: t.border },
-    fieldLabel: { color: t.text, fontSize: 15 },
-    fieldValue: { color: t.text, fontSize: 15, flexShrink: 1, textAlign: "right" },
-    fieldEmpty: { color: t.dim },
+    field: { gap: 6, marginHorizontal: -16 },
+    fieldHead: { flexDirection: "row", justifyContent: "space-between", alignItems: "baseline", gap: 12, paddingHorizontal: 16 },
+    fieldLabel: { color: t.dim, fontSize: 13, textTransform: "uppercase" },
+    fieldValue: { color: t.text, fontSize: 14, flexShrink: 1, textAlign: "right" },
     danger: { color: t.danger, fontWeight: "600" },
     section: { color: t.dim, fontSize: 13, textTransform: "uppercase", marginTop: 4 },
     notes: { backgroundColor: t.surface, color: t.text, borderRadius: 12, padding: 12, minHeight: 120, fontSize: 15 },
