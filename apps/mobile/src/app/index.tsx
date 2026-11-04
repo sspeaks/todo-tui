@@ -1,4 +1,3 @@
-import { ClientsProvider, LiveStoreProvider } from "@todo-tui/client/react";
 import { Redirect } from "expo-router";
 import { ActivityIndicator, Pressable, StyleSheet, Text, View } from "react-native";
 import { Home } from "../components/Home";
@@ -29,13 +28,7 @@ export default function Index() {
         </View>
       );
     case "ready":
-      return (
-        <LiveStoreProvider store={session.store}>
-          <ClientsProvider clients={session.conn}>
-            <Home onUnpair={unpair} />
-          </ClientsProvider>
-        </LiveStoreProvider>
-      );
+      return <Home onUnpair={unpair} />;
   }
 }
 

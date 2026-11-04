@@ -9,6 +9,7 @@
   },
   "include": [
     "src",
+    "jest.setup.ts",
     "expo-env.d.ts",
     ".expo/types/**/*.ts"
   ]

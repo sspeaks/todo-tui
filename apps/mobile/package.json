@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "main": "expo-router/entry",
   "dependencies": {
+    "@react-native-community/datetimepicker": "9.2.1",
     "@todo-tui/client": "workspace:*",
     "@todo-tui/present": "workspace:*",
     "expo": "~58.0.23",
@@ -45,6 +46,9 @@
     },
     "testMatch": [
       "<rootDir>/src/**/*.test.ts?(x)"
+    ],
+    "setupFiles": [
+      "<rootDir>/jest.setup.ts"
     ]
   }
 }

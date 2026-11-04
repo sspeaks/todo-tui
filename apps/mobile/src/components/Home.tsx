@@ -1,31 +1,34 @@
-import { type Item, Status, setStatus, undo } from "@todo-tui/client/portable";
-import { useClients, useConnection, useLiveStore, useStatusCounts, useView, useViews } from "@todo-tui/client/react";
-import { dayOf, localDay, tabQuery } from "@todo-tui/present";
-import { Stack } from "expo-router";
+import { type Item, Status, setStatus } from "@todo-tui/client/portable";
+import { useClients, useConnection, useStatusCounts, useView, useViews, useLiveStore } from "@todo-tui/client/react";
+import { tabQuery } from "@todo-tui/present";
+import { Stack, router } from "expo-router";
 import { useCallback, useEffect, useState } from "react";
 import { ActivityIndicator, Alert, FlatList, KeyboardAvoidingView, Platform, Pressable, RefreshControl, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { describeError, isUnauthenticated } from "../errors";
+import { useSnack } from "../snack";
 import { type Theme, useTheme } from "../theme";
+import { useToday } from "../today";
 import { Banner } from "./Banner";
+import { Composer } from "./Composer";
 import { ItemRow } from "./ItemRow";
-import { QuickAdd } from "./QuickAdd";
-import { type Snack, Snackbar } from "./Snackbar";
 import { TabStrip } from "./TabStrip";
 
-/** The tabs, the selected tab's list, quick-add, and complete / undo. */
+const closed = (s: Status) => s === Status.DONE || s === Status.CANCELLED;
+
+/** The tabs, the selected tab's list, and adding; a row opens its item. */
 export function Home({ onUnpair }: { onUnpair: (message?: string) => Promise<void> }) {
   const t = useTheme();
   const s = styles(t);
   const store = useLiveStore();
   const clients = useClients();
+  const snack = useSnack();
   const views = useViews();
   const counts = useStatusCounts();
+  const today = useToday();
   const [tab, setTab] = useState<string>();
-  const [snack, setSnack] = useState<Snack>();
   const [refreshing, setRefreshing] = useState(false);
 
-  const today = counts.today ? dayOf(counts.today) : localDay(new Date());
   const selected = tab !== undefined && views.views.some((v) => v.id === tab) ? tab : views.views[0]?.id;
 
   // A revoked token: the stream keeps failing UNAUTHENTICATED.
@@ -34,37 +37,20 @@ export function Home({ onUnpair }: { onUnpair: (message?: string) => Promise<voi
     if (isUnauthenticated(streamError)) void onUnpair(describeError(streamError));
   }, [streamError, onUnpair]);
 
-  const show = useCallback((text: string, opts: { opId?: string; error?: boolean } = {}) => setSnack({ key: Date.now(), text, ...opts }), []);
-  const dismiss = useCallback(() => setSnack(undefined), []);
-
   const toggle = useCallback(
     async (item: Item) => {
-      const reopen = item.status === Status.DONE || item.status === Status.CANCELLED;
+      const reopen = closed(item.status);
       try {
         const res = await setStatus(clients.items, item.id, reopen ? Status.NEXT : Status.DONE, { timeoutMs: 15_000 });
-        const changed = [res.item, res.generated].filter((i): i is Item => i !== undefined);
-        if (res.result) store.applyItems(changed, res.result.revision);
-        const next = res.generated?.dueDate ? ` · next ^${res.generated.dueDate.month}/${res.generated.dueDate.day}` : "";
-        show(`${reopen ? "Reopened" : "Done"}: ${item.title}${next}`, { opId: res.result?.opId });
+        snack.done(`${reopen ? "Reopened" : "Done"}: ${item.title}`, { ...(res.result && { result: res.result }), items: [res.item, res.generated] });
       } catch (err) {
-        show(describeError(err), { error: true });
+        snack.fail(err);
       }
     },
-    [clients, store, show],
+    [clients, snack],
   );
 
-  const onUndo = useCallback(
-    async (opId: string) => {
-      try {
-        const res = await undo(clients.items, { expectedOpId: opId, timeoutMs: 15_000 });
-        if (res.result) store.applyItems(res.items, res.result.revision);
-        show(res.entry ? `Undid: ${res.entry.description}` : "Nothing to undo");
-      } catch (err) {
-        show(describeError(err), { error: true });
-      }
-    },
-    [clients, store, show],
-  );
+  const openItem = useCallback((item: Item) => router.push({ pathname: "/item/[id]", params: { id: item.id } }), []);
 
   const onRefresh = useCallback(() => {
     setRefreshing(true);
@@ -93,12 +79,11 @@ export function Home({ onUnpair }: { onUnpair: (message?: string) => Promise<voi
       <TabStrip views={views.views} counts={counts.views} selected={selected} onSelect={setTab} />
       <KeyboardAvoidingView style={s.page} behavior={Platform.OS === "ios" ? "padding" : undefined} keyboardVerticalOffset={100}>
         {selected ? (
-          <List tab={selected} today={today} onToggle={toggle} refreshing={refreshing} onRefresh={onRefresh} />
+          <List tab={selected} today={today} onToggle={toggle} onOpen={openItem} refreshing={refreshing} onRefresh={onRefresh} />
         ) : (
           <View style={s.center}>{views.status === "loading" ? <ActivityIndicator color={t.accent} /> : <Text style={s.message}>No views.</Text>}</View>
         )}
-        <Snackbar snack={snack} onUndo={onUndo} onDismiss={dismiss} />
-        <QuickAdd today={today} onCaptured={(title, opId) => show(`Added: ${title}`, opId ? { opId } : {})} />
+        <Composer today={today} />
       </KeyboardAvoidingView>
     </SafeAreaView>
   );
@@ -108,12 +93,14 @@ function List({
   tab,
   today,
   onToggle,
+  onOpen,
   refreshing,
   onRefresh,
 }: {
   tab: string;
   today: number;
   onToggle: (item: Item) => void;
+  onOpen: (item: Item) => void;
   refreshing: boolean;
   onRefresh: () => void;
 }) {
@@ -131,7 +118,7 @@ function List({
       style={s.page}
       data={view.items}
       keyExtractor={(i) => i.id}
-      renderItem={({ item }) => <ItemRow item={item} today={today} onToggle={onToggle} />}
+      renderItem={({ item }) => <ItemRow item={item} today={today} onToggle={onToggle} onOpen={onOpen} />}
       ItemSeparatorComponent={() => <View style={s.sep} />}
       refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={t.dim} />}
       ListEmptyComponent={<Text style={[s.message, s.empty]}>{view.status === "error" ? describeError(view.error) : "Nothing here."}</Text>}
@@ -146,8 +133,6 @@ const styles = (t: Theme) =>
     center: { flex: 1, alignItems: "center", justifyContent: "center", padding: 24, gap: 16, backgroundColor: t.bg },
     message: { color: t.dim, textAlign: "center", fontSize: 15 },
     empty: { marginTop: 48 },
-    button: { backgroundColor: t.accent, borderRadius: 8, paddingHorizontal: 20, paddingVertical: 12 },
-    buttonText: { color: t.onAccent, fontWeight: "600" },
     headerLink: { color: t.accent, fontSize: 15 },
     sep: { height: StyleSheet.hairlineWidth, backgroundColor: t.border, marginLeft: 52 },
   });

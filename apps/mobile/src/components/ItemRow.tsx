@@ -7,7 +7,17 @@ import { type Theme, useTheme } from "../theme";
 const closed = (s: Status) => s === Status.DONE || s === Status.CANCELLED;
 
 /** One Item as the TUI's row reads: glyph, priority, title, then due, waiting, progress and markers. */
-export const ItemRow = memo(function ItemRow({ item, today, onToggle }: { item: Item; today: number; onToggle: (item: Item) => void }) {
+export const ItemRow = memo(function ItemRow({
+  item,
+  today,
+  onToggle,
+  onOpen,
+}: {
+  item: Item;
+  today: number;
+  onToggle: (item: Item) => void;
+  onOpen: (item: Item) => void;
+}) {
   const t = useTheme();
   const s = styles(t);
   const cells = rowCells(item, today);
@@ -25,7 +35,7 @@ export const ItemRow = memo(function ItemRow({ item, today, onToggle }: { item: 
       >
         <Text style={[s.glyph, done && s.dim]}>{statusGlyph(item.status)}</Text>
       </Pressable>
-      <View style={s.body}>
+      <Pressable style={s.body} onPress={() => onOpen(item)} accessibilityRole="button" accessibilityHint="Opens the details">
         <Text style={[s.title, done && s.doneTitle]} numberOfLines={2}>
           {priority ? <Text style={s.priority}>{priority} </Text> : null}
           {singleLine(item.title)}
@@ -36,7 +46,7 @@ export const ItemRow = memo(function ItemRow({ item, today, onToggle }: { item: 
             {meta.join("  ")}
           </Text>
         ) : null}
-      </View>
+      </Pressable>
       {cells.due ? <Text style={[s.due, cells.overdue && s.overdue]}>{cells.due}</Text> : null}
     </View>
   );

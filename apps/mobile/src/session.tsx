@@ -79,8 +79,12 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     void loadPairing().then((p) => (p ? open(p) : setSession({ state: "unpaired" })));
     const sub = AppState.addEventListener("change", (state) => {
       const s = current.current;
-      if (state === "active" && (s.state === "ready" || s.state === "failed")) {
-        close();
+      if (state === "active" && s.state === "ready") {
+        // A fresh store on the same connection: the session stays ready, so
+        // the screens (and where you were) stay mounted.
+        void s.store.stop();
+        setSession({ ...s, store: createRemoteLiveStore(s.conn) });
+      } else if (state === "active" && s.state === "failed") {
         void open(s.pairing);
       } else if (state === "background" && s.state === "ready") {
         void s.store.stop();
