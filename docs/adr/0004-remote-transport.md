@@ -57,5 +57,14 @@ over Tailscale.
 - `api_minor` 9.
 - The tokens file is daemon state that the CLI writes, not configuration. The
   daemon still never writes `config.toml`.
+- The client side is `@todo-tui/client/portable` (no Node APIs, checked by
+  `test/portable.test.ts`) with `connectRemote`, `createRemoteLiveStore`,
+  `parsePairingLink` and `isUnreachable` (`src/remote.ts`), over
+  `@connectrpc/connect-web`. The conformance suites run over the listener too
+  (`test/remote.integration.test.ts`).
+- `ClientKind` is recorded per connection, and fetch spreads gRPC-Web calls
+  over pooled HTTP/1.1 connections, so a phone's MOBILE kind only marks the
+  connection its hello used. In practice that is the Watch stream's, since it
+  stays open. It only matters for refusing upgrade restarts.
 - Anyone on the tailnet who holds a token has full read and write access to the
   todo list. Tokens are per device and revocable.

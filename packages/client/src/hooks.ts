@@ -1,5 +1,5 @@
 import { createContext, createElement, type ReactNode, useContext, useEffect, useMemo, useSyncExternalStore } from "react";
-import type { TodoClients } from "./connect.js";
+import type { TodoClients } from "./clients.js";
 import type { Item } from "./gen/todo/v1/item_pb.js";
 import type {
   ConnectionSnapshot,

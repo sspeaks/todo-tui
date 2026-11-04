@@ -38,7 +38,7 @@
       pnpmDepsHash = {
         x86_64-linux = "sha256-UQCNT9d14RUBXuWQ1/wT2zJnQER+uWKAedS0yi2KLGk=";
         aarch64-linux = "sha256-UQCNT9d14RUBXuWQ1/wT2zJnQER+uWKAedS0yi2KLGk=";
-        aarch64-darwin = "sha256-GD0k69V28HOBnQrUXKOfaYzyMW3rS9mVsZlZV2q1HRA=";
+        aarch64-darwin = "sha256-HaMiKAmOiu0jNIe01j3cdU/rzsegrwAldHo5wG9olDE=";
       };
 
       # Each part sees only the files it builds from, so a README edit

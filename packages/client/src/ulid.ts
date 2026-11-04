@@ -1,4 +1,3 @@
-import { getRandomValues } from "node:crypto";
 
 /** Crockford's base32, as used by ULIDs. */
 const ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
@@ -38,10 +37,10 @@ export function monotonicUlid(clock: () => number = Date.now): () => string {
     const now = clock();
     if (now > lastTime) {
       lastTime = now;
-      getRandomValues(random);
+      globalThis.crypto.getRandomValues(random);
     } else if (!increment(random)) {
       lastTime++;
-      getRandomValues(random);
+      globalThis.crypto.getRandomValues(random);
     }
     let tail = "";
     for (let off = 0; off < RANDOM_BYTES; off += 5) {

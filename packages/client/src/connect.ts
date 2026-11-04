@@ -4,22 +4,20 @@ import { ItemService } from "./gen/todo/v1/item_service_pb.js";
 import { ClientKind, type GetServerInfoResponse, SystemService } from "./gen/todo/v1/system_service_pb.js";
 import { ViewService } from "./gen/todo/v1/view_service_pb.js";
 import { WatchService } from "./gen/todo/v1/watch_service_pb.js";
+import { type TodoClients, createClients } from "./clients.js";
 import { LiveStore, type LiveStoreOptions } from "./live-store.js";
 import { errorReason } from "./mutations.js";
 import { defaultSocketPath, envFromProcess, resolvePaths } from "./paths.js";
-import { isConnectionFailure, readDaemonPid, spawnDaemon, waitForDaemonExit, withAutoSpawn } from "./spawn.js";
+import { DaemonTooOldError, isConnectionFailure } from "./errors.js";
+import { readDaemonPid, spawnDaemon, waitForDaemonExit, withAutoSpawn } from "./spawn.js";
 import { type TodoTransport, type TodoTransportOptions, UnsafeRuntimeDirError, checkRuntimeDir, createTodoTransport } from "./transport.js";
 
 /** The api_minor this client was built against. */
 export const CLIENT_API_MINOR = 8;
 export const CLIENT_VERSION = "0.1.0";
 
-export interface TodoClients {
-  system: Client<typeof SystemService>;
-  items: Client<typeof ItemService>;
-  views: Client<typeof ViewService>;
-  watch: Client<typeof WatchService>;
-}
+export { type TodoClients, createClients } from "./clients.js";
+export { DaemonTooOldError } from "./errors.js";
 
 export interface TodoConnection extends TodoClients {
   transport: TodoTransport;
@@ -44,17 +42,6 @@ export interface ConnectOptions extends TodoTransportOptions {
   spawnBudgetMs?: number;
 }
 
-export class DaemonTooOldError extends Error {
-  constructor(
-    readonly serverInfo: GetServerInfoResponse,
-    readonly requiredApiMinor: number,
-    options?: ErrorOptions,
-  ) {
-    super(`daemon ${serverInfo.daemonVersion} has api_minor ${serverInfo.apiMinor}, client needs ${requiredApiMinor}`, options);
-    this.name = "DaemonTooOldError";
-  }
-}
-
 /** The daemon is too old and refused the upgrade restart: other interactive clients are connected (4.2). */
 export class DaemonRestartRefusedError extends DaemonTooOldError {
   constructor(serverInfo: GetServerInfoResponse, requiredApiMinor: number, options?: ErrorOptions) {
@@ -62,15 +49,6 @@ export class DaemonRestartRefusedError extends DaemonTooOldError {
     this.message = `restart required (${this.message}); close other todo sessions first`;
     this.name = "DaemonRestartRefusedError";
   }
-}
-
-export function createClients(transport: Transport): TodoClients {
-  return {
-    system: createClient(SystemService, transport),
-    items: createClient(ItemService, transport),
-    views: createClient(ViewService, transport),
-    watch: createClient(WatchService, transport),
-  };
 }
 
 /** The steps of an upgrade restart; injectable for tests. */

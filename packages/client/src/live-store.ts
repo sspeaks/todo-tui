@@ -1,4 +1,5 @@
 import { type MessageInitShape, create, toBinary } from "@bufbuild/protobuf";
+import { base64Encode } from "@bufbuild/protobuf/wire";
 import { Code, type Client, ConnectError, type Transport, createClient } from "@connectrpc/connect";
 import { ErrorInfoSchema } from "./gen/google/rpc/error_details_pb.js";
 import type { Date as ProtoDate } from "./gen/google/type/date_pb.js";
@@ -11,7 +12,7 @@ import type { View } from "./gen/todo/v1/view_pb.js";
 import { ViewService } from "./gen/todo/v1/view_service_pb.js";
 import { type Change, type Notice, WatchService } from "./gen/todo/v1/watch_service_pb.js";
 import { MAX_PAGE_SIZE } from "./limits.js";
-import { isConnectionFailure } from "./spawn.js";
+import { isConnectionFailure } from "./errors.js";
 
 export interface ViewQuery {
   filter?: MessageInitShape<typeof FilterSchema>;
@@ -269,7 +270,7 @@ export class LiveStore {
       ...(query.sort !== undefined && { sort: query.sort }),
       ...(query.viewId !== undefined && { viewId: query.viewId }),
     });
-    const key = Buffer.from(toBinary(ListItemsRequestSchema, request)).toString("base64");
+    const key = base64Encode(toBinary(ListItemsRequestSchema, request));
     let view = this.views.get(key);
     if (!view) {
       view = new LiveView(this, key, request);
