@@ -23,11 +23,9 @@ export default function RootLayout() {
               contentStyle: { backgroundColor: t.bg },
             }}
           >
-            <Stack.Screen name="index" options={{ title: "todo" }} />
+            <Stack.Screen name="(tabs)" options={{ headerShown: false, title: "todo" }} />
             <Stack.Screen name="pair" options={{ title: "Pair with your computer" }} />
             <Stack.Screen name="item/[id]" options={{ title: "" }} />
-            <Stack.Screen name="search" options={{ title: "Search" }} />
-            <Stack.Screen name="settings" options={{ title: "Settings" }} />
           </Stack>
         </Connected>
       </SessionProvider>

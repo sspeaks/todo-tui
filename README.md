@@ -485,7 +485,7 @@ round + button, type a title and set the rest with one tap each (due, priority,
 status, repeat, the labels and names you use), or type the capture syntax; a preview
 shows what will be captured. The item screen has the same one-tap choices.
 Tap ○ (or swipe right) to complete an item and ● to reopen it; swipe left to delete.
-Search is the magnifier, and Settings (the gear) shows the connection and pairing.
+The tab bar has the list, Search, and Settings (the connection and pairing).
 What you add while your computer is out of reach is kept on the phone and sent
 once it is back. Tap an item to edit its title, status,
 priority, due date, repeat, labels, waiting on and follow-up, hide-until date and

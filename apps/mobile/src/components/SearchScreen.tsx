@@ -1,7 +1,8 @@
 // Search everything, done and archived too: titles, labels, the remote key
 // and notes, as `:search` does in the TUI, the most recently changed first.
 import { matchText, searchTab, tabQuery } from "@todo-tui/present";
-import { useState } from "react";
+import { useFocusEffect } from "expo-router";
+import { type ComponentRef, useCallback, useRef, useState } from "react";
 import { StyleSheet, Text, TextInput, View } from "react-native";
 import { type Theme, useTheme } from "../theme";
 import { useToday } from "../today";
@@ -12,16 +13,19 @@ export function SearchScreen() {
   const s = styles(t);
   const today = useToday();
   const [text, setText] = useState("");
+  const input = useRef<ComponentRef<typeof TextInput>>(null);
+  // Choosing the tab is asking to search: the keyboard comes up.
+  useFocusEffect(useCallback(() => void input.current?.focus(), []));
   const q = matchText(text);
   return (
     <View style={s.page}>
       <TextInput
+        ref={input}
         style={s.input}
         value={text}
         onChangeText={setText}
         placeholder="Search titles, labels and notes"
         placeholderTextColor={t.dim}
-        autoFocus
         autoCorrect={false}
         returnKeyType="search"
         clearButtonMode="while-editing"
