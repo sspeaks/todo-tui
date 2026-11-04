@@ -72,8 +72,18 @@ export function PillGroup({ label, icon, children }: { label: string; icon: Icon
   const t = useTheme();
   const s = styles(t);
   const { compact } = useContext(PillStyleContext);
+  // Compact: the icon alone, beside the pills, saves the heading's line.
+  if (compact)
+    return (
+      <View style={[s.group, s.compactGroup]} accessibilityLabel={label}>
+        <View style={s.compactIcon}>
+          <Ionicons name={icon} size={17} color={t.dim} />
+        </View>
+        <View style={[s.row, s.grow]}>{children}</View>
+      </View>
+    );
   return (
-    <View style={[s.group, compact && s.compactGroup]}>
+    <View style={s.group}>
       <View style={s.heading}>
         <Ionicons name={icon} size={14} color={t.dim} />
         <Text style={s.label}>{label}</Text>
@@ -103,7 +113,9 @@ const styles = (t: Theme) =>
     // Squarer and shorter: the add sheet fits on one screen.
     compact: { borderRadius: 8, minHeight: 32, paddingHorizontal: 10, gap: 5 },
     compactText: { fontSize: 14 },
-    compactGroup: { gap: 6, paddingVertical: 8, paddingHorizontal: 12 },
+    compactGroup: { flexDirection: "row", alignItems: "flex-start", gap: 10, paddingVertical: 8, paddingHorizontal: 12 },
+    compactIcon: { width: 20, height: 32, alignItems: "center", justifyContent: "center" },
+    grow: { flex: 1 },
     pressed: { opacity: 0.7 },
     dot: { width: 9, height: 9, borderRadius: 5 },
     text: { fontSize: 15 },

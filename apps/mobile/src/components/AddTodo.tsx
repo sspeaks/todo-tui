@@ -171,11 +171,8 @@ export function AddTodo({ visible, today, onClose }: { visible: boolean; today: 
                 <QuickDate title="Due" value={choices.due} today={today} onChange={(due) => choose({ due })} />
               </PillGroup>
               <Divider />
-              <PillGroup label="Priority" icon="flag-outline">
+              <PillGroup label="Priority and status" icon="flag-outline">
                 <QuickPriority value={choices.priority} onChange={(priority) => choose({ priority })} />
-              </PillGroup>
-              <Divider />
-              <PillGroup label="Status" icon="albums-outline">
                 <Pill
                   icon="arrow-forward-circle-outline"
                   label="Next"
@@ -208,11 +205,11 @@ export function AddTodo({ visible, today, onClose }: { visible: boolean; today: 
               </PillGroup>
               <Divider />
               <PillGroup label="Labels" icon="pricetags-outline">
-                <QuickLabels value={choices.labels} known={known.labels} onChange={(labels) => choose({ labels })} />
+                <QuickLabels value={choices.labels} known={known.labels} onChange={(labels) => choose({ labels })} limit={MOST_USED} />
               </PillGroup>
               <Divider />
               <PillGroup label="Waiting on" icon="hourglass-outline">
-                <QuickWaiting value={choices.waiting} known={known.names} onChange={(waiting) => choose({ waiting })} />
+                <QuickWaiting value={choices.waiting} known={known.names} onChange={(waiting) => choose({ waiting })} limit={MOST_USED} />
               </PillGroup>
             </View>
           </PillStyleContext.Provider>
@@ -224,6 +221,9 @@ export function AddTodo({ visible, today, onClose }: { visible: boolean; today: 
 
 /** Square, compact pills; a choice closes the keyboard, so every section is in sight. */
 const ADD_SHEET: PillStyle = { compact: true, dismissKeyboard: true };
+
+/** Labels and names shown on the sheet, most used first; "More…" has the rest. */
+const MOST_USED = 5;
 
 function Divider() {
   const s = styles(useTheme());
