@@ -851,7 +851,11 @@ where
 
 fn actor_for(via: CreatedVia) -> Actor {
     match via {
-        CreatedVia::Tui | CreatedVia::Cli | CreatedVia::Mcp | CreatedVia::Split => Actor::User,
+        CreatedVia::Tui
+        | CreatedVia::Cli
+        | CreatedVia::Mcp
+        | CreatedVia::Mobile
+        | CreatedVia::Split => Actor::User,
         CreatedVia::RemoteImport => Actor::Sync,
         CreatedVia::Restore | CreatedVia::Recurrence => Actor::System,
     }

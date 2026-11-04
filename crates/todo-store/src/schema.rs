@@ -9,12 +9,32 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 
 use crate::{Result, StoreError};
 
+/// One schema step. `rebuilds` marks a migration that rebuilds a table
+/// referenced by foreign keys (SQLite's "other kinds of table schema
+/// changes"): it runs with `foreign_keys` OFF, which cannot change inside a
+/// transaction, and commits only if `foreign_key_check` finds nothing.
+struct Migration {
+    sql: &'static str,
+    rebuilds: bool,
+}
+
+const fn plain(sql: &'static str) -> Migration {
+    Migration {
+        sql,
+        rebuilds: false,
+    }
+}
+
 /// Migration `i` takes the schema from version `i` to `i + 1`.
-const MIGRATIONS: &[&str] = &[
-    include_str!("../migrations/0001_init.sql"),
-    include_str!("../migrations/0002_undo_relations.sql"),
-    include_str!("../migrations/0003_views_fts.sql"),
-    include_str!("../migrations/0004_recurrence.sql"),
+const MIGRATIONS: &[Migration] = &[
+    plain(include_str!("../migrations/0001_init.sql")),
+    plain(include_str!("../migrations/0002_undo_relations.sql")),
+    plain(include_str!("../migrations/0003_views_fts.sql")),
+    plain(include_str!("../migrations/0004_recurrence.sql")),
+    Migration {
+        sql: include_str!("../migrations/0005_created_via_mobile.sql"),
+        rebuilds: true,
+    },
 ];
 
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
@@ -61,13 +81,39 @@ pub(crate) fn migrate(conn: &mut Connection) -> Result<()> {
             supported: SCHEMA_VERSION,
         });
     }
-    for (version, sql) in MIGRATIONS.iter().enumerate().skip(found as usize) {
+    for (version, m) in MIGRATIONS.iter().enumerate().skip(found as usize) {
         let to = version as u32 + 1;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Exclusive)?;
-        tx.execute_batch(sql)?;
-        tx.pragma_update(None, "user_version", to)?;
-        tx.commit()?;
+        if m.rebuilds {
+            let fk: bool = conn.pragma_query_value(None, "foreign_keys", |r| r.get(0))?;
+            conn.pragma_update(None, "foreign_keys", false)?;
+            let applied = apply(conn, m, to);
+            // Restore it whatever happened; the migration's error wins.
+            let restored = conn.pragma_update(None, "foreign_keys", fk);
+            applied?;
+            restored?;
+        } else {
+            apply(conn, m, to)?;
+        }
         tracing::info!(version = to, "applied migration");
     }
+    Ok(())
+}
+
+fn apply(conn: &mut Connection, m: &Migration, to: u32) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    tx.execute_batch(m.sql)?;
+    if m.rebuilds {
+        let violations: i64 =
+            tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })?;
+        if violations > 0 {
+            return Err(StoreError::Corrupt(format!(
+                "migration to version {to} left {violations} foreign key violations"
+            )));
+        }
+    }
+    tx.pragma_update(None, "user_version", to)?;
+    tx.commit()?;
     Ok(())
 }

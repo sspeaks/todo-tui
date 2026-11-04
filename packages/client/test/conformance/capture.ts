@@ -421,9 +421,9 @@ export function captureConformance(open: () => Promise<CaptureTarget>): void {
       expect(await rejected(capture("x", { createdVia: CreatedVia.UNSPECIFIED }))).toEqual(["created_via", "value must not be UNSPECIFIED"]);
       expect(await rejected(capture("x", { createdVia: 99 as CreatedVia }))).toEqual(["created_via", "unknown enum value 99"]);
       for (const via of [CreatedVia.REMOTE_IMPORT, CreatedVia.RESTORE, CreatedVia.SPLIT, CreatedVia.RECURRENCE]) {
-        expect(await rejected(capture("x", { createdVia: via }))).toEqual(["created_via", "must be TUI, CLI or MCP; the other values are reserved for the daemon"]);
+        expect(await rejected(capture("x", { createdVia: via }))).toEqual(["created_via", "must be TUI, CLI, MCP or MOBILE; the other values are reserved for the daemon"]);
       }
-      for (const via of [CreatedVia.CLI, CreatedVia.MCP]) expect((await capture("x", { createdVia: via })).item?.createdVia).toBe(via);
+      for (const via of [CreatedVia.CLI, CreatedVia.MCP, CreatedVia.MOBILE]) expect((await capture("x", { createdVia: via })).item?.createdVia).toBe(via);
     });
 
     it("UpdateItem waits since today in the daemon's zone, and a nested waiting path changes only its field", async () => {

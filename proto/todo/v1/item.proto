@@ -266,6 +266,7 @@ enum CreatedVia {
   CREATED_VIA_RESTORE = 5;
   CREATED_VIA_SPLIT = 6;
   CREATED_VIA_RECURRENCE = 7;
+  CREATED_VIA_MOBILE = 8;
 }
 
 enum ArchiveReason {

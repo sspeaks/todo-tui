@@ -158,6 +158,10 @@
             pkgs.nodejs_24
             pkgs.pnpm_12
             pkgs.buf
+            # `tailscale serve` fronts the daemon's remote listener for the
+            # phone app (ADR-0004). This is the CLI only: it talks to the
+            # tailscaled already running on the machine.
+            pkgs.tailscale
           ];
           RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
         };

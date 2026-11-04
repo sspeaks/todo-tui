@@ -2,6 +2,7 @@
 
 use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
 use std::io::{self, Write as _};
+use std::net::SocketAddr;
 use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::Path;
 use std::time::Duration;
@@ -13,14 +14,16 @@ use todo_proto::v1::system_service_server::SystemServiceServer;
 use todo_proto::v1::view_service_server::ViewServiceServer;
 use todo_proto::v1::watch_service_server::WatchServiceServer;
 use todo_store::Store;
-use tokio::net::UnixListener;
+use tokio::net::{TcpListener, UnixListener};
 use tokio::signal::unix::{SignalKind, signal};
 use tonic::transport::Server;
+use tonic_web::GrpcWebLayer;
 
 use crate::ShutdownHandle;
 use crate::client;
 use crate::conn::Clients;
 use crate::paths::Paths;
+use crate::remote::{self, Auth};
 use crate::scheduler::{self, Wake};
 use crate::service::{Ctx, item::Items, system::System, view::Views, watch::Watch};
 use crate::spool;
@@ -72,6 +75,8 @@ pub struct Daemon {
     paths: Paths,
     store: Store,
     listener: UnixListener,
+    /// The remote listener (ADR-0004), when `[remote]` is configured.
+    remote: Option<TcpListener>,
     shutdown: ShutdownHandle,
     options: DaemonOptions,
     _lock: File,
@@ -122,11 +127,13 @@ impl Daemon {
         let listener = UnixListener::bind(&paths.socket)
             .with_context(|| format!("binding {}", paths.socket.display()))?;
         fs::set_permissions(&paths.socket, Permissions::from_mode(0o600))?;
+        let remote = bind_remote(&paths).await;
 
         Ok(Started::Running(Box::new(Daemon {
             paths,
             store,
             listener,
+            remote,
             shutdown: ShutdownHandle::new(),
             options,
             _lock: lock,
@@ -145,6 +152,11 @@ impl Daemon {
         self.shutdown.clone()
     }
 
+    /// The remote listener's bound address, when it is listening.
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
+        self.remote.as_ref().and_then(|l| l.local_addr().ok())
+    }
+
     /// Imports the capture spool (design 2.1), then serves until shutdown is
     /// triggered (by a handle or the `Shutdown` RPC), then drains for up to
     /// 10s, removes the socket and releases the lock. Meanwhile imports the
@@ -157,6 +169,7 @@ impl Daemon {
             paths,
             store,
             listener,
+            remote,
             shutdown,
             options,
             _lock,
@@ -205,6 +218,7 @@ impl Daemon {
             shutdown: shutdown.clone(),
             wake,
         };
+        let remote_clients = clients.clone();
 
         let incoming = async_stream::stream! {
             loop {
@@ -225,13 +239,60 @@ impl Daemon {
             .add_service(SystemServiceServer::new(System(ctx.clone())))
             .add_service(ItemServiceServer::new(Items(ctx.clone())))
             .add_service(ViewServiceServer::new(Views(ctx.clone())))
-            .add_service(WatchServiceServer::new(Watch(ctx)))
+            .add_service(WatchServiceServer::new(Watch(ctx.clone())))
             .serve_with_incoming_shutdown(incoming, async move { stop.wait().await });
+
+        // The remote listener: the same services as gRPC-Web over HTTP/1.1,
+        // each call checked by `Auth` (ADR-0004).
+        let remote_server = remote.map(|remote| {
+            let clients = remote_clients;
+            let auth = Auth::new(paths.remote_tokens());
+            let incoming = async_stream::stream! {
+                loop {
+                    match remote.accept().await {
+                        Ok((io, _)) => yield Ok::<_, io::Error>(clients.accept(io)),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "remote accept failed");
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    }
+                }
+            };
+            let mut stop = shutdown.signal();
+            Server::builder()
+                .accept_http1(true)
+                .layer(GrpcWebLayer::new())
+                .add_service(SystemServiceServer::with_interceptor(
+                    System(ctx.clone()),
+                    auth.clone(),
+                ))
+                .add_service(ItemServiceServer::with_interceptor(
+                    Items(ctx.clone()),
+                    auth.clone(),
+                ))
+                .add_service(ViewServiceServer::with_interceptor(
+                    Views(ctx.clone()),
+                    auth.clone(),
+                ))
+                .add_service(WatchServiceServer::with_interceptor(Watch(ctx), auth))
+                .serve_with_incoming_shutdown(incoming, async move { stop.wait().await })
+        });
+        let servers = async {
+            match remote_server {
+                Some(remote_server) => {
+                    let (local, remote) = tokio::join!(server, remote_server);
+                    local
+                        .context("server failed")
+                        .and(remote.context("remote server failed"))
+                }
+                None => server.await.context("server failed"),
+            }
+        };
 
         tracing::info!(socket = %paths.socket.display(), pid = std::process::id(), "daemon listening");
         let mut stop = shutdown.signal();
         let result = tokio::select! {
-            r = server => r.context("server failed"),
+            r = servers => r,
             () = async { stop.wait().await; tokio::time::sleep(SHUTDOWN_GRACE).await } => {
                 tracing::warn!("in-flight work did not finish within {SHUTDOWN_GRACE:?}");
                 Ok(())
@@ -251,6 +312,29 @@ impl Daemon {
         let _ = fs::remove_file(&paths.socket);
         tracing::info!("daemon stopped");
         result
+    }
+}
+
+/// Binds the remote listener when `[remote]` is configured. A config or
+/// bind problem is logged and leaves the daemon serving the socket alone:
+/// the local clients must not lose the daemon over the phone's listener.
+async fn bind_remote(paths: &Paths) -> Option<TcpListener> {
+    let config = match remote::read_config(&paths.config) {
+        Ok(c) => c?,
+        Err(e) => {
+            tracing::error!(error = %format!("{e:#}"), "remote listener disabled");
+            return None;
+        }
+    };
+    match TcpListener::bind(config.listen).await {
+        Ok(l) => {
+            tracing::info!(addr = %l.local_addr().map_or(config.listen, |a| a), "remote listener bound");
+            Some(l)
+        }
+        Err(e) => {
+            tracing::error!(addr = %config.listen, error = %e, "remote listener disabled: bind failed");
+            None
+        }
     }
 }
 

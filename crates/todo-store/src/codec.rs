@@ -60,6 +60,7 @@ sql_enum!(CreatedVia, "created_via", {
     CreatedVia::Restore => "restore",
     CreatedVia::Split => "split",
     CreatedVia::Recurrence => "recurrence",
+    CreatedVia::Mobile => "mobile",
 });
 sql_enum!(StatusCategory, "status_category", {
     StatusCategory::Todo => "todo",

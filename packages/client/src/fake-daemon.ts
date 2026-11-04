@@ -394,7 +394,7 @@ export class FakeDaemon {
   maxPageSize = MAX_PAGE_SIZE;
   /** Runs before every ListItems; throw from it to fail that call. */
   onListItems: ((req: ListItemsRequest) => void) | undefined;
-  apiMinor = 8;
+  apiMinor = 9;
   readonly calls = { listItems: 0, listViews: 0, getStatusCounts: 0, subscribe: [] as (bigint | undefined)[] };
   readonly transport: Transport;
   readonly now: () => Date;
@@ -2156,12 +2156,12 @@ function requestIdOf(requestId: string): string {
   return id;
 }
 
-/** CaptureItem's created_via, converted and checked as the daemon does: TUI, CLI or MCP. */
+/** CaptureItem's created_via, converted and checked as the daemon does: TUI, CLI, MCP or MOBILE. */
 function checkCreatedVia(via: CreatedVia): void {
   if (via === CreatedVia.UNSPECIFIED) throw badRequest("created_via", "value must not be UNSPECIFIED");
   if (CreatedVia[via] === undefined) throw badRequest("created_via", `unknown enum value ${via}`);
-  if (via !== CreatedVia.TUI && via !== CreatedVia.CLI && via !== CreatedVia.MCP) {
-    throw badRequest("created_via", "must be TUI, CLI or MCP; the other values are reserved for the daemon");
+  if (via !== CreatedVia.TUI && via !== CreatedVia.CLI && via !== CreatedVia.MCP && via !== CreatedVia.MOBILE) {
+    throw badRequest("created_via", "must be TUI, CLI, MCP or MOBILE; the other values are reserved for the daemon");
   }
 }
 

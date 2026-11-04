@@ -219,6 +219,12 @@ impl Paths {
     pub fn spool_rejected(&self) -> PathBuf {
         self.data.join("spool.rejected.jsonl")
     }
+
+    /// The remote listener's paired devices (ADR-0004), in [`Paths::data`]:
+    /// written by `todo remote`, read by the daemon.
+    pub fn remote_tokens(&self) -> PathBuf {
+        self.data.join("remote-tokens.json")
+    }
 }
 
 const SOCKET_NAME: &str = "daemon.sock";

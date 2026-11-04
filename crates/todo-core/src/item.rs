@@ -38,6 +38,7 @@ pub enum CreatedVia {
     Restore,
     Split,
     Recurrence,
+    Mobile,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

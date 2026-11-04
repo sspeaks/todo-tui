@@ -46,6 +46,7 @@ const createdVia: Partial<Record<CreatedVia, string>> = {
   [CreatedVia.RESTORE]: "restore",
   [CreatedVia.SPLIT]: "split",
   [CreatedVia.RECURRENCE]: "recurrence",
+  [CreatedVia.MOBILE]: "mobile",
 };
 
 export const statusGlyph = (status: Status): string => glyphs[status] ?? "?";

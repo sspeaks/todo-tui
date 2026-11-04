@@ -5458,3 +5458,109 @@ async fn migrates_an_m1_database() {
     .await;
     assert_eq!(get(&db, id).await.relations.len(), 1);
 }
+
+#[tokio::test]
+async fn migrates_an_m5_database_rebuilding_items() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("todo.db");
+    let (parent, child) = ("01JB8X4Z5Q6R7S8T9V0W1X2Y3Z", "01JB8X4Z5Q6R7S8T9V0W1X2Y40");
+    {
+        // The M5 schema (version 4) with a parent, a recurring child, a
+        // relation and an event, so the rebuild must keep every reference.
+        let conn = Connection::open(&path).unwrap();
+        for sql in [
+            include_str!("../migrations/0001_init.sql"),
+            include_str!("../migrations/0002_undo_relations.sql"),
+            include_str!("../migrations/0003_views_fts.sql"),
+            include_str!("../migrations/0004_recurrence.sql"),
+        ] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 4).unwrap();
+        conn.execute_batch(&format!(
+            r#"
+            INSERT INTO items (id, created_via, created_at, updated_at, revision, title,
+                               status_category, labels)
+            VALUES ('{parent}', 'tui', 1000, 1000, 1, 'Ship auth migration', 'todo', '["work"]');
+            INSERT INTO items (id, created_via, created_at, updated_at, revision, title,
+                               status_category, parent_id, recurrence_series_id,
+                               recurrence_rule, archived_at, archived_reason)
+            VALUES ('{child}', 'cli', 2000, 2000, 2, 'water plants', 'done', '{parent}',
+                    '{child}', '{{"daily":{{"interval":1}}}}', 3000, 'auto_done');
+            INSERT INTO relations (from_id, to_id, kind, created_at)
+            VALUES ('{parent}', '{child}', 'blocks', 3000);
+            INSERT INTO ops (id, kind, actor, at, request_id, revision)
+            VALUES ('OP1', 'capture', 'user', 1000, 'r1', 1);
+            INSERT INTO events (id, op_id, item_id, at, actor, kind, field, old, new)
+            VALUES ('E1', 'OP1', '{parent}', 1000, 'user', 'create', NULL, NULL, '"x"');
+            UPDATE meta SET revision = 2;
+            "#
+        ))
+        .unwrap();
+    }
+    let db = Db {
+        store: Store::open(&path).unwrap(),
+        path,
+        _dir: dir,
+    };
+    let conn = Connection::open(&db.path).unwrap();
+    let version: u32 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+    let one = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+    // Rows, seq, references and the generated status all survive.
+    assert_eq!(one("SELECT count(*) FROM items"), 2);
+    assert_eq!(
+        one(&format!("SELECT seq FROM items WHERE id = '{child}'")),
+        2
+    );
+    assert_eq!(
+        one(&format!(
+            "SELECT count(*) FROM items WHERE id = '{child}' AND parent_id = '{parent}'
+               AND status = 'done' AND recurrence_rule IS NOT NULL"
+        )),
+        1
+    );
+    assert_eq!(one("SELECT count(*) FROM pragma_foreign_key_check"), 0);
+    assert_eq!(
+        one("SELECT count(*) FROM sqlite_schema WHERE name = 'items_new'"),
+        0
+    );
+    // Every index and trigger is back.
+    assert_eq!(
+        one("SELECT count(*) FROM sqlite_schema WHERE tbl_name = 'items'
+               AND type IN ('index', 'trigger') AND name NOT LIKE 'sqlite_autoindex%'"),
+        7 + 3
+    );
+    // The full-text index still finds the old rows and follows edits.
+    assert_eq!(
+        one("SELECT count(*) FROM items_fts WHERE items_fts MATCH 'auth'"),
+        1
+    );
+    // The new value is accepted, through the store too.
+    let (item, _) = db
+        .store
+        .capture(CaptureInput {
+            created_via: CreatedVia::Mobile,
+            ..input("from the phone", 4000)
+        })
+        .await
+        .unwrap();
+    assert_eq!(item.created_via, CreatedVia::Mobile);
+    assert_eq!(
+        one("SELECT count(*) FROM items_fts WHERE items_fts MATCH 'phone'"),
+        1
+    );
+    assert_eq!(
+        one("SELECT count(*) FROM items WHERE created_via = 'mobile'"),
+        1
+    );
+    // Foreign keys are on again for the store's writer.
+    let fk: i64 = db
+        .store
+        .read(|c| Ok(c.pragma_query_value(None, "foreign_keys", |r| r.get(0))?))
+        .await
+        .unwrap();
+    assert_eq!(fk, 1);
+}

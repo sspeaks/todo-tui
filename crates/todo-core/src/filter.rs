@@ -1178,6 +1178,7 @@ pub fn enum_number(value: &FieldValue) -> Option<u32> {
             CreatedVia::Restore => 5,
             CreatedVia::Split => 6,
             CreatedVia::Recurrence => 7,
+            CreatedVia::Mobile => 8,
         },
         V::ArchiveReason(r) => match r {
             ArchiveReason::User => 1,

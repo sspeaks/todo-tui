@@ -2,6 +2,7 @@
 
 mod add;
 mod launch;
+mod remote;
 mod rpc;
 mod spawn;
 mod status;
@@ -61,6 +62,35 @@ enum Command {
         #[command(subcommand)]
         action: Option<DaemonAction>,
     },
+    /// Pair the phone app with the remote listener, and manage its devices.
+    Remote {
+        #[command(subcommand)]
+        action: RemoteAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum RemoteAction {
+    /// Show whether the remote listener is on, and how to turn it on.
+    Status,
+    /// Pair a device: prints its token and a QR code for the app.
+    Pair {
+        /// A name for the device, e.g. `phone`.
+        #[arg(long)]
+        name: String,
+        /// The address the app connects to. Defaults to this machine's
+        /// Tailscale name, https://<machine>.<tailnet>.ts.net.
+        #[arg(long)]
+        url: Option<String>,
+        /// Leave out the QR code.
+        #[arg(long)]
+        no_qr: bool,
+    },
+    /// List the paired devices.
+    List,
+    /// Unpair a device, by name or by the id `list` shows. Takes effect at
+    /// once.
+    Revoke { device: String },
 }
 
 #[derive(Subcommand)]
@@ -120,6 +150,14 @@ async fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
                 spawn::spawn_and_wait(&paths).await?;
                 println!("todo daemon: started");
             }
+        }
+        Command::Remote { action } => {
+            return match action {
+                RemoteAction::Status => remote::status(&paths).await,
+                RemoteAction::Pair { name, url, no_qr } => remote::pair(&paths, &name, url, !no_qr),
+                RemoteAction::List => remote::list(&paths),
+                RemoteAction::Revoke { device } => remote::revoke(&paths, &device),
+            };
         }
         Command::Daemon { detach: false, .. } => {
             if todo_daemon::run(paths).await? == todo_daemon::Exit::AlreadyRunning {
@@ -205,6 +243,19 @@ mod tests {
         ));
         let cli = Cli::try_parse_from(["todo", "status", "--short"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Status { short: true })));
+        let cli =
+            Cli::try_parse_from(["todo", "remote", "pair", "--name", "phone", "--no-qr"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Remote { action: RemoteAction::Pair { name, url: None, no_qr: true } }) if name == "phone"
+        ));
+        let cli = Cli::try_parse_from(["todo", "remote", "revoke", "phone"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Remote { action: RemoteAction::Revoke { device } }) if device == "phone"
+        ));
+        assert!(Cli::try_parse_from(["todo", "remote", "pair"]).is_err());
+        assert!(Cli::try_parse_from(["todo", "remote"]).is_err());
         // Without a command, `todo` opens the TUI; --help still helps.
         assert!(Cli::try_parse_from(["todo"]).unwrap().command.is_none());
         let help = Cli::try_parse_from(["todo", "--help"]).err().unwrap();

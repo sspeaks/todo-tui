@@ -29,6 +29,7 @@ jiff = { version = "0.2.38", features = ["serde"] }
 prost = "0.14.4"
 prost-reflect = { version = "0.16.5", features = ["serde"] }
 prost-types = "0.14.4"
+qrcode = { version = "0.14", default-features = false }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rustix = { version = "1.1.5", features = ["fs", "process"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -43,6 +44,7 @@ tonic = "0.14.6"
 tonic-prost = "0.14.6"
 tonic-prost-build = "0.14.6"
 tonic-types = "0.14.6"
+tonic-web = "0.14.6"
 tower = { version = "0.5.3", features = ["util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

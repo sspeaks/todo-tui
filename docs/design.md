@@ -265,7 +265,7 @@ Every Item has:
 
 - **`id`** — a local ULID, assigned at creation, never changes, never reused. All local references (relations, events, suggestions) use it.
 - **`remote_link`** (optional) — present once the Item is linked to a tracker issue. See 3.3.
-- **`created_via`** — `tui | cli | mcp | remote_import | restore | split | recurrence`, for filtering and for the standup.
+- **`created_via`** — `tui | cli | mcp | mobile | remote_import | restore | split | recurrence`, for filtering and for the standup.
 - **`created_at`, `updated_at`** — local timestamps (distinct from `remote_*_at`).
 - **`revision`** — the global revision (4.4) of the Item's last change; used as an etag by clients.
 
@@ -534,7 +534,8 @@ Three independent version axes: the **API** is versioned by protobuf package (`t
 - **Stays running** after clients disconnect, so background sync and scheduled jobs continue. An optional `todo daemon install` registers a launchd agent (macOS) / systemd user unit (Linux) so it starts at login. Not required.
 - **Version handshake**: the first call from any client is `GetServerInfo(client_kind: interactive | oneshot | mcp, client_version, required_api_minor)` → daemon version, `api_minor` (an integer bumped with every additive change to `todo.v1`, and when an RPC that answered `UNIMPLEMENTED` starts working; 7 added recurrence rules and `SetRecurrence` / `ParseRecurrence` as stubs, and 8 since they work, completions report the next instance and the scheduler runs), and capability strings (e.g. `jira`, `assistant`). Interactive clients connected drive the faster pull cadence (5.4). **One exception**: `todo status --short` (2.1) makes no handshake and never spawns or restarts the daemon; an older daemon's `UNIMPLEMENTED` just prints nothing.
 - **Upgrade restart**: if the daemon's `api_minor` is lower than the client requires, the daemon binary on disk is presumably newer (an upgrade happened). The client calls `Shutdown(restart = true)`; the daemon refuses if other interactive clients are connected (the client then shows "restart required; close other sessions"), otherwise it waits up to 10s for in-flight work (outbox ops `in_flight`, open Claude calls) and exits; the client re-spawns `todo daemon` from **its own install path**.
-- **Socket**: `daemon.sock` in the runtime directory (7.1), mode `0600`; the gRPC `:authority` is `localhost`. No TCP listener in v1. A network transport (TLS + token) is a later, opt-in addition and must not change the API.
+- **Socket**: `daemon.sock` in the runtime directory (7.1), mode `0600`; the gRPC `:authority` is `localhost`.
+- **Remote listener** (opt-in, ADR-0004): with `[remote] listen = "127.0.0.1:7743"` in the config, the daemon also serves the same services as **gRPC-Web** (HTTP/1.1) on that loopback address, for the phone app. TLS comes from `tailscale serve` in front of it, not from the daemon. Every call needs `authorization: Bearer <token>` from `todo remote pair`, checked against the hashes in `data/remote-tokens.json`, which the daemon rereads when it changes. `Shutdown` is refused on it. A config or bind problem is logged and leaves the socket serving. The phone is a thin client of this daemon, not a sync replica.
 
 ### 4.3 The gRPC contract
 

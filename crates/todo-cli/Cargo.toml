@@ -20,7 +20,9 @@ anyhow.workspace = true
 clap.workspace = true
 hyper-util.workspace = true
 jiff.workspace = true
+qrcode.workspace = true
 rustix.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 tonic-types.workspace = true
@@ -31,7 +33,6 @@ ulid.workspace = true
 [dev-dependencies]
 rusqlite.workspace = true
 rustix = { workspace = true, features = ["pty"] }
-serde_json.workspace = true
 tempfile.workspace = true
 todo-store.workspace = true
 

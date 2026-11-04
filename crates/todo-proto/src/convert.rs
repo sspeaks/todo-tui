@@ -297,7 +297,7 @@ enum_map!(core::TodoRefinement, v1::TodoRefinement, "todo_refinement", {
 });
 enum_map!(core::CreatedVia, v1::CreatedVia, "created_via", {
     Tui => Tui, Cli => Cli, Mcp => Mcp, RemoteImport => RemoteImport, Restore => Restore,
-    Split => Split, Recurrence => Recurrence,
+    Split => Split, Recurrence => Recurrence, Mobile => Mobile,
 });
 enum_map!(core::ArchiveReason, v1::ArchiveReason, "archive_reason", {
     User => User, LeftScope => LeftScope, RemoteUnavailable => RemoteUnavailable, AutoDone => AutoDone,

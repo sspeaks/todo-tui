@@ -295,7 +295,7 @@ async fn handshake_reports_version_and_api_minor() {
         .into_inner();
     assert_eq!(info.daemon_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(info.api_minor, todo_proto::API_MINOR);
-    assert_eq!(info.api_minor, 8);
+    assert_eq!(info.api_minor, 9);
     d.stop().await;
 }
 
@@ -1891,7 +1891,12 @@ async fn capture_parses_tokens_and_returns_the_draft() {
 async fn capture_checks_created_via_and_reference_time() {
     let d = start().await;
     let mut items = d.items().await;
-    for via in [CreatedVia::Tui, CreatedVia::Cli, CreatedVia::Mcp] {
+    for via in [
+        CreatedVia::Tui,
+        CreatedVia::Cli,
+        CreatedVia::Mcp,
+        CreatedVia::Mobile,
+    ] {
         let req = CaptureItemRequest {
             created_via: via.into(),
             ..capture_req("ok")
