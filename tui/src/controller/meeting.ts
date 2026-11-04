@@ -10,13 +10,24 @@ import { type Mode, normalMode } from "../state/types.js";
 import type { Controller } from "./controller.js";
 import { errorText } from "./messages.js";
 
-/** Opens a URL in the browser or app that takes it; rejects when it cannot start (tests replace it). */
+/** Opens a URL in the browser or app that takes it; rejects when it cannot (tests replace it). */
 export type UrlOpener = (url: string) => Promise<void>;
 
-/** `open` on macOS, else `xdg-open`, detached, so the TUI never waits on it once it runs. */
-export const systemOpener: UrlOpener = (url) =>
-  new Promise((resolve, reject) => {
-    const cmd = process.platform === "darwin" ? "open" : "xdg-open";
+const TEAMS_WEB = "https://teams.microsoft.com/l/";
+
+/**
+ * The Teams link as the desktop app takes it: `msteams:/l/…`. A browser
+ * given the https link may show web Teams instead of handing it on, which
+ * loses the form, so the app's own scheme goes first; `undefined` for any
+ * other link.
+ */
+export function teamsAppLink(url: string): string | undefined {
+  return url.startsWith(TEAMS_WEB) ? `msteams:/l/${url.slice(TEAMS_WEB.length)}` : undefined;
+}
+
+/** Starts `cmd url` detached; resolves once it runs, so the TUI never waits on a browser. */
+function launch(cmd: string, url: string): Promise<void> {
+  return new Promise((resolve, reject) => {
     const child = spawn(cmd, [url], { detached: true, stdio: "ignore" });
     child.once("error", (err) => reject(new Error(`${cmd}: ${err.message}`)));
     child.once("spawn", () => {
@@ -24,6 +35,47 @@ export const systemOpener: UrlOpener = (url) =>
       resolve();
     });
   });
+}
+
+/** macOS `open url`, waited for: it exits once an app has the link, or non-zero when none takes its scheme. */
+function openNow(url: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("open", [url], { stdio: "ignore" });
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error("open: no answer"));
+    }, 5000);
+    child.once("error", (err) => {
+      clearTimeout(timer);
+      reject(new Error(`open: ${err.message}`));
+    });
+    child.once("exit", (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error(`open exited ${code}`));
+    });
+  });
+}
+
+/**
+ * `open` on macOS, else `xdg-open`. On macOS a Teams link goes to the
+ * desktop app first (`msteams:`), and to the browser when no app takes
+ * that scheme.
+ */
+export const systemOpener: UrlOpener = async (url) => {
+  const app = teamsAppLink(url);
+  if (process.platform === "darwin") {
+    if (app !== undefined) {
+      try {
+        return await openNow(app);
+      } catch {
+        // No Teams app: the browser, with the web link.
+      }
+    }
+    return launch("open", url);
+  }
+  return launch("xdg-open", url);
+};
 
 type Prompt = Extract<Mode, { kind: "prompt" }>;
 

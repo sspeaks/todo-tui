@@ -553,8 +553,8 @@ N48:
 the title as the subject (edit it in the prompt first), the description's first
 paragraph and Jira link as the content, and who it waits on as the attendee when
 that is an email address (`~dana@example.com`). With marks it is one meeting about
-all of them. You pick the time and send it in Teams; todo-tui creates nothing and
-needs no login. `[meetings] provider = "none"` turns it off.
+all of them. On macOS it opens the Teams app (`msteams:`), else the browser. You
+pick the time and send it in Teams; todo-tui creates nothing and needs no login. `[meetings] provider = "none"` turns it off.
 
 ### Backups and export
 

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fakeDaemon, item } from "../fake.test-util.js";
+import { teamsAppLink } from "./meeting.js";
 import { setup, stopControllers } from "./setup.test-util.js";
 
 afterEach(async () => {
@@ -71,5 +72,12 @@ describe("[meetings] off", () => {
     expect(t.state().keymap.warnings).toEqual([]);
     await t.c.press("M");
     expect(t.toast()).toBe("M: not bound · ? for help");
+  });
+});
+
+describe("teamsAppLink", () => {
+  it("gives the desktop app's msteams: link for a Teams link, nothing for others", () => {
+    expect(teamsAppLink("https://teams.microsoft.com/l/meeting/new?subject=a%20b")).toBe("msteams:/l/meeting/new?subject=a%20b");
+    expect(teamsAppLink("https://jira.example.com/browse/PLAT-1")).toBeUndefined();
   });
 });
