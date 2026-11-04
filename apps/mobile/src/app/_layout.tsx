@@ -4,6 +4,7 @@ import { Stack } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import type { ReactNode } from "react";
 import { SafeAreaProvider } from "react-native-safe-area-context";
+import { OutboxProvider } from "../outbox";
 import { SessionProvider, useSession } from "../session";
 import { SnackProvider } from "../snack";
 import { useTheme } from "../theme";
@@ -25,6 +26,8 @@ export default function RootLayout() {
             <Stack.Screen name="index" options={{ title: "todo" }} />
             <Stack.Screen name="pair" options={{ title: "Pair with your computer" }} />
             <Stack.Screen name="item/[id]" options={{ title: "" }} />
+            <Stack.Screen name="search" options={{ title: "Search" }} />
+            <Stack.Screen name="settings" options={{ title: "Settings" }} />
           </Stack>
         </Connected>
       </SessionProvider>
@@ -43,7 +46,9 @@ function Connected({ children }: { children: ReactNode }) {
   return (
     <LiveStoreProvider store={session.store}>
       <ClientsProvider clients={session.conn}>
-        <SnackProvider>{children}</SnackProvider>
+        <SnackProvider>
+          <OutboxProvider url={session.pairing.url}>{children}</OutboxProvider>
+        </SnackProvider>
       </ClientsProvider>
     </LiveStoreProvider>
   );

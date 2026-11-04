@@ -1,22 +1,30 @@
 import { useConnection } from "@todo-tui/client/react";
-import { StyleSheet, Text } from "react-native";
+import { Pressable, StyleSheet, Text } from "react-native";
 import { describeError } from "../errors";
+import { useSession } from "../session";
 import { type Theme, useTheme } from "../theme";
 
-/** Shown while the change stream is down: the list may be stale. */
+/** Why the list may be stale: the computer out of reach, or its todo too old. Tap to retry now. */
 export function Banner() {
   const s = styles(useTheme());
   const conn = useConnection();
-  if (conn.state === "live" || conn.state === "closed") return null;
-  if (conn.state === "connecting" && conn.attempt === 0) return null;
+  const { session, retry } = useSession();
+  const link = session.state === "ready" ? session.link : undefined;
+  let text: string | undefined;
+  if (link?.state === "too-old") text = link.message;
+  else if (link?.state === "unreachable" || (conn.state === "reconnecting" && conn.attempt > 1)) {
+    const why = link?.state === "unreachable" ? link.message : conn.error ? describeError(conn.error) : "Reconnecting…";
+    text = `${why} What you add is kept on this phone until then.`;
+  }
+  if (!text) return null;
   return (
-    <Text style={s.banner} numberOfLines={2}>
-      Reconnecting{conn.attempt > 1 ? ` (${conn.attempt})` : ""}… {conn.error ? describeError(conn.error) : ""}
-    </Text>
+    <Pressable onPress={retry} accessibilityRole="button" accessibilityHint="Tries again now">
+      <Text style={s.banner}>{text}</Text>
+    </Pressable>
   );
 }
 
 const styles = (t: Theme) =>
   StyleSheet.create({
-    banner: { backgroundColor: t.surface, color: t.warn, paddingHorizontal: 16, paddingVertical: 6, fontSize: 13 },
+    banner: { backgroundColor: t.surface, color: t.warn, paddingHorizontal: 16, paddingVertical: 8, fontSize: 13 },
   });

@@ -12,3 +12,4 @@ jest.mock("expo-haptics", () => ({
   ImpactFeedbackStyle: { Light: "light" },
   NotificationFeedbackType: { Success: "success" },
 }));
+jest.mock("@react-native-async-storage/async-storage", () => jest.requireActual("@react-native-async-storage/async-storage/jest/async-storage-mock"));

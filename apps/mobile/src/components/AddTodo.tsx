@@ -9,14 +9,15 @@
 // live preview and one Undo, and typed tokens still work. The request id
 // is kept until the capture succeeds or the text changes, so a retry after
 // an unknown outcome cannot capture twice.
-import { type CaptureDraft, CreatedVia, captureItem, parseCapture, ulid } from "@todo-tui/client/portable";
-import { useClients } from "@todo-tui/client/react";
+import { type CaptureDraft, Code, ConnectError, CreatedVia, captureItem, isUnreachable, parseCapture, ulid } from "@todo-tui/client/portable";
+import { useClients, useLiveStore } from "@todo-tui/client/react";
 import { Latest, captureSummary, describeRule } from "@todo-tui/present";
 import { router } from "expo-router";
 import { useMemo, useRef, useState } from "react";
 import { ActivityIndicator, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { type CaptureChoices, NO_CHOICES, captureText, hasChoices } from "../capture-draft";
 import { useKnown } from "../known";
+import { useOutbox } from "../outbox";
 import { success } from "../haptics";
 import { useSnack } from "../snack";
 import { type Theme, useTheme } from "../theme";
@@ -33,6 +34,8 @@ export function AddTodo({ visible, today, onClose }: { visible: boolean; today: 
   const s = styles(t);
   const clients = useClients();
   const snack = useSnack();
+  const store = useLiveStore();
+  const outbox = useOutbox();
   const known = useKnown();
   const [title, setTitle] = useState("");
   const [choices, setChoices] = useState<CaptureChoices>(NO_CHOICES);
@@ -76,23 +79,35 @@ export function AddTodo({ visible, today, onClose }: { visible: boolean; today: 
   };
 
   const text = captureText(title, choices);
+  /** Kept on the phone to send later: the computer is out of reach. */
+  const keep = async (id: string) => {
+    await outbox.add({ requestId: id, text, title: title.trim(), at: new Date().toISOString() });
+    success();
+    snack.show(`Saved on this phone: ${title.trim()}. It'll be added when your computer is back.`);
+    reset();
+    onClose();
+  };
+
   const submit = async () => {
     if (!title.trim() || busy) return;
-    requestId.current ??= ulid();
+    const id = (requestId.current ??= ulid());
+    // Not connected: don't wait for a request that cannot get through.
+    if (store.getConnection().state !== "live") return keep(id);
     setBusy(true);
     try {
       const res = await captureItem(clients.items, text, { createdVia: CreatedVia.MOBILE, requestId: requestId.current, timeoutMs: 15_000 });
-      const id = res.item?.id;
+      const added = res.item?.id;
       success();
       snack.done(
         `Added: ${res.item?.title ?? title}`,
         { ...(res.result && { result: res.result }), items: [res.item] },
-        id ? [{ label: "Details", onPress: () => router.push({ pathname: "/item/[id]", params: { id } }) }] : [],
+        added ? [{ label: "Details", onPress: () => router.push({ pathname: "/item/[id]", params: { id: added } }) }] : [],
       );
       reset();
       onClose();
     } catch (err) {
-      snack.fail(err);
+      if (isUnreachable(err) || (err instanceof ConnectError && err.code === Code.DeadlineExceeded)) await keep(id);
+      else snack.fail(err);
     } finally {
       setBusy(false);
     }

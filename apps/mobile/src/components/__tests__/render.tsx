@@ -1,13 +1,16 @@
-// Renders a screen on the client's in-memory FakeDaemon, with the store,
-// the clients and the snackbar, as the root layout gives them.
+// Renders a screen on the client's in-memory FakeDaemon with what the root
+// layout gives it: a ready session, the store, the clients, the snackbar
+// and the outbox.
 import { FakeDaemon } from "@todo-tui/client/fake";
 import { type ItemSchema, LiveStore, type MessageInitShape, createClients } from "@todo-tui/client/portable";
 import { ClientsProvider, LiveStoreProvider } from "@todo-tui/client/react";
 import { act, render } from "@testing-library/react-native";
 import type { ReactElement } from "react";
+import { OutboxProvider } from "../../outbox";
+import { type Link, type SessionApi, SessionContext } from "../../session";
 import { SnackProvider } from "../../snack";
 
-let stores: LiveStore[] = [];
+const stores: LiveStore[] = [];
 
 export async function stopStores(): Promise<void> {
   await act(async () => {
@@ -15,17 +18,37 @@ export async function stopStores(): Promise<void> {
   });
 }
 
-export async function renderOn(items: MessageInitShape<typeof ItemSchema>[], ui: ReactElement) {
+export const URL = "https://mac.tail1.ts.net";
+
+export async function renderOn(items: MessageInitShape<typeof ItemSchema>[], ui: ReactElement, opts: { link?: Link; down?: boolean } = {}) {
   const daemon = new FakeDaemon(items);
-  const store = new LiveStore({ transport: daemon.transport, debounceMs: 0 });
+  daemon.down = opts.down ?? false;
+  const store = new LiveStore({ transport: daemon.transport, debounceMs: 0, backoff: { initialMs: 10, maxMs: 20 } });
   stores.push(store);
   store.start();
+  const clients = createClients(daemon.transport);
+  const session: SessionApi = {
+    session: {
+      state: "ready",
+      pairing: { url: URL, token: "todo_t" },
+      conn: { ...clients, transport: daemon.transport },
+      store,
+      link: opts.link ?? { state: "checking" },
+    },
+    pair: jest.fn(async () => {}),
+    unpair: jest.fn(async () => {}),
+    retry: jest.fn(),
+  };
   await render(
-    <LiveStoreProvider store={store}>
-      <ClientsProvider clients={createClients(daemon.transport)}>
-        <SnackProvider>{ui}</SnackProvider>
-      </ClientsProvider>
-    </LiveStoreProvider>,
+    <SessionContext.Provider value={session}>
+      <LiveStoreProvider store={store}>
+        <ClientsProvider clients={clients}>
+          <SnackProvider>
+            <OutboxProvider url={URL}>{ui}</OutboxProvider>
+          </SnackProvider>
+        </ClientsProvider>
+      </LiveStoreProvider>
+    </SessionContext.Provider>,
   );
-  return { daemon, store };
+  return { daemon, store, session };
 }

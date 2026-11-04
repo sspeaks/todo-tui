@@ -54,7 +54,8 @@ export const ItemRow = memo(function ItemRow({
 
 const styles = (t: Theme) =>
   StyleSheet.create({
-    row: { flexDirection: "row", alignItems: "flex-start", paddingHorizontal: 16, paddingVertical: 12, gap: 12 },
+    // Opaque, to cover the swipe actions under it.
+    row: { flexDirection: "row", alignItems: "flex-start", paddingHorizontal: 16, paddingVertical: 12, gap: 12, backgroundColor: t.bg },
     glyph: { fontSize: 20, color: t.accent, width: 24, textAlign: "center", lineHeight: 22 },
     body: { flex: 1, gap: 2 },
     title: { color: t.text, fontSize: 16, lineHeight: 22 },

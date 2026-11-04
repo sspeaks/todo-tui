@@ -28,6 +28,8 @@ export default function Pair() {
       setError(undefined);
       try {
         await pair({ url: p.url.trim().replace(/\/+$/, ""), token: p.token.trim() });
+        // Opened from Settings: back to the list, not to Settings.
+        if (router.canDismiss()) router.dismissAll();
         router.replace("/");
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));

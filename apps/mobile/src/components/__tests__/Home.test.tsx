@@ -13,7 +13,7 @@ const items = [
   { id: "01JB0000000000000000000002", title: "plan trip", status: Status.NEXT },
 ];
 
-const setup = () => renderOn(items, <Home onUnpair={jest.fn(async () => {})} />);
+const setup = () => renderOn(items, <Home />);
 
 test("shows the views as tabs and the first one's items", async () => {
   await setup();
