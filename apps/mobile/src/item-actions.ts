@@ -40,7 +40,7 @@ export function useItemActions(today: number): ItemActions {
       tap();
       try {
         const res = await deleteItem(clients.items, item.id, { timeoutMs: 15_000 });
-        snack.done(`Deleted: ${item.title}`, { ...(res.result && { result: res.result }), items: [res.item] });
+        snack.done(`Deleted: ${item.title}`, { ...(res.result && { result: res.result }), items: [res.item] }, [], "trash");
       } catch (err) {
         snack.fail(err);
       }
