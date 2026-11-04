@@ -5,6 +5,7 @@ package todo.v1;
 import "todo/v1/common.proto";
 import "todo/v1/config.proto";
 import "todo/v1/item.proto";
+import "todo/v1/sync_service.proto";
 import "todo/v1/view.proto";
 
 service WatchService {
@@ -64,7 +65,8 @@ message Change {
 message Notice {
   oneof kind {
     Toast toast = 10;
-    // Allocated: SyncStatus sync_status = 11;
+    // An instance's sync state changed (design 5.11).
+    SyncStatus sync_status = 11;
     // Allocated: ImportProgress import_progress = 12;
     // Allocated: AssistantJob assistant_job = 13;
   }

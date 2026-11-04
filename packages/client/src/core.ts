@@ -7,6 +7,7 @@ export * from "./gen/todo/v1/item_pb.js";
 export * from "./gen/todo/v1/item_service_pb.js";
 export * from "./gen/todo/v1/op_pb.js";
 export * from "./gen/todo/v1/relation_pb.js";
+export * from "./gen/todo/v1/sync_service_pb.js";
 export * from "./gen/todo/v1/system_service_pb.js";
 export * from "./gen/todo/v1/view_pb.js";
 export * from "./gen/todo/v1/view_service_pb.js";

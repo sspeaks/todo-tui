@@ -296,6 +296,30 @@ impl Adapter {
         Ok(out)
     }
 
+    /// Which of `ids` still exist and can be read (design 5.5 step 1): by
+    /// id, ids only, a gone or forbidden one simply not returned.
+    pub async fn existing_ids(&self, ids: &[String]) -> Result<Vec<String>, JiraError> {
+        let mut out = Vec::new();
+        for chunk in ids.chunks(ID_BATCH) {
+            let list: Vec<&str> = chunk
+                .iter()
+                .map(String::as_str)
+                .filter(|i| is_issue_id(i))
+                .collect();
+            if list.is_empty() {
+                continue;
+            }
+            let jql = format!("id in ({}) ORDER BY id ASC", list.join(","));
+            let res = self.search(&jql, 0, vec!["id".to_owned()], false).await?;
+            out.extend(
+                res.issues
+                    .iter()
+                    .filter_map(|v| v.get("id").and_then(Value::as_str).map(str::to_owned)),
+            );
+        }
+        Ok(out)
+    }
+
     /// Every id `scope` lists now (design 5.5), ids only: keyed by id, so
     /// an issue leaving the scope mid-listing does not hide another.
     pub async fn scope_ids(&self, scope: &str) -> Result<Vec<String>, JiraError> {

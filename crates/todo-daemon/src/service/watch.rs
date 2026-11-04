@@ -44,6 +44,7 @@ impl WatchService for Watch {
 
         let store = self.0.store.clone();
         let config = self.0.config.clone();
+        let mut sync = self.0.sync_status.clone();
         let mut shutdown = self.0.shutdown.signal();
         let stream = async_stream::stream! {
             let mut live = store.subscribe();
@@ -71,10 +72,41 @@ impl WatchService for Watch {
                 },
             };
             yield Ok(message(Message::CaughtUp(CaughtUp { revision: last })));
+            // The sync state as it is, then each change of it (design 5.11).
+            let mut sent: std::collections::BTreeMap<String, v1::SyncStatus> =
+                sync.borrow_and_update().clone();
+            for status in sent.values() {
+                yield Ok(sync_notice(status.clone()));
+            }
+            let mut sync_closed = false;
 
             loop {
                 let next = tokio::select! {
                     next = live.recv() => next,
+                    changed = sync.changed(), if !sync_closed => {
+                        if changed.is_err() {
+                            // The sync task is gone with the daemon.
+                            sync_closed = true;
+                            continue;
+                        }
+                        let now = sync.borrow_and_update().clone();
+                        for (id, status) in &now {
+                            if sent.get(id) != Some(status) {
+                                yield Ok(sync_notice(status.clone()));
+                            }
+                        }
+                        // An instance no longer configured: its last word.
+                        for id in sent.keys().filter(|id| !now.contains_key(*id)) {
+                            yield Ok(sync_notice(v1::SyncStatus {
+                                instance_id: id.clone(),
+                                state: v1::SyncState::Unspecified as i32,
+                                last_error: "no longer configured".to_owned(),
+                                ..v1::SyncStatus::default()
+                            }));
+                        }
+                        sent = now;
+                        continue;
+                    }
                     () = shutdown.wait() => break,
                 };
                 let row = match next {
@@ -128,6 +160,12 @@ async fn replay(store: &Store, since: Revision) -> Result<Replay, Status> {
         }
         Err(ChangesSinceError::Store(e)) => Err(error::store(e)),
     }
+}
+
+fn sync_notice(status: v1::SyncStatus) -> SubscribeResponse {
+    message(Message::Notice(v1::Notice {
+        kind: Some(v1::notice::Kind::SyncStatus(status)),
+    }))
 }
 
 fn message(m: Message) -> SubscribeResponse {
@@ -207,6 +245,8 @@ mod tests {
             wake: Wake::default(),
             config: ConfigHandle::new(Config::defaults("/c/config.toml".into())),
             backups: "/c/backups".into(),
+            sync_status: crate::sync::status_channel().1,
+            sync_now: crate::sync::SyncNow::default(),
         });
         let mut stream = watch
             .subscribe(Request::new(SubscribeRequest::default()))
@@ -241,6 +281,8 @@ mod tests {
             wake: Wake::default(),
             config: ConfigHandle::new(Config::defaults("/c/config.toml".into())),
             backups: "/c/backups".into(),
+            sync_status: crate::sync::status_channel().1,
+            sync_now: crate::sync::SyncNow::default(),
         });
         let subscribe = async |since_revision| {
             let req = SubscribeRequest {

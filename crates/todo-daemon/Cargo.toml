@@ -38,6 +38,7 @@ tracing-subscriber.workspace = true
 ulid.workspace = true
 
 [dev-dependencies]
+todo-jira = { workspace = true, features = ["testing"] }
 rusqlite.workspace = true
 tempfile.workspace = true
 

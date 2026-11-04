@@ -22,6 +22,8 @@ pub(crate) struct ConnId(u64);
 pub(crate) struct Clients {
     next_id: Arc<AtomicU64>,
     kinds: Arc<Mutex<HashMap<ConnId, ClientKind>>>,
+    /// Told when an interactive client arrives with none connected.
+    arrived: Arc<tokio::sync::Notify>,
 }
 
 impl Clients {
@@ -38,9 +40,18 @@ impl Clients {
     }
 
     pub(crate) fn set_kind(&self, id: ConnId, kind: ClientKind) {
+        let first = kind == ClientKind::Interactive && self.other_interactive(Some(id)) == 0;
         if let Some(k) = self.lock().get_mut(&id) {
             *k = kind;
         }
+        if first {
+            self.arrived.notify_waiters();
+        }
+    }
+
+    /// Resolves when an interactive client arrives with none connected.
+    pub(crate) async fn interactive_arrived(&self) {
+        self.arrived.notified().await;
     }
 
     /// Interactive clients on connections other than `except`.

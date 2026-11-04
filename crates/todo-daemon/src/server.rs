@@ -9,6 +9,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use jiff::SignedDuration;
 use todo_proto::v1::item_service_server::ItemServiceServer;
+use todo_proto::v1::sync_service_server::SyncServiceServer;
 use todo_proto::v1::system_service_server::SystemServiceServer;
 use todo_proto::v1::view_service_server::ViewServiceServer;
 use todo_proto::v1::watch_service_server::WatchServiceServer;
@@ -23,7 +24,7 @@ use crate::config::{self, Config, ConfigHandle};
 use crate::conn::Clients;
 use crate::paths::Paths;
 use crate::scheduler::{self, Wake};
-use crate::service::{Ctx, item::Items, system::System, view::Views, watch::Watch};
+use crate::service::{Ctx, item::Items, sync::Sync, system::System, view::Views, watch::Watch};
 use crate::spool;
 use crate::supervise::{Backoff, spawn_supervised};
 
@@ -250,7 +251,30 @@ impl Daemon {
                 )
             })
         };
+        let (status_tx, sync_status) = crate::sync::status_channel();
+        let sync_now = crate::sync::SyncNow::default();
+        let sync = {
+            let (store, config, clients, now, stop) = (
+                store.clone(),
+                config.subscribe(),
+                clients.clone(),
+                sync_now.clone(),
+                shutdown.signal(),
+            );
+            spawn_supervised("sync", shutdown.signal(), backoff, move || {
+                crate::sync::run(
+                    store.clone(),
+                    config.clone(),
+                    clients.clone(),
+                    now.clone(),
+                    status_tx.clone(),
+                    stop.clone(),
+                )
+            })
+        };
         let ctx = Ctx {
+            sync_status,
+            sync_now,
             backups: paths.backups(),
             store,
             clients: clients.clone(),
@@ -283,6 +307,7 @@ impl Daemon {
             )
             .add_service(ItemServiceServer::new(Items(ctx.clone())))
             .add_service(ViewServiceServer::new(Views(ctx.clone())))
+            .add_service(SyncServiceServer::new(Sync(ctx.clone())))
             .add_service(WatchServiceServer::new(Watch(ctx)))
             .serve_with_incoming_shutdown(incoming, async move { stop.wait().await });
 
@@ -303,7 +328,7 @@ impl Daemon {
         // has been dropped, so the last clone (dropped here) joins the
         // writer thread before the lock is released: a daemon that takes
         // the lock next sees every commit.
-        for task in [spool, scheduler, backups] {
+        for task in [spool, scheduler, backups, sync] {
             task.abort().await;
         }
         let _ = fs::remove_file(&paths.socket);

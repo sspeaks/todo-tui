@@ -74,6 +74,7 @@ import {
   ViewService,
 } from "./gen/todo/v1/view_service_pb.js";
 import { type Change, ChangeSchema, type SubscribeResponse, SubscribeResponseSchema, WatchService } from "./gen/todo/v1/watch_service_pb.js";
+import { type SyncStatus, SyncStatusSchema, SyncService } from "./gen/todo/v1/sync_service_pb.js";
 import { parseCaptureText } from "./capture.js";
 import { meeting, teamsUrl } from "./meeting.js";
 import { civil, dayIn, dayOf, epochMs, isDate, parseDateExpr, protoDate, rustTrim, weekday } from "./dates.js";
@@ -456,7 +457,7 @@ export class FakeDaemon {
   maxPageSize = MAX_PAGE_SIZE;
   /** Runs before every ListItems; throw from it to fail that call. */
   onListItems: ((req: ListItemsRequest) => void) | undefined;
-  apiMinor = 17;
+  apiMinor = 18;
   /** What Export streams, as one batch; unset, Export is UNIMPLEMENTED (the format is the daemon's). */
   exportLines: string[] | undefined;
   /** What GetConfig serves; change it with {@link setConfig}. */
@@ -471,6 +472,10 @@ export class FakeDaemon {
   /** Captures by spool_id (upper case), for replays. */
   private readonly spools = new Map<string, Recorded>();
   /** What GetActivityReport answers: setActivityReport's. */
+  /** What GetSyncStatus answers: setSyncStatus's, by instance. */
+  private syncStatus = new Map<string, SyncStatus>();
+  /** SyncNow calls, by instance ("" for all). */
+  readonly syncNows: string[] = [];
   private activityReport: MessageInitShape<typeof GetActivityReportResponseSchema> = { text: "L48:\n- (nothing)\nN48:\n- (nothing)\n" };
   /** What ParseQuery reads, by text: the default views' and defineQuery's. */
   private readonly queries = new Map<string, { filter: Filter; sort: SortKey[]; showCount: boolean }>();
@@ -611,6 +616,22 @@ export class FakeDaemon {
         addRelation: (req) => this.relationTx("AddRelation", req, true),
         removeRelation: (req) => this.relationTx("RemoveRelation", req, false),
       });
+      service(SyncService, {
+        getSyncStatus: () => {
+          this.check();
+          return { instances: [...this.syncStatus.values()] };
+        },
+        syncNow: (req) => {
+          this.check();
+          // As the daemon decides it: by the config's instances.
+          const ids = this.config.instances.map((i) => i.id);
+          if (ids.length === 0 || (req.instanceId && !ids.includes(req.instanceId))) {
+            throw errorInfo(Code.FailedPrecondition, "NO_INSTANCE", "no [[instances]] are configured to sync", {});
+          }
+          this.syncNows.push(req.instanceId);
+          return {};
+        },
+      });
       service(ViewService, {
         listViews: () => {
           this.check();
@@ -649,6 +670,14 @@ export class FakeDaemon {
               }
             }
             yield msg({ case: "caughtUp", value: { revision: self.revision } });
+            // The sync state as it is, as the daemon sends it after CaughtUp
+            // (a later setSyncStatus reaches it through the watchers).
+            for (const s of self.syncStatus.values()) yield msg({ case: "notice", value: { kind: { case: "syncStatus", value: s } } });
+            // A status queued before the snapshot is in it: not sent twice.
+            for (let i = queue.length - 1; i >= 0; i--) {
+              const q = queue[i];
+              if (!(q instanceof Error) && q?.message.case === "notice" && q.message.value.kind.case === "syncStatus") queue.splice(i, 1);
+            }
             while (!ctx.signal.aborted) {
               const next = queue.shift();
               if (next instanceof Error) throw next;
@@ -814,6 +843,17 @@ export class FakeDaemon {
       this.views.set(view.id, view);
       this.publish({ revision: view.revision, topic: Topic.VIEW, id: view.id, resource: { case: "view", value: view } });
     }
+  }
+
+  /**
+   * An instance's sync state from now on (the daemon's pull loop is not
+   * modelled), sent to subscribers as Notice.sync_status.
+   */
+  setSyncStatus(status: MessageInitShape<typeof SyncStatusSchema>): SyncStatus {
+    const s = create(SyncStatusSchema, status);
+    this.syncStatus.set(s.instanceId, s);
+    for (const w of [...this.watchers]) w(msg({ case: "notice", value: { kind: { case: "syncStatus", value: s } } }));
+    return s;
   }
 
   /** What GetActivityReport answers from now on; the revision and today are the fake's. */

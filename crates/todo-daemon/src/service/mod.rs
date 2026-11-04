@@ -1,6 +1,7 @@
 //! tonic service implementations over a shared [`Ctx`].
 
 pub(crate) mod item;
+pub(crate) mod sync;
 pub(crate) mod system;
 pub(crate) mod view;
 pub(crate) mod watch;
@@ -22,4 +23,7 @@ pub(crate) struct Ctx {
     pub(crate) config: ConfigHandle,
     /// Where backups go (`data/backups`).
     pub(crate) backups: std::path::PathBuf,
+    /// The sync state, by instance (design 5.11).
+    pub(crate) sync_status: crate::sync::Status,
+    pub(crate) sync_now: crate::sync::SyncNow,
 }

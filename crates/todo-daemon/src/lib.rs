@@ -13,6 +13,7 @@ mod service;
 mod shutdown;
 pub mod spool;
 mod supervise;
+mod sync;
 
 pub use config::ARCHIVE_DONE_AFTER_DAYS;
 pub use server::{Daemon, DaemonOptions, Exit, ReloadHandle, Started, run};

@@ -153,7 +153,17 @@ async fn serve(stream: tokio::net::TcpStream, state: Arc<Mutex<State>>) -> std::
                     json!({"errorMessages": ["You are not authenticated."]}),
                     vec![],
                 )
-            } else if let Some(h) = st.routes.get(&path).cloned() {
+            } else if let Some(h) = st.routes.get(&path).cloned().or_else(|| {
+                // `/a/*` answers every path under `/a/` that has no route.
+                st.routes
+                    .iter()
+                    .filter_map(|(k, h)| {
+                        k.strip_suffix('*')
+                            .filter(|p| path.starts_with(p))
+                            .map(|_| h.clone())
+                    })
+                    .next()
+            }) {
                 drop(st);
                 h(&seen)
             } else {

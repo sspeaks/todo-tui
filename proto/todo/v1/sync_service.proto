@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package todo.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Jira sync (design 5, ADR-0006): read-only in its first milestone.
+service SyncService {
+  // Each configured instance's sync state (design 5.11). The same state is
+  // pushed to subscribers as Notice.sync_status whenever it changes.
+  rpc GetSyncStatus(GetSyncStatusRequest) returns (GetSyncStatusResponse);
+  // Starts a pull now (design 5.4: a manual "sync now"), of one instance or
+  // all of them, and returns at once; its progress is the sync status.
+  // FAILED_PRECONDITION / NO_INSTANCE when none is configured.
+  rpc SyncNow(SyncNowRequest) returns (SyncNowResponse);
+}
+
+message GetSyncStatusRequest {}
+
+message GetSyncStatusResponse {
+  repeated SyncStatus instances = 1;
+}
+
+message SyncNowRequest {
+  // Empty for every instance.
+  string instance_id = 1;
+}
+
+message SyncNowResponse {}
+
+// One instance's sync state (design 5.11).
+message SyncStatus {
+  string instance_id = 1;
+  SyncState state = 2;
+  google.protobuf.Timestamp last_successful_pull_at = 3;
+  // The last failure, for the status line; empty when the last pull was
+  // fine.
+  string last_error = 4;
+  // Linked Items of this instance (live).
+  uint32 items = 5;
+  // While syncing: the issues this pull has handed over so far.
+  uint32 pulled = 6;
+}
+
+enum SyncState {
+  // In a Notice: the instance is no longer configured.
+  SYNC_STATE_UNSPECIFIED = 0;
+  // Pulled, and nothing is wrong.
+  SYNC_STATE_OK = 1;
+  // A pull is running.
+  SYNC_STATE_SYNCING = 2;
+  // The tracker cannot be reached; pulls retry with backoff.
+  SYNC_STATE_OFFLINE = 3;
+  // The token was refused (or its credential cannot be read); pulls pause
+  // until the config changes or SyncNow asks (after a new token is stored).
+  SYNC_STATE_AUTH_ERROR = 4;
+  // Reachable, but a pull failed for another reason (a bad scope query).
+  SYNC_STATE_DEGRADED = 5;
+  // Before its first pull.
+  SYNC_STATE_STARTING = 6;
+}
