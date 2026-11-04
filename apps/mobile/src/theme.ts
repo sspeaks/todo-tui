@@ -11,6 +11,17 @@ const light = {
   warn: "#b45309",
   ok: "#059669",
   onAccent: "#ffffff",
+  /** Behind grouped cards, as iOS settings. */
+  grouped: "#f2f2f7",
+  card: "#ffffff",
+  /** An unselected choice. */
+  chip: "#eef0f4",
+  /** Priority +1 … +5. */
+  p1: "#ef4444",
+  p2: "#f97316",
+  p3: "#eab308",
+  p4: "#3b82f6",
+  p5: "#9ca3af",
 };
 
 export type Theme = typeof light;
@@ -26,6 +37,14 @@ const dark: Theme = {
   warn: "#fbbf24",
   ok: "#34d399",
   onAccent: "#0b0f14",
+  grouped: "#000000",
+  card: "#16181d",
+  chip: "#252a33",
+  p1: "#f87171",
+  p2: "#fb923c",
+  p3: "#facc15",
+  p4: "#60a5fa",
+  p5: "#9ca3af",
 };
 
 export const useTheme = (): Theme => (useColorScheme() === "dark" ? dark : light);

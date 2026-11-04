@@ -6,7 +6,7 @@ import { Pill } from "./Pill";
 
 /**
  * A repeat in one tap: Daily, Weekdays, Weekly, Monthly (the chosen one
- * again stops it); "🔁 …" opens the sheet for any other rule, which then
+ * again stops it); "Custom…" opens the sheet for any other rule, which then
  * shows as its own chosen pill.
  */
 export function QuickRepeat({
@@ -40,7 +40,7 @@ export function QuickRepeat({
           accessibilityLabel={`Repeat ${p.label}`}
         />
       ))}
-      <Pill label={custom ? `🔁 ${custom}` : "🔁 …"} on={!!custom} onPress={() => setSheet(true)} accessibilityLabel="Repeat: other" />
+      <Pill icon="options-outline" label={custom ?? "Custom…"} on={!!custom} onPress={() => setSheet(true)} accessibilityLabel="Repeat: other" />
       {sheet ? <RepeatSheet visible value={current} anchor={anchor} onChange={onChange} onClose={() => setSheet(false)} /> : null}
     </>
   );

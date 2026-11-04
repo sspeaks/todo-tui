@@ -9,9 +9,10 @@
 // live preview and one Undo, and typed tokens still work. The request id
 // is kept until the capture succeeds or the text changes, so a retry after
 // an unknown outcome cannot capture twice.
+import { Ionicons } from "@expo/vector-icons";
 import { type CaptureDraft, Code, ConnectError, CreatedVia, captureItem, isUnreachable, parseCapture, ulid } from "@todo-tui/client/portable";
 import { useClients, useLiveStore } from "@todo-tui/client/react";
-import { Latest, captureSummary, describeRule } from "@todo-tui/present";
+import { Latest, describeRule } from "@todo-tui/present";
 import { router } from "expo-router";
 import { useMemo, useRef, useState } from "react";
 import { ActivityIndicator, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
@@ -21,6 +22,7 @@ import { useOutbox } from "../outbox";
 import { success } from "../haptics";
 import { useSnack } from "../snack";
 import { type Theme, useTheme } from "../theme";
+import { CapturePreview } from "./CapturePreview";
 import { Pill, PillGroup } from "./quick/Pill";
 import { REPEAT_PRESETS, type RepeatPreset } from "./quick/presets";
 import { QuickDate } from "./quick/QuickDate";
@@ -123,56 +125,71 @@ export function AddTodo({ visible, today, onClose }: { visible: boolean; today: 
     <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={cancel}>
       <KeyboardAvoidingView style={s.page} behavior={Platform.OS === "ios" ? "padding" : undefined}>
         <View style={s.header}>
-          <Pressable onPress={cancel} hitSlop={8}>
+          <Pressable onPress={cancel} hitSlop={10} style={s.headerSide}>
             <Text style={s.cancel}>Cancel</Text>
           </Pressable>
           <Text style={s.heading}>New todo</Text>
-          <Pressable
-            onPress={submit}
-            disabled={!canAdd}
-            hitSlop={8}
-            accessibilityLabel="Add"
-            style={({ pressed }) => [s.add, !canAdd && s.disabled, pressed && s.pressed]}
-          >
-            {busy ? <ActivityIndicator color={t.onAccent} /> : <Text style={s.addText}>Add</Text>}
-          </Pressable>
+          <View style={[s.headerSide, s.headerEnd]}>
+            <Pressable
+              onPress={submit}
+              disabled={!canAdd}
+              hitSlop={8}
+              accessibilityLabel="Add"
+              style={({ pressed }) => [s.add, !canAdd && s.disabled, pressed && s.pressed]}
+            >
+              {busy ? <ActivityIndicator color={t.onAccent} /> : <Text style={s.addText}>Add</Text>}
+            </Pressable>
+          </View>
         </View>
         <ScrollView style={s.page} contentContainerStyle={s.content} keyboardShouldPersistTaps="always">
-          <TextInput
-            style={s.input}
-            value={title}
-            onChangeText={(next) => update(next, choices)}
-            placeholder="What needs doing?"
-            placeholderTextColor={t.dim}
-            returnKeyType="done"
-            onSubmitEditing={submit}
-            submitBehavior="submit"
-            autoFocus
-            multiline
-            accessibilityLabel="Title"
-          />
-          {showPreview ? <Text style={s.preview}>{captureSummary(draft, today)}</Text> : null}
-          {warnings.map((w) => (
-            <Text key={w} style={s.warn}>
-              {w}
-            </Text>
-          ))}
-          <View style={s.choices}>
-            <PillGroup label="Due">
+          <View style={[s.card, s.titleCard]}>
+            <TextInput
+              style={s.input}
+              value={title}
+              onChangeText={(next) => update(next, choices)}
+              placeholder="What needs doing?"
+              placeholderTextColor={t.dim}
+              returnKeyType="done"
+              onSubmitEditing={submit}
+              submitBehavior="submit"
+              autoFocus
+              multiline
+              accessibilityLabel="Title"
+            />
+            {showPreview ? <CapturePreview draft={draft} today={today} typed={title} /> : null}
+            {warnings.map((w) => (
+              <View key={w} style={s.warning}>
+                <Ionicons name="warning-outline" size={14} color={t.warn} />
+                <Text style={s.warn}>{w}</Text>
+              </View>
+            ))}
+          </View>
+
+          <View style={s.card}>
+            <PillGroup label="Due" icon="calendar-outline">
               <QuickDate title="Due" value={choices.due} today={today} onChange={(due) => choose({ due })} />
             </PillGroup>
-            <PillGroup label="Priority">
+            <Divider />
+            <PillGroup label="Priority" icon="flag-outline">
               <QuickPriority value={choices.priority} onChange={(priority) => choose({ priority })} />
             </PillGroup>
-            <PillGroup label="Status">
-              <Pill label="Next" on={choices.status === "next"} onPress={() => choose({ status: choices.status === "next" ? undefined : "next" })} />
+            <Divider />
+            <PillGroup label="Status" icon="albums-outline">
               <Pill
+                icon="arrow-forward-circle-outline"
+                label="Next"
+                on={choices.status === "next"}
+                onPress={() => choose({ status: choices.status === "next" ? undefined : "next" })}
+              />
+              <Pill
+                icon="moon-outline"
                 label="Someday"
                 on={choices.status === "someday"}
                 onPress={() => choose({ status: choices.status === "someday" ? undefined : "someday" })}
               />
             </PillGroup>
-            <PillGroup label="Repeat">
+            <Divider />
+            <PillGroup label="Repeat" icon="repeat">
               <QuickRepeat
                 preset={preset as RepeatPreset | undefined}
                 custom={preset ? undefined : customRepeat}
@@ -188,10 +205,12 @@ export function AddTodo({ visible, today, onClose }: { visible: boolean; today: 
                 }}
               />
             </PillGroup>
-            <PillGroup label="Labels">
+            <Divider />
+            <PillGroup label="Labels" icon="pricetags-outline">
               <QuickLabels value={choices.labels} known={known.labels} onChange={(labels) => choose({ labels })} />
             </PillGroup>
-            <PillGroup label="Waiting on">
+            <Divider />
+            <PillGroup label="Waiting on" icon="hourglass-outline">
               <QuickWaiting value={choices.waiting} known={known.names} onChange={(waiting) => choose({ waiting })} />
             </PillGroup>
           </View>
@@ -201,27 +220,28 @@ export function AddTodo({ visible, today, onClose }: { visible: boolean; today: 
   );
 }
 
+function Divider() {
+  const s = styles(useTheme());
+  return <View style={s.divider} />;
+}
+
 const styles = (t: Theme) =>
   StyleSheet.create({
-    page: { flex: 1, backgroundColor: t.bg },
-    header: {
-      flexDirection: "row",
-      alignItems: "center",
-      justifyContent: "space-between",
-      paddingHorizontal: 16,
-      paddingVertical: 14,
-      borderBottomWidth: StyleSheet.hairlineWidth,
-      borderBottomColor: t.border,
-    },
-    heading: { color: t.text, fontWeight: "600", fontSize: 16 },
-    cancel: { color: t.dim, fontSize: 16 },
-    add: { backgroundColor: t.accent, borderRadius: 20, minWidth: 76, paddingHorizontal: 20, paddingVertical: 10, alignItems: "center" },
+    page: { flex: 1, backgroundColor: t.grouped },
+    header: { flexDirection: "row", alignItems: "center", paddingHorizontal: 16, paddingTop: 14, paddingBottom: 10 },
+    headerSide: { flex: 1 },
+    headerEnd: { alignItems: "flex-end" },
+    heading: { color: t.text, fontWeight: "600", fontSize: 17 },
+    cancel: { color: t.accent, fontSize: 17 },
+    add: { backgroundColor: t.accent, borderRadius: 20, minWidth: 76, paddingHorizontal: 20, paddingVertical: 9, alignItems: "center" },
     addText: { color: t.onAccent, fontWeight: "700", fontSize: 17 },
-    disabled: { opacity: 0.4 },
+    disabled: { opacity: 0.35 },
     pressed: { opacity: 0.8 },
-    content: { paddingVertical: 12, gap: 10, paddingBottom: 32 },
-    input: { color: t.text, fontSize: 20, paddingHorizontal: 16, paddingVertical: 6, minHeight: 44 },
-    preview: { color: t.dim, fontSize: 14, lineHeight: 20, paddingHorizontal: 16 },
-    warn: { color: t.warn, fontSize: 13, paddingHorizontal: 16 },
-    choices: { gap: 10, marginTop: 6 },
+    content: { paddingHorizontal: 16, paddingTop: 6, paddingBottom: 40, gap: 16 },
+    card: { backgroundColor: t.card, borderRadius: 14, overflow: "hidden" },
+    titleCard: { padding: 16, gap: 12 },
+    input: { color: t.text, fontSize: 22, fontWeight: "600", padding: 0, minHeight: 32 },
+    warning: { flexDirection: "row", alignItems: "center", gap: 6 },
+    warn: { color: t.warn, fontSize: 13, flexShrink: 1 },
+    divider: { height: StyleSheet.hairlineWidth, backgroundColor: t.border, marginLeft: 16 },
   });

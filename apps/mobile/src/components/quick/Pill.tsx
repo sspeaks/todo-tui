@@ -1,14 +1,36 @@
+import { Ionicons } from "@expo/vector-icons";
 import type { ReactNode } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import { tick } from "../../haptics";
 import { type Theme, useTheme } from "../../theme";
 
-/** One tap: `on` shows it chosen. */
-export function Pill({ label, on, onPress, accessibilityLabel }: { label: string; on?: boolean; onPress: () => void; accessibilityLabel?: string }) {
-  const s = styles(useTheme());
+type Icon = keyof typeof Ionicons.glyphMap;
+
+/**
+ * One tap: `on` shows it chosen (filled, with a check). `icon` leads the
+ * label; `dot` is a coloured dot instead (the priorities).
+ */
+export function Pill({
+  label,
+  on,
+  onPress,
+  icon,
+  dot,
+  accessibilityLabel,
+}: {
+  label: string;
+  on?: boolean;
+  onPress: () => void;
+  icon?: Icon;
+  dot?: string;
+  accessibilityLabel?: string;
+}) {
+  const t = useTheme();
+  const s = styles(t);
+  const fg = on ? t.onAccent : t.text;
   return (
     <Pressable
-      style={[s.pill, on && s.on]}
+      style={({ pressed }) => [s.pill, on && s.on, pressed && s.pressed]}
       onPress={() => {
         tick();
         onPress();
@@ -18,7 +40,8 @@ export function Pill({ label, on, onPress, accessibilityLabel }: { label: string
       accessibilityState={{ selected: !!on }}
       accessibilityLabel={accessibilityLabel ?? label}
     >
-      <Text style={[s.text, on && s.onText]} numberOfLines={1}>
+      {on ? <Ionicons name="checkmark" size={15} color={fg} /> : dot ? <View style={[s.dot, { backgroundColor: dot }]} /> : icon ? <Ionicons name={icon} size={15} color={t.dim} /> : null}
+      <Text style={[s.text, { color: fg }, on && s.onText]} numberOfLines={1}>
         {label}
       </Text>
     </Pressable>
@@ -31,25 +54,40 @@ export function PillRow({ children }: { children: ReactNode }) {
   return <View style={s.row}>{children}</View>;
 }
 
-/** A labelled group of pills: the label on the left, the pills wrapping beside it. */
-export function PillGroup({ label, children }: { label: string; children: ReactNode }) {
-  const s = styles(useTheme());
+/** A section of choices: a small icon and heading, then the pills, wrapping. */
+export function PillGroup({ label, icon, children }: { label: string; icon: Icon; children: ReactNode }) {
+  const t = useTheme();
+  const s = styles(t);
   return (
     <View style={s.group}>
-      <Text style={s.label}>{label}</Text>
-      <View style={[s.row, s.grow]}>{children}</View>
+      <View style={s.heading}>
+        <Ionicons name={icon} size={14} color={t.dim} />
+        <Text style={s.label}>{label}</Text>
+      </View>
+      <View style={s.row}>{children}</View>
     </View>
   );
 }
 
 const styles = (t: Theme) =>
   StyleSheet.create({
-    row: { flexDirection: "row", flexWrap: "wrap", gap: 6, alignItems: "center" },
-    grow: { flex: 1 },
-    group: { flexDirection: "row", alignItems: "flex-start", gap: 8, paddingHorizontal: 12 },
-    label: { width: 64, color: t.dim, fontSize: 12, paddingTop: 7 },
-    pill: { paddingHorizontal: 11, paddingVertical: 6, borderRadius: 14, backgroundColor: t.surface, maxWidth: 200 },
+    row: { flexDirection: "row", flexWrap: "wrap", gap: 8, alignItems: "center" },
+    group: { gap: 10, paddingHorizontal: 16, paddingVertical: 14 },
+    heading: { flexDirection: "row", alignItems: "center", gap: 6 },
+    label: { color: t.dim, fontSize: 12, fontWeight: "600", letterSpacing: 0.6, textTransform: "uppercase" },
+    pill: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 6,
+      minHeight: 36,
+      paddingHorizontal: 14,
+      borderRadius: 18,
+      backgroundColor: t.chip,
+      maxWidth: 240,
+    },
     on: { backgroundColor: t.accent },
-    text: { color: t.text, fontSize: 14 },
-    onText: { color: t.onAccent, fontWeight: "600" },
+    pressed: { opacity: 0.7 },
+    dot: { width: 9, height: 9, borderRadius: 5 },
+    text: { fontSize: 15 },
+    onText: { fontWeight: "600" },
   });

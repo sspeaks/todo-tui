@@ -6,7 +6,7 @@ import { Pill } from "./Pill";
 
 /**
  * A day in one tap: Today, Tomorrow, Weekend, Next week; tapping the chosen
- * one clears it. "📅" opens the calendar for any other day, which then
+ * one clears it. "Pick…" opens the calendar for any other day, which then
  * shows as its own chosen pill.
  */
 export function QuickDate({
@@ -30,7 +30,8 @@ export function QuickDate({
         <Pill key={p.label} label={p.label} on={value === p.day} onPress={() => onChange(value === p.day ? undefined : p.day)} accessibilityLabel={`${title}: ${p.label}`} />
       ))}
       <Pill
-        label={other ? `📅 ${shortDay(value, today)}` : "📅"}
+        icon="calendar-outline"
+        label={other ? shortDay(value, today) : "Pick…"}
         on={other}
         onPress={() => setCalendar(true)}
         accessibilityLabel={`${title}: pick a date`}

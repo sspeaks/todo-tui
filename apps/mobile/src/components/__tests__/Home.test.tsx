@@ -37,7 +37,8 @@ test("adds with one tap per choice: due, priority, a label in use, a status", as
   await fireEvent.press(screen.getByRole("button", { name: "Next" }));
   await fireEvent.press(screen.getByRole("button", { name: "Someday" }));
 
-  expect(await screen.findByText(/^→ call dentist · \+2 · \^.* · #errand · >someday$/)).toBeTruthy();
+  // The preview: a tag per field the capture will set.
+  expect(await screen.findByLabelText(/^Will add call dentist: \+2, .+, errand, Someday$/)).toBeTruthy();
   await fireEvent.press(screen.getByLabelText("Add"));
   expect(await screen.findByText("Added: call dentist")).toBeTruthy();
   const captured = [...daemon.items.values()].find((i) => i.title === "call dentist");
@@ -66,7 +67,7 @@ test("a repeat preset is one tap", async () => {
   await fireEvent.press(screen.getByLabelText("New todo"));
   await fireEvent.changeText(await screen.findByLabelText("Title"), "water plants");
   await fireEvent.press(screen.getByLabelText("Repeat Weekdays"));
-  expect(await screen.findByText(/repeats every weekday/)).toBeTruthy();
+  expect(await screen.findByLabelText(/^Will add water plants: .*every weekday/)).toBeTruthy();
   await fireEvent.press(screen.getByLabelText("Add"));
   await screen.findByText("Added: water plants");
   const captured = [...daemon.items.values()].find((i) => i.title === "water plants");
