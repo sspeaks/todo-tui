@@ -484,7 +484,10 @@ It shows the views as tabs with the same rows as the TUI. To add an item, tap th
 round + button, type a title and set the rest with one tap each (due, priority,
 status, repeat, the labels and names you use), or type the capture syntax; a preview
 shows what will be captured. The item screen has the same one-tap choices.
-Tap ○ to complete an item and ● to reopen it. Tap an item to edit its title, status,
+Tap ○ (or swipe right) to complete an item and ● to reopen it; swipe left to delete.
+Search is the magnifier, and Settings (the gear) shows the connection and pairing.
+What you add while your computer is out of reach is kept on the phone and sent
+once it is back. Tap an item to edit its title, status,
 priority, due date, repeat, labels, waiting on and follow-up, hide-until date and
 notes, or to delete it. Every change can be undone from the snackbar. It is a thin client: it shows nothing while your
 computer is asleep or off the tailnet.
@@ -528,6 +531,27 @@ In the app, tap **Scan QR code** and scan the pairing code. `todo remote list` s
 the paired devices and `todo remote revoke phone` unpairs one at once; the app then
 asks to pair again. `todo remote status` checks the setup. Every call needs the
 token, and the phone cannot stop the daemon.
+
+#### Install it on your iPhone (no dev server)
+
+With Expo Go the app runs only while `pnpm -C apps/mobile start` does. To install
+it as an app of its own:
+
+- **Free, with Xcode** (the install lasts 7 days, then run it again): install
+  CocoaPods once (`brew install cocoapods`), plug the iPhone in, turn on Developer
+  Mode (Settings › Privacy & Security), then
+
+  ```sh
+  pnpm -C apps/mobile ios:device    # expo run:ios --device --configuration Release
+  ```
+
+  Pick the iPhone, and your Apple ID as the team when asked. The first time, trust
+  the developer in Settings › General › VPN & Device Management. With an install of
+  its own, `todo-tui://pair` links from `todo remote pair` open the app.
+
+- **TestFlight** (Apple Developer Program): `npx eas-cli@latest build -p ios
+  --profile production` from `apps/mobile`, then `npx eas-cli@latest submit -p ios`
+  (`eas.json` has the profiles).
 
 ### The daemon
 
