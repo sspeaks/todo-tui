@@ -173,3 +173,108 @@ async fn serve(stream: tokio::net::TcpStream, state: Arc<Mutex<State>>) -> std::
         write.write_all(text.as_bytes()).await?;
     }
 }
+
+/// A synthetic issue as Data Center's search returns one.
+pub fn issue_json(id: u32, title: &str, category: &str, updated: &str) -> Value {
+    json!({
+        "id": id.to_string(),
+        "key": format!("PLAT-{id}"),
+        "fields": {
+            "summary": title,
+            "description": null,
+            "issuetype": {"name": "Task"},
+            "status": {"name": "Open", "statusCategory": {"key": category}},
+            "priority": {"name": "Major"},
+            "assignee": {"key": "JIRAUSER10100", "name": "dana", "displayName": "Dana Example"},
+            "labels": [],
+            "components": [],
+            "fixVersions": [],
+            "created": "2026-10-01T09:00:00.000+0000",
+            "updated": updated
+        }
+    })
+}
+
+impl FakeJira {
+    /// Serves discovery: five priorities, a Story Points and a Sprint field.
+    pub fn serve_discovery(&self) {
+        self.route("/rest/api/2/priority", |_| {
+            let p: Vec<Value> = ["Blocker", "Critical", "Major", "Minor", "Trivial"]
+                .iter()
+                .map(|n| json!({"name": n}))
+                .collect();
+            (200, Value::Array(p), vec![])
+        });
+        self.route("/rest/api/2/field", |_| {
+            (
+                200,
+                json!([
+                    {"id": "summary", "name": "Summary", "custom": false},
+                    {"id": "customfield_10002", "name": "Story Points", "custom": true,
+                     "schema": {"type": "number", "custom": "com.atlassian.jira.plugin.system.customfieldtypes:float"}},
+                    {"id": "customfield_10004", "name": "Sprint", "custom": true,
+                     "schema": {"type": "array", "custom": "com.pyxis.greenhopper.jira:gh-sprint"}}
+                ]),
+                vec![],
+            )
+        });
+    }
+
+    /// Serves `issues` to searches, `page` at a time. It reads the JQL as
+    /// the adapter writes it: `updated >= "yyyy/MM/dd HH:mm"` (in UTC, the
+    /// zone tests give the user), `id > n` and `ORDER BY id`, else in the
+    /// list's order. `issues` can change between calls (a shared list).
+    pub fn serve_search(&self, issues: Arc<Mutex<Vec<Value>>>, page: usize) {
+        self.route("/rest/api/2/search", move |seen| {
+            let body: Value = serde_json::from_str(&seen.body).unwrap_or_default();
+            let jql = body["jql"].as_str().unwrap_or_default().to_owned();
+            let start = body["startAt"].as_u64().unwrap_or(0) as usize;
+            let since = jql
+                .split("updated >= \"")
+                .nth(1)
+                .and_then(|t| t.split('"').next())
+                .map(|t| {
+                    let wall =
+                        jiff::civil::DateTime::strptime("%Y/%m/%d %H:%M", t).expect("a JQL date");
+                    wall.to_zoned(jiff::tz::TimeZone::UTC)
+                        .expect("UTC")
+                        .timestamp()
+                });
+            let after = jql
+                .split("id > ")
+                .nth(1)
+                .and_then(|t| t.split(' ').next())
+                .and_then(|t| t.parse::<u64>().ok());
+            let updated = |v: &Value| {
+                v["fields"]["updated"]
+                    .as_str()
+                    .and_then(crate::issue::parse_time)
+            };
+            let id = |v: &Value| {
+                v["id"]
+                    .as_str()
+                    .and_then(|i| i.parse::<u64>().ok())
+                    .unwrap_or(0)
+            };
+            let mut all: Vec<Value> = issues
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|v| since.is_none_or(|s| updated(v).is_some_and(|u| u >= s)))
+                .filter(|v| after.is_none_or(|a| id(v) > a))
+                .cloned()
+                .collect();
+            if jql.contains("ORDER BY id") {
+                all.sort_by_key(id);
+            } else {
+                all.sort_by_key(|v| (updated(v), id(v)));
+            }
+            let slice: Vec<Value> = all.iter().skip(start).take(page).cloned().collect();
+            (
+                200,
+                json!({"startAt": start, "maxResults": page, "total": all.len(), "issues": slice}),
+                vec![],
+            )
+        });
+    }
+}
