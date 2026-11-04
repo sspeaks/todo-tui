@@ -1,11 +1,12 @@
 import { type Item, Status, setStatus } from "@todo-tui/client/portable";
 import { useClients, useConnection, useStatusCounts, useView, useViews, useLiveStore } from "@todo-tui/client/react";
-import { tabQuery } from "@todo-tui/present";
+import { dayLabel, dayOf, tabQuery } from "@todo-tui/present";
 import { Stack, router } from "expo-router";
 import { useCallback, useEffect, useState } from "react";
 import { ActivityIndicator, Alert, FlatList, Pressable, RefreshControl, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { describeError, isUnauthenticated } from "../errors";
+import { tap } from "../haptics";
 import { useSnack } from "../snack";
 import { type Theme, useTheme } from "../theme";
 import { useToday } from "../today";
@@ -42,14 +43,17 @@ export function Home({ onUnpair }: { onUnpair: (message?: string) => Promise<voi
   const toggle = useCallback(
     async (item: Item) => {
       const reopen = closed(item.status);
+      tap();
       try {
         const res = await setStatus(clients.items, item.id, reopen ? Status.NEXT : Status.DONE, { timeoutMs: 15_000 });
-        snack.done(`${reopen ? "Reopened" : "Done"}: ${item.title}`, { ...(res.result && { result: res.result }), items: [res.item, res.generated] });
+        // A recurring Item: when the next one is due.
+        const next = res.generated?.dueDate ? ` · next ${dayLabel(dayOf(res.generated.dueDate), today)}` : "";
+        snack.done(`${reopen ? "Reopened" : "Done"}: ${item.title}${next}`, { ...(res.result && { result: res.result }), items: [res.item, res.generated] });
       } catch (err) {
         snack.fail(err);
       }
     },
-    [clients, snack],
+    [clients, snack, today],
   );
 
   const openItem = useCallback((item: Item) => router.push({ pathname: "/item/[id]", params: { id: item.id } }), []);

@@ -5,3 +5,10 @@ jest.mock("expo-router", () => ({
   Stack: { Screen: () => null },
   router: { push: jest.fn(), back: jest.fn(), replace: jest.fn() },
 }));
+jest.mock("expo-haptics", () => ({
+  selectionAsync: jest.fn(async () => {}),
+  impactAsync: jest.fn(async () => {}),
+  notificationAsync: jest.fn(async () => {}),
+  ImpactFeedbackStyle: { Light: "light" },
+  NotificationFeedbackType: { Success: "success" },
+}));

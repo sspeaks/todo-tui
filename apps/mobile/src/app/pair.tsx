@@ -92,11 +92,18 @@ export default function Pair() {
         </Pressable>
       )}
 
-      <Text style={s.label}>Or enter them yourself</Text>
+      <Text style={s.label}>Or paste the Link line it prints, or the server and token</Text>
       <TextInput
         style={s.input}
         value={url}
-        onChangeText={setUrl}
+        onChangeText={(text) => {
+          // The whole pairing link pasted here fills both fields.
+          const link = parsePairingLink(text);
+          if (link) {
+            setUrl(link.url);
+            setToken(link.token);
+          } else setUrl(text);
+        }}
         placeholder="https://laptop.tailnet.ts.net"
         placeholderTextColor={t.dim}
         autoCapitalize="none"

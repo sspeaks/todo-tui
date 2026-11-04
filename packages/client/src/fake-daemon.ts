@@ -13,6 +13,7 @@ import {
   type Item,
   ItemRecurrenceSchema,
   ItemSchema,
+  Priority,
   RecurrenceRuleSchema,
   ResolutionKind,
   Status,
@@ -1799,6 +1800,8 @@ function patchOf(p: Planned, item: Item, now: Timestamp): Fields {
           if (LINE_BREAK.test(value as string)) throw badRequest(where, "must be a single line");
         }
         if (field === "parentId" && value === item.id) throw badRequest(where, "an Item cannot be its own parent");
+        // Priority's domain has a "none": unset clears it to that, as the daemon does.
+        if (field === "priority" && (value === undefined || value === Priority.UNSPECIFIED)) value = Priority.NONE;
         if (field === "labels" && Array.isArray(value)) {
           if (value.some((l: string) => l === "" || BAD_LABEL.test(l))) {
             throw badRequest(where, "labels must be non-empty and contain no whitespace or control characters");

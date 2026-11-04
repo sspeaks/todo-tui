@@ -426,6 +426,12 @@ export function captureConformance(open: () => Promise<CaptureTarget>): void {
       for (const via of [CreatedVia.CLI, CreatedVia.MCP, CreatedVia.MOBILE]) expect((await capture("x", { createdVia: via })).item?.createdVia).toBe(via);
     });
 
+    it("UpdateItem clears the priority to NONE", async () => {
+      const id = (await capture("call +2")).item!.id;
+      const res = await updateItem(t.items, { id }, ["priority"]);
+      expect(res.item?.priority).toBe(Priority.NONE);
+    });
+
     it("UpdateItem waits since today in the daemon's zone, and a nested waiting path changes only its field", async () => {
       const id = (await capture("chase")).item!.id;
       const set = (waiting: Parameters<typeof updateItem>[1]["waiting"], paths: string[]) => updateItem(t.items, { id, ...(waiting && { waiting }) }, paths);

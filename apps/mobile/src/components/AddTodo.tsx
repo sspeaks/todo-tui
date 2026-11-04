@@ -17,6 +17,7 @@ import { useMemo, useRef, useState } from "react";
 import { ActivityIndicator, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { type CaptureChoices, NO_CHOICES, captureText, hasChoices } from "../capture-draft";
 import { useKnown } from "../known";
+import { success } from "../haptics";
 import { useSnack } from "../snack";
 import { type Theme, useTheme } from "../theme";
 import { Pill, PillGroup } from "./quick/Pill";
@@ -82,6 +83,7 @@ export function AddTodo({ visible, today, onClose }: { visible: boolean; today: 
     try {
       const res = await captureItem(clients.items, text, { createdVia: CreatedVia.MOBILE, requestId: requestId.current, timeoutMs: 15_000 });
       const id = res.item?.id;
+      success();
       snack.done(
         `Added: ${res.item?.title ?? title}`,
         { ...(res.result && { result: res.result }), items: [res.item] },
@@ -110,8 +112,14 @@ export function AddTodo({ visible, today, onClose }: { visible: boolean; today: 
             <Text style={s.cancel}>Cancel</Text>
           </Pressable>
           <Text style={s.heading}>New todo</Text>
-          <Pressable onPress={submit} disabled={!canAdd} hitSlop={8} accessibilityLabel="Add">
-            {busy ? <ActivityIndicator color={t.accent} /> : <Text style={[s.add, !canAdd && s.disabled]}>Add</Text>}
+          <Pressable
+            onPress={submit}
+            disabled={!canAdd}
+            hitSlop={8}
+            accessibilityLabel="Add"
+            style={({ pressed }) => [s.add, !canAdd && s.disabled, pressed && s.pressed]}
+          >
+            {busy ? <ActivityIndicator color={t.onAccent} /> : <Text style={s.addText}>Add</Text>}
           </Pressable>
         </View>
         <ScrollView style={s.page} contentContainerStyle={s.content} keyboardShouldPersistTaps="always">
@@ -192,8 +200,10 @@ const styles = (t: Theme) =>
     },
     heading: { color: t.text, fontWeight: "600", fontSize: 16 },
     cancel: { color: t.dim, fontSize: 16 },
-    add: { color: t.accent, fontWeight: "700", fontSize: 16 },
+    add: { backgroundColor: t.accent, borderRadius: 20, minWidth: 76, paddingHorizontal: 20, paddingVertical: 10, alignItems: "center" },
+    addText: { color: t.onAccent, fontWeight: "700", fontSize: 17 },
     disabled: { opacity: 0.4 },
+    pressed: { opacity: 0.8 },
     content: { paddingVertical: 12, gap: 10, paddingBottom: 32 },
     input: { color: t.text, fontSize: 20, paddingHorizontal: 16, paddingVertical: 6, minHeight: 44 },
     preview: { color: t.dim, fontSize: 14, lineHeight: 20, paddingHorizontal: 16 },

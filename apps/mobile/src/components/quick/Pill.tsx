@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
+import { tick } from "../../haptics";
 import { type Theme, useTheme } from "../../theme";
 
 /** One tap: `on` shows it chosen. */
@@ -8,7 +9,10 @@ export function Pill({ label, on, onPress, accessibilityLabel }: { label: string
   return (
     <Pressable
       style={[s.pill, on && s.on]}
-      onPress={onPress}
+      onPress={() => {
+        tick();
+        onPress();
+      }}
       hitSlop={4}
       accessibilityRole="button"
       accessibilityState={{ selected: !!on }}

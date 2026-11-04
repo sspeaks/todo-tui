@@ -22,8 +22,9 @@ export default function Index() {
       return (
         <View style={s.center}>
           <Text style={s.message}>{session.message}</Text>
+          {session.retrying ? <Text style={s.hint}>Trying again automatically…</Text> : null}
           <Pressable style={s.button} onPress={retry}>
-            <Text style={s.buttonText}>Try again</Text>
+            <Text style={s.buttonText}>Try now</Text>
           </Pressable>
         </View>
       );
@@ -36,6 +37,7 @@ const styles = (t: Theme) =>
   StyleSheet.create({
     center: { flex: 1, alignItems: "center", justifyContent: "center", padding: 24, gap: 16, backgroundColor: t.bg },
     message: { color: t.dim, textAlign: "center", fontSize: 15 },
+    hint: { color: t.dim, textAlign: "center", fontSize: 13 },
     button: { backgroundColor: t.accent, borderRadius: 8, paddingHorizontal: 20, paddingVertical: 12 },
     buttonText: { color: t.onAccent, fontWeight: "600" },
   });
