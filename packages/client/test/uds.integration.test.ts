@@ -15,6 +15,7 @@ import { MAX_CAPTURE_BYTES } from "../src/limits.js";
 import type { LiveStore } from "../src/live-store.js";
 import { updateItem } from "../src/mutations.js";
 import { resolvePaths, envFromProcess } from "../src/paths.js";
+import { readDaemonPid, waitForDaemonExit } from "../src/spawn.js";
 import { ulid } from "../src/ulid.js";
 import { CAPTURE_ZONE, captureConformance } from "./conformance/capture.js";
 import { energyConformance } from "./conformance/energy.js";
@@ -59,6 +60,8 @@ async function home(extra: NodeJS.ProcessEnv = {}, tracked = true) {
   const add = (text: string) => run(TODO_BIN!, ["add", text], { env });
   const close = async () => {
     for (const c of conns) c.close();
+    const paths = resolvePaths(envFromProcess(env));
+    const pid = readDaemonPid(paths.lock);
     try {
       // Any api_minor will do for a shutdown.
       const c = await connect({ env, autoSpawn: false, clientKind: ClientKind.ONESHOT, requiredApiMinor: 0 });
@@ -67,7 +70,11 @@ async function home(extra: NodeJS.ProcessEnv = {}, tracked = true) {
     } catch {
       // already down
     }
-    rmSync(dir, { recursive: true, force: true });
+    // Shutdown answers before the daemon exits; until it has, it may still
+    // write into the home (its backup at start, in data/backups), which
+    // would race the removal below (ENOTEMPTY).
+    await waitForDaemonExit(pid, paths.socket).catch(() => {});
+    rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
   };
   if (tracked) cleanups.push(close);
   return { dir, env, open, add, close, socket: resolvePaths(envFromProcess(env)).socket };
