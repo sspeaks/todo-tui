@@ -31,6 +31,9 @@ enum OpKind {
   OP_KIND_UPDATE_VIEW = 16;
   OP_KIND_DELETE_VIEW = 17;
   OP_KIND_MOVE_VIEW = 18;
+  // A pull from a tracker (design 5.4): imports and Core updates, actor
+  // sync. Never an undo stack entry.
+  OP_KIND_SYNC = 19;
 }
 
 // An entry of the undo stack (design 3.10).

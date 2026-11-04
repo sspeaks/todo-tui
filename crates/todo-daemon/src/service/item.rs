@@ -783,6 +783,7 @@ fn op_kind(kind: OpKind) -> v1::OpKind {
         OpKind::RemoveRelation => v1::OpKind::RemoveRelation,
         OpKind::SetRecurrence => v1::OpKind::SetRecurrence,
         OpKind::AutoArchive => v1::OpKind::AutoArchive,
+        OpKind::Sync => v1::OpKind::Sync,
         OpKind::CreateView => v1::OpKind::CreateView,
         OpKind::UpdateView => v1::OpKind::UpdateView,
         OpKind::DeleteView => v1::OpKind::DeleteView,
@@ -875,6 +876,7 @@ mod tests {
             OpKind::UpdateView,
             OpKind::DeleteView,
             OpKind::MoveView,
+            OpKind::Sync,
         ];
         let proto: HashSet<i32> = kinds.iter().map(|&k| op_kind(k) as i32).collect();
         assert_eq!(proto.len(), kinds.len());

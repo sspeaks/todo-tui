@@ -280,6 +280,22 @@ impl Shape<'_> {
                 ),
                 id.map(|id| ("item_id", id.to_string())),
             ),
+            MutationError::LinkedReadOnly(field) => error_info(
+                Code::FailedPrecondition,
+                "LINKED_READ_ONLY",
+                self.in_batch(
+                    index,
+                    format!(
+                        "{} is the tracker's: the item is linked, and edits reach the tracker only once pushes arrive",
+                        item_field_path(*field)
+                    ),
+                ),
+                [
+                    ("field", item_field_path(*field).to_owned()),
+                ]
+                .into_iter()
+                .chain(id.map(|id| ("item_id", id.to_string()))),
+            ),
             _ => bad_request(&self.path(index, error), describe(error)),
         }
     }
@@ -392,6 +408,7 @@ fn describe(error: &MutationError) -> String {
         ),
         MutationError::Deleted => "the item is deleted".to_owned(),
         MutationError::Closed => "the item is done or cancelled: reopen it first".to_owned(),
+        MutationError::LinkedReadOnly(_) => "is the tracker's until pushes arrive".to_owned(),
     }
 }
 

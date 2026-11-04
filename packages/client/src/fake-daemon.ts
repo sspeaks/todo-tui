@@ -1325,6 +1325,18 @@ export class FakeDaemon {
       // Read before the undelete replaces it.
       const deletedBy = p.kind === "undelete" ? batch.deletedBy(p.id) : undefined;
       const { next, changes } = applyPatch(item, patchOf(p, item, now));
+      // Read-only sync (ADR-0006): a person changes only Overlay fields of a
+      // linked Item, as todo_core's apply refuses.
+      const core = item.remoteLink !== undefined ? changes.find((c) => CORE_FIELDS.has(c.field)) : undefined;
+      if (core) {
+        const path = CORE_PATHS[core.field]!;
+        throw errorInfo(
+          Code.FailedPrecondition,
+          "LINKED_READ_ONLY",
+          inBatch(p, `${path} is the tracker's: the item is linked, and edits reach the tracker only once pushes arrive`),
+          { field: path, item_id: p.id },
+        );
+      }
       // As the core maintains status_entered_at, mutation by mutation.
       if (next.status !== item.status) batch.statusChanged.add(p.id);
       const parent = changes.find((c) => c.field === "parentId")?.new;
@@ -2700,6 +2712,26 @@ function planItemOp(kind: MutationKind, req: { id: string; expectedRevision?: bi
 const STATUS_PATHS = new Set(["status", "status_category", "resolution_kind", "todo_refinement"]);
 
 const FIELDS_BY_NAME = new Map(ItemSchema.fields.map((f) => [f.name, f]));
+
+/** The Core fields (design 3.2), by local name, with their paths: the tracker's on a linked Item. */
+const CORE_PATHS: Record<string, string> = {
+  title: "title",
+  description: "description",
+  itemType: "item_type",
+  statusCategory: "status_category",
+  resolutionKind: "resolution_kind",
+  priority: "priority",
+  assignee: "assignee",
+  labels: "labels",
+  components: "components",
+  fixVersions: "fix_versions",
+  dueDate: "due_date",
+  parentId: "parent_id",
+  storyPoints: "story_points",
+  originalEstimate: "original_estimate",
+  remainingEstimate: "remaining_estimate",
+};
+const CORE_FIELDS = new Set(Object.keys(CORE_PATHS));
 
 /** The Item fields whose own fields are mask paths too ("waiting.reason"), as ItemField names them. */
 const NESTED_PATHS = new Set(["waiting", "archived", "remote_link", "recurrence", "staleness"]);

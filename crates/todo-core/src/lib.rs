@@ -13,6 +13,7 @@ pub mod mutation;
 pub mod query;
 pub mod recurrence;
 pub mod relation;
+pub mod remote;
 pub mod report;
 pub mod status;
 pub mod value;

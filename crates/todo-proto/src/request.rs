@@ -466,9 +466,12 @@ mod tests {
         item: &core::Item,
         updates: Vec<FieldUpdate>,
     ) -> Result<core::Applied, core::MutationError> {
+        // As sync: the Item is linked (components need a link), and a
+        // person's Core edits on one wait for pushes (ADR-0006). This checks
+        // the values' variants, which are the same either way.
         let ctx = core::ApplyCtx {
             now: Timestamp::from_second(5_000).unwrap(),
-            actor: core::Actor::User,
+            actor: core::Actor::Sync,
         };
         core::apply(item, &MutationOp::Update(updates), &ctx)
     }

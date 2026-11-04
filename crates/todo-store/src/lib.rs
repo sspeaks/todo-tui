@@ -14,6 +14,7 @@ mod report;
 mod restore;
 mod schema;
 mod summary;
+mod sync;
 mod undo;
 mod view;
 
@@ -44,6 +45,7 @@ pub use report::{MAX_NEXT, Report, ReportInput, ReportLine};
 pub use restore::{DbInfo, backup_file, inspect, prepare_restored};
 pub use schema::{SCHEMA_VERSION, free_backup_path};
 use summary::Action;
+pub use sync::{PullOutcome, PullPage, Reconcile, ReconcileOutcome};
 pub use view::{
     CreateViewInput, MAX_VIEW_NAME_CHARS, MAX_VIEW_OFFSET_DAYS, MoveViewInput, UpdateViewInput,
     ViewOutput, ViewUpdate, check_view_filter, check_view_name,
@@ -257,6 +259,9 @@ pub enum OpKind {
     /// [`Store::auto_archive`]: the scheduler's archive of done Items and
     /// its healing (design 3.7). Actor system, so never an undo stack entry.
     AutoArchive,
+    /// [`Store::apply_remote`]: a page of a tracker pull (design 5.4). Actor
+    /// sync, so never an undo stack entry.
+    Sync,
 }
 
 impl OpKind {
@@ -909,6 +914,30 @@ impl Store {
     /// would: a view's tab count.
     pub async fn count_items(&self, filter: todo_core::Resolved) -> Result<u32> {
         self.read(move |conn| query::count_tx(conn, &filter)).await
+    }
+
+    /// A pulled page (design 5.4): imports and Core updates as one op of
+    /// actor sync, then the scope's cursor.
+    pub async fn apply_pull(&self, page: PullPage) -> Result<PullOutcome> {
+        self.write(move |tx| sync::apply_page_tx(tx, page)).await
+    }
+
+    /// The scope reconciliation (design 5.5) of the Items no scope lists.
+    pub async fn reconcile(&self, input: Reconcile) -> Result<ReconcileOutcome> {
+        self.write(move |tx| sync::reconcile_tx(tx, input)).await
+    }
+
+    /// `instance`'s tracked set: each live linked Item, its remote id and
+    /// the scopes it matched last.
+    pub async fn tracked(&self, instance: String) -> Result<Vec<(ItemId, String, Vec<String>)>> {
+        self.read(move |conn| sync::tracked_tx(conn, &instance))
+            .await
+    }
+
+    /// A scope's cursor, `None` before its first pull.
+    pub async fn sync_cursor(&self, instance: String, scope: String) -> Result<Option<Timestamp>> {
+        self.read(move |conn| sync::cursor_tx(conn, &instance, &scope))
+            .await
     }
 
     /// The L48 / N48 report (design 6.6), both halves read at one revision.

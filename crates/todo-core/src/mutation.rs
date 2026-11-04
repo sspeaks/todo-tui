@@ -204,6 +204,10 @@ pub enum MutationError {
     Closed,
     #[error("{field:?}: {reason}")]
     Unsupported { field: ItemField, reason: String },
+    /// A Core field of a linked Item, before pushes exist (ADR-0006): the
+    /// tracker owns it, and the next pull would undo the edit.
+    #[error("{0:?} is the tracker's until pushes arrive")]
+    LinkedReadOnly(ItemField),
 }
 
 impl MutationError {
@@ -217,7 +221,8 @@ impl MutationError {
             | MutationError::Duplicate(field)
             | MutationError::WrongType { field, .. }
             | MutationError::Invalid { field, .. }
-            | MutationError::Unsupported { field, .. } => Some(*field),
+            | MutationError::Unsupported { field, .. }
+            | MutationError::LinkedReadOnly(field) => Some(*field),
             MutationError::Deleted | MutationError::Closed => None,
         }
     }
@@ -313,12 +318,44 @@ pub fn apply(item: &Item, op: &MutationOp, ctx: &ApplyCtx) -> Result<Applied, Mu
             skipped: Vec::new(),
         });
     }
+    // Read-only sync (ADR-0006): on a linked Item a person changes only
+    // Overlay fields. Sync writes Core; undo restores what it recorded.
+    if item.is_linked()
+        && matches!(ctx.actor, Actor::User | Actor::Suggestion(_))
+        && let Some(c) = changes.iter().find(|c| is_core(c.field))
+    {
+        return Err(MutationError::LinkedReadOnly(c.field));
+    }
     maintain_derived(item, &mut next, ctx);
     Ok(Applied {
         item: next,
         changes,
         skipped: Vec::new(),
     })
+}
+
+/// A Core field (design 3.2): the tracker's once the Item is linked. The
+/// status category and resolution kind are Core; the refinement is not.
+fn is_core(field: ItemField) -> bool {
+    use ItemField as F;
+    matches!(
+        field,
+        F::Title
+            | F::Description
+            | F::ItemType
+            | F::StatusCategory
+            | F::ResolutionKind
+            | F::Priority
+            | F::Assignee
+            | F::Labels
+            | F::Components
+            | F::FixVersions
+            | F::DueDate
+            | F::ParentId
+            | F::StoryPoints
+            | F::OriginalEstimate
+            | F::RemainingEstimate
+    )
 }
 
 /// The `SetRecurrence` op on `item`.
@@ -1276,6 +1313,23 @@ mod tests {
     #[test]
     fn tracker_set_fields_need_a_link() {
         let names = |v: &[&str]| V::StringSet(v.iter().map(|&s| s.to_owned()).collect());
+        // On a linked Item only sync writes them for now (ADR-0006); its
+        // values are checked as a person's will be once pushes arrive.
+        let set = |item: &Item, field: ItemField, value: FieldValue| {
+            if item.is_linked() {
+                let ctx = ApplyCtx {
+                    now: Timestamp::from_second(10).unwrap(),
+                    actor: Actor::Sync,
+                };
+                apply(
+                    item,
+                    &MutationOp::Update(vec![FieldUpdate { field, value }]),
+                    &ctx,
+                )
+            } else {
+                set(item, field, value)
+            }
+        };
         for field in [F::Components, F::FixVersions] {
             assert!(matches!(
                 set(&item(), field, names(&["api"])),
@@ -2709,5 +2763,92 @@ mod tests {
                 .to_string(),
             "Title: must not be empty"
         );
+    }
+}
+
+#[cfg(test)]
+mod linked_tests {
+    use super::*;
+    use crate::item::{CreatedVia, LinkState, RemoteLink};
+    use crate::status::Status;
+
+    fn linked() -> Item {
+        let mut item = Item::new_capture(
+            crate::new_ulid(),
+            "PLAT-1".into(),
+            CreatedVia::RemoteImport,
+            Timestamp::UNIX_EPOCH,
+        );
+        item.remote_link = Some(RemoteLink {
+            tracker_kind: "jira".into(),
+            instance_id: "w".into(),
+            remote_id: "1".into(),
+            key: "PLAT-1".into(),
+            url: String::new(),
+            last_pulled_version: None,
+            link_state: LinkState::Ok,
+            pinned: false,
+        });
+        item
+    }
+
+    fn user() -> ApplyCtx {
+        ApplyCtx {
+            now: Timestamp::from_second(10).unwrap(),
+            actor: Actor::User,
+        }
+    }
+
+    fn set(field: ItemField, value: FieldValue) -> MutationOp {
+        MutationOp::Update(vec![FieldUpdate { field, value }])
+    }
+
+    #[test]
+    fn a_linked_item_takes_overlay_edits_only_from_a_person() {
+        let item = linked();
+        use FieldValue as V;
+        use ItemField as F;
+        for (field, value) in [
+            (F::Title, V::String("x".into())),
+            (F::Priority, V::Priority(crate::item::Priority::High)),
+            (F::Labels, V::StringSet(vec!["a".into()])),
+            (F::DueDate, V::Date(jiff::civil::date(2026, 1, 1))),
+        ] {
+            assert_eq!(
+                apply(&item, &set(field, value), &user()),
+                Err(MutationError::LinkedReadOnly(field))
+            );
+        }
+        // Done and in progress are the tracker's; next and someday are the
+        // refinement, which is local.
+        assert_eq!(
+            apply(&item, &MutationOp::SetStatus(Status::Done), &user()),
+            Err(MutationError::LinkedReadOnly(F::StatusCategory))
+        );
+        assert!(apply(&item, &MutationOp::SetStatus(Status::Someday), &user()).is_ok());
+        for (field, value) in [
+            (F::PrivateNotes, V::Markdown("n".into())),
+            (
+                F::LocalPriorityOverride,
+                V::Priority(crate::item::Priority::Low),
+            ),
+            (F::Energy, V::Energy(crate::item::Energy::Low)),
+            (F::DeferUntil, V::Date(jiff::civil::date(2026, 1, 1))),
+        ] {
+            assert!(
+                apply(&item, &set(field, value), &user()).is_ok(),
+                "{field:?}"
+            );
+        }
+        assert!(apply(&item, &MutationOp::Archive(ArchiveReason::User), &user()).is_ok());
+        assert!(apply(&item, &MutationOp::Delete, &user()).is_ok());
+        // An edit that changes nothing is no edit.
+        assert!(apply(&item, &set(F::Title, V::String("PLAT-1".into())), &user()).is_ok());
+        // Sync writes Core.
+        let sync = ApplyCtx {
+            actor: Actor::Sync,
+            ..user()
+        };
+        assert!(apply(&item, &set(F::Title, V::String("x".into())), &sync).is_ok());
     }
 }

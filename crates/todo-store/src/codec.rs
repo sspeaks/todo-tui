@@ -132,6 +132,7 @@ sql_enum!(OpKind, "op_kind", {
     OpKind::RemoveRelation => "remove_relation",
     OpKind::SetRecurrence => "set_recurrence",
     OpKind::AutoArchive => "auto_archive",
+    OpKind::Sync => "sync",
     OpKind::CreateView => "create_view",
     OpKind::UpdateView => "update_view",
     OpKind::DeleteView => "delete_view",

@@ -550,3 +550,21 @@ describe("FakeDaemon clock, zone and derived fields", () => {
     expect([again.item?.id, iso(first.draft?.dueDate), iso(again.draft?.dueDate)]).toEqual([first.item?.id, "2026-11-9", "2026-11-9"]);
   });
 });
+
+describe("FakeDaemon on a linked Item (read-only sync, ADR-0006)", () => {
+  it("refuses Core edits with LINKED_READ_ONLY and takes Overlay ones", async () => {
+    const daemon = new FakeDaemon([
+      { title: "PLAT-1", remoteLink: { trackerKind: "jira", instanceId: "work-jira", remoteId: "10001", key: "PLAT-1", url: "https://jira.example.com/browse/PLAT-1" } },
+    ]);
+    const [item] = [...daemon.items.values()];
+    const items = createClient(ItemService, daemon.transport);
+    const err = await failure(updateItem(items, { id: item!.id, title: "mine" }, ["title"]));
+    expect(err?.code).toBe(Code.FailedPrecondition);
+    const [info] = err?.findDetails(ErrorInfoSchema) ?? [];
+    expect([info?.reason, info?.metadata.field]).toEqual(["LINKED_READ_ONLY", "title"]);
+    expect((await failure(setStatus(items, item!.id, Status.DONE)))?.code).toBe(Code.FailedPrecondition);
+    // The refinement and the Overlay are local.
+    expect((await setStatus(items, item!.id, Status.SOMEDAY)).item?.status).toBe(Status.SOMEDAY);
+    expect((await updateItem(items, { id: item!.id, privateNotes: "mine" }, ["private_notes"])).item?.privateNotes).toBe("mine");
+  });
+});
