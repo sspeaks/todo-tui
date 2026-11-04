@@ -42,7 +42,8 @@ export default function Pair() {
     if (scanned.current) return;
     const p = parsePairingLink(result.data);
     if (!p) {
-      setError("That QR code isn't a todo pairing code. Run `todo remote pair` on your computer.");
+      const seen = result.data.length > 40 ? `${result.data.slice(0, 40)}…` : result.data;
+      setError(`That QR code isn't a todo pairing code (it reads "${seen}"). Scan the one \`todo remote pair\` prints.`);
       return;
     }
     scanned.current = true;

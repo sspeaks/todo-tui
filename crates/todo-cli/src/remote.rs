@@ -186,15 +186,29 @@ fn encode(s: &str) -> String {
 }
 
 fn render_qr(link: &str) -> anyhow::Result<String> {
-    let code = QrCode::new(link.as_bytes())?;
-    // Light modules as dark cells: reads on a dark terminal, and a scanner
-    // accepts the inverted code too.
-    Ok(code
+    use std::io::IsTerminal as _;
+    render_qr_for(link, std::io::stdout().is_terminal())
+}
+
+/// The code as text: dark modules as blocks in the text colour. On a
+/// terminal, each line is set black on bright white, so the code reads the
+/// right way round whatever the theme: phone scanners (iOS's included) do
+/// not reliably read an inverted code.
+fn render_qr_for(link: &str, terminal: bool) -> anyhow::Result<String> {
+    let text = QrCode::new(link.as_bytes())?
         .render::<Dense1x2>()
-        .dark_color(Dense1x2::Light)
-        .light_color(Dense1x2::Dark)
+        .dark_color(Dense1x2::Dark)
+        .light_color(Dense1x2::Light)
         .quiet_zone(true)
-        .build())
+        .build();
+    if !terminal {
+        return Ok(text);
+    }
+    Ok(text
+        .lines()
+        .map(|line| format!("\x1b[30;107m{line}\x1b[0m"))
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 #[cfg(test)]
@@ -225,13 +239,17 @@ mod tests {
     }
 
     #[test]
-    fn qr_renders() {
+    fn qr_renders_dark_on_light() {
+        let plain = render_qr_for("todo-tui://pair?url=x&token=y", false).unwrap();
+        assert!(plain.lines().count() > 10);
+        assert!(!plain.contains('\x1b'));
+        // The quiet zone is light: spaces, not blocks.
+        assert!(plain.lines().next().unwrap().chars().all(|c| c == ' '));
+        let colored = render_qr_for("todo-tui://pair?url=x&token=y", true).unwrap();
         assert!(
-            render_qr("todo-tui://pair?url=x&token=y")
-                .unwrap()
+            colored
                 .lines()
-                .count()
-                > 10
+                .all(|l| l.starts_with("\x1b[30;107m") && l.ends_with("\x1b[0m"))
         );
     }
 }
