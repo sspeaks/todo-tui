@@ -63,8 +63,12 @@ over Tailscale.
   `@connectrpc/connect-web`. The conformance suites run over the listener too
   (`test/remote.integration.test.ts`).
 - `ClientKind` is recorded per connection, and fetch spreads gRPC-Web calls
-  over pooled HTTP/1.1 connections, so a phone's MOBILE kind only marks the
-  connection its hello used. In practice that is the Watch stream's, since it
-  stays open. It only matters for refusing upgrade restarts.
+  over pooled HTTP/1.1 connections it chooses, so a phone's MOBILE kind marks
+  only the connection its hello happened to use, for as long as fetch keeps
+  it open. An upgrade restart may therefore not wait for a phone. The phone
+  just reconnects.
+- What the TUI and the app show alike (dates, row cells, repeat rules, the
+  quick-add preview, the tabs' queries, `Latest`) is `@todo-tui/present`,
+  typechecked without Node types.
 - Anyone on the tailnet who holds a token has full read and write access to the
   todo list. Tokens are per device and revocable.

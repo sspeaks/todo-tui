@@ -1,6 +1,6 @@
-import { ItemField, ListItemsRequestSchema, Operator, create } from "@todo-tui/client";
+import { ItemField, ListItemsRequestSchema, Operator, create } from "@todo-tui/client/portable";
 import { describe, expect, it } from "vitest";
-import { matchText, searchQuery, searchTab, tabQuery } from "./tabs.js";
+import { matchText, searchQuery, searchTab, tabQuery } from "../src/tabs.js";
 
 const targets = (clauses: readonly { kind: { case?: string; value?: unknown } }[] | undefined) =>
   (clauses ?? []).map((c) => (c.kind.value as { target: ItemField; op: Operator }).target);

@@ -14,6 +14,7 @@
   },
   "dependencies": {
     "@todo-tui/client": "workspace:*",
+    "@todo-tui/present": "workspace:*",
     "ink": "8.0.0",
     "react": "19.3.1"
   },

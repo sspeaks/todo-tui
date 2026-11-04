@@ -1,7 +1,7 @@
-import { create, ItemSchema, ParseRecurrenceResponseSchema, type RecurrenceRule, RecurrenceRuleSchema, Weekday } from "@todo-tui/client";
+import { create, ItemSchema, ParseRecurrenceResponseSchema, type RecurrenceRule, RecurrenceRuleSchema, Weekday } from "@todo-tui/client/portable";
 import { describe, expect, it } from "vitest";
-import { dayNumber } from "./dates.js";
-import { describeRule, repeatPreview, repeatsLine, ruleText } from "./recurrence.js";
+import { dayNumber } from "../src/dates.js";
+import { describeRule, repeatPreview, repeatsLine, ruleText } from "../src/recurrence.js";
 
 const today = dayNumber(2026, 10, 26); // a Monday
 

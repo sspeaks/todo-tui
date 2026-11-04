@@ -1,0 +1,26 @@
+{
+  "name": "@todo-tui/present",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./capture": "./src/capture.ts",
+    "./dates": "./src/dates.ts",
+    "./item": "./src/item.ts",
+    "./latest": "./src/latest.ts",
+    "./recurrence": "./src/recurrence.ts",
+    "./tabs": "./src/tabs.ts",
+    "./text": "./src/text.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@todo-tui/client": "workspace:*"
+  },
+  "devDependencies": {
+    "vitest": "5.0.5"
+  }
+}

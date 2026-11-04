@@ -229,11 +229,24 @@ importers:
         specifier: 5.0.5
         version: 5.0.5(@types/node@24.19.2)(vite@8.3.4(@types/node@24.19.2)(esbuild@0.28.2)(tsx@4.23.15))
 
+  packages/present:
+    dependencies:
+      '@todo-tui/client':
+        specifier: workspace:*
+        version: link:../client
+    devDependencies:
+      vitest:
+        specifier: 5.0.5
+        version: 5.0.5(@types/node@24.19.2)(vite@8.3.4(@types/node@24.19.2)(esbuild@0.28.2)(tsx@4.23.15))
+
   tui:
     dependencies:
       '@todo-tui/client':
         specifier: workspace:*
         version: link:../packages/client
+      '@todo-tui/present':
+        specifier: workspace:*
+        version: link:../packages/present
       ink:
         specifier: 8.0.0
         version: 8.0.0(@types/react@19.3.0)(react@19.3.1)
