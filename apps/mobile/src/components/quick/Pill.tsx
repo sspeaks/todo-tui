@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { Pressable, StyleSheet, Text, View } from "react-native";
 import { type Theme, useTheme } from "../../theme";
 
 /** One tap: `on` shows it chosen. */
@@ -21,28 +21,31 @@ export function Pill({ label, on, onPress, accessibilityLabel }: { label: string
   );
 }
 
-/** A thin divider between groups in a row. */
-export function Gap() {
-  const s = styles(useTheme());
-  return <View style={s.gap} />;
-}
-
-/** A horizontally scrolling row of pills. */
+/** Pills that wrap onto as many lines as they need: every one in sight. */
 export function PillRow({ children }: { children: ReactNode }) {
   const s = styles(useTheme());
+  return <View style={s.row}>{children}</View>;
+}
+
+/** A labelled group of pills: the label on the left, the pills wrapping beside it. */
+export function PillGroup({ label, children }: { label: string; children: ReactNode }) {
+  const s = styles(useTheme());
   return (
-    <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.row} keyboardShouldPersistTaps="always">
-      {children}
-    </ScrollView>
+    <View style={s.group}>
+      <Text style={s.label}>{label}</Text>
+      <View style={[s.row, s.grow]}>{children}</View>
+    </View>
   );
 }
 
 const styles = (t: Theme) =>
   StyleSheet.create({
-    row: { gap: 6, paddingHorizontal: 8, alignItems: "center" },
+    row: { flexDirection: "row", flexWrap: "wrap", gap: 6, alignItems: "center" },
+    grow: { flex: 1 },
+    group: { flexDirection: "row", alignItems: "flex-start", gap: 8, paddingHorizontal: 12 },
+    label: { width: 64, color: t.dim, fontSize: 12, paddingTop: 7 },
     pill: { paddingHorizontal: 11, paddingVertical: 6, borderRadius: 14, backgroundColor: t.surface, maxWidth: 200 },
     on: { backgroundColor: t.accent },
     text: { color: t.text, fontSize: 14 },
     onText: { color: t.onAccent, fontWeight: "600" },
-    gap: { width: StyleSheet.hairlineWidth, height: 20, backgroundColor: t.border, marginHorizontal: 4 },
   });

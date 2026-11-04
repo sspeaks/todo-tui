@@ -1,5 +1,6 @@
-// Adding an item: a title, and above it rows of one-tap choices: due,
-// priority and status; repeat, labels and waiting on. Tapping a chosen
+// Adding an item: a title, and above it one row per field of one-tap
+// choices (due, priority, status, repeat, labels, waiting on), each
+// wrapping so every choice is in sight. Tapping a chosen
 // pill again clears it. Only a calendar date, a new label, a new name or
 // an unusual repeat opens a sheet. The choices become capture tokens after
 // the title (capture-draft.ts), so it is one capture with ParseCapture's
@@ -11,12 +12,12 @@ import { useClients } from "@todo-tui/client/react";
 import { Latest, captureSummary, describeRule } from "@todo-tui/present";
 import { router } from "expo-router";
 import { useMemo, useRef, useState } from "react";
-import { ActivityIndicator, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { type CaptureChoices, NO_CHOICES, captureText, hasChoices } from "../capture-draft";
 import { useKnown } from "../known";
 import { useSnack } from "../snack";
 import { type Theme, useTheme } from "../theme";
-import { Gap, Pill, PillRow } from "./quick/Pill";
+import { Pill, PillGroup } from "./quick/Pill";
 import { REPEAT_PRESETS, type RepeatPreset } from "./quick/presets";
 import { QuickDate } from "./quick/QuickDate";
 import { QuickLabels } from "./quick/QuickLabels";
@@ -103,22 +104,22 @@ export function Composer({ today }: { today: number }) {
         </Text>
       ))}
       {showChoices ? (
-        <>
-          <PillRow>
-            <Text style={s.group}>Due</Text>
+        <ScrollView style={s.choices} contentContainerStyle={s.choicesContent} keyboardShouldPersistTaps="always">
+          <PillGroup label="Due">
             <QuickDate title="Due" value={choices.due} today={today} onChange={(due) => choose({ due })} />
-            <Gap />
+          </PillGroup>
+          <PillGroup label="Priority">
             <QuickPriority value={choices.priority} onChange={(priority) => choose({ priority })} />
-            <Gap />
+          </PillGroup>
+          <PillGroup label="Status">
             <Pill label="Next" on={choices.status === "next"} onPress={() => choose({ status: choices.status === "next" ? undefined : "next" })} />
             <Pill
               label="Someday"
               on={choices.status === "someday"}
               onPress={() => choose({ status: choices.status === "someday" ? undefined : "someday" })}
             />
-          </PillRow>
-          <PillRow>
-            <Text style={s.group}>Repeat</Text>
+          </PillGroup>
+          <PillGroup label="Repeat">
             <QuickRepeat
               preset={preset as RepeatPreset | undefined}
               custom={preset ? undefined : customRepeat}
@@ -133,12 +134,14 @@ export function Composer({ today }: { today: number }) {
                 choose({ repeat: c?.text });
               }}
             />
-            <Gap />
+          </PillGroup>
+          <PillGroup label="Labels">
             <QuickLabels value={choices.labels} known={known.labels} onChange={(labels) => choose({ labels })} />
-            <Gap />
+          </PillGroup>
+          <PillGroup label="Waiting on">
             <QuickWaiting value={choices.waiting} known={known.names} onChange={(waiting) => choose({ waiting })} />
-          </PillRow>
-        </>
+          </PillGroup>
+        </ScrollView>
       ) : null}
       <View style={s.bar}>
         <TextInput
@@ -164,10 +167,12 @@ export function Composer({ today }: { today: number }) {
 
 const styles = (t: Theme) =>
   StyleSheet.create({
-    wrap: { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: t.border, paddingVertical: 8, gap: 6, backgroundColor: t.bg },
+    // Shrinks only after the list above it has: the choices then scroll.
+    wrap: { flexShrink: 1, borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: t.border, paddingVertical: 8, gap: 6, backgroundColor: t.bg },
+    choices: { flexGrow: 0, flexShrink: 1 },
+    choicesContent: { gap: 8, paddingVertical: 2 },
     preview: { color: t.dim, fontSize: 13, paddingHorizontal: 12 },
     warn: { color: t.warn, fontSize: 13, paddingHorizontal: 12 },
-    group: { color: t.dim, fontSize: 12, marginRight: 2 },
     bar: { flexDirection: "row", gap: 8, paddingHorizontal: 8 },
     input: { flex: 1, backgroundColor: t.surface, color: t.text, borderRadius: 8, paddingHorizontal: 12, paddingVertical: 10, fontSize: 16 },
     add: { backgroundColor: t.accent, borderRadius: 8, paddingHorizontal: 16, justifyContent: "center" },
