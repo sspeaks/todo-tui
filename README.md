@@ -16,7 +16,9 @@ Milestone M5 (recurring items) is done: repeat rules with `@`, in captures and a
 a TUI key, the next instance created when you complete one, and done items archived
 after a week; see [Recurring items](#recurring-items). Milestone M7 (the MCP
 server) is done, ahead of M6: `todo mcp` gives Claude Code tools to list, capture,
-edit and complete items; see [Claude Code](#claude-code). Next comes M6 (config,
+edit and complete items; see [Claude Code](#claude-code). A phone app (Expo) can
+capture, browse the views and complete items over Tailscale; see
+[Phone app](#phone-app). Next comes M6 (config,
 export/import, backups, editing views). The CLI captures, undoes and counts; listing,
 editing and completing items happen in the TUI or through Claude Code.
 
@@ -474,6 +476,55 @@ if needed.
 teaches Claude the capture syntax, the views, recurrence and, for later, Jira-linked
 items. To use it everywhere: `ln -s ~/todo-tui/claude/skills/todo ~/.claude/skills/todo`.
 
+### Phone app
+
+`apps/mobile` is an Expo (React Native) app that talks to the daemon on your
+computer over [Tailscale](https://tailscale.com) ([ADR-0004](docs/adr/0004-remote-transport.md)).
+It shows the views as tabs with the same rows as the TUI. You can capture with the
+same syntax and a live preview, tap ○ to complete an item and ● to reopen it, and
+undo either from the snackbar. It is a thin client: it shows nothing while your
+computer is asleep or off the tailnet.
+
+Set it up once on the computer:
+
+1. Turn the remote listener on: add this to `~/.config/todo-tui/config.toml`
+   (`$XDG_CONFIG_HOME/todo-tui/` if set, on macOS too; `todo remote status` prints
+   the path), then `todo daemon stop`. The next `todo` command starts the daemon
+   again with the listener on.
+
+   ```toml
+   [remote]
+   listen = "127.0.0.1:7743"
+   ```
+
+2. Give it HTTPS on your tailnet. The listener is loopback only; Tailscale adds the
+   certificate and keeps it to your devices:
+
+   ```sh
+   tailscale serve --bg --https=443 http://127.0.0.1:7743
+   ```
+
+   With the macOS Tailscale app, the CLI is
+   `/Applications/Tailscale.app/Contents/MacOS/Tailscale`. The flake's dev shell has a
+   `tailscale` CLI too, but on macOS it only reaches an open-source `tailscaled`, not
+   the app.
+
+3. Pair the phone: `todo remote pair --name phone` prints a QR code, the server
+   (`https://<computer>.<tailnet>.ts.net`, found with `tailscale status`; `--url`
+   overrides it) and a token, which is shown only once.
+
+Then run the app (the phone needs Tailscale on, and Expo Go from the App Store or
+Play Store):
+
+```sh
+pnpm -C apps/mobile start     # scan the Expo QR code with the phone's camera
+```
+
+In the app, tap **Scan QR code** and scan the pairing code. `todo remote list` shows
+the paired devices and `todo remote revoke phone` unpairs one at once; the app then
+asks to pair again. `todo remote status` checks the setup. Every call needs the
+token, and the phone cannot stop the daemon.
+
 ### The daemon
 
 You rarely need to manage it: `todo add`, `todo undo`, `todo redo`, `todo status`,
@@ -522,8 +573,11 @@ rm -rf "$TODO_TUI_HOME"; unset TODO_TUI_HOME
 
 - `proto/` — the `todo.v1` contract (Buf)
 - `crates/` — Rust workspace: core, store, sync, jira, assistant, proto, daemon, cli
-- `packages/client/` — shared TypeScript client (Connect-ES)
+- `packages/client/` — shared TypeScript client (Connect-ES); `./portable` is the
+  Node-free part, with the gRPC-Web client for the remote listener
+- `packages/present/` — how items read, shared by the TUI and the phone app
 - `tui/`, `mcp/` — the Ink TUI and the MCP server
+- `apps/mobile/` — the phone app (Expo)
 - `claude/skills/todo/` — the Claude Code skill for managing todos through the MCP server (not in `skills/`, which symposium would sync into `.claude/skills/`)
 - `scripts/smoke.sh` — end-to-end smoke test
 

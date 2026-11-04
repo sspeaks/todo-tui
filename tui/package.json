@@ -16,7 +16,7 @@
     "@todo-tui/client": "workspace:*",
     "@todo-tui/present": "workspace:*",
     "ink": "8.0.0",
-    "react": "19.3.1"
+    "react": "19.3.0"
   },
   "devDependencies": {
     "@types/react": "19.3.0",

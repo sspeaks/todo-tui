@@ -38,7 +38,7 @@
       pnpmDepsHash = {
         x86_64-linux = "sha256-UQCNT9d14RUBXuWQ1/wT2zJnQER+uWKAedS0yi2KLGk=";
         aarch64-linux = "sha256-UQCNT9d14RUBXuWQ1/wT2zJnQER+uWKAedS0yi2KLGk=";
-        aarch64-darwin = "sha256-HaMiKAmOiu0jNIe01j3cdU/rzsegrwAldHo5wG9olDE=";
+        aarch64-darwin = "sha256-eSJ/Jppg3pdpNQA4VRoKDelsYvF/x3iRVdudQSujboo=";
       };
 
       # Each part sees only the files it builds from, so a README edit
@@ -97,8 +97,15 @@
               pnpm
               pkgs.pnpmConfigHook
             ];
+            # Only what the bundles need: not apps/mobile's Expo and React
+            # Native (`...` adds each project's workspace dependencies).
+            pnpmWorkspaces = [
+              "todo-tui"
+              "@todo-tui/tui..."
+              "@todo-tui/mcp..."
+            ];
             pnpmDeps = pkgs.fetchPnpmDeps {
-              inherit (finalAttrs) pname version src;
+              inherit (finalAttrs) pname version src pnpmWorkspaces;
               inherit pnpm;
               fetcherVersion = 4;
               hash = pnpmDepsHash.${pkgs.stdenv.hostPlatform.system};
