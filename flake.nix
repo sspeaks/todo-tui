@@ -36,8 +36,8 @@
       version = (lib.importTOML ./Cargo.toml).workspace.package.version;
       # Per system: see the maintenance notes above.
       pnpmDepsHash = {
-        x86_64-linux = "sha256-UQCNT9d14RUBXuWQ1/wT2zJnQER+uWKAedS0yi2KLGk=";
-        aarch64-linux = "sha256-UQCNT9d14RUBXuWQ1/wT2zJnQER+uWKAedS0yi2KLGk=";
+        x86_64-linux = "sha256-J9fU109O0t2DdPwzzehAWrqnIPBdM98Uh2uhAGqMK7k=";
+        aarch64-linux = "sha256-J9fU109O0t2DdPwzzehAWrqnIPBdM98Uh2uhAGqMK7k=";
         aarch64-darwin = "sha256-GD0k69V28HOBnQrUXKOfaYzyMW3rS9mVsZlZV2q1HRA=";
       };
 

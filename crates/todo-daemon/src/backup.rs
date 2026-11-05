@@ -193,7 +193,7 @@ mod tests {
         let names = [
             "todo-20261001-0900.db",
             "todo-premigrate-v3-20261001-090000.db",
-            "todo-prerestore-20261020-0900.db",
+            "todo-prerestore-20261019-0900.db",
             "todo-20261101-0900.db",
             "notes.db",
             "todo-20261001-0900.db.tmp",
@@ -201,6 +201,10 @@ mod tests {
         for n in names {
             std::fs::write(dir.path().join(n), "x").unwrap();
         }
+        // No backup sits on the window's edge (exactly 14 x 24 h before
+        // now, which is kept): where DST ends in between (America/Los_Angeles
+        // on Nov 1) the same wall times are an hour further apart, so a
+        // backup on the edge would be kept in UTC and deleted there.
         let now = "2026-11-03T09:00"
             .parse::<DateTime>()
             .unwrap()
@@ -218,7 +222,7 @@ mod tests {
             [
                 "todo-20261001-0900.db",
                 "todo-premigrate-v3-20261001-090000.db",
-                "todo-prerestore-20261020-0900.db"
+                "todo-prerestore-20261019-0900.db"
             ]
         );
         assert!(dir.path().join("notes.db").exists());
