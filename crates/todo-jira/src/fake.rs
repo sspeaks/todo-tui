@@ -237,6 +237,15 @@ impl FakeJira {
     pub fn serve_search(&self, issues: Arc<Mutex<Vec<Value>>>, page: usize) {
         self.route("/rest/api/2/search", move |seen| {
             let body: Value = serde_json::from_str(&seen.body).unwrap_or_default();
+            // As Data Center answers a body it cannot read: validateQuery is
+            // a boolean in POST /search.
+            if !body["validateQuery"].is_null() && !body["validateQuery"].is_boolean() {
+                return (
+                    400,
+                    json!({"errorMessages": ["Cannot deserialize value of type `java.lang.Boolean`"]}),
+                    vec![],
+                );
+            }
             let jql = body["jql"].as_str().unwrap_or_default().to_owned();
             let start = body["startAt"].as_u64().unwrap_or(0) as usize;
             let since = jql

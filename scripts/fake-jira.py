@@ -83,6 +83,9 @@ class Handler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
         if self.path.split("?")[0] != "/rest/api/2/search":
             return self.reply(404, {"errorMessages": ["no such resource"]})
+        # Data Center's POST /search reads validateQuery as a boolean only.
+        if not isinstance(body.get("validateQuery", True), bool):
+            return self.reply(400, {"errorMessages": ["Cannot deserialize value of type `java.lang.Boolean`"]})
         jql = body.get("jql", "")
         after = re.search(r"id > (\d+)", jql)
         wanted = re.search(r"id in \(([^)]*)\)", jql)

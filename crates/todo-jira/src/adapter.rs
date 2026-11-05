@@ -150,7 +150,9 @@ impl Adapter {
 
     /// One search page. `strict` validates the JQL (a scope's typo is an
     /// error); an id list is not strict, so a deleted or forbidden id is a
-    /// warning rather than failing the whole query.
+    /// warning rather than failing the whole query. Data Center's POST body
+    /// takes `validateQuery` as a boolean (true is strict, false warns); the
+    /// "strict" / "warn" strings are only the GET form's, and a 400 here.
     async fn search(
         &self,
         jql: &str,
@@ -166,7 +168,7 @@ impl Adapter {
                     "startAt": start_at,
                     "maxResults": PAGE_SIZE,
                     "fields": fields,
-                    "validateQuery": if strict { "strict" } else { "warn" },
+                    "validateQuery": strict,
                 }),
             )
             .await
