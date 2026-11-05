@@ -24,7 +24,9 @@ daily backups and `todo restore`, and `todo export` / `todo import`; see
 on items (`%low`, `e`), `h` / `l` between views, the L48 / N48 scrum report
 (`todo l48`, `:l48`), and Teams meeting links (`M`); see
 [Your scrum report: L48 / N48](#your-scrum-report-l48--n48) and
-[Meetings](#meetings). The CLI captures, undoes and counts;
+[Meetings](#meetings). The first P2 milestone is done: read-only sync from
+Jira Data Center (`todo sync check|now|status`, `⇅` in the status bar, `o`);
+see [Jira sync (read-only)](#jira-sync-read-only). The CLI captures, undoes and counts;
 listing, editing and completing items happen in the TUI or through Claude Code.
 
 ## Quick start
@@ -340,6 +342,7 @@ key hints) and a message line for prompts and results.
 | `z` | Archive / unarchive |
 | `dd` | Delete, with its subtasks (asks first: `y` deletes) |
 | `M` | Schedule a Teams meeting about it ([Meetings](#meetings)) |
+| `o` | Open its Jira issue in the browser ([Jira sync](#jira-sync-read-only)) |
 | **Marks and bulk** | |
 | `m` | Mark or unmark the item, and move down |
 | `V` | Mark the rows you move over; `V` or `esc` ends it |
@@ -350,7 +353,8 @@ key hints) and a message line for prompts and results.
 | **Undo** | |
 | `u`, `ctrl-r` | Undo, redo: the same history as `todo undo` |
 | **Commands** | |
-| `:` | Command line: `:q`, `:help`, `:search <words>`, `:refresh`, `:view …` ([Views](#views-of-your-own)), `:config`, `:export [path]`, `:l48 [since]`, `:meet`; `tab` completes |
+| `:` | Command line: `:q`, `:help`, `:search <words>`, `:refresh`, `:view …` ([Views](#views-of-your-own)), `:config`, `:export [path]`, `:l48 [since]`, `:meet`, `:sync [status]`; `tab` completes |
+| `gs` | Sync with Jira now |
 | `?`, F1, `:help` | Help: every key, the capture syntax and the dates |
 | `ctrl-z` | Suspend to the shell; `fg` comes back |
 | `q`, `ctrl-c` | Quit |
@@ -555,6 +559,56 @@ paragraph and Jira link as the content, and who it waits on as the attendee when
 that is an email address (`~dana@example.com`). With marks it is one meeting about
 all of them. On macOS it opens the Teams app (`msteams:`), else the browser. You
 pick the time and send it in Teams; todo-tui creates nothing and needs no login. `[meetings] provider = "none"` turns it off.
+
+### Jira sync (read-only)
+
+Your assigned Jira Data Center issues can live next to your todos: they are
+imported as items, with their key, status and link, and kept fresh (every
+minute while the TUI is open, every ten otherwise). This first version only
+**reads** Jira; nothing you do here changes an issue.
+
+1. Make a Personal Access Token in Jira: your avatar → Profile → Personal
+   Access Tokens → Create token (read is all it needs).
+2. Keep it in the macOS keychain (it prompts for the token):
+
+   ```sh
+   security add-generic-password -s todo-tui -a work-jira -w
+   ```
+
+3. Add the instance to `~/.config/todo-tui/config.toml`:
+
+   ```toml
+   [[instances]]
+   id = "work-jira"
+   kind = "jira-dc"
+   base_url = "https://jira.example.com"
+   credential = "keychain:todo-tui/work-jira"   # service/account; or env:NAME, or file:PATH (mode 0600)
+   # The default scope: your open issues.
+   scopes = [{ name = "mine", query = "assignee = currentUser() AND resolution = Unresolved" }]
+   ```
+
+   `todo config reload` (or a SIGHUP) picks it up.
+4. `todo sync check` asks Jira who the token is, without the daemon:
+   `work-jira: ok as Dana Example (JIRAUSER10100), time zone America/Los_Angeles`.
+5. `todo sync now` pulls and waits for it; `todo sync status` says how it
+   stands (`ok · 12 items · last pull 3m ago`, `offline, retrying`, or a
+   refused token). Both exit non-zero when something needs you.
+
+In the TUI, the status bar shows `⇅ work-jira 2m`, `o` opens the selected
+issue in the browser, `gs` (or `:sync`) pulls now and `:sync status` says
+how it stands. To Do and In Progress issues land in Next; a resolution of
+Won't Do, Duplicate and the like (`cancelled_resolutions`) makes one
+cancelled, any other done.
+
+Read-only means Jira owns the title, description, status, priority,
+labels, due date and the other Jira fields: the TUI refuses to change them
+("PLAT-1 is a Jira issue: edits reach Jira when pushes arrive"), and a
+bulk edit leaves those items out. What is yours still works on them:
+waiting, defer, notes, the local priority override, energy, archive,
+delete, and inbox / next / someday while Jira has the issue in To Do. An
+issue that leaves your scopes is archived on its own, one deleted in Jira
+(or that you lost access to) is marked unavailable, and deleting an item
+here only hides it. Pushing edits to Jira comes in a later milestone.
 
 ### Backups and export
 

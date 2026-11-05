@@ -34,6 +34,12 @@ pub enum ExportRow {
     },
     Op(Box<OpRecord>),
     Event(Box<EventRecord>),
+    /// A `sync_cursors` row (design 5.3).
+    SyncCursor {
+        instance_id: String,
+        scope: String,
+        cursor_at: Timestamp,
+    },
 }
 
 /// An `ops` row, as stored.
@@ -136,6 +142,19 @@ pub(crate) fn export_tx(conn: &Connection, history: bool) -> Result<Export> {
             rows.push(ExportRow::ViewSeed {
                 seed: row.get(0)?,
                 seeded_at: ts_from_sql(row.get(1)?)?,
+            });
+        }
+    }
+    {
+        let mut stmt = tx.prepare(
+            "SELECT instance_id, scope, cursor_at FROM sync_cursors ORDER BY instance_id, scope",
+        )?;
+        let mut q = stmt.query([])?;
+        while let Some(row) = q.next()? {
+            rows.push(ExportRow::SyncCursor {
+                instance_id: row.get(0)?,
+                scope: row.get(1)?,
+                cursor_at: ts_from_sql(row.get(2)?)?,
             });
         }
     }
@@ -276,12 +295,15 @@ pub struct ImportOutput {
     pub revision: Revision,
 }
 
-/// Whether the database is empty, as an import needs it: no Item and no op.
-/// (The default views are seeded into every database, and an edit of one
-/// is an op.)
+/// Whether the database is empty, as an import needs it: no Item and no op
+/// but sync's. (The default views are seeded into every database, and an
+/// edit of one is an op.) What sync pulled before the import, when a home
+/// starts with `[[instances]]` in its config, is only a copy of the
+/// tracker's: the import replaces it, and the export's cursors take over.
 fn is_empty(conn: &Connection) -> Result<bool> {
     let any: bool = conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM items) OR EXISTS (SELECT 1 FROM ops)",
+        "SELECT EXISTS (SELECT 1 FROM items WHERE created_via != 'remote_import')
+             OR EXISTS (SELECT 1 FROM ops WHERE kind != 'sync' OR actor != 'sync')",
         [],
         |r| r.get(0),
     )?;
@@ -304,7 +326,11 @@ pub(crate) fn import_tx(
     if !is_empty(conn)? {
         return Err(StoreError::NotEmpty);
     }
-    conn.execute_batch("DELETE FROM views; DELETE FROM view_seeds; DELETE FROM changes;")?;
+    conn.execute_batch(
+        "DELETE FROM events; DELETE FROM relations; DELETE FROM items; DELETE FROM ops;
+         DELETE FROM sync_cursors;
+         DELETE FROM views; DELETE FROM view_seeds; DELETE FROM changes;",
+    )?;
     let mut items = 0;
     let records = rows.len() as u64;
     for (i, row) in rows.into_iter().enumerate() {
@@ -355,6 +381,16 @@ fn put(conn: &Connection, row: ExportRow, items: &mut u64) -> Result<()> {
             conn.execute(
                 "INSERT INTO view_seeds (seed, seeded_at) VALUES (?1, ?2)",
                 params![seed, ts_to_sql(seeded_at)?],
+            )?;
+        }
+        ExportRow::SyncCursor {
+            instance_id,
+            scope,
+            cursor_at,
+        } => {
+            conn.execute(
+                "INSERT INTO sync_cursors (instance_id, scope, cursor_at) VALUES (?1, ?2, ?3)",
+                params![instance_id, scope, ts_to_sql(cursor_at)?],
             )?;
         }
         ExportRow::Op(op) => {

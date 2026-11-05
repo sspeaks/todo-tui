@@ -1456,6 +1456,19 @@ fn sync_now_pulls_and_status_reports_it() {
         h.ok(&["sync", "status"])
             .starts_with("work-jira: ok · 2 items")
     );
+    // The synced Items (their assignee a name, until People) export and
+    // import into a fresh home.
+    let file = h.home.join("export.jsonl");
+    h.ok(&["export", "--out", file.to_str().unwrap()]);
+    let fresh = Home::new();
+    let imported = fresh.todo(&["import", file.to_str().unwrap()]);
+    assert!(imported.status.success(), "{}", text(&imported.stderr));
+    let assignees: Vec<_> = fresh
+        .items()
+        .iter()
+        .filter_map(|i| i.assignee.clone())
+        .collect();
+    assert_eq!(assignees, vec![free_text("Dana Example").unwrap(); 2]);
     let missing = h.todo(&["sync", "now", "other"]);
     assert!(!missing.status.success());
     assert!(

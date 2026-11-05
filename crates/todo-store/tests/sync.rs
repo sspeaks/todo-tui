@@ -68,6 +68,7 @@ fn page(issues: Vec<RemoteIssue>, cursor: Option<i64>) -> PullPage {
             .map(|i| (i, vec!["mine".into()]))
             .collect(),
         cursor: cursor.map(|s| ("mine".into(), ts(s))),
+        replace_scopes: false,
         now: ts(1_000),
         today: TODAY,
     }
@@ -75,7 +76,7 @@ fn page(issues: Vec<RemoteIssue>, cursor: Option<i64>) -> PullPage {
 
 async fn by_key(store: &Store, key: &str) -> todo_core::Item {
     let tracked = store.tracked("work-jira".into()).await.unwrap();
-    for (id, _, _) in tracked {
+    for todo_store::Tracked { id, .. } in tracked {
         let item = store.get_item(id, TODAY).await.unwrap().item;
         if item.remote_link.as_ref().is_some_and(|l| l.key == key) {
             return item;
@@ -263,6 +264,19 @@ async fn a_deleted_item_is_left_alone_by_pulls() {
             .title,
         "one"
     );
+    // Undeleted (an undo here), it is stale: the pass reads it again by id.
+    store
+        .undo(UndoInput {
+            request_id: new_ulid().to_string(),
+            expected_op_id: None,
+            now: ts(3_000),
+            today: TODAY,
+        })
+        .await
+        .unwrap();
+    let tracked = store.tracked("work-jira".into()).await.unwrap();
+    assert_eq!(tracked.len(), 1);
+    assert!(tracked[0].stale);
 }
 
 #[tokio::test]
@@ -400,9 +414,13 @@ async fn an_unavailable_item_comes_back_when_readable_again() {
         })
         .await
         .unwrap();
+    // Unreadable: read again by id on every pass until it answers.
+    let stale = |t: Vec<todo_store::Tracked>| t.iter().filter(|t| t.stale).count();
+    assert_eq!(stale(store.tracked("work-jira".into()).await.unwrap()), 1);
     let mut back = issue(1, "one");
     back.updated_at = ts(3_000);
     store.apply_pull(page(vec![back], None)).await.unwrap();
+    assert_eq!(stale(store.tracked("work-jira".into()).await.unwrap()), 0);
     let a = store.get_item(a.id, TODAY).await.unwrap().item;
     assert_eq!(
         (
@@ -424,4 +442,100 @@ async fn an_unavailable_item_comes_back_when_readable_again() {
         a.overlay.archived.map(|x| x.reason),
         Some(ArchiveReason::User)
     );
+}
+
+#[tokio::test]
+async fn an_export_carries_the_cursors_and_replaces_what_sync_pulled_first() {
+    let (_a, source) = open();
+    source
+        .apply_pull(page(vec![issue(1, "One")], Some(300)))
+        .await
+        .unwrap();
+    source
+        .apply_pull(PullPage {
+            cursor: Some(("\u{0}outside".into(), ts(400))),
+            ..page(vec![], None)
+        })
+        .await
+        .unwrap();
+    let export = source.export(true).await.unwrap();
+    // A new home whose config syncs: a pass pulled before the import.
+    let (_b, target) = open();
+    target
+        .apply_pull(page(vec![issue(2, "Two")], Some(250)))
+        .await
+        .unwrap();
+    target.import(export.revision, export.rows).await.unwrap();
+    let keys: Vec<String> = {
+        let mut out = Vec::new();
+        for todo_store::Tracked { id, .. } in target.tracked("work-jira".into()).await.unwrap() {
+            let item = target.get_item(id, TODAY).await.unwrap().item;
+            out.push(item.remote_link.unwrap().key);
+        }
+        out
+    };
+    assert_eq!(keys, ["PLAT-1"]);
+    assert_eq!(
+        target
+            .sync_cursor("work-jira".into(), "mine".into())
+            .await
+            .unwrap(),
+        Some(ts(300))
+    );
+    assert_eq!(
+        target
+            .sync_cursor("work-jira".into(), "\u{0}outside".into())
+            .await
+            .unwrap(),
+        Some(ts(400))
+    );
+    // Once a person has written, the home is not empty.
+    let (_c, used) = open();
+    used.apply_pull(page(vec![issue(3, "Three")], None))
+        .await
+        .unwrap();
+    let three = by_key(&used, "PLAT-3").await;
+    used.mutate(user_edit(
+        three.id,
+        ItemField::PrivateNotes,
+        FieldValue::Markdown("mine".into()),
+    ))
+    .await
+    .unwrap();
+    let export = source.export(true).await.unwrap();
+    assert!(matches!(
+        used.import(export.revision, export.rows).await,
+        Err(StoreError::NotEmpty)
+    ));
+}
+
+#[tokio::test]
+async fn a_scope_pull_adds_its_scope_and_only_reconciliation_replaces_them() {
+    let (_d, store) = open();
+    let scoped = |name: &str, replace: bool, n: i64| PullPage {
+        issues: vec![(
+            RemoteIssue {
+                updated_at: ts(200 + n),
+                ..issue(1, "In both")
+            },
+            vec![name.to_owned()],
+        )],
+        replace_scopes: replace,
+        ..page(vec![], None)
+    };
+    store.apply_pull(scoped("mine", false, 0)).await.unwrap();
+    store.apply_pull(scoped("sprint", false, 1)).await.unwrap();
+    assert_eq!(
+        by_key(&store, "PLAT-1").await.derived.scopes,
+        ["mine", "sprint"]
+    );
+    // Changed again: each scope's pull leaves the other's membership.
+    store.apply_pull(scoped("mine", false, 2)).await.unwrap();
+    assert_eq!(
+        by_key(&store, "PLAT-1").await.derived.scopes,
+        ["mine", "sprint"]
+    );
+    // Reconciliation, which listed every scope, says what it is in now.
+    store.apply_pull(scoped("sprint", true, 3)).await.unwrap();
+    assert_eq!(by_key(&store, "PLAT-1").await.derived.scopes, ["sprint"]);
 }

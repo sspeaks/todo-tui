@@ -45,7 +45,7 @@ pub use report::{MAX_NEXT, Report, ReportInput, ReportLine};
 pub use restore::{DbInfo, backup_file, inspect, prepare_restored};
 pub use schema::{SCHEMA_VERSION, free_backup_path};
 use summary::Action;
-pub use sync::{PullOutcome, PullPage, Reconcile, ReconcileOutcome};
+pub use sync::{PullOutcome, PullPage, Reconcile, ReconcileOutcome, Tracked};
 pub use view::{
     CreateViewInput, MAX_VIEW_NAME_CHARS, MAX_VIEW_OFFSET_DAYS, MoveViewInput, UpdateViewInput,
     ViewOutput, ViewUpdate, check_view_filter, check_view_name,
@@ -929,7 +929,7 @@ impl Store {
 
     /// `instance`'s tracked set: each live linked Item, its remote id and
     /// the scopes it matched last.
-    pub async fn tracked(&self, instance: String) -> Result<Vec<(ItemId, String, Vec<String>)>> {
+    pub async fn tracked(&self, instance: String) -> Result<Vec<Tracked>> {
         self.read(move |conn| sync::tracked_tx(conn, &instance))
             .await
     }

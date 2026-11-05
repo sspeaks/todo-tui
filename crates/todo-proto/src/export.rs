@@ -133,7 +133,15 @@ pub fn read_record(line: &str) -> Result<ExportRow, LineError> {
     row_of(&record).map_err(|e| LineError(e.to_string()))
 }
 
-const RECORD_TYPES: [&str; 6] = ["item", "relation", "view", "view_seed", "op", "event"];
+const RECORD_TYPES: [&str; 7] = [
+    "item",
+    "relation",
+    "view",
+    "view_seed",
+    "op",
+    "event",
+    "sync_cursor",
+];
 
 fn snake(s: &str) -> String {
     let mut out = String::new();
@@ -193,6 +201,15 @@ fn record_of(row: &ExportRow) -> ex::Record {
         ExportRow::ViewSeed { seed, seeded_at } => R::ViewSeed(ex::ViewSeed {
             seed: seed.clone(),
             seeded_at: Some(timestamp_to_proto(*seeded_at)),
+        }),
+        ExportRow::SyncCursor {
+            instance_id,
+            scope,
+            cursor_at,
+        } => R::SyncCursor(ex::SyncCursor {
+            instance_id: instance_id.clone(),
+            scope: scope.clone(),
+            cursor_at: Some(timestamp_to_proto(*cursor_at)),
         }),
         ExportRow::Op(op) => R::Op(ex::Op {
             id: op.id.clone(),
@@ -268,6 +285,11 @@ fn row_of(record: &ex::Record) -> Result<ExportRow, ConvertError> {
             R::ViewSeed(s) => ExportRow::ViewSeed {
                 seed: s.seed.clone(),
                 seeded_at: ts("seeded_at", &s.seeded_at)?,
+            },
+            R::SyncCursor(c) => ExportRow::SyncCursor {
+                instance_id: c.instance_id.clone(),
+                scope: c.scope.clone(),
+                cursor_at: ts("cursor_at", &c.cursor_at)?,
             },
             R::Op(op) => ExportRow::Op(Box::new(OpRecord {
                 id: op.id.clone(),

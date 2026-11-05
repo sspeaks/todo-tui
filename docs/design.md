@@ -366,6 +366,8 @@ RemoteLink {
 
 `remote_id`, not `key`, is the identity, because keys change when issues are moved between projects.
 
+**As built (P2 M9, read-only)**: only **import** exists. A linked Item's Core fields are the tracker's, and a person's (or a Suggestion's) edit of one fails with `FAILED_PRECONDITION` / `LINKED_READ_ONLY` naming the field, until pushes arrive (ADR-0006). Overlay edits, archive and delete work as on any Item.
+
 An Item gains a link in one of three ways: **import** (an issue matched the configured auto-import query, Section 5), **promote** (you push a local Item to create a new Jira issue), or **attach** (you link an existing local Item to an existing Jira issue; Core fields are then overwritten by Jira's values, and any local Core values that differed are offered back to you as a Suggestion rather than silently discarded).
 
 ### 3.4 Status
@@ -387,6 +389,7 @@ Clients change status with one call, `SetStatus(item, status)`, which the daemon
 - **Local owns the refinement.** Moving an Item from `next` to `someday` never touches Jira.
 - **Changing category locally** (e.g. `next` → `in_progress`, or `x` / `X`) enqueues a Jira *transition*. Which transition to use per (project, target category) comes from instance config, with a default (first available transition into that category; for `cancelled`, one that can set a cancelled resolution). If no valid transition exists, or the transition screen requires fields, the op fails and a `push_failed` Suggestion offers a `choose_transition` alternative group (3.11) and/or the missing fields.
 - The exact Jira status name (e.g. "In Review") is `remote_status_name`, read-only, shown in the detail pane.
+- **As built (P2 M9, read-only)**: an import into To Do gets `next`; In Progress, Done and Cancelled come from the category and the resolution (`cancelled_resolutions`). Changing the category locally is refused (`LINKED_READ_ONLY`) until transitions exist; `inbox` / `next` / `someday` within To Do are local and allowed.
 
 `waiting` is a flag (3.2), not a status, because Jira will keep reporting "In Progress" while you wait on someone.
 
@@ -573,7 +576,7 @@ Three independent version axes: the **API** is versioned by protobuf package (`t
 | `PeopleService` | (P2, 3.5) List/search (for `~` fuzzy match), get, update display name, merge duplicates |
 | `ReviewService` | Weekly review sessions (start, resume, advance step), standup generation (works without Claude; Claude condenses when configured) |
 | `SuggestionService` | List, apply (selected patches), reject, request generation |
-| `SyncService` | Instances, link/promote/attach, sync now, sync status, auth setup |
+| `SyncService` | Instances, link/promote/attach, sync now, sync status, auth setup. **As built (P2 M9)**: `GetSyncStatus` and `SyncNow` (`NO_INSTANCE` without one); `SyncNowResponse.request` numbers the request and `SyncStatus.served_request` names the newest one a finished pass began after, so `todo sync now` waits for its own pass. Each change is a `Notice.sync_status` on `Subscribe`, the full set after every `CaughtUp`; `UNSPECIFIED` means the instance left the config |
 | `AssistantService` | Claude-backed operations that aren't plain suggestions (Q&A, drafting) |
 | `WatchService` | The change stream (below) |
 
@@ -704,6 +707,15 @@ Binding conventions for the API design phase, so implementers don't diverge:
 ## 5. Sync Engine
 
 The sync engine keeps linked Items consistent with their tracker issues. It runs inside the daemon (Section 4), and it is the only component that talks to trackers.
+
+> **As built in P2's first milestone (M9, ADR-0006): read-only, Jira Data Center.** What follows is the whole design; M9 builds its pull half. In short:
+> - **Adapter** (`crates/todo-jira`, `kind = "jira-dc"`): a PAT as `Authorization: Bearer`, REST v2. It only reads: `GET /myself`, `/priority`, `/field`, `/issue/{id}` and `POST /search`. Redirects are refused and proxies ignored; `base_url` must be https (http only to loopback) with no userinfo, query or fragment. Descriptions are kept as the raw wiki text. 5.2's write operations (`validate_create`, `update`, `transition`, `add_comment`) and text conversion wait for pushes.
+> - **Pulls** (5.3, 5.4): one instance (another is skipped, with a warning). Each scope from its cursor: `updated >= ` the cursor less 2 minutes, in the user's time zone from `/myself` (unknown: 14 h earlier in UTC; a DST fold: an hour earlier), `ORDER BY updated, key`, paged by the cursor itself with a seen set, so a long run of one minute never skips. Each page is one `OpKind::Sync` op (actor `sync`, never an undo entry) committed with its cursor (`sync_cursors`, migration `0006`). The tracked set outside every scope is re-read by `id in (…)` batches of 100, on a cursor of its own. A subtask whose parent comes later is linked once the parent arrives (`todo-tui.parent_remote_id` in its extras). Cadence: 60 s while a TUI is connected (one arriving wakes the loop), 600 s otherwise (`poll_seconds`); offline doubles its wait up to 10 minutes; a refused token waits for the config or "sync now".
+> - **Reconciliation** (5.5) at start, hourly and on every "sync now": each Item in a scope that the scope pulls did not return is read again by id (so a resolution, which takes it out of the default scope's query, shows at once); L − R is fetched and archived `left_scope` or broken `remote_unavailable`; outside Items that no longer exist are broken; R − L is imported whatever its age. A scope pull adds its scope to an Item's membership; only reconciliation takes one away.
+> - **Read again by id on every pass**: an Item whose pull it missed while deleted (it is undeleted), or whose issue could not be read (broken): its pulled version is cleared, and it is fetched until it answers, the link then whole again and the `remote_unavailable` archive lifted. The outside cursor is the newest `updated` Jira returned for them, never this machine's clock.
+> - **Status** (5.11): `starting`, `syncing` (with `pulled`), `ok`, `offline`, `auth_error`, `degraded`, with `last_successful_pull_at`, `last_error` and `items`; no outbox counts yet.
+> - **Clients**: the TUI's `⇅` status, `o`, `gs` / `:sync`, the Jira fields in the detail, the read-only toast and bulk actions that leave refused Items out; `todo sync check|status|now`; MCP's `todo_status.sync` and its refusal text.
+> - **Not yet**: the outbox, conflicts and Suggestions (5.6), promote and attach (5.7), editing Items you don't own (5.9), changelog attribution, comments, People. Discovery runs at the start of each pass, not daily.
 
 ### 5.1 Principles
 
@@ -838,6 +850,8 @@ All linked Items are editable locally. If the Item's assignee is not the authent
 
 A `CredentialStore` abstraction with backends in priority order: macOS Keychain → Linux Secret Service → environment variable → permission-checked file. Instance config stores only a credential *reference*. v1 auth for Jira Cloud is email + API token (basic auth). OAuth 2.0 (3LO) is a later addition behind the same abstraction.
 
+**As built (M9, `crates/todo-sync`)**: `keychain:service[/account]` (macOS, through `/usr/bin/security find-generic-password`, so no native dependency), `env:NAME`, and `file:PATH` (`~/` allowed), refused unless only its owner can read it (0600). Linux Secret Service waits for a need. A missing or empty secret is `auth_error`; the secret never reaches a log, an error or the API. Data Center takes a Personal Access Token.
+
 ### 5.11 Offline behaviour and sync status
 
 - Network failure moves an instance into `offline` state. The pull loop pauses with backoff probing, and the outbox keeps accepting ops. On reconnect: pull first (so conflict checks use fresh data), then drain the outbox.
@@ -862,6 +876,7 @@ A `CredentialStore` abstraction with backends in priority order: macOS Keychain 
 - An **in-memory fake adapter** implementing the trait, with controllable time, failures and remote edits. Most engine tests (conflicts, outbox ordering, reconciliation, tombstones) run against it.
 - **Recorded HTTP fixtures** of real Jira Cloud responses for adapter tests (mapping, ADF conversion, pagination, error shapes).
 - An optional, manually triggered live test suite against a sandbox Jira project.
+- **As built (M9)**: the adapter and daemon tests run against `todo_jira::fake::FakeJira`, an in-process HTTP server on 127.0.0.1 with synthetic issues (`PLAT-1`, `jira.example.com`), which reads the JQL as the adapter writes it; `scripts/smoke.sh` uses a small Python one (`scripts/fake-jira.py`). The live check is `todo sync check` and `todo sync now` against the real instance, run by hand; it only reads.
 
 > Implementation note for Jira Cloud (verify at build time): use REST API v3; issue search via the enhanced JQL search endpoint with token pagination; per-issue changelog for attribution; per-issue transitions endpoint; create-metadata per project/issue type. Rate limiting is signalled by HTTP 429 with `Retry-After`. JQL date literals are interpreted in the **Jira user's profile time zone** at minute precision, so cursors must be stored as UTC instants and converted to that zone (fetched with the account during discovery) when building queries.
 
@@ -1018,6 +1033,7 @@ Conceptual tables. Exact columns belong to the implementation phase, but each ma
 
 `items` (incl. soft-delete / tombstone columns, 3.7) · `remote_links` · `remote_snapshots` · `remote_extras` · `relations` · `people` (+ `person_identities`) · `comments` · `events` · `ops` (op_id, actor, undo/redo state) · `suggestions` · `suggestion_patches` · `suggestion_decisions` (6.8) · `outbox` · `sync_instances` (cursors, state, account id, time zone) · `scope_membership` · `tracker_metadata` (cached discovery, 5.8) · `views` + `view_seeds` (2.4, 4.8) · `review_sessions` (2.7) · `assistant_jobs` · `assistant_usage` · `request_ids` (idempotency, 24h) · `spool_imports` (imported spool ids) · `kv` (e.g. last standup time) · `changes` (watch replay, 4.4) · `meta` (schema version, current revision) · `items_fts` (FTS5 over title, description, key, labels).
 
+- **Sync** (P2 M9): `0006_sync` adds `sync_cursors (instance_id, scope, cursor_at)`, one row per scope and one (`\0outside`) for the tracked Items outside every scope, only ever moved forward. The remote snapshot, scope membership and extras are columns of `items`, written since `0001`.
 - **Recurrence** has no table of its own (3.8, ADR-0003): it is the `items` columns `recurrence_series_id`, `recurrence_occurrence_date` and `recurrence_rule` (JSON, from `0004`), with partial indexes for the series guard and the scheduler's scans.
 - **Migrations** are embedded in the binary, forward-only, and run at daemon start inside a transaction, after an automatic pre-migration backup. A daemon refuses to open a database whose schema version is newer than it understands. Real databases exist since M1, so from `0002` on every schema change is a **new** migration, and the statements of a migration that databases have applied are never edited (this replaces "edit `0001` until the first release").
 - **`changes` retention**: last 30 days or 50k rows, whichever is larger. Clients older than that get `RESYNC_REQUIRED` (4.4).
@@ -1037,7 +1053,7 @@ The status bar makes offline state obvious. Nothing prompts or blocks because of
 
 - `todo export [--out PATH] [--no-history]` (also the `SystemService.Export` server stream, and `:export [path]` in the TUI) writes **JSON Lines**:
   - line 1: the header, `{"format": "todo-tui-export", "formatVersion": 1, "schemaVersion": N, "exportedAt": "…", "daemonVersion": "…", "revision": R, "history": true}`;
-  - each following line: `{"type": "<record type>", "data": { … }}`, one per record, in dependency order. As built in M6: `item` (every Item, deleted ones too, each with its recurrence, each parent and merge target before the Items naming it; there is no `series` record, 3.8) → `relation` (with its `created_at`) → `view` → `view_seed` (so a deleted default stays deleted) → `op` (in log order, kind, actor and undo state in the store's words) → `event` (in op order). Later phases add their records in this order: people before items; remote snapshots and extras, scope membership, comments after relations; sync instances (cursors) and the outbox (non-`done`) after views; suggestions (+ patches), suggestion decisions, review sessions and kv after events.
+  - each following line: `{"type": "<record type>", "data": { … }}`, one per record, in dependency order. As built in M6: `item` (every Item, deleted ones too, each with its recurrence, each parent and merge target before the Items naming it; there is no `series` record, 3.8) → `relation` (with its `created_at`) → `view` → `view_seed` (so a deleted default stays deleted) → `sync_cursor` (P2 M9: per instance and scope, and `\u0000outside`) → `op` (in log order, kind, actor and undo state in the store's words) → `event` (in op order). A linked Item's remote snapshot, extras and scope membership are fields of its `item` record. An import into a home where sync has already pulled (its config has `[[instances]]`) replaces what sync pulled: only Items and ops a person made make it not empty. Later phases add their records in this order: people before items; remote snapshots and extras, scope membership, comments after relations; sync instances (cursors) and the outbox (non-`done`) after views; suggestions (+ patches), suggestion decisions, review sessions and kv after events.
 - **Record shapes are protobuf messages in their canonical proto3 JSON mapping**, in the package `todo.export.v1` (`proto/todo/export/v1/export.proto`): an Item is a `todo.v1.Item` with only its stored fields (what is computed when it is read, the status, effective priority, overdue flag, subtask counts, parent title and relations, is left unset); records no RPC exposes (ops, events, seeds, later snapshots and cursors) get messages of their own there. The `.proto` files are the export schema, with no second schema to maintain, and follow the same additive-evolution rules (4.3): a field a later minor adds is skipped on import.
 - **Excluded** (caches, derived or ephemeral): `tracker_metadata`, `changes`, `items_fts`, `assistant_jobs`, `assistant_usage`, `request_ids`, `spool_imports`, `done` outbox ops; the config (it lives in the TOML). `--no-history` omits `events` and `ops`. **Never included**: credentials or API keys.
 - Snapshots, cursors and pending outbox ops (P2) are included so a restore resumes sync without a full re-import and without losing conflict detection.
@@ -1111,10 +1127,11 @@ provider = "teams"          # "teams" | "none"
 
 [[instances]]
 id = "work-jira"
-kind = "jira"
-base_url = "https://example.atlassian.net"
-email = "me@example.com"
-credential = "keychain:todo-tui/work-jira"
+kind = "jira-dc"            # Data Center (ADR-0006); "jira" (Cloud) later
+base_url = "https://jira.example.com"
+# email = "me@example.com"  # Cloud only
+credential = "keychain:todo-tui/work-jira"   # or env:NAME, file:PATH (0600)
+# poll_seconds = 60         # while a TUI is connected; 600 otherwise
 promote_default = { project = "PLAT", issue_type = "Task" }
 subtask_issue_type = "Sub-task"
 # priority_map = { highest = "Blocker", high = "Critical" }   # overrides only
@@ -1138,6 +1155,8 @@ in_progress_days = 7
 ```
 
 **As built in M6** (ADR-0005): the daemon reads the file and serves it as a `ConfigSnapshot` (`SystemService.GetConfig`), with the defaults filled in and one warning per problem, naming its key (`ui.archive_done_after_days: must be a whole number ≥ 1; using 7`): the value falls back to its default, and nothing stops the daemon. Sections a later phase reads (`[[instances]]`, `[assistant]`, `[stale]`) warn that they are not used yet. The daemon reads it at start, on `todo config reload` (`ReloadConfig`) and on SIGHUP; a reload of a file that is not TOML is refused and the running config stays (at start such a file is read as empty, with a warning). `todo config check` reads it in-process, prints each warning and fails if there is one; `todo config path` prints where it is. M6 reads `[ui] archive_done_after_days` (3.7) and `review_day` (kept for P4), `[backup]` (7.5) and `[keymap]`. In `[keymap]`, a key sequence names the action it runs, an action id of 2.5's table (`move_up`, `set_priority_1`, `mark_done`, …); the action keeps its own keys, and the sequence is taken off what held it. The daemon checks the ids and key names (a copy of the TUI's vocabulary, kept equal by a test); `ctrl+h`, `ctrl+i`, `ctrl+j` and `ctrl+m` are refused, since the terminal sends them as backspace, tab and enter. The TUI applies the overrides (2.5).
+
+**As built in P2 M9** (ADR-0006): `[[instances]]` is read, at most one instance (another warns "only one instance syncs for now"), with `id`, `kind = "jira-dc"`, `base_url`, `credential`, `scopes` (default: `mine`, `assignee = currentUser() AND resolution = Unresolved`; names unique), `poll_seconds` and `cancelled_resolutions`. An instance with an error is skipped, with a warning naming the key; `email`, `promote_default`, `subtask_issue_type`, `priority_map` and `assistant_enabled` warn "not used until pushes and promote arrive". `ConfigSnapshot.instances` serves the instance without its credential. A reload starts a pass (with reconciliation) on the new config once the current pass ends.
 
 ### 8.3 Open-source readiness
 
@@ -1211,6 +1230,18 @@ M8 built the personal-workflow pieces, in five phases (`api_minor` 14–16, 4.2)
 
 M8 left these for later: Teams attendees from People (P2; until then only a `waiting.on` that is an email address); the Claude `l48` and `meeting_agenda` task kinds (P4); the standup (P4), which is to reuse the report's builder; an energy field in the detail pane's editor (P2, with the editor).
 
+**P2 progress.** P2 is built in milestones; the first is read-only (ADR-0006):
+
+| Milestone | Scope | Status |
+|---|---|---|
+| M9 | Read-only sync from Jira Data Center: `[[instances]]`, credentials, `todo sync check`; the store's sync write path and the `LINKED_READ_ONLY` guard; the adapter; the pull loop, reconciliation and `SyncService`; the clients (`⇅`, `o`, `gs`, `:sync`, `todo sync status|now`, MCP) | done (`api_minor` 17–19) |
+| next | Pushes: the outbox, conflicts and the Suggestions pane (5.6), wiki-markup conversion, transitions | planned |
+| then | Promote and attach (5.7), then People and `~` (3.5) | planned |
+
+M9 built it in five phases: config and credentials (`api_minor` 17: `ConfigSnapshot.instances`); the store's `apply_pull` and `reconcile` with migration `0006` and the read-only guard; the Data Center adapter; the pull loop and `SyncService` (`api_minor` 18: `GetSyncStatus`, `SyncNow`, `Notice.sync_status`, `OP_KIND_SYNC`); the clients (`api_minor` 19: `SyncNowResponse.request`, `SyncStatus.served_request`).
+
+M9 left these for later: everything that writes to Jira (the outbox, transitions, comments, promote, attach); `is_mine` warnings (5.9); a second instance; a daily discovery cache (it runs each pass); `priority_map`; Linux Secret Service; import progress (`Notice.import_progress`, reserved); a Cloud adapter.
+
 ### 9.2 Open questions
 
 | # | Question | Default until decided | Decide by |
@@ -1225,5 +1256,5 @@ M8 left these for later: Teams attendees from People (P2; until then only a `wai
 | 8 | Import-merge into a non-empty database | Restore-to-empty only | Post-P5 |
 | 9 | Stale thresholds (6.5) | As specified | After a month of P4 use |
 | 10 | Drop the Node runtime dependency (single-executable TUI) | Node required | P5 |
-| 11 | Jira Server / Data Center (PAT auth, API v2, wiki markup) | Unsupported | On demand |
+| 11 | Jira Server / Data Center (PAT auth, API v2, wiki markup) | **Answered** (ADR-0006): Data Center first, read-only in M9; Cloud is a second adapter, on demand | — |
 | 12 | Multi-device sync beyond Jira | Out of scope; export/import only | — |

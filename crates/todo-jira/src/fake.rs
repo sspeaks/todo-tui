@@ -232,8 +232,10 @@ impl FakeJira {
 
     /// Serves `issues` to searches, `page` at a time. It reads the JQL as
     /// the adapter writes it: `updated >= "yyyy/MM/dd HH:mm"` (in UTC, the
-    /// zone tests give the user), `id > n` and `ORDER BY id`, else in the
-    /// list's order. `issues` can change between calls (a shared list).
+    /// zone tests give the user), `id > n`, `id in (…)`, `resolution =
+    /// Unresolved` (an issue with a `resolution` field is resolved) and
+    /// `ORDER BY id`, else in the list's order. `issues` can change between
+    /// calls (a shared list).
     pub fn serve_search(&self, issues: Arc<Mutex<Vec<Value>>>, page: usize) {
         self.route("/rest/api/2/search", move |seen| {
             let body: Value = serde_json::from_str(&seen.body).unwrap_or_default();
@@ -264,6 +266,12 @@ impl FakeJira {
                 .nth(1)
                 .and_then(|t| t.split(' ').next())
                 .and_then(|t| t.parse::<u64>().ok());
+            let wanted: Option<Vec<String>> = jql
+                .split("id in (")
+                .nth(1)
+                .and_then(|t| t.split(')').next())
+                .map(|t| t.split(',').map(|s| s.trim().to_owned()).collect());
+            let unresolved = jql.contains("resolution = Unresolved");
             let updated = |v: &Value| {
                 v["fields"]["updated"]
                     .as_str()
@@ -281,6 +289,12 @@ impl FakeJira {
                 .iter()
                 .filter(|v| since.is_none_or(|s| updated(v).is_some_and(|u| u >= s)))
                 .filter(|v| after.is_none_or(|a| id(v) > a))
+                .filter(|v| {
+                    wanted
+                        .as_ref()
+                        .is_none_or(|w| w.iter().any(|x| v["id"] == x.as_str()))
+                })
+                .filter(|v| !unresolved || v["fields"]["resolution"].is_null())
                 .cloned()
                 .collect();
             if jql.contains("ORDER BY id") {

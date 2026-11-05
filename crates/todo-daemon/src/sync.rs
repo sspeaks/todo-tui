@@ -139,7 +139,9 @@ pub(crate) async fn run(
         };
         tokio::select! {
             () = sleep => {}
-            () = now.0.notified() => {}
+            // A sync now reconciles too: a resolution in the default scope
+            // (resolution = Unresolved) shows only there (5.5).
+            () = now.0.notified() => last_reconcile = None,
             // A TUI arriving moves to its cadence now (design 5.4).
             () = clients.interactive_arrived() => {}
             changed = config.changed() => {
@@ -186,7 +188,6 @@ async fn pass(store: &Store, i: &Instance, state: &State, reconcile: bool) -> Ou
             return Outcome::Auth;
         }
     };
-    let started = Timestamp::now();
     state.set(&i.id, |st| {
         st.state = v1::SyncState::Syncing as i32;
         st.pulled = 0;
@@ -199,6 +200,8 @@ async fn pass(store: &Store, i: &Instance, state: &State, reconcile: bool) -> Ou
         Err(e) => return fail(state, &i.id, &e),
     };
     let mut pulled = 0u32;
+    // What the scope pulls returned, so the rest can be read by id.
+    let mut seen: HashSet<String> = HashSet::new();
     // Each scope from its cursor.
     for scope in &i.scopes {
         let cursor = match store.sync_cursor(i.id.clone(), scope.name.clone()).await {
@@ -210,6 +213,7 @@ async fn pass(store: &Store, i: &Instance, state: &State, reconcile: bool) -> Ou
                 pulled += u32::try_from(issues.len()).unwrap_or(u32::MAX);
                 let n = pulled;
                 state.set(&i.id, |st| st.pulled = n);
+                seen.extend(issues.iter().map(|is| is.remote_id.clone()));
                 let page = PullPage {
                     instance_id: i.id.clone(),
                     issues: issues
@@ -217,6 +221,7 @@ async fn pass(store: &Store, i: &Instance, state: &State, reconcile: bool) -> Ou
                         .map(|is| (is, vec![scope.name.clone()]))
                         .collect(),
                     cursor: cursor.map(|c| (scope.name.clone(), c)),
+                    replace_scopes: false,
                     now: Timestamp::now(),
                     today: Zoned::now().date(),
                 };
@@ -230,7 +235,7 @@ async fn pass(store: &Store, i: &Instance, state: &State, reconcile: bool) -> Ou
             Err(PullError::Page(e)) => return store_fail(state, &i.id, &e),
         }
     }
-    if let Err(o) = tracked_and_reconcile(store, i, &adapter, state, reconcile, started).await {
+    if let Err(o) = tracked_and_reconcile(store, i, &adapter, state, reconcile, &seen).await {
         return o;
     }
     let items = store
@@ -247,8 +252,8 @@ async fn pass(store: &Store, i: &Instance, state: &State, reconcile: bool) -> Ou
     Outcome::Ok
 }
 
-/// The cursor of the tracked Items outside every scope: when a pass last
-/// read them (not an issue's time), kept beside the scopes' cursors.
+/// The cursor of the tracked Items outside every scope: the newest update
+/// among them a pass has read (Jira's clock, as the scopes' cursors are).
 const OUTSIDE: &str = "\u{0}outside";
 
 fn store_fail(state: &State, id: &str, e: &todo_store::StoreError) -> Outcome {
@@ -264,34 +269,42 @@ fn page(
     i: &Instance,
     issues: Vec<(todo_core::remote::RemoteIssue, Vec<String>)>,
     cursor: Option<(String, Timestamp)>,
+    replace_scopes: bool,
 ) -> PullPage {
     PullPage {
         instance_id: i.id.clone(),
         issues,
         cursor,
+        replace_scopes,
         now: Timestamp::now(),
         today: Zoned::now().date(),
     }
 }
 
-/// The tracked Items outside every scope (design 5.4 step 2b) and, when
-/// due, the reconciliation (5.5). `started` is when this pass began: what
-/// changed outside the scopes since the last pass's start is read again.
+/// The tracked Items outside every scope (design 5.4 step 2b), those to be
+/// read again by id, and, when due, the reconciliation (5.5). `seen` is
+/// what this pass's scope pulls returned.
 async fn tracked_and_reconcile(
     store: &Store,
     i: &Instance,
     adapter: &Adapter,
     state: &State,
     reconcile: bool,
-    started: Timestamp,
+    seen: &HashSet<String>,
 ) -> Result<(), Outcome> {
     let sfail = |e: todo_store::StoreError| store_fail(state, &i.id, &e);
     let jfail = |e: JiraError| fail(state, &i.id, &e);
     let tracked = store.tracked(i.id.clone()).await.map_err(sfail)?;
     let outside: Vec<String> = tracked
         .iter()
-        .filter(|(_, _, scopes)| scopes.is_empty())
-        .map(|(_, remote, _)| remote.clone())
+        .filter(|t| t.scopes.is_empty() && !t.stale)
+        .map(|t| t.remote_id.clone())
+        .collect();
+    // Stale ones are read below, from no cursor.
+    let all_outside: Vec<String> = tracked
+        .iter()
+        .filter(|t| t.scopes.is_empty())
+        .map(|t| t.remote_id.clone())
         .collect();
     if !outside.is_empty() {
         let since = store
@@ -299,9 +312,43 @@ async fn tracked_and_reconcile(
             .await
             .map_err(sfail)?;
         let issues = adapter.pull_ids(&outside, since).await.map_err(jfail)?;
+        let newest = issues.iter().map(|is| is.updated_at).max();
         let issues = issues.into_iter().map(|is| (is, Vec::new())).collect();
         store
-            .apply_pull(page(i, issues, Some((OUTSIDE.to_owned(), started))))
+            .apply_pull(page(
+                i,
+                issues,
+                newest.map(|at| (OUTSIDE.to_owned(), at)),
+                false,
+            ))
+            .await
+            .map_err(sfail)?;
+    }
+    // Read again by id, whatever their update time: what a pull could not
+    // bring up to date (deleted meanwhile, or unreadable), and, on a
+    // reconciling pass, every Item in a scope its pulls did not return, so
+    // a change that took it out of the scope's query (a resolution) shows
+    // at once. Reconciliation below sorts out what is gone.
+    let again: Vec<&todo_store::Tracked> = tracked
+        .iter()
+        .filter(|t| t.stale || (reconcile && !t.scopes.is_empty() && !seen.contains(&t.remote_id)))
+        .collect();
+    if !again.is_empty() {
+        let ids: Vec<String> = again.iter().map(|t| t.remote_id.clone()).collect();
+        let issues = adapter.pull_ids(&ids, None).await.map_err(jfail)?;
+        let issues = issues
+            .into_iter()
+            .map(|is| {
+                let scopes = again
+                    .iter()
+                    .find(|t| t.remote_id == is.remote_id)
+                    .map(|t| t.scopes.clone())
+                    .unwrap_or_default();
+                (is, scopes)
+            })
+            .collect();
+        store
+            .apply_pull(page(i, issues, None, true))
             .await
             .map_err(sfail)?;
     }
@@ -315,18 +362,19 @@ async fn tracked_and_reconcile(
             listed.entry(id).or_default().push(s.name.clone());
         }
     }
-    let known: HashSet<&str> = tracked.iter().map(|(_, r, _)| r.as_str()).collect();
+    let known: HashSet<&str> = tracked.iter().map(|t| t.remote_id.as_str()).collect();
     // L - R (design 5.5 step 2): in a scope here, in none there. And the
     // outside Items that no longer exist (step 1): a by-id listing of them
     // leaves out what is gone or forbidden.
     let still: HashSet<String> = adapter
-        .existing_ids(&outside)
+        .existing_ids(&all_outside)
         .await
         .map_err(jfail)?
         .into_iter()
         .collect();
     let mut out = Vec::new();
-    for (id, remote, scopes) in &tracked {
+    for t in &tracked {
+        let (id, remote, scopes) = (&t.id, &t.remote_id, &t.scopes);
         let gone_outside = scopes.is_empty() && !still.contains(remote);
         let left = !scopes.is_empty() && !listed.contains_key(remote);
         if !(gone_outside || left) {
@@ -356,8 +404,10 @@ async fn tracked_and_reconcile(
     // R - L (step 3): listed but not in that scope here, whatever their
     // update time (a scope query edited, a sprint joined): imported, or
     // their membership (and a left_scope archive) back.
-    let in_scope: BTreeMap<&str, &Vec<String>> =
-        tracked.iter().map(|(_, r, s)| (r.as_str(), s)).collect();
+    let in_scope: BTreeMap<&str, &Vec<String>> = tracked
+        .iter()
+        .map(|t| (t.remote_id.as_str(), &t.scopes))
+        .collect();
     let missing: Vec<String> = listed
         .iter()
         .filter(|(id, scopes)| match in_scope.get(id.as_str()) {
@@ -376,7 +426,7 @@ async fn tracked_and_reconcile(
             })
             .collect();
         store
-            .apply_pull(page(i, issues, None))
+            .apply_pull(page(i, issues, None, true))
             .await
             .map_err(sfail)?;
     }

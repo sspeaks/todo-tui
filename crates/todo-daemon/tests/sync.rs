@@ -394,7 +394,7 @@ async fn reconciliation_imports_what_the_scope_lists_whatever_its_age() {
     settled(&r, SyncState::Ok).await;
     // An issue joins the scope with an update time long before the cursor
     // (an edited scope query, a sprint joined): a pull by cursor cannot see
-    // it; the next reconcile (a restart) imports it.
+    // it; a reconcile imports it, and a sync now reconciles.
     issues.lock().unwrap().push(issue_json(
         2,
         "old but now mine",
@@ -402,13 +402,6 @@ async fn reconciliation_imports_what_the_scope_lists_whatever_its_age() {
         "2026-01-01T09:00:00.000+0000",
     ));
     sync_now(&r).await;
-    assert_eq!(
-        linked(&r).await.len(),
-        1,
-        "a pull by cursor does not see it"
-    );
-    let r = restart(r, &fake).await;
-    settled(&r, SyncState::Ok).await;
     let items = linked(&r).await;
     assert_eq!(
         items.iter().map(|i| i.title.as_str()).collect::<Vec<_>>(),
@@ -451,5 +444,119 @@ async fn status_changes_reach_a_subscriber_live() {
     }
     // The snapshot (ok), then the pass: syncing, then ok again.
     assert!(states.contains(&(SyncState::Syncing as i32)), "{states:?}");
+    r.stop().await;
+}
+
+/// Resolves issue `n` in `issues` (Done, with a resolution), at `updated`.
+fn resolve(issues: &Arc<Mutex<Vec<Value>>>, n: &str, updated: &str) {
+    let mut all = issues.lock().unwrap();
+    let v = all.iter_mut().find(|v| v["id"] == n).unwrap();
+    v["fields"]["status"] = json!({"name": "Done", "statusCategory": {"key": "done"}});
+    v["fields"]["resolution"] = json!({"name": "Fixed"});
+    v["fields"]["updated"] = json!(updated);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resolution_in_jira_shows_on_the_next_sync_now() {
+    let fake = FakeJira::start("pat").await;
+    let issues = Arc::new(Mutex::new(vec![issue_json(1, "finish it", "new", &at(1))]));
+    serve(&fake, issues.clone());
+    let r = start(&fake, "pat").await;
+    settled(&r, SyncState::Ok).await;
+    // Resolved: the default scope (resolution = Unresolved) no longer lists
+    // it, so only a read by id sees the resolution.
+    resolve(&issues, "1", &at(2));
+    sync_now(&r).await;
+    let items = linked(&r).await;
+    assert_eq!(items[0].status, Status::Done as i32);
+    assert!(items[0].archived.is_none(), "done, not left scope");
+    r.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_item_undeleted_catches_up_with_what_changed_while_deleted() {
+    let fake = FakeJira::start("pat").await;
+    let issues = Arc::new(Mutex::new(vec![
+        issue_json(1, "old title", "new", &at(1)),
+        issue_json(2, "other", "new", &at(1)),
+    ]));
+    serve(&fake, issues.clone());
+    let r = start(&fake, "pat").await;
+    settled(&r, SyncState::Ok).await;
+    let id = linked(&r).await[0].id.clone();
+    let mut client = ItemServiceClient::new(r.channel().await);
+    client
+        .delete_item(todo_proto::v1::DeleteItemRequest {
+            request_id: todo_core::new_ulid().to_string(),
+            id: id.clone(),
+            expected_revision: None,
+        })
+        .await
+        .unwrap();
+    // Changed in Jira while deleted here: the pull skips it, and its cursor
+    // moves past the change.
+    issues.lock().unwrap()[0]["fields"]["summary"] = json!("new title");
+    issues.lock().unwrap()[0]["fields"]["updated"] = json!(at(2));
+    sync_now(&r).await;
+    // Later changes take the cursor hours past it.
+    issues.lock().unwrap()[1]["fields"]["updated"] = json!(at(6));
+    sync_now(&r).await;
+    client
+        .undelete_item(todo_proto::v1::UndeleteItemRequest {
+            request_id: todo_core::new_ulid().to_string(),
+            id,
+            expected_revision: None,
+        })
+        .await
+        .unwrap();
+    sync_now(&r).await;
+    assert_eq!(linked(&r).await[0].title, "new title");
+    r.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_issue_unreadable_for_a_while_heals_when_readable_again() {
+    let fake = FakeJira::start("pat").await;
+    let issues = Arc::new(Mutex::new(vec![issue_json(1, "restricted", "new", &at(1))]));
+    serve(&fake, issues.clone());
+    let r = start(&fake, "pat").await;
+    settled(&r, SyncState::Ok).await;
+    // Unreadable (a permission scheme): gone from every search.
+    let saved = issues.lock().unwrap().remove(0);
+    sync_now(&r).await;
+    let items = linked(&r).await;
+    assert_eq!(
+        items[0].remote_link.as_ref().unwrap().link_state,
+        todo_proto::v1::LinkState::Broken as i32
+    );
+    // Readable again, its update time unchanged.
+    issues.lock().unwrap().push(saved);
+    sync_now(&r).await;
+    let items = linked(&r).await;
+    assert_eq!(
+        items[0].remote_link.as_ref().unwrap().link_state,
+        todo_proto::v1::LinkState::Ok as i32
+    );
+    assert!(items[0].archived.is_none(), "{:?}", items[0].archived);
+    r.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_item_outside_every_scope_follows_jira_by_jiras_own_clock() {
+    let fake = FakeJira::start("pat").await;
+    let issues = Arc::new(Mutex::new(vec![issue_json(1, "left", "new", &at(1))]));
+    serve(&fake, issues.clone());
+    let r = start(&fake, "pat").await;
+    settled(&r, SyncState::Ok).await;
+    // Resolved, so out of the scope; done, so tracked outside it, unarchived.
+    resolve(&issues, "1", &at(2));
+    sync_now(&r).await;
+    assert!(linked(&r).await[0].remote_link.is_some());
+    // An edit dated before this machine's clock (Jira's clock behind ours):
+    // still read, as the outside cursor is the newest update Jira gave.
+    issues.lock().unwrap()[0]["fields"]["summary"] = json!("edited outside");
+    issues.lock().unwrap()[0]["fields"]["updated"] = json!(at(3));
+    sync_now(&r).await;
+    assert_eq!(linked(&r).await[0].title, "edited outside");
     r.stop().await;
 }

@@ -22,6 +22,11 @@ use crate::{Batch, OpKind, OpRow, Result, StoreError, WriteTx, write_op};
 pub struct PullPage {
     pub instance_id: String,
     pub issues: Vec<(RemoteIssue, Vec<String>)>,
+    /// The scopes given are each issue's whole membership (reconciliation
+    /// listed every scope); otherwise they are added to what an Item has, as
+    /// one scope's pull knows nothing of the others, and only
+    /// reconciliation takes a scope away (5.5).
+    pub replace_scopes: bool,
     /// Moves the scope's cursor once the page is committed (5.4 step 6).
     pub cursor: Option<(String, Timestamp)>,
     pub now: Timestamp,
@@ -91,16 +96,44 @@ pub(crate) fn apply_page_tx(tx: &mut WriteTx<'_>, page: PullPage) -> Result<Pull
                 let current = batch.items[slot].clone();
                 if current.is_deleted() {
                     out.skipped_deleted += 1;
+                    // The cursor moves past this change: once undeleted,
+                    // the Item is read again by id (`stale`).
+                    forget_pulled(conn, id)?;
                     continue;
                 }
-                let (mut next, changes) = update(&current, issue, parent, scopes, page.now);
+                let scopes = if page.replace_scopes {
+                    scopes.clone()
+                } else {
+                    let mut all = current.derived.scopes.clone();
+                    all.extend(
+                        scopes
+                            .iter()
+                            .filter(|s| !all.contains(s))
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                    );
+                    all
+                };
+                let (mut next, changes) = update(&current, issue, parent, &scopes, page.now);
                 // Back in a scope, or readable again: a left_scope or
-                // remote_unavailable archive lifts (5.5 step 3).
+                // remote_unavailable archive lifts (5.5 step 3); one still in
+                // no scope is archived left_scope instead, as 5.3 has it.
                 let mut changes = changes;
-                if !scopes.is_empty() && is_sync_archived(&next) {
+                let unavailable = next
+                    .overlay
+                    .archived
+                    .is_some_and(|a| a.reason == ArchiveReason::RemoteUnavailable);
+                if is_sync_archived(&next) && (!scopes.is_empty() || unavailable) {
                     let a = apply(&next, &MutationOp::Unarchive, &ctx).map_err(|e| sweep(id, e))?;
                     next = a.item;
                     changes.extend(a.changes);
+                    let pinned = next.remote_link.as_ref().is_some_and(|l| l.pinned);
+                    if scopes.is_empty() && !pinned && !next.status().is_closed() {
+                        let a = apply(&next, &MutationOp::Archive(ArchiveReason::LeftScope), &ctx)
+                            .map_err(|e| sweep(id, e))?;
+                        next = a.item;
+                        changes.extend(a.changes);
+                    }
                 }
                 if changes.is_empty() && next == current {
                     continue;
@@ -170,6 +203,7 @@ pub(crate) fn reconcile_tx(tx: &mut WriteTx<'_>, input: Reconcile) -> Result<Rec
     };
     let mut batch = Batch::default();
     let mut out = ReconcileOutcome::default();
+    let mut forget = Vec::new();
     for (id, fetched) in &input.out_of_scope {
         let slot = batch.load(conn, *id, input.today)?;
         let current = batch.items[slot].clone();
@@ -183,13 +217,18 @@ pub(crate) fn reconcile_tx(tx: &mut WriteTx<'_>, input: Reconcile) -> Result<Rec
                 let parent = live_parent(conn, &input.instance_id, issue, &HashMap::new())?;
                 update(&current, issue, parent, &[], input.now)
             }
-            None => match break_link(&current) {
-                Some((next, change)) => {
-                    out.broken.push(*id);
-                    (next, vec![change])
+            None => {
+                // Read again by id each pass (`stale`), so that it heals
+                // once readable, whatever its update time.
+                forget.push(*id);
+                match break_link(&current) {
+                    Some((next, change)) => {
+                        out.broken.push(*id);
+                        (next, vec![change])
+                    }
+                    None => (current.clone(), Vec::new()),
                 }
-                None => (current.clone(), Vec::new()),
-            },
+            }
         };
         let pinned = next.remote_link.as_ref().is_some_and(|l| l.pinned);
         let reason = match fetched {
@@ -223,20 +262,23 @@ pub(crate) fn reconcile_tx(tx: &mut WriteTx<'_>, input: Reconcile) -> Result<Rec
             record(&mut batch, slot, next, changes);
         }
     }
-    if batch.touched().is_empty() {
-        return Ok(out);
+    if !batch.touched().is_empty() {
+        let mut op = OpRow::new(OpKind::Sync, Actor::Sync, "")?;
+        op.summary = format!(
+            "sync: {} left scope, {} unavailable",
+            out.left_scope.len(),
+            out.broken.len()
+        );
+        let (revision, _) = write_op(tx, &op, &mut batch, input.today)?;
+        out.result = Some(MutationResult {
+            op_id: op.id,
+            revision,
+        });
     }
-    let mut op = OpRow::new(OpKind::Sync, Actor::Sync, "")?;
-    op.summary = format!(
-        "sync: {} left scope, {} unavailable",
-        out.left_scope.len(),
-        out.broken.len()
-    );
-    let (revision, _) = write_op(tx, &op, &mut batch, input.today)?;
-    out.result = Some(MutationResult {
-        op_id: op.id,
-        revision,
-    });
+    // After the op, which writes the link as the Item holds it.
+    for id in forget {
+        forget_pulled(tx.conn(), id)?;
+    }
     Ok(out)
 }
 
@@ -344,14 +386,32 @@ fn summary(imported: usize, updated: usize) -> String {
     }
 }
 
+/// Clears the Item's pulled version: a pull has not brought it up to date
+/// (it was deleted) or could not read it (broken). Bookkeeping, outside the
+/// op, as the pulled version is.
+fn forget_pulled(conn: &Connection, id: ItemId) -> Result<()> {
+    conn.prepare_cached("UPDATE items SET remote_last_pulled_version = NULL WHERE id = ?1")?
+        .execute([id.to_string()])?;
+    Ok(())
+}
+
+/// One Item of the tracked set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tracked {
+    pub id: ItemId,
+    pub remote_id: String,
+    /// The scopes it matched last.
+    pub scopes: Vec<String>,
+    /// No pull has brought it up to date since it was deleted, or since its
+    /// issue could not be read: it is read again by id, whatever the cursors.
+    pub stale: bool,
+}
+
 /// The linked, live Items of `instance`: its tracked set (design 5.3), by
 /// remote id, with the scopes each matched last.
-pub(crate) fn tracked_tx(
-    conn: &Connection,
-    instance: &str,
-) -> Result<Vec<(ItemId, String, Vec<String>)>> {
+pub(crate) fn tracked_tx(conn: &Connection, instance: &str) -> Result<Vec<Tracked>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT id, remote_id, scopes FROM items
+        "SELECT id, remote_id, scopes, remote_last_pulled_version IS NULL FROM items
          WHERE remote_instance_id = ?1 AND deleted_at IS NULL ORDER BY seq",
     )?;
     let rows = stmt.query_map([instance], |r| {
@@ -359,13 +419,19 @@ pub(crate) fn tracked_tx(
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
             r.get::<_, String>(2)?,
+            r.get::<_, bool>(3)?,
         ))
     })?;
     rows.map(|row| {
-        let (id, remote, scopes) = row?;
+        let (id, remote_id, scopes, stale) = row?;
         let scopes: Vec<String> =
             serde_json::from_str(&scopes).map_err(|e| StoreError::Corrupt(e.to_string()))?;
-        Ok((codec::item_id_from_str(&id)?, remote, scopes))
+        Ok(Tracked {
+            id: codec::item_id_from_str(&id)?,
+            remote_id,
+            scopes,
+            stale,
+        })
     })
     .collect()
 }

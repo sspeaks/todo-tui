@@ -45,6 +45,9 @@ message Record {
     ViewSeed view_seed = 4;
     Op op = 5;
     Event event = 6;
+    // A sync scope's cursor (design 5.3, 7.4), so a restore resumes
+    // sync without pulling everything again.
+    SyncCursor sync_cursor = 7;
   }
 }
 
@@ -57,6 +60,15 @@ message RelationRecord {
 message ViewSeed {
   string seed = 1;
   google.protobuf.Timestamp seeded_at = 2;
+}
+
+// How far an instance's scope has been pulled: the newest issue update a
+// committed page held. `scope` is the config's scope name, or "\u0000outside"
+// for the tracked Items outside every scope.
+message SyncCursor {
+  string instance_id = 1;
+  string scope = 2;
+  google.protobuf.Timestamp cursor_at = 3;
 }
 
 // A row of the op log (design 3.10), as stored: kinds, actors and undo

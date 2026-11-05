@@ -400,18 +400,6 @@ pub fn iso_week_from_proto(field: &'static str, s: &str) -> Result<String> {
     Ok(s.to_owned())
 }
 
-/// A person id only: free text is valid only for `waiting.on` (design 4.8).
-fn person_id_from_proto(field: &'static str, p: &v1::PersonRef) -> Result<core::PersonRef> {
-    use v1::person_ref::Ref;
-    match require(field, p.r#ref.as_ref())? {
-        Ref::PersonId(id) => Ok(core::PersonRef::Person(parse_id(field, id)?)),
-        Ref::FreeText(_) => Err(ConvertError::Invalid(
-            field.into(),
-            "free text only valid for waiting.on".into(),
-        )),
-    }
-}
-
 pub(crate) fn person_from_proto(field: &'static str, p: &v1::PersonRef) -> Result<core::PersonRef> {
     use v1::person_ref::Ref;
     match require(field, p.r#ref.as_ref())? {
@@ -738,10 +726,11 @@ impl TryFrom<&v1::Item> for core::Item {
                 .map(|d| duration_from_proto(field, d))
                 .transpose()
         };
+        // A whole Item is a stored one (export, 7.4): sync keeps a tracker's
+        // people as their names until People (3.5). A client's own edit is
+        // checked by request.rs, which takes a person id only.
         let person = |field, r: &Option<v1::PersonRef>| {
-            r.as_ref()
-                .map(|r| person_id_from_proto(field, r))
-                .transpose()
+            r.as_ref().map(|r| person_from_proto(field, r)).transpose()
         };
         let id = |field, s: &Option<String>| s.as_deref().map(|s| parse_id(field, s)).transpose();
 
@@ -1704,18 +1693,19 @@ mod tests {
         ));
         let free_text = v1::PersonRef::from(&core::PersonRef::FreeText("Dana".into()));
 
+        // A stored Item (an export) holds a tracker's people as names until
+        // People (3.5); a person's own edit is refused by the mutation.
         let mut p = good.clone();
         p.assignee = Some(free_text.clone());
-        assert!(matches!(
-            core::Item::try_from(&p),
-            Err(ConvertError::Invalid(f, _)) if f == "assignee"
-        ));
-        let mut p = good.clone();
         p.reporter = Some(free_text);
-        assert!(matches!(
-            core::Item::try_from(&p),
-            Err(ConvertError::Invalid(f, _)) if f == "reporter"
-        ));
+        let item = core::Item::try_from(&p).unwrap();
+        assert_eq!(
+            (item.core.assignee, item.core.reporter),
+            (
+                Some(core::PersonRef::FreeText("Dana".into())),
+                Some(core::PersonRef::FreeText("Dana".into()))
+            )
+        );
 
         for bad in [
             "next week",
