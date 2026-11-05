@@ -1,6 +1,7 @@
 import { createContext, createElement, type ReactNode, useContext, useEffect, useMemo, useSyncExternalStore } from "react";
 import type { TodoClients } from "./connect.js";
 import type { Item } from "./gen/todo/v1/item_pb.js";
+import type { SyncStatus } from "./gen/todo/v1/sync_service_pb.js";
 import type {
   ConnectionSnapshot,
   CountsSnapshot,
@@ -79,6 +80,12 @@ export function useViews(): SavedViewsSnapshot {
 export function useConfig(): LiveConfigSnapshot {
   const store = useLiveStore();
   return useSyncExternalStore(store.subscribe, store.getConfig);
+}
+
+/** Each configured instance's sync state, kept live from Notice.sync_status. */
+export function useSyncStatus(): ReadonlyMap<string, SyncStatus> {
+  const store = useLiveStore();
+  return useSyncExternalStore(store.subscribe, store.getSyncStatus);
 }
 
 /**

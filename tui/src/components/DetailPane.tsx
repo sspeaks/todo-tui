@@ -1,6 +1,8 @@
 import {
+  ArchiveReason,
   type Item,
   ItemField,
+  LinkState,
   Operator,
   type Relation,
   RelationKind,
@@ -19,6 +21,12 @@ import { useController, useDebounced, useOptionalView, useToday, useUi } from ".
 export const DETAIL_FETCH_MS = 80;
 
 const LABEL = 10;
+
+/** Why sync archived an Item; the others (a person's z, auto_done) say nothing. */
+const ARCHIVE_WHY: Partial<Record<ArchiveReason, string>> = {
+  [ArchiveReason.LEFT_SCOPE]: "no longer in a synced scope",
+  [ArchiveReason.REMOTE_UNAVAILABLE]: "its Jira issue is unavailable",
+};
 
 /** Direct children, whatever their status (Decision 4). */
 const subtasksOf = (id: string): ViewQuery => ({
@@ -137,6 +145,13 @@ export function DetailPane({ id, width, height, focused }: { id: string | undefi
         <Text bold wrap="wrap" color={focused ? "cyan" : undefined}>
           {singleLine(item.title)}
         </Text>
+        {item.remoteLink ? (
+          <Field label="Jira">
+            {singleLine(item.remoteLink.key)}
+            {item.remoteLink.linkState === LinkState.BROKEN ? <Text color="red"> (unavailable: deleted, or no access)</Text> : null}
+            <Text dimColor> · {singleLine(item.remoteLink.url)}</Text>
+          </Field>
+        ) : null}
         <Field label="Status">
           {statusGlyph(item.status)} {item.remoteStatusName ? singleLine(item.remoteStatusName) : statusName(item.status)}
         </Field>
@@ -185,7 +200,17 @@ export function DetailPane({ id, width, height, focused }: { id: string | undefi
             {[minutes(item.originalEstimate), item.remainingEstimate ? `${minutes(item.remainingEstimate)} left` : ""].filter(Boolean).join(" · ")}
           </Field>
         ) : null}
-        {item.archived ? <Field label="Archived">{item.archived.at ? localTime(item.archived.at) : "yes"}</Field> : null}
+        {item.assignee ? <Field label="Assignee">{personName(item.assignee)}</Field> : null}
+        {item.reporter ? <Field label="Reporter">{personName(item.reporter)}</Field> : null}
+        {item.components.length ? <Field label="Component">{item.components.map(singleLine).join(", ")}</Field> : null}
+        {item.fixVersions.length ? <Field label="Fix ver.">{item.fixVersions.map(singleLine).join(", ")}</Field> : null}
+        {item.sprint ? <Field label="Sprint">{singleLine(item.sprint)}</Field> : null}
+        {item.archived ? (
+          <Field label="Archived">
+            {item.archived.at ? localTime(item.archived.at) : "yes"}
+            {ARCHIVE_WHY[item.archived.reason] ? ` (${ARCHIVE_WHY[item.archived.reason]})` : ""}
+          </Field>
+        ) : null}
         {item.deletedAt ? <Field label="Deleted">{localTime(item.deletedAt)}</Field> : null}
         <Field label="Created">
           {item.createdAt ? localTime(item.createdAt) : "—"}

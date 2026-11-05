@@ -1,4 +1,5 @@
 import { create } from "@bufbuild/protobuf";
+import { SyncState } from "../src/gen/todo/v1/sync_service_pb.js";
 import { Code, ConnectError, type Transport, createClient } from "@connectrpc/connect";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ItemField } from "../src/gen/todo/v1/field_pb.js";
@@ -312,6 +313,34 @@ describe("LiveStore", () => {
     daemon.setConfig({ keymap: { K: "move_up" } });
     await waitFor(() => store.getConfig().config?.keymap.K === "move_up");
     expect(store.getConfig().revision).toBe(daemon.revision);
+  });
+
+  it("keeps each instance's sync state from the notices, across a reconnect", async () => {
+    const { daemon, store } = setup(0);
+    daemon.setSyncStatus({ instanceId: "work-jira", state: SyncState.SYNCING });
+    store.start();
+    // The snapshot after CaughtUp.
+    await waitFor(() => store.getSyncStatus().get("work-jira")?.state === SyncState.SYNCING);
+    daemon.setSyncStatus({ instanceId: "work-jira", state: SyncState.OK, items: 3 });
+    await waitFor(() => store.getSyncStatus().get("work-jira")?.state === SyncState.OK);
+    expect(store.getSyncStatus().get("work-jira")?.items).toBe(3);
+    // A reconnect gets the snapshot again; no longer configured, it goes.
+    daemon.dropStreams();
+    await waitFor(() => store.getConnection().state === "live");
+    daemon.setSyncStatus({ instanceId: "work-jira", state: SyncState.UNSPECIFIED });
+    await waitFor(() => store.getSyncStatus().size === 0);
+    // Removed while the stream was down (a restart without it): the new
+    // stream's snapshot leaves it out, and so does the store.
+    daemon.setSyncStatus({ instanceId: "old-jira", state: SyncState.OK });
+    await waitFor(() => store.getSyncStatus().has("old-jira"));
+    daemon.down = true;
+    daemon.dropStreams();
+    await waitFor(() => store.getConnection().state === "reconnecting");
+    daemon.forgetSyncStatus("old-jira");
+    daemon.setSyncStatus({ instanceId: "new-jira", state: SyncState.STARTING });
+    daemon.down = false;
+    await waitFor(() => store.getSyncStatus().has("new-jira"));
+    expect([...store.getSyncStatus().keys()]).toEqual(["new-jira"]);
   });
 
   it("re-reads the config after an outage, which a restarted daemon may have read anew", async () => {

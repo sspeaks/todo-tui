@@ -87,7 +87,7 @@ describe("[keymap] overrides", () => {
       expect(keysOf(bindings, "delete")).toEqual(["d"]);
       expect(runs(bindings, ["d"])).toBe("delete");
     }
-    const { bindings, warnings } = applyOverrides(BINDINGS, { g: "top", "g g": "" });
+    const { bindings, warnings } = applyOverrides(BINDINGS, { g: "top", "g g": "", "g s": "" });
     expect(warnings).toEqual([]);
     expect(runs(bindings, ["g"])).toBe("top");
     expect(runs(bindings, ["g"], "help")).toBe("unbound");

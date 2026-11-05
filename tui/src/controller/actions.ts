@@ -115,7 +115,7 @@ export class ItemActions {
     if (!item) return;
     if (item.status === status) return this.c.toast("info", `already ${statusWord(status)}${picked ? "" : "; s to reopen"}`);
     const out = await this.c.pipeline.run({ call: (opts) => setStatus(this.c.items, item.id, status, opts), items: single });
-    if (!out.ok) return this.c.failed(errorText(out.err, item.title));
+    if (!out.ok) return this.c.failed(errorText(out.err, item));
     this.c.toastOp(out.res.result?.opId, opText(STATUS_CHOICES.find((c) => c.status === status)?.verb ?? "change", item.title));
   }
 
@@ -131,7 +131,7 @@ export class ItemActions {
     const item = this.itemOf(target);
     if (!item) return;
     const out = await this.c.pipeline.run({ call: (opts) => updateItem(this.c.items, { id: item.id, priority }, ["priority"], opts), items: single });
-    if (!out.ok) return this.c.failed(errorText(out.err, item.title));
+    if (!out.ok) return this.c.failed(errorText(out.err, item));
     this.c.toastIfLeft(item.id, out.res.result?.opId, opText("edit", item.title));
   }
 
@@ -147,7 +147,7 @@ export class ItemActions {
     const item = this.itemOf(target);
     if (!item) return;
     const out = await this.c.pipeline.run({ call: (opts) => updateItem(this.c.items, { id: item.id, energy }, ["energy"], opts), items: single });
-    if (!out.ok) return this.c.failed(errorText(out.err, item.title));
+    if (!out.ok) return this.c.failed(errorText(out.err, item));
     this.c.toastIfLeft(item.id, out.res.result?.opId, opText("edit", item.title));
   }
 
@@ -164,7 +164,7 @@ export class ItemActions {
     if (!item) return;
     if (!item.waiting) return this.c.toast("info", "Not waiting on anyone");
     const out = await this.c.pipeline.run({ call: (opts) => updateItem(this.c.items, { id: item.id }, ["waiting"], opts), items: single });
-    if (!out.ok) return this.c.failed(errorText(out.err, item.title));
+    if (!out.ok) return this.c.failed(errorText(out.err, item));
     this.c.toastIfLeft(item.id, out.res.result?.opId, opText("edit", item.title));
   }
 
@@ -186,7 +186,7 @@ export class ItemActions {
     if (!item) return;
     const rpc = item.archived ? unarchiveItem : archiveItem;
     const out = await this.c.pipeline.run<ArchiveItemResponse | UnarchiveItemResponse>({ call: (opts) => rpc(this.c.items, item.id, opts), items: single });
-    if (!out.ok) return this.c.failed(errorText(out.err, item.title));
+    if (!out.ok) return this.c.failed(errorText(out.err, item));
     this.c.toastOp(out.res.result?.opId, opText(item.archived ? "unarchive" : "archive", item.title));
   }
 
@@ -245,7 +245,7 @@ export class ItemActions {
       );
       children = res.items.filter((child) => !target.ids.includes(child.id)).length;
     } catch (err) {
-      return this.c.failed(errorText(err, item?.title));
+      return this.c.failed(errorText(err, item));
     }
     const subtasks = (whose: string) => (children ? ` and ${whose} ${children} subtask${children === 1 ? "" : "s"}` : "");
     if (target.bulk) {
@@ -274,7 +274,7 @@ export class ItemActions {
     const item = this.itemOf(target);
     if (!item) return;
     const out = await this.c.pipeline.run({ call: (opts) => deleteItem(this.c.items, item.id, opts), items: single });
-    if (!out.ok) return this.c.failed(errorText(out.err, item.title));
+    if (!out.ok) return this.c.failed(errorText(out.err, item));
     this.c.toastOp(out.res.result?.opId, opText("delete", item.title));
   }
 

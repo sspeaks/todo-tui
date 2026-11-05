@@ -6,6 +6,7 @@ import {
   Priority,
   RelationKind,
   Status,
+  SyncState,
   addRelation,
   Weekday,
   deleteItem,
@@ -500,6 +501,42 @@ describe("the detail pane", () => {
     await setRecurrence(items, plants.id, undefined);
     await t.waitFrame((f) => expect(f).not.toContain("Repeats"));
     expect(t.frame()).toMatch(/Defer {5}—/);
+  });
+
+  it("shows a Jira issue's key, link and tracker fields, and why sync archived it", async () => {
+    const fd = fakeDaemon([
+      item("PLAT-1 work", {
+        remoteLink: { trackerKind: "jira", instanceId: "work-jira", remoteId: "1", key: "PLAT-1", url: "https://jira.example.com/browse/PLAT-1" },
+        remoteStatusName: "In Review",
+        components: ["api", "ui"],
+        fixVersions: ["2.1"],
+        sprint: "Sprint 9",
+        storyPoints: 3,
+        archived: { reason: ArchiveReason.LEFT_SCOPE },
+      }),
+    ]);
+    const t = renderTui({ daemon: fd, columns: 140, rows: 40 });
+    await t.live();
+    await t.press("6");
+    await t.waitFrame((f) => expect(f).toMatch(/Jira {6}PLAT-1 ·[\s│]*https:\/\/jira\.example\.com\/browse\/PLAT-1/));
+    const f = t.frame();
+    expect(f).toMatch(/Status .* In Review/);
+    expect(f).toMatch(/Component api, ui/);
+    expect(f).toMatch(/Fix ver\. {2}2\.1/);
+    expect(f).toMatch(/Sprint {4}Sprint 9/);
+    expect(f).toMatch(/Points {4}3/);
+    expect(f).toMatch(/Archived .*\(no longer in a synced scope\)/);
+  });
+
+  it("shows each synced instance in the status bar, red when it needs the user", async () => {
+    const fd = fakeDaemon([item("a")]);
+    const t = renderTui({ daemon: fd, columns: 120, rows: 12 });
+    await t.live();
+    fd.daemon.setSyncStatus({ instanceId: "work-jira", state: SyncState.SYNCING, pulled: 40 });
+    await t.waitFrame((f) => expect(f).toContain("● live · ⇅ work-jira syncing… 40"));
+    fd.daemon.setSyncStatus({ instanceId: "work-jira", state: SyncState.AUTH_ERROR });
+    await t.waitFrame((f) => expect(f).toContain("⇅ work-jira auth"));
+    expect(t.raw().split("\n").find((l) => l.includes("⇅"))).toContain(RED);
   });
 
   it("fetches only once the selection settles", async () => {

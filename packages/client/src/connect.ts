@@ -1,6 +1,7 @@
 import { dirname } from "node:path";
 import { Code, ConnectError, type Client, type Transport, createClient } from "@connectrpc/connect";
 import { ItemService } from "./gen/todo/v1/item_service_pb.js";
+import { SyncService } from "./gen/todo/v1/sync_service_pb.js";
 import { ClientKind, type GetServerInfoResponse, SystemService } from "./gen/todo/v1/system_service_pb.js";
 import { ViewService } from "./gen/todo/v1/view_service_pb.js";
 import { WatchService } from "./gen/todo/v1/watch_service_pb.js";
@@ -11,7 +12,7 @@ import { isConnectionFailure, readDaemonPid, spawnDaemon, waitForDaemonExit, wit
 import { type TodoTransport, type TodoTransportOptions, UnsafeRuntimeDirError, checkRuntimeDir, createTodoTransport } from "./transport.js";
 
 /** The api_minor this client was built against. */
-export const CLIENT_API_MINOR = 18;
+export const CLIENT_API_MINOR = 19;
 export const CLIENT_VERSION = "0.1.0";
 
 export interface TodoClients {
@@ -19,6 +20,7 @@ export interface TodoClients {
   items: Client<typeof ItemService>;
   views: Client<typeof ViewService>;
   watch: Client<typeof WatchService>;
+  sync: Client<typeof SyncService>;
 }
 
 export interface TodoConnection extends TodoClients {
@@ -70,6 +72,7 @@ export function createClients(transport: Transport): TodoClients {
     items: createClient(ItemService, transport),
     views: createClient(ViewService, transport),
     watch: createClient(WatchService, transport),
+    sync: createClient(SyncService, transport),
   };
 }
 

@@ -477,12 +477,12 @@ export class Prompts {
         this.c.setMode(normalMode);
         return this.c.toastIfLeft(item.id, out.res.result?.opId, opText("edit", patch.title ?? item.title));
       }
-      if (errorReason(out.err) !== "REVISION_MISMATCH") return this.c.failed(errorText(out.err, item.title));
+      if (errorReason(out.err) !== "REVISION_MISMATCH") return this.c.failed(errorText(out.err, item));
       let fresh: Item | undefined;
       try {
         fresh = await this.c.store.fetchItem(item.id);
       } catch (err) {
-        return this.c.failed(errorText(err, item.title));
+        return this.c.failed(errorText(err, item));
       }
       if (!fresh || fresh.deletedAt) return this.c.failed(`${quoted(item.title)} was deleted elsewhere`);
       const value = valueOf(fresh);
@@ -508,7 +508,7 @@ export class Prompts {
     if (sameDate(date, due ? item.dueDate : item.deferUntil)) return this.c.setMode(normalMode);
     const patch = due ? { id: item.id, dueDate: date } : { id: item.id, deferUntil: date };
     const out = await this.c.pipeline.run({ call: (opts) => updateItem(this.c.items, patch, [due ? "due_date" : "defer_until"], opts), items: single });
-    if (!out.ok) return this.c.failed(errorText(out.err, item.title));
+    if (!out.ok) return this.c.failed(errorText(out.err, item));
     this.c.setMode(normalMode);
     // Deferring takes the Item out of every active view: always toasted.
     if (due) this.c.toastIfLeft(item.id, out.res.result?.opId, opText("edit", item.title));
@@ -545,7 +545,7 @@ export class Prompts {
 
   private async saveWaitingPatch(item: Item, patch: MessageInitShape<typeof ItemSchema> & { id: string }, paths: string[]): Promise<void> {
     const out = await this.c.pipeline.run({ call: (opts) => updateItem(this.c.items, patch, paths, opts), items: single });
-    if (!out.ok) return this.c.failed(errorText(out.err, item.title));
+    if (!out.ok) return this.c.failed(errorText(out.err, item));
     this.c.setMode(normalMode);
     this.c.toastIfLeft(item.id, out.res.result?.opId, opText("edit", item.title));
   }
@@ -565,7 +565,7 @@ export class Prompts {
     }
     if (rule ? sameRule(rule, item.recurrence?.rule) : !item.recurrence) return this.c.setMode(normalMode);
     const out = await this.c.pipeline.run({ call: (opts) => setRecurrence(this.c.items, item.id, rule, opts), items: single });
-    if (!out.ok) return this.c.failed(errorText(out.err, item.title));
+    if (!out.ok) return this.c.failed(errorText(out.err, item));
     this.c.setMode(normalMode);
     this.c.toastIfLeft(item.id, out.res.result?.opId, opText(rule ? "set repeat" : "stop repeating", item.title));
   }
@@ -701,7 +701,7 @@ export class Prompts {
         parseRecurrence(this.c.items, text, { ...(timeoutMs !== undefined && { timeoutMs }), ...(anchor && { anchor }) }),
       );
     } catch (err) {
-      this.c.failed(errorText(err, item?.title));
+      this.c.failed(errorText(err, item));
       return undefined;
     }
     if (res.rule && !res.warning) return res.rule;
@@ -717,7 +717,7 @@ export class Prompts {
     try {
       res = await this.c.pipeline.call(({ timeoutMs }) => parseDate(this.c.items, text, { ...(timeoutMs !== undefined && { timeoutMs }) }));
     } catch (err) {
-      this.c.failed(errorText(err, item?.title));
+      this.c.failed(errorText(err, item));
       return undefined;
     }
     if (res.date) return res.date;

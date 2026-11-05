@@ -2,7 +2,7 @@
 // §3.2): errors mapped to a sentence, and the undo and redo results in
 // the CLI's words (crates/todo-cli/src/undo.rs).
 
-import { BadRequestSchema, Code, ConnectError, type RedoResponse, type UndoResponse, errorReason, isConnectionFailure } from "@todo-tui/client";
+import { BadRequestSchema, Code, ConnectError, type Item, type RedoResponse, type UndoResponse, errorReason, isConnectionFailure } from "@todo-tui/client";
 import { singleLine, truncate } from "../format/text.js";
 
 /** An action gave up waiting for the daemon after a connection failure. */
@@ -18,10 +18,17 @@ export const quoted = (title: string): string => `“${truncate(singleLine(title
 /** What an op did, as OpSummary words it: `mark done "x"`. */
 export const opText = (verb: string, title: string): string => `${verb} "${truncate(singleLine(title), 40)}"`;
 
-/** One line for an action's error; `title` names the Item it acted on. */
-export function errorText(err: unknown, title?: string): string {
+/** The refusal of a Core edit on a linked Item (ADR-0006), naming its key. */
+export const readOnlyText = (key: string | undefined): string =>
+  `${key ? singleLine(key) : "It"} is a Jira issue: edits reach Jira when pushes arrive`;
+
+/** One line for an action's error; `about` is the Item it acted on, or its title. */
+export function errorText(err: unknown, about?: string | Pick<Item, "title" | "remoteLink">): string {
   if (err instanceof DaemonUnavailable) return "Not saved: daemon unavailable";
+  const title = typeof about === "string" ? about : about?.title;
   switch (errorReason(err)) {
+    case "LINKED_READ_ONLY":
+      return readOnlyText(typeof about === "string" ? undefined : about?.remoteLink?.key);
     case "ITEM_DELETED":
     case "ITEM_NOT_FOUND":
       return title === undefined ? "The Item was deleted elsewhere" : `${quoted(title)} was deleted elsewhere`;

@@ -8,6 +8,7 @@ import type { FilterSchema, SortKeySchema } from "./gen/todo/v1/filter_pb.js";
 import type { Item } from "./gen/todo/v1/item_pb.js";
 import { ItemService, type ListItemsRequest, ListItemsRequestSchema, type StatusCounts } from "./gen/todo/v1/item_service_pb.js";
 import type { OpSummary } from "./gen/todo/v1/op_pb.js";
+import { SyncState, type SyncStatus } from "./gen/todo/v1/sync_service_pb.js";
 import { SystemService } from "./gen/todo/v1/system_service_pb.js";
 import type { View } from "./gen/todo/v1/view_pb.js";
 import { ViewService } from "./gen/todo/v1/view_service_pb.js";
@@ -137,6 +138,13 @@ export class LiveStore {
   private readonly fetches = new Map<string, Promise<Item | undefined>>();
   private readonly listeners = new Set<Listener>();
   private readonly noticeListeners = new Set<(n: Notice) => void>();
+  /**
+   * Each instance's sync state (design 5.11). The daemon sends them all
+   * after every CaughtUp and each change after, so a CaughtUp starts it
+   * afresh (an instance removed while the stream was down gets no
+   * notice) and the notices keep it current.
+   */
+  private syncSnap: ReadonlyMap<string, SyncStatus> = new Map();
   private readonly itemsClient: Client<typeof ItemService>;
   private readonly viewsClient: Client<typeof ViewService>;
   private readonly systemClient: Client<typeof SystemService>;
@@ -215,6 +223,9 @@ export class LiveStore {
 
   /** The daemon's config; referentially stable until it changes. */
   getConfig = (): LiveConfigSnapshot => this.configSnap;
+
+  /** Each configured instance's sync state, by id; referentially stable until one changes. */
+  getSyncStatus = (): ReadonlyMap<string, SyncStatus> => this.syncSnap;
 
   /** A saved view by id (in any case), once loaded. */
   getSavedView = (id: string): View | undefined => this.savedViews.get(id.toUpperCase());
@@ -520,6 +531,10 @@ export class LiveStore {
         case "caughtUp":
           if (this.revision === undefined || msg.value.revision > this.revision) this.revision = msg.value.revision;
           this.setConn({ state: "live", attempt: 0 });
+          if (this.syncSnap.size) {
+            this.syncSnap = new Map();
+            this.bump();
+          }
           if (this.pendingResync) {
             void this.reloadAll(this.revision);
           } else {
@@ -541,10 +556,20 @@ export class LiveStore {
           this.pendingResync = true;
           break;
         case "notice":
+          if (msg.value.kind.case === "syncStatus") this.applySyncStatus(msg.value.kind.value);
           for (const l of [...this.noticeListeners]) l(msg.value);
           break;
       }
     }
+  }
+
+  private applySyncStatus(s: SyncStatus): void {
+    const next = new Map(this.syncSnap);
+    // UNSPECIFIED: the instance is no longer configured.
+    if (s.state === SyncState.UNSPECIFIED) next.delete(s.instanceId);
+    else next.set(s.instanceId, s);
+    this.syncSnap = next;
+    this.bump();
   }
 
   private applyChange(change: Change): void {

@@ -1,7 +1,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { FakeDaemon, ItemField, LinkState, Priority, Status, createClients } from "@todo-tui/client/core";
+import { ArchiveReason, FakeDaemon, ItemField, LinkState, Priority, Status, SyncState, createClients, timestampFromDate } from "@todo-tui/client/core";
 import { describe, expect, it } from "vitest";
 import { registerTools } from "../src/tools.js";
 
@@ -148,6 +148,39 @@ describe("todo mcp tools", () => {
     const status = await call("todo_status");
     expect(status).toMatchObject({ today: "2026-11-02", inbox: 2, due: 1, overdue: 1 });
     expect(status.views.Inbox).toBe(2);
+    expect(status).not.toHaveProperty("sync");
+  });
+
+  it("todo_status carries each instance's sync state", async () => {
+    const { call, daemon } = await harness();
+    daemon.setSyncStatus({ instanceId: "work-jira", state: SyncState.OK, items: 4, lastSuccessfulPullAt: timestampFromDate(NOW) });
+    daemon.setSyncStatus({ instanceId: "other", state: SyncState.AUTH_ERROR, lastError: "the token was refused (401)" });
+    const { sync } = await call("todo_status");
+    expect(sync).toEqual([
+      { instance: "work-jira", state: "ok", items: 4, last_pull: "2026-11-02T12:00:00.000Z" },
+      { instance: "other", state: "auth_error", items: 0, error: "the token was refused (401)" },
+    ]);
+  });
+
+  it("refuses a Jira field edit on a linked item, in words a model can act on", async () => {
+    const link = { trackerKind: "jira", instanceId: "work-jira", remoteId: "1", key: "PLAT-1", url: "https://jira.example.com/browse/PLAT-1" };
+    const { call } = await harness({
+      items: [
+        { id: "01JBQ00000000000000000JRA2", title: "Linked", status: Status.NEXT, remoteLink: link },
+        {
+          id: "01JBQ00000000000000000JRA3",
+          title: "Gone",
+          remoteLink: { ...link, remoteId: "9", key: "PLAT-9", linkState: LinkState.BROKEN },
+          archived: { reason: ArchiveReason.REMOTE_UNAVAILABLE },
+        },
+      ],
+    });
+    await expect(call("todo_update", { id: "0000JRA2", title: "Renamed" })).rejects.toThrow(/is a Jira issue, synced read-only/);
+    await expect(call("todo_set_status", { id: "0000JRA2", status: "done" })).rejects.toThrow(/Change them in Jira/);
+    const broken = await call("todo_list", { text: "PLAT-9", include_done: true });
+    expect(broken.items[0]).toMatchObject({ archived: "remote_unavailable", jira: { key: "PLAT-9", unavailable: true } });
+    await call("todo_update", { id: "0000JRA2", private_notes: "mine" });
+    expect((await call("todo_get", { id: "0000JRA2" })).private_notes).toBe("mine");
   });
 
   it("shows the Jira link and sync state when an item has one", async () => {

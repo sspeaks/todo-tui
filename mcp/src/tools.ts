@@ -16,6 +16,8 @@ import {
   Operator,
   Priority,
   type ProtoDate,
+  SyncState,
+  timestampDate,
   type TodoClients,
   archiveItem,
   captureItem,
@@ -58,6 +60,11 @@ function describe(err: unknown): Error {
     const reason = errorReason(err);
     if (err.code === Code.Aborted) return new ToolError(`changed elsewhere since it was read; get it again and retry (${err.rawMessage})`);
     if (err.code === Code.Unavailable) return new ToolError(`the todo daemon is not answering: ${err.rawMessage}`);
+    if (reason === "LINKED_READ_ONLY") {
+      return new ToolError(
+        "this item is a Jira issue, synced read-only: its title, description, status category (to do, in progress, done, cancelled), priority, labels, due date and the other Jira fields are Jira's. Change them in Jira. Here only waiting, defer, notes, the local priority, energy, archive and delete apply, and inbox/next/someday while Jira has it in to do",
+      );
+    }
     return new ToolError(`${Code[err.code]}${reason ? ` ${reason}` : ""}: ${err.rawMessage}`);
   }
   return err instanceof Error ? err : new Error(String(err));
@@ -80,7 +87,7 @@ const textOf = (text: string): FilterInit["anyOf"] =>
   }));
 
 export function registerTools(server: McpServer, clients: TodoClients, opts: ToolOptions = {}): void {
-  const { items, views } = clients;
+  const { items, views, sync } = clients;
 
   /** Runs `fn`, rewording daemon errors for a model. */
   async function run(fn: () => Promise<unknown>): Promise<Result> {
@@ -202,12 +209,17 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
     "todo_status",
     {
       title: "Todo counts",
-      description: "The inbox, due and overdue counts, the count of each view that shows one, and today's date as the daemon sees it.",
+      description:
+        "The inbox, due and overdue counts, the count of each view that shows one, today's date as the daemon sees it, and each Jira instance's sync state (ok, syncing, offline, auth_error, degraded) with its last pull.",
       annotations: { readOnlyHint: true },
     },
     () =>
       run(async () => {
-        const [counts, { views: all }] = await Promise.all([getStatusCounts(items, { includeViews: true }), listViews(views)]);
+        const [counts, { views: all }, synced] = await Promise.all([
+          getStatusCounts(items, { includeViews: true }),
+          listViews(views),
+          sync.getSyncStatus({}),
+        ]);
         const names = new Map(all.map((v) => [v.id, v.name]));
         return {
           today: isoDate(counts.today),
@@ -215,6 +227,15 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
           due: counts.counts?.due ?? 0,
           overdue: counts.counts?.overdue ?? 0,
           views: Object.fromEntries(counts.views.map((v) => [names.get(v.viewId) ?? v.viewId, v.count])),
+          ...(synced.instances.length && {
+            sync: synced.instances.map((s) => ({
+              instance: s.instanceId,
+              state: SyncState[s.state]?.toLowerCase() ?? "unknown",
+              items: s.items,
+              ...(s.lastSuccessfulPullAt && { last_pull: timestampDate(s.lastSuccessfulPullAt).toISOString() }),
+              ...(s.lastError && s.state !== SyncState.OK && { error: s.lastError }),
+            })),
+          }),
         };
       }),
   );
@@ -313,8 +334,8 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
       title: "Update a todo",
       description:
         "Change fields of an item; only the fields given change. Empty string (or null) clears a field. " +
-        "Status, repeat, archive and delete have their own tools. On a Jira-linked item, prefer the local fields " +
-        "(defer_until, waiting, private_notes, local_priority, energy): the rest are Jira's and are pushed there.",
+        "Status, repeat, archive and delete have their own tools. A Jira-linked item syncs read-only: only the local fields " +
+        "(defer_until, waiting, private_notes, local_priority, energy) change; the rest are Jira's, to change in Jira.",
       inputSchema: {
         id: ID,
         title: z.string().optional(),

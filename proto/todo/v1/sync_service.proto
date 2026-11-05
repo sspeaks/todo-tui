@@ -26,7 +26,11 @@ message SyncNowRequest {
   string instance_id = 1;
 }
 
-message SyncNowResponse {}
+message SyncNowResponse {
+  // This request's number. The pass that serves it reports it (or a later
+  // one) as SyncStatus.served_request, so a caller can wait for that pass.
+  uint64 request = 1;
+}
 
 // One instance's sync state (design 5.11).
 message SyncStatus {
@@ -40,6 +44,11 @@ message SyncStatus {
   uint32 items = 5;
   // While syncing: the issues this pull has handed over so far.
   uint32 pulled = 6;
+  // The newest SyncNow request (SyncNowResponse.request) the latest pass
+  // began after; 0 before any. A pass started after the request pulls
+  // what changed before it, so once served_request reaches a caller's
+  // request and the state is no longer SYNCING, its pull is done.
+  uint64 served_request = 7;
 }
 
 enum SyncState {

@@ -2,7 +2,9 @@
 // x X s p e ^ D w W t z dd @ act on every marked Item through one BatchMutate,
 // in list order and without expected_revision (they are absolute): one op,
 // so one undo entry, toasted with its OpSummary. An Item deleted elsewhere
-// meanwhile is dropped and the rest retried once.
+// meanwhile is dropped and the rest retried once. A linked Item whose
+// Core the edit would change (ADR-0006) is dropped too, one refusal at a
+// time: the same edit can be Overlay on another (next on a Jira to-do).
 
 import {
   type BatchMutateResponse,
@@ -17,7 +19,7 @@ import {
 } from "@todo-tui/client";
 import type { Target } from "../state/types.js";
 import type { Controller } from "./controller.js";
-import { errorText, opText } from "./messages.js";
+import { errorText, opText, readOnlyText } from "./messages.js";
 
 export type MutationInit = MessageInitShape<typeof MutationSchema>;
 
@@ -88,6 +90,7 @@ export class Bulk {
     const first = this.c.firstMarkedIndex();
     let todo = steps;
     let dropped = 0;
+    let linked = 0;
     for (;;) {
       const batch = todo;
       const out = await this.c.pipeline.run<BatchMutateResponse>({
@@ -98,8 +101,22 @@ export class Bulk {
       if (out.ok) {
         this.c.clearMarks();
         if (first >= 0) this.c.selectIndex(first);
-        this.c.toastOp(out.res.result?.opId, describe(batch), dropped ? ` · ${dropped} was deleted elsewhere` : "");
+        const notes = [
+          dropped ? ` · ${dropped} was deleted elsewhere` : "",
+          linked ? ` · ${linked} Jira item${linked === 1 ? "" : "s"} left as ${linked === 1 ? "it is" : "they are"}` : "",
+        ];
+        this.c.toastOp(out.res.result?.opId, describe(batch), notes.join(""));
         return true;
+      }
+      const refused = errorReason(out.err) === "LINKED_READ_ONLY" ? batch.find((s) => s.id === errorItemId(out.err)) : undefined;
+      if (refused) {
+        // Each retry drops one step, so this ends.
+        linked++;
+        todo = batch.filter((s) => s !== refused);
+        if (todo.length) continue;
+        const key = this.c.store.getItem(refused.id)?.remoteLink?.key;
+        this.c.failed(linked === 1 ? readOnlyText(key) : `${linked} Jira items: edits reach Jira when pushes arrive`);
+        return false;
       }
       const gone = deletedItemId(out.err);
       const step = batch.find((s) => s.id === gone);

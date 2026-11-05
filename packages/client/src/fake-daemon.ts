@@ -457,7 +457,7 @@ export class FakeDaemon {
   maxPageSize = MAX_PAGE_SIZE;
   /** Runs before every ListItems; throw from it to fail that call. */
   onListItems: ((req: ListItemsRequest) => void) | undefined;
-  apiMinor = 18;
+  apiMinor = 19;
   /** What Export streams, as one batch; unset, Export is UNIMPLEMENTED (the format is the daemon's). */
   exportLines: string[] | undefined;
   /** What GetConfig serves; change it with {@link setConfig}. */
@@ -629,7 +629,7 @@ export class FakeDaemon {
             throw errorInfo(Code.FailedPrecondition, "NO_INSTANCE", "no [[instances]] are configured to sync", {});
           }
           this.syncNows.push(req.instanceId);
-          return {};
+          return { request: BigInt(this.syncNows.length) };
         },
       });
       service(ViewService, {
@@ -854,6 +854,14 @@ export class FakeDaemon {
     this.syncStatus.set(s.instanceId, s);
     for (const w of [...this.watchers]) w(msg({ case: "notice", value: { kind: { case: "syncStatus", value: s } } }));
     return s;
+  }
+
+  /**
+   * Forgets an instance's status without a notice, as a daemon restarted
+   * without it does: only a new stream (its snapshot) leaves it out.
+   */
+  forgetSyncStatus(instanceId: string): void {
+    this.syncStatus.delete(instanceId);
   }
 
   /** What GetActivityReport answers from now on; the revision and today are the fake's. */

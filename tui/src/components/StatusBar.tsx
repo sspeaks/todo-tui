@@ -1,5 +1,7 @@
-import { type ConnectionSnapshot, useConnection, useUndoState } from "@todo-tui/client";
+import { type ConnectionSnapshot, type SyncStatus, useConnection, useSyncStatus, useUndoState } from "@todo-tui/client";
 import { Box, Text } from "ink";
+import { useEffect, useState } from "react";
+import { stateColor, stateWord } from "../controller/sync.js";
 import { displayWidth, singleLine, truncate } from "../format/text.js";
 import { keyFor, keyPair } from "../keys/overrides.js";
 import { sequenceLabel } from "../keys/tokenize.js";
@@ -94,8 +96,24 @@ function marksLabel(marks: ReadonlySet<string>, listed: readonly { id: string }[
   return `${marks.size} marked${hidden ? ` (${hidden} hidden)` : ""}`;
 }
 
+/** "⇅ work-jira 2m" for each synced instance, with its colour. */
+function syncLabels(all: ReadonlyMap<string, SyncStatus>, now: Date): { id: string; text: string; color: "red" | "yellow" | undefined }[] {
+  return [...all.values()].map((s) => ({ id: s.instanceId, text: `⇅ ${truncate(singleLine(s.instanceId), 16)} ${stateWord(s, now)}`, color: stateColor(s.state) }));
+}
+
+/** The controller's clock, re-read every 30 s so that "2m" ages. */
+function useClock(now: () => Date): Date {
+  const [at, setAt] = useState(now);
+  useEffect(() => {
+    const t = setInterval(() => setAt(now()), 30_000);
+    t.unref?.();
+    return () => clearInterval(t);
+  }, [now]);
+  return at;
+}
+
 /**
- * Mode · connection · saving… · marks · pending prefix · the narrowing ·
+ * Mode · connection · ⇅ sync · saving… · marks · pending prefix · the narrowing ·
  * the undo hint, and the keys for this mode on the right. The undo hint
  * and the error detail are cut first; the key hints give way when the
  * essentials would not fit beside them.
@@ -105,6 +123,8 @@ export function StatusBar({ width }: { width: number }) {
   const state = useUi((s) => s);
   const connection = useConnection();
   const undo = useUndoState().undo;
+  const clock = useClock(controller.now);
+  const syncs = syncLabels(useSyncStatus(), clock);
   const undoKey = keyFor(state.keymap.bindings, "undo", sequenceLabel);
   const listed = useOptionalView(state.tab === undefined ? undefined : tabQuery(state.tab, state.narrow?.shown));
   const mode = modeLabel(state);
@@ -116,7 +136,7 @@ export function StatusBar({ width }: { width: number }) {
   const marks = marksLabel(state.marks, rows, narrowed !== undefined);
   const narrow = narrowed === undefined ? "" : `/${truncate(singleLine(narrowed), 24)} · ${rows.length}`;
   const keys = ` ${hints(state)}`;
-  const essential = [mode, conn, busy, marks, pending, narrow].filter(Boolean).join(" · ");
+  const essential = [mode, conn, ...syncs.map((s) => s.text), busy, marks, pending, narrow].filter(Boolean).join(" · ");
   const showKeys = displayWidth(essential) + displayWidth(keys) <= width;
   const live = connection.state === "live";
   const error = connectionError(connection);
@@ -127,6 +147,12 @@ export function StatusBar({ width }: { width: number }) {
           <Text bold>{mode}</Text>
           <Text dimColor> · </Text>
           <Text color={live ? "green" : "yellow"}>{conn}</Text>
+          {syncs.map((s) => (
+            <Text key={s.id} color={s.color} dimColor={s.color === undefined}>
+              {" · "}
+              {s.text}
+            </Text>
+          ))}
           {busy ? <Text color="yellow"> · {busy}</Text> : null}
           {marks ? <Text color="magenta"> · {marks}</Text> : null}
           {pending ? <Text color="cyan"> · {pending}</Text> : null}

@@ -45,6 +45,7 @@ import { Prompts } from "./prompts.js";
 import { type ExportFs, Exporter } from "./export.js";
 import { type Clipboard, systemClipboard } from "./clipboard.js";
 import { Meetings, type UrlOpener } from "./meeting.js";
+import { Sync, type SyncClient } from "./sync.js";
 import { errorText } from "./messages.js";
 import { Views } from "./views.js";
 import { QuickAdd, typedLines } from "./quick-add.js";
@@ -78,8 +79,10 @@ export interface ControllerOptions {
   exportFs?: ExportFs;
   /** :l48's y (default: pbcopy, wl-copy or xclip, else OSC 52). */
   clipboard?: Clipboard;
-  /** M's Teams link (default: open / xdg-open). */
+  /** M's Teams link and o's issue (default: open / xdg-open). */
   openUrl?: UrlOpener;
+  /** The SyncService client gs and :sync call (default: one over the store's transport). */
+  sync?: SyncClient;
 }
 
 /** How a toast is cut when it does not fit (Toast.keepEnd). */
@@ -133,7 +136,8 @@ export class Controller {
   private readonly stopProcess: () => Promise<boolean>;
   private readonly clipboard: Clipboard;
   readonly meetings: Meetings;
-  private readonly now: () => Date;
+  readonly syncing: Sync;
+  readonly now: () => Date;
   private readonly queue: InputQueue;
   private readonly defaults: readonly Binding[];
   private tries: Readonly<Record<KeymapMode, TrieNode>>;
@@ -184,6 +188,7 @@ export class Controller {
     this.stopProcess = opts.stopProcess ?? (() => stopSelf());
     this.clipboard = opts.clipboard ?? systemClipboard();
     this.meetings = new Meetings(this, opts.openUrl);
+    this.syncing = new Sync(this, opts.openUrl, opts.sync);
   }
 
   /** Observes the store: the tabs, the current view, the counts and the undo state; starts the midnight poll. */
@@ -779,6 +784,8 @@ export class Controller {
         return this.openReport(r.args);
       case "meet":
         return this.meetings.start();
+      case "sync":
+        return this.syncing.run(r.args);
     }
   }
 
@@ -857,6 +864,10 @@ export class Controller {
         return this.setMode(normalMode);
       case "copy_report":
         return this.copyReport();
+      case "open_remote":
+        return this.syncing.openRemote();
+      case "sync_now":
+        return this.syncing.now();
       case "command":
         return this.setMode({ kind: "command", line: emptyLine });
       case "quit":

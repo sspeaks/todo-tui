@@ -24,7 +24,7 @@ describe("help", () => {
     const text = helpLines().map((l) => l.text).join("\n");
     expect(text).toMatch(/:quit :q\s+Quit/);
     expect(text).toContain(":refresh");
-    expect(text).toMatch(/:search <query>\s+Search everything/);
+    expect(text).toMatch(/:search :s <query>\s+Search everything/);
     expect(text).toMatch(/\^<date>\s+due date/);
     expect(text).toMatch(/@<rule>\s+repeats/);
     expect(text).toMatch(/3d 2w\s+days, weeks after done/);

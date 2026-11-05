@@ -64,7 +64,7 @@ describe("the trie dispatcher", () => {
 
   it("lists a prefix's continuations", () => {
     const root = buildTrie(BINDINGS, "normal");
-    expect(continuations(root, ["g"]).map(([k, b]) => [k, b.id])).toEqual([["g", "top"]]);
+    expect(continuations(root, ["g"]).map(([k, b]) => [k, b.id])).toEqual([["g", "top"], ["s", "sync_now"]]);
     expect(continuations(root, ["p"]).map(([k]) => k)).toEqual(["1", "2", "3", "4", "5", "0"]);
   });
 });

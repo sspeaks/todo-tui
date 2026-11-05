@@ -5,7 +5,7 @@
 # `todo status` and the seeded Today view (P1 M3), the TUI driven in a
 # private tmux server (P1 M4; skipped without tmux), and x in the TUI on an
 # @daily capture making the next instance (P1 M5), and :view new with query
-# text (P1 M6).
+# text (P1 M6), and Jira sync, read-only, against a fake Data Center (P2).
 # Usage: scripts/smoke.sh   (TODO_BIN overrides the binary; default: cargo build;
 # TODO_TUI_ENTRY the TUI bundle; default: pnpm -C tui build)
 set -euo pipefail
@@ -22,6 +22,8 @@ export TODO_BIN
 root=$(cd "$(mktemp -d "${TMPDIR:-/tmp}/todo-smoke.XXXXXX")" && pwd)
 homes=()
 watcher_pid=
+# The fake Jira of step 9.
+jira_pid=
 # The private tmux server's socket directory (step 8), kept short: a unix
 # socket path must fit in about 100 bytes.
 tmux_dir=
@@ -44,6 +46,7 @@ lock_holders() { lock_holder_pids "$1" | sort -u | wc -l | tr -d ' '; }
 cleanup() {
   local status=$?
   [[ -n $watcher_pid ]] && kill "$watcher_pid" 2>/dev/null || true
+  [[ -n $jira_pid ]] && kill "$jira_pid" 2>/dev/null || true
   if [[ -n $tmux_dir ]]; then
     TMUX_TMPDIR=$tmux_dir tmux -L todo-smoke kill-server 2>/dev/null || true
     rm -rf "$tmux_dir"
@@ -440,6 +443,56 @@ else
   rsee 'Created +[0-9-]+ [0-9:]+ via recurrence' "the instance created via recurrence"
   rsee 'Repeats +every day · this one ' "the instance's Repeats line"
   tmx send-keys -t tui:recur q
+
+  # 9. Jira sync, read-only (P2): a fake Data Center on 127.0.0.1 with two
+  #    issues; `todo sync now` imports them, `todo sync status` says ok,
+  #    and the TUI shows ⇅ in the status bar and the key in the detail.
+  if command -v python3 >/dev/null; then
+    jhome=$root/jira
+    new_home "$jhome"
+    python3 -I "$repo/scripts/fake-jira.py" smoke-pat >"$root/jira.port" &
+    jira_pid=$!
+    for _ in $(seq 1 50); do [[ -s $root/jira.port ]] && break; sleep 0.1; done
+    port=$(head -n1 "$root/jira.port")
+    [[ -n $port ]] || fail "the fake Jira did not start"
+    printf 'smoke-pat' >"$jhome/jira.token"
+    chmod 600 "$jhome/jira.token"
+    printf '[[instances]]\nid = "work-jira"\nkind = "jira-dc"\nbase_url = "http://127.0.0.1:%s"\ncredential = "file:%s"\nscopes = [{ name = "mine", query = "assignee = currentUser()" }]\n' \
+      "$port" "$jhome/jira.token" >"$jhome/config.toml"
+    out=$(TODO_TUI_HOME=$jhome "$TODO_BIN" sync check) || fail "sync check failed: $out"
+    [[ $out == "work-jira: ok as Dana Example (JIRAUSER10100), time zone UTC" ]] || fail "unexpected sync check: $out"
+    out=$(TODO_TUI_HOME=$jhome "$TODO_BIN" sync now) || fail "sync now failed: $out"
+    [[ $out == "work-jira: ok · 2 items · last pull just now" ]] || fail "unexpected sync now: $out"
+    TODO_TUI_HOME=$jhome "$TODO_BIN" sync status | grep -q '^work-jira: ok · 2 items' || fail "sync status is not ok"
+    TODO_TUI_HOME=$jhome list_items >"$root/jira.items" || fail "listing items failed"
+    grep -qF '"key":"PLAT-1"' "$root/jira.items" || { cat "$root/jira.items" >&2; fail "PLAT-1 was not imported"; }
+    tmx new-window -t tui -n jira -e "TODO_TUI_HOME=$jhome" -e "TODO_BIN=$TODO_BIN" -e "TODO_TUI_ENTRY=$TODO_TUI_ENTRY" \
+      "\"\$TODO_BIN\"; sleep 600"
+    tmx resize-window -t tui:jira -x 130 -y 30
+    kscreen() { tmx capture-pane -p -t tui:jira; }
+    ksee() {
+      for _ in $(seq 1 100); do
+        kscreen | grep -Eq -- "$1" && return 0
+        sleep 0.1
+      done
+      kscreen >&2
+      fail "the TUI never showed $2"
+    }
+    ksee '^NORMAL · ● live · ⇅ work-jira (now|[0-9]+m)' "the sync state in the status bar"
+    # To Do and In Progress both land in Next (design 5.4); their order is
+    # the import's.
+    tmx send-keys -t tui:jira 3
+    ksee '^[› ] ○ .*smoke jira login fix +PLAT-1 ' "the to-do issue in Next"
+    ksee '^[› ] ◐ .*smoke jira report +PLAT-2 ' "the in-progress issue in Next"
+    ksee 'Jira +PLAT-[12] ·' "the selected issue's key in the detail"
+    tmx send-keys -t tui:jira x
+    ksee 'PLAT-[12] is a Jira issue: edits reach Jira when pushes arrive' "the read-only refusal"
+    tmx send-keys -t tui:jira q
+    kill "$jira_pid" 2>/dev/null || true
+    TODO_TUI_HOME=$jhome "$TODO_BIN" daemon stop >/dev/null
+  else
+    echo "smoke: python3 not found; skipping the Jira step"
+  fi
   tmx kill-server
   rm -rf "$tmux_dir"
   tmux_dir=

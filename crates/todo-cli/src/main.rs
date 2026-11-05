@@ -69,7 +69,7 @@ enum Command {
         #[arg(long)]
         read_only: bool,
     },
-    /// Jira sync (design 5): check an instance's token.
+    /// Jira sync (design 5): check a token, see the state, pull now.
     Sync {
         #[command(subcommand)]
         action: SyncAction,
@@ -129,6 +129,13 @@ enum BackupAction {
 enum SyncAction {
     /// Check each Jira instance's config and token, reading only: no daemon needed.
     Check,
+    /// Each instance's sync state: ok, offline, a refused token; the last pull.
+    Status,
+    /// Pull now, and wait for it.
+    Now {
+        /// Only this instance (its id in the config).
+        instance: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -200,6 +207,8 @@ async fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
         Command::Sync { action } => {
             return match action {
                 SyncAction::Check => sync::check(&paths).await,
+                SyncAction::Status => sync::status(&paths).await,
+                SyncAction::Now { instance } => sync::now(&paths, instance).await,
             };
         }
         Command::Config { action } => {

@@ -38,7 +38,9 @@ export type Action =
   | { type: "undo" }
   | { type: "redo" }
   | { type: "help_close" }
-  | { type: "copy_report" };
+  | { type: "copy_report" }
+  | { type: "open_remote" }
+  | { type: "sync_now" };
 
 /** The modes with a keymap; the text modes (command, quick-add, prompts, search) take their keys from the line editor. */
 export type KeymapMode = "normal" | "help" | "report";
@@ -137,6 +139,7 @@ export const BINDINGS: readonly Binding[] = [
   { id: "mark_cancelled", keys: ["X"], action: { type: "set_status", status: Status.CANCELLED }, markAware: true, section: "Items", help: "Mark cancelled" },
   { id: "edit_labels", keys: ["t"], action: { type: "prompt", prompt: "labels" }, markAware: true, section: "Items", help: "Edit the labels" },
   { id: "toggle_archive", keys: ["z"], action: { type: "archive_toggle" }, markAware: true, section: "Items", help: "Archive / unarchive" },
+  { id: "open_remote", keys: ["o"], action: { type: "open_remote" }, section: "Items", help: "Open its Jira issue in the browser" },
   { id: "schedule_meeting", keys: ["M"], action: { type: "prompt", prompt: "meeting" }, markAware: true, section: "Items", help: "Schedule a Teams meeting about it (Teams opens, prefilled)" },
   { id: "delete", keys: ["d d"], action: { type: "delete" }, markAware: true, section: "Items", help: "Delete (confirm)" },
 
@@ -147,6 +150,7 @@ export const BINDINGS: readonly Binding[] = [
   { id: "redo", keys: ["ctrl+r"], action: { type: "redo" }, section: "Undo", help: "Redo" },
 
   { id: "command", keys: [":"], action: { type: "command" }, section: "App", help: "Command line" },
+  { id: "sync_now", keys: ["g s"], action: { type: "sync_now" }, section: "App", help: "Sync with Jira now" },
   { id: "help", keys: ["?", "fkey"], action: { type: "help" }, section: "App", help: "This help" },
   { id: "quit", keys: ["q", "ctrl+c"], action: { type: "quit" }, section: "App", help: "Quit" },
   { id: "suspend", keys: ["ctrl+z"], action: { type: "suspend" }, section: "App", help: "Suspend to the shell (fg resumes)" },

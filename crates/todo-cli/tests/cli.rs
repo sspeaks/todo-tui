@@ -1384,3 +1384,94 @@ fn sync_check_reads_who_the_token_is() {
     assert!(!socket_in(&h.home.join("run")), "check needs no daemon");
     drop(fake);
 }
+
+/// `todo sync now` and `todo sync status` through the daemon, against a
+/// fake Jira: the pull lands, the line says so; a refused token fails.
+#[test]
+fn sync_now_pulls_and_status_reports_it() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let fake = rt.block_on(todo_jira::fake::FakeJira::start("good-token"));
+    fake.route("/rest/api/2/myself", |_| {
+        (
+            200,
+            serde_json::json!({"key": "JIRAUSER10100", "name": "dana", "displayName": "Dana Example", "timeZone": "UTC"}),
+            vec![],
+        )
+    });
+    fake.serve_discovery();
+    let issues = std::sync::Arc::new(std::sync::Mutex::new(vec![
+        todo_jira::fake::issue_json(1, "Fix the login", "new", "2026-10-02T09:00:00.000+0000"),
+        todo_jira::fake::issue_json(
+            2,
+            "Ship the report",
+            "indeterminate",
+            "2026-10-03T09:00:00.000+0000",
+        ),
+    ]));
+    fake.serve_search(issues, 100);
+    let h = Home::new();
+    let none = h.todo(&["sync", "status"]);
+    assert!(!none.status.success());
+    assert!(
+        text(&none.stderr).contains("no [[instances]] sync"),
+        "{}",
+        text(&none.stderr)
+    );
+    let token = h.home.join("work-jira.token");
+    std::fs::write(&token, "good-token").unwrap();
+    std::fs::set_permissions(&token, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    std::fs::write(
+        h.home.join("config.toml"),
+        format!(
+            "[[instances]]\nid = \"work-jira\"\nkind = \"jira-dc\"\nbase_url = \"{}\"\ncredential = \"file:{}\"\nscopes = [{{ name = \"mine\", query = \"assignee = currentUser()\" }}]\n",
+            fake.base_url(),
+            token.display()
+        ),
+    )
+    .unwrap();
+    h.ok(&["config", "reload"]);
+    let now = h.todo(&["sync", "now"]);
+    assert!(
+        now.status.success(),
+        "{}{}",
+        text(&now.stdout),
+        text(&now.stderr)
+    );
+    assert!(
+        text(&now.stdout).starts_with("work-jira: ok · 2 items · last pull just now"),
+        "{}",
+        text(&now.stdout)
+    );
+    let keys: Vec<String> = h
+        .items()
+        .iter()
+        .filter_map(|i| i.remote_link.as_ref().map(|l| l.key.clone()))
+        .collect();
+    assert_eq!(keys.len(), 2, "{keys:?}");
+    assert!(
+        h.ok(&["sync", "status"])
+            .starts_with("work-jira: ok · 2 items")
+    );
+    let missing = h.todo(&["sync", "now", "other"]);
+    assert!(!missing.status.success());
+    assert!(
+        text(&missing.stderr).contains("no instance \"other\""),
+        "{}",
+        text(&missing.stderr)
+    );
+    // A refused token: the line says what to do, and the exit fails.
+    std::fs::write(&token, "wrong").unwrap();
+    let bad = h.todo(&["sync", "now"]);
+    assert!(!bad.status.success());
+    assert!(
+        text(&bad.stdout).contains("work-jira: the token was refused"),
+        "{}{}",
+        text(&bad.stdout),
+        text(&bad.stderr)
+    );
+    drop(fake);
+}

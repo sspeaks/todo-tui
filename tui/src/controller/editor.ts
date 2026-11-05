@@ -114,12 +114,12 @@ export class DescriptionEditor {
         items: single,
       });
       if (out.ok) return this.c.toastOp(out.res.result?.opId, opText("edit", item.title));
-      if (errorReason(out.err) !== "REVISION_MISMATCH") return this.keep(item, text, errorText(out.err, item.title));
+      if (errorReason(out.err) !== "REVISION_MISMATCH") return this.keep(item, text, errorText(out.err, item));
       let fresh: Item | undefined;
       try {
         fresh = await this.c.store.fetchItem(item.id);
       } catch (err) {
-        return this.keep(item, text, errorText(err, item.title));
+        return this.keep(item, text, errorText(err, item));
       }
       if (!fresh || fresh.deletedAt) return this.keep(item, text, `${quoted(item.title)} was deleted elsewhere`);
       // Only other fields changed: save on the new revision.

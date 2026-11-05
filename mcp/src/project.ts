@@ -3,9 +3,11 @@
 // once an Item is linked (P2), so nothing here changes when sync lands.
 
 import {
+  ArchiveReason,
   Energy,
   type Item,
   ItemField,
+  LinkState,
   Priority,
   type ProtoDate,
   Status,
@@ -58,6 +60,12 @@ function fieldName(f: ItemField): string {
   return (ItemField[f] ?? String(f)).toLowerCase();
 }
 
+/** Why sync archived an Item, as `archived` says it. */
+const SYNC_ARCHIVE: ReadonlyMap<ArchiveReason, string> = new Map([
+  [ArchiveReason.LEFT_SCOPE, "left_scope"],
+  [ArchiveReason.REMOTE_UNAVAILABLE, "remote_unavailable"],
+]);
+
 export interface ProjectOptions {
   /** Include the description and private notes (todo_get). */
   detail?: boolean;
@@ -91,7 +99,8 @@ export function project(item: Item, opts: ProjectOptions = {}): Record<string, u
     repeat: rule && "rule" in rule ? ruleToken(rule.rule) : undefined,
     parent: item.parentTitle,
     subtasks: item.subtasksTotal > 0 ? `${item.subtasksDone}/${item.subtasksTotal}` : undefined,
-    archived: item.archived ? true : undefined,
+    // Sync's reasons say why; a person's archive is just true.
+    archived: item.archived ? (SYNC_ARCHIVE.get(item.archived.reason) ?? true) : undefined,
     deleted: item.deletedAt ? true : undefined,
     jira: link && {
       key: link.key,
@@ -99,6 +108,7 @@ export function project(item: Item, opts: ProjectOptions = {}): Record<string, u
       instance: link.instanceId,
       tracker: link.trackerKind,
       remote_status: item.remoteStatusName,
+      unavailable: link.linkState === LinkState.BROKEN || undefined,
     },
     has_conflict: item.hasConflict || undefined,
     push_failed: item.hasPushFailure || undefined,

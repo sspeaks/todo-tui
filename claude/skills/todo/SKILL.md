@@ -71,11 +71,11 @@ Every tool returns `short_id` (8 characters, the same id `todo add` prints) and 
 
 ## Jira-linked items
 
-An item with a `jira` field (key, url, remote_status) mirrors a Jira issue. Before Jira sync lands, none will have one. When one does, read `references/jira.md` before changing it. In short:
+An item with a `jira` field (key, url, remote_status) mirrors a Jira issue, synced **read-only** for now: nothing is written to Jira. Read `references/jira.md` before changing one. In short:
 
-- Jira owns its title, description, status, priority, labels and due date, so changing them changes the ticket.
-- For Seth's own ordering and scheduling, use the local fields: `local_priority`, `defer_until`, waiting and `private_notes`.
-- Done and cancelled resolve the issue in Jira. To take a ticket off his list without touching it in Jira (reassigned, not his any more), delete it locally.
+- Jira owns its title, description, status (done, cancelled, in progress), priority, labels and due date. The tools refuse to change them; say it is changed in Jira, and give the link.
+- For Seth's own ordering and scheduling, use the local fields: `local_priority`, `defer_until`, waiting, energy and `private_notes`. Not repeat rules or due dates.
+- To take a ticket off his list without touching it in Jira (reassigned, not his any more), delete it locally. `todo_status` shows each instance's sync state.
 
 ## Replying
 

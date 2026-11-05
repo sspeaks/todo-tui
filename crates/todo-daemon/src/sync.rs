@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use jiff::{Timestamp, Zoned};
@@ -33,13 +34,22 @@ const OFFLINE_MAX: Duration = Duration::from_secs(10 * 60);
 /// The sync state, by instance, for the SyncService and Subscribe.
 pub(crate) type Status = watch::Receiver<BTreeMap<String, v1::SyncStatus>>;
 
-/// Wakes the loop for a pull now ("sync now", design 5.4).
+/// Wakes the loop for a pull now ("sync now", design 5.4), numbering
+/// each request so that its caller can wait for the pass that serves it.
 #[derive(Clone, Default)]
-pub(crate) struct SyncNow(Arc<Notify>);
+pub(crate) struct SyncNow(Arc<Notify>, Arc<AtomicU64>);
 
 impl SyncNow {
-    pub(crate) fn poke(&self) {
+    /// Asks for a pass; this request's number.
+    pub(crate) fn poke(&self) -> u64 {
+        let n = self.1.fetch_add(1, Ordering::SeqCst) + 1;
         self.0.notify_one();
+        n
+    }
+
+    /// The newest request so far: a pass that starts now serves it.
+    fn requested(&self) -> u64 {
+        self.1.load(Ordering::SeqCst)
     }
 }
 
@@ -87,10 +97,18 @@ pub(crate) async fn run(
         let wait = match &instance {
             None => None,
             Some(i) => {
+                // A status from the start, before the credential is read
+                // (a keychain prompt can take a while).
+                state.set(&i.id, |_| {});
+                let served = now.requested();
                 let reconcile = last_reconcile.is_none_or(|at| {
                     Timestamp::now().duration_since(at).unsigned_abs() >= RECONCILE_EVERY
                 });
-                match pass(&store, i, &state, reconcile).await {
+                let outcome = pass(&store, i, &state, reconcile).await;
+                // Only once the pass is over: a caller waiting on its request
+                // reads served_request with the state the pass ended in.
+                state.set(&i.id, |st| st.served_request = served);
+                match outcome {
                     Outcome::Ok => {
                         offline_wait = Duration::from_secs(15);
                         if reconcile {

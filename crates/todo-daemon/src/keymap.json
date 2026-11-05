@@ -47,6 +47,7 @@
       "mark_cancelled",
       "edit_labels",
       "toggle_archive",
+      "open_remote",
       "schedule_meeting",
       "delete",
       "mark",
@@ -54,6 +55,7 @@
       "undo",
       "redo",
       "command",
+      "sync_now",
       "help",
       "quit",
       "suspend"

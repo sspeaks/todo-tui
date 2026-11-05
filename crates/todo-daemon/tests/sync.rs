@@ -177,19 +177,20 @@ async fn linked(r: &Running) -> Vec<Item> {
     out
 }
 
-/// Pulls now, and waits for the pass to finish.
+/// Pulls now, and waits for the pass that serves the request: one that
+/// began after it (served_request), and has ended.
 async fn sync_now(r: &Running) -> SyncStatus {
-    let before = status(r).await.last_successful_pull_at;
-    SyncServiceClient::new(r.channel().await)
+    let request = SyncServiceClient::new(r.channel().await)
         .sync_now(SyncNowRequest::default())
         .await
-        .unwrap();
+        .unwrap()
+        .into_inner()
+        .request;
+    assert!(request > 0);
     for _ in 0..200 {
         let s = status(r).await;
-        if s.state == SyncState::Ok as i32 && s.last_successful_pull_at != before {
-            return s;
-        }
-        if s.state == SyncState::AuthError as i32 || s.state == SyncState::Degraded as i32 {
+        let running = s.state == SyncState::Syncing as i32 || s.state == SyncState::Starting as i32;
+        if s.served_request >= request && !running {
             return s;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;

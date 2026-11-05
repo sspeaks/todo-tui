@@ -43,7 +43,7 @@ impl SyncService for Sync {
                 [],
             ));
         }
-        self.0.sync_now.poke();
-        Ok(Response::new(SyncNowResponse {}))
+        let request = self.0.sync_now.poke();
+        Ok(Response::new(SyncNowResponse { request }))
     }
 }
