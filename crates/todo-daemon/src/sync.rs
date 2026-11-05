@@ -193,7 +193,9 @@ async fn pass(store: &Store, i: &Instance, state: &State, reconcile: bool) -> Ou
         st.pulled = 0;
     });
     let adapter = match Client::new(&i.base_url, token) {
-        Ok(c) => match Adapter::connect(c, &i.id, i.cancelled_resolutions.clone()).await {
+        Ok(c) => match Adapter::connect(c, &i.id, i.cancelled_resolutions.clone(), i.push.clone())
+            .await
+        {
             Ok(a) => a,
             Err(e) => return fail(state, &i.id, &e),
         },

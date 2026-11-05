@@ -24,9 +24,13 @@ pub enum JiraError {
     /// 429: rate limited; wait this long.
     #[error("rate limited (429); retry after {0:?}")]
     RateLimited(Duration),
-    /// Another 4xx: the request is wrong (a bad JQL query).
+    /// Another 4xx: the request is wrong (a bad JQL query, a value Jira
+    /// will not take).
     #[error("refused ({0}): {1}")]
     Refused(u16, String),
+    /// A 400 naming fields: what Jira said about each (a push, design 5.6).
+    #[error("refused (400): {}", field_text(.0))]
+    Fields(std::collections::BTreeMap<String, String>),
     /// 5xx: the server failed; try again later.
     #[error("server error ({0}): {1}")]
     Server(u16, String),
@@ -130,10 +134,32 @@ impl Client {
         self.send(req).await
     }
 
+    /// A PUT of `body` to `path`; Jira answers 204 with no body.
+    pub async fn put_empty(&self, path: &str, body: &serde_json::Value) -> Result<(), JiraError> {
+        let req = self.http.put(format!("{}{path}", self.base_url)).json(body);
+        self.send_raw(req).await.map(drop)
+    }
+
+    /// A POST of `body` to `path` that answers 204 with no body (a
+    /// transition).
+    pub async fn post_empty(&self, path: &str, body: &serde_json::Value) -> Result<(), JiraError> {
+        let req = self
+            .http
+            .post(format!("{}{path}", self.base_url))
+            .json(body);
+        self.send_raw(req).await.map(drop)
+    }
+
     async fn send<T: DeserializeOwned>(
         &self,
         req: reqwest::RequestBuilder,
     ) -> Result<T, JiraError> {
+        let body = self.send_raw(req).await?;
+        serde_json::from_slice(&body).map_err(|e| JiraError::Malformed(e.to_string()))
+    }
+
+    /// The 2xx body, or the error the status says.
+    async fn send_raw(&self, req: reqwest::RequestBuilder) -> Result<Vec<u8>, JiraError> {
         let res = req
             .bearer_auth(self.token.expose())
             .header("Accept", "application/json")
@@ -146,7 +172,7 @@ impl Client {
                 .bytes()
                 .await
                 .map_err(|e| JiraError::Offline(without_url(&e)))?;
-            return serde_json::from_slice(&body).map_err(|e| JiraError::Malformed(e.to_string()));
+            return Ok(body.to_vec());
         }
         let retry_after = res
             .headers()
@@ -160,9 +186,38 @@ impl Client {
             404 => JiraError::NotFound,
             429 => JiraError::RateLimited(Duration::from_secs(retry_after.unwrap_or(1).max(1))),
             500..=599 => JiraError::Server(status, messages(&body)),
+            400 => match field_errors(&body) {
+                Some(fields) => JiraError::Fields(fields),
+                None => JiraError::Refused(status, messages(&body)),
+            },
             _ => JiraError::Refused(status, messages(&body)),
         })
     }
+}
+
+/// `{"errors": {"field": "message"}}` with no general message: a refusal
+/// of named fields.
+fn field_errors(body: &str) -> Option<std::collections::BTreeMap<String, String>> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let general = v
+        .get("errorMessages")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|a| !a.is_empty());
+    let errors: std::collections::BTreeMap<String, String> = v
+        .get("errors")?
+        .as_object()?
+        .iter()
+        .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned())))
+        .collect();
+    (!general && !errors.is_empty()).then_some(errors)
+}
+
+fn field_text(fields: &std::collections::BTreeMap<String, String>) -> String {
+    fields
+        .iter()
+        .map(|(k, v)| format!("{k}: {v}"))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// `Retry-After` as seconds: delta-seconds, or an HTTP-date (RFC 9110) from
@@ -269,6 +324,27 @@ mod tests {
         assert!(JiraError::RateLimited(Duration::from_secs(1)).is_transient());
         assert!(!JiraError::Auth.is_transient());
         assert!(!JiraError::Refused(400, String::new()).is_transient());
+        assert!(!JiraError::Fields(Default::default()).is_transient());
+    }
+
+    #[test]
+    fn a_refusal_naming_fields_keeps_them() {
+        let f = field_errors(r#"{"errorMessages":[],"errors":{"duedate":"Due date is invalid"}}"#);
+        assert_eq!(
+            f,
+            Some([("duedate".to_owned(), "Due date is invalid".to_owned())].into())
+        );
+        assert_eq!(
+            JiraError::Fields(f.unwrap()).to_string(),
+            "refused (400): duedate: Due date is invalid"
+        );
+        // A general message (or none named) is a plain refusal.
+        assert_eq!(
+            field_errors(r#"{"errorMessages":["no"],"errors":{"a":"b"}}"#),
+            None
+        );
+        assert_eq!(field_errors(r#"{"errorMessages":[],"errors":{}}"#), None);
+        assert_eq!(field_errors("<html>"), None);
     }
 
     #[test]

@@ -7,5 +7,5 @@ pub mod client;
 pub mod fake;
 pub mod issue;
 
-pub use adapter::{Adapter, Fetched, PullError};
+pub use adapter::{Adapter, Fetched, FieldPatch, PullError, PushError, Target};
 pub use client::{Client, JiraError, Myself};

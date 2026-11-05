@@ -18,6 +18,9 @@ pub struct Discovery {
     pub time_zone: String,
     /// Priority name → local level, by rank (5.8).
     pub priorities: BTreeMap<String, Priority>,
+    /// Local level → the Jira name a push sets: `priority_map`'s, else the
+    /// first of that rank in Jira's order (5.8).
+    pub priority_names: BTreeMap<Priority, String>,
     /// Custom field ids, when the instance has them.
     pub story_points: Option<String>,
     pub sprint: Option<String>,
@@ -80,6 +83,51 @@ pub fn map_priorities(names: &[String]) -> BTreeMap<String, Priority> {
             (name.clone(), LEVELS[level])
         })
         .collect()
+}
+
+/// Both directions of the priority mapping (design 5.8), built together
+/// so a level pushed reads back as itself: Jira name → level for pulls,
+/// level → Jira name for pushes. Ranks first (`map_priorities`); then each
+/// `priority_map` entry that names a Jira priority takes that level both
+/// ways. A level with no name of its own pushes as the nearest one that
+/// has (above on a tie).
+pub fn priority_maps(
+    names: &[String],
+    overrides: &BTreeMap<Priority, String>,
+) -> (BTreeMap<String, Priority>, BTreeMap<Priority, String>) {
+    const LEVELS: [Priority; 5] = [
+        Priority::Highest,
+        Priority::High,
+        Priority::Medium,
+        Priority::Low,
+        Priority::Lowest,
+    ];
+    let mut pull = map_priorities(names);
+    for (level, name) in overrides {
+        // Jira's own spelling, whatever the config's case.
+        if let Some(n) = names.iter().find(|n| n.eq_ignore_ascii_case(name)) {
+            pull.insert(n.clone(), *level);
+        }
+    }
+    let first = |level: Priority| {
+        overrides
+            .get(&level)
+            .and_then(|o| names.iter().find(|n| n.eq_ignore_ascii_case(o)))
+            .or_else(|| names.iter().find(|n| pull.get(*n) == Some(&level)))
+            .cloned()
+    };
+    let mut push = BTreeMap::new();
+    for (i, &level) in LEVELS.iter().enumerate() {
+        let near = (0..LEVELS.len()).flat_map(|d| {
+            let up = i.checked_sub(d);
+            let down = (d > 0).then_some(i + d).filter(|&j| j < LEVELS.len());
+            up.into_iter().chain(down)
+        });
+        if let Some(n) = near.into_iter().find_map(|j| first(LEVELS[j])) {
+            push.insert(level, n);
+        }
+    }
+    (pull, push)
 }
 
 /// `2024-01-31T14:05:12.345+0000`: Jira's colon-less offset.
@@ -262,6 +310,7 @@ mod tests {
             ),
             story_points: Some("customfield_10002".into()),
             sprint: Some("customfield_10004".into()),
+            priority_names: BTreeMap::new(),
             cancelled_resolutions: vec!["Won't Do".into()],
         }
     }
@@ -270,6 +319,42 @@ mod tests {
     fn priorities_spread_over_five_levels() {
         let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let three = map_priorities(&names(&["High", "Medium", "Low"]));
+        let push = |n: &[&str], o: &[(Priority, &str)]| {
+            priority_maps(
+                &names(n),
+                &o.iter().map(|(l, s)| (*l, s.to_string())).collect(),
+            )
+            .1
+        };
+        let order = |m: BTreeMap<Priority, String>| m.into_values().collect::<Vec<_>>();
+        // Lowest, Low, Medium, High, Highest (a BTreeMap by rank). A level
+        // with no name of its own takes the nearest, above on a tie.
+        assert_eq!(
+            order(push(&["High", "Medium", "Low"], &[])),
+            ["Low", "Medium", "Medium", "High", "High"]
+        );
+        assert_eq!(
+            order(push(&["High", "Low"], &[])),
+            ["Low", "Low", "High", "High", "High"]
+        );
+        assert_eq!(order(push(&["Only"], &[])), ["Only"; 5]);
+        assert!(push(&[], &[]).is_empty());
+        // An override holds both ways; one naming no Jira priority is ignored.
+        let brme = names(&["Blocker", "Critical", "Major", "Normal", "Minor", "Trivial"]);
+        let overrides: BTreeMap<_, _> = [
+            (Priority::High, "major".to_owned()),
+            (Priority::Low, "Nope".to_owned()),
+        ]
+        .into();
+        let (pull, push) = priority_maps(&brme, &overrides);
+        assert_eq!(push[&Priority::High], "Major");
+        assert_eq!(pull["Major"], Priority::High);
+        for (level, name) in &push {
+            assert_eq!(
+                pull[name], *level,
+                "{level:?} pushes as {name}, which reads back otherwise"
+            );
+        }
         assert_eq!(
             (three["High"], three["Medium"], three["Low"]),
             (Priority::Highest, Priority::Medium, Priority::Lowest)

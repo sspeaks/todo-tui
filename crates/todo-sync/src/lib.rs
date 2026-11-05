@@ -4,4 +4,4 @@ pub mod credential;
 pub mod instance;
 
 pub use credential::{Credential, CredentialError, CredentialRef};
-pub use instance::{Instance, Scope, TrackerKind};
+pub use instance::{Category, Instance, Push, Scope, TrackerKind};

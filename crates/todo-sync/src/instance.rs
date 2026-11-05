@@ -1,6 +1,9 @@
 //! A configured tracker connection (design 5.3, 8.2 `[[instances]]`).
 
+use std::collections::BTreeMap;
 use std::time::Duration;
+
+use todo_core::Priority;
 
 use crate::credential::CredentialRef;
 
@@ -66,6 +69,57 @@ pub struct Instance {
     pub poll_idle: Duration,
     /// Resolution names that mean cancelled (design 5.8); any other means done.
     pub cancelled_resolutions: Vec<String>,
+    /// How edits reach the tracker (ADR-0007).
+    pub push: Push,
+}
+
+/// An instance's push settings (ADR-0007).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Push {
+    /// False keeps the instance read-only, as M9 was.
+    pub enabled: bool,
+    /// The resolution a close to done sets (the transition screen asks).
+    pub done_resolution: String,
+    /// The resolution a close to cancelled sets.
+    pub cancel_resolution: String,
+    /// The target status, by name, of the transition into a category; the
+    /// first Jira offers into it otherwise.
+    pub transitions: BTreeMap<Category, String>,
+    /// Local level → the Jira priority name to set; the first of that rank
+    /// otherwise (design 5.8).
+    pub priority_map: BTreeMap<Priority, String>,
+}
+
+impl Default for Push {
+    fn default() -> Self {
+        Push {
+            enabled: true,
+            done_resolution: "Done".to_owned(),
+            cancel_resolution: "Won't Do".to_owned(),
+            transitions: BTreeMap::new(),
+            priority_map: BTreeMap::new(),
+        }
+    }
+}
+
+/// A status category a transition goes into (design 3.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Category {
+    Todo,
+    InProgress,
+    Done,
+}
+
+impl Category {
+    /// As config names it: `todo`, `in_progress`, `done`.
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s {
+            "todo" => Some(Category::Todo),
+            "in_progress" => Some(Category::InProgress),
+            "done" => Some(Category::Done),
+            _ => None,
+        }
+    }
 }
 
 /// The default `cancelled_resolutions` (design 5.8).

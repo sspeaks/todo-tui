@@ -20,7 +20,8 @@ pub struct Seen {
     pub body: String,
 }
 
-/// How the fake answers a path: a status and a JSON body, or a handler.
+/// How the fake answers a path: a status and a JSON body (none when it is
+/// `null`, as for a 204), or a handler.
 type Handler = Arc<dyn Fn(&Seen) -> (u16, Value, Vec<(String, String)>) + Send + Sync>;
 
 #[derive(Default)]
@@ -170,7 +171,11 @@ async fn serve(stream: tokio::net::TcpStream, state: Arc<Mutex<State>>) -> std::
                 (404, json!({"errorMessages": ["Not found"]}), vec![])
             }
         };
-        let text = value.to_string();
+        let text = if value.is_null() {
+            String::new()
+        } else {
+            value.to_string()
+        };
         let mut head = format!(
             "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\n",
             text.len()
@@ -182,6 +187,85 @@ async fn serve(stream: tokio::net::TcpStream, state: Arc<Mutex<State>>) -> std::
         write.write_all(head.as_bytes()).await?;
         write.write_all(text.as_bytes()).await?;
     }
+}
+
+/// BRME's transitions (ADR-0007): their target statuses and categories.
+const WORKFLOW: [(&str, &str, &str, &str); 3] = [
+    ("61", "Open", "Open", "new"),
+    ("91", "In Progress (2)", "In Progress", "indeterminate"),
+    ("71", "Closed", "Closed", "done"),
+];
+
+/// The resolutions a close offers.
+const RESOLUTIONS: [(&str, &str); 3] = [("10000", "Done"), ("10101", "Won't Do"), ("1", "Fixed")];
+
+/// `GET` and `POST /issue/{id}/transitions` over `issues`.
+fn transitions(
+    seen: &Seen,
+    issues: &Arc<Mutex<Vec<Value>>>,
+    now: &(dyn Fn() -> String + Send + Sync),
+) -> (u16, Value, Vec<(String, String)>) {
+    let path = seen.target.split('?').next().unwrap_or_default();
+    let Some(id) = path
+        .strip_prefix("/rest/api/2/issue/")
+        .and_then(|p| p.strip_suffix("/transitions"))
+    else {
+        return (404, json!({"errorMessages": ["Not found"]}), vec![]);
+    };
+    let mut all = issues.lock().unwrap();
+    let Some(issue) = all.iter_mut().find(|v| v["id"] == id) else {
+        return (
+            404,
+            json!({"errorMessages": ["Issue Does Not Exist"]}),
+            vec![],
+        );
+    };
+    if seen.method == "GET" {
+        let list: Vec<Value> = WORKFLOW
+            .iter()
+            .map(|(tid, name, to, key)| {
+                let mut t = json!({"id": tid, "name": name, "to": {"name": to, "statusCategory": {"key": key}}, "fields": {}});
+                if *key == "done" {
+                    t["fields"]["resolution"] = json!({
+                        "required": true,
+                        "name": "Resolution",
+                        "allowedValues": RESOLUTIONS.iter().map(|(id, n)| json!({"id": id, "name": n})).collect::<Vec<_>>()
+                    });
+                }
+                t
+            })
+            .collect();
+        return (200, json!({ "transitions": list }), vec![]);
+    }
+    let body: Value = serde_json::from_str(&seen.body).unwrap_or_default();
+    let tid = body["transition"]["id"].as_str().unwrap_or_default();
+    let Some((_, _, to, key)) = WORKFLOW.iter().find(|(t, ..)| *t == tid) else {
+        return (
+            400,
+            json!({"errorMessages": ["It seems that you have tried to perform a workflow operation that is not valid"]}),
+            vec![],
+        );
+    };
+    // By id or name, as Jira takes it; its own spelling is what it stores.
+    let r = &body["fields"]["resolution"];
+    let resolution = RESOLUTIONS
+        .iter()
+        .find(|(id, n)| r["id"].as_str() == Some(*id) || r["name"].as_str() == Some(*n));
+    if *key == "done" && resolution.is_none() {
+        return (
+            400,
+            json!({"errorMessages": [], "errors": {"resolution": "Resolution is required."}}),
+            vec![],
+        );
+    }
+    let f = &mut issue["fields"];
+    f["status"] = json!({"name": to, "statusCategory": {"key": key}});
+    f["resolution"] = match resolution {
+        Some((id, n)) if *key == "done" => json!({"id": id, "name": n}),
+        _ => Value::Null,
+    };
+    f["updated"] = json!(now());
+    (204, Value::Null, vec![])
 }
 
 /// A synthetic issue as Data Center's search returns one.
@@ -227,6 +311,51 @@ impl FakeJira {
                 ]),
                 vec![],
             )
+        });
+    }
+
+    /// Serves writes as BRME's workflow takes them (ADR-0007): `PUT
+    /// /issue/{id}` sets summary, priority, labels and duedate in `issues`,
+    /// and `…/transitions` lists Open, In Progress (2) and Closed, which
+    /// requires a resolution, and applies one. Each write bumps `updated` to
+    /// `now`, as Jira does. A write to an id not in `issues` is a 404.
+    pub fn serve_writes(
+        &self,
+        issues: Arc<Mutex<Vec<Value>>>,
+        now: impl Fn() -> String + Send + Sync + 'static,
+    ) {
+        let now = Arc::new(now);
+        let id_of = |seen: &Seen, tail: &str| {
+            let path = seen.target.split('?').next().unwrap_or_default();
+            path.strip_prefix("/rest/api/2/issue/")
+                .and_then(|p| p.strip_suffix(tail))
+                .map(str::to_owned)
+        };
+        let (list, at) = (issues.clone(), now.clone());
+        self.route("/rest/api/2/issue/*", move |seen| {
+            let Some(id) = id_of(seen, "").filter(|id| !id.contains('/')) else {
+                return transitions(seen, &list, &*at);
+            };
+            let mut all = list.lock().unwrap();
+            let Some(issue) = all.iter_mut().find(|v| v["id"] == id.as_str()) else {
+                return (
+                    404,
+                    json!({"errorMessages": ["Issue Does Not Exist"]}),
+                    vec![],
+                );
+            };
+            match seen.method.as_str() {
+                "GET" => (200, issue.clone(), vec![]),
+                "PUT" => {
+                    let body: Value = serde_json::from_str(&seen.body).unwrap_or_default();
+                    for (k, v) in body["fields"].as_object().cloned().unwrap_or_default() {
+                        issue["fields"][k] = v;
+                    }
+                    issue["fields"]["updated"] = json!(at());
+                    (204, Value::Null, vec![])
+                }
+                _ => (405, json!({"errorMessages": ["method"]}), vec![]),
+            }
         });
     }
 

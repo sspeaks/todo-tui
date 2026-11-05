@@ -11,14 +11,14 @@ use std::sync::{Arc, LazyLock};
 
 use jiff::{SignedDuration, Timestamp};
 use serde::Deserialize;
-use todo_core::Weekday;
 use todo_core::report::ReportConfig;
+use todo_core::{Priority, Weekday};
 use todo_proto::convert::{EnumField as _, timestamp_to_proto};
 use todo_proto::v1;
 use todo_sync::instance::{
     POLL_IDLE, POLL_INTERACTIVE, default_cancelled_resolutions, default_scopes, tracker_base_url,
 };
-use todo_sync::{CredentialRef, Instance, Scope, TrackerKind};
+use todo_sync::{Category, CredentialRef, Instance, Push, Scope, TrackerKind};
 use tokio::sync::{Mutex, watch};
 
 /// The config file format this build reads.
@@ -520,6 +520,7 @@ impl<'a> Reader<'a> {
         let mut scopes = default_scopes();
         let mut poll = POLL_INTERACTIVE;
         let mut cancelled = default_cancelled_resolutions();
+        let mut push = Push::default();
         for (key, value) in table {
             let path = format!("{at}.{}", quote_key(&key));
             let text = value.as_str().map(str::trim);
@@ -593,12 +594,47 @@ impl<'a> Reader<'a> {
                         "must be a list of resolution names; using the defaults",
                     ),
                 },
-                "email" | "promote_default" | "subtask_issue_type" | "priority_map"
-                | "assistant_enabled" => {
-                    self.warn(path, "not used until pushes and promote arrive");
+                "push" => match value.as_bool() {
+                    Some(b) => push.enabled = b,
+                    None => self.warn(path, "must be true or false; using true"),
+                },
+                "done_resolution" | "cancel_resolution" => match text.filter(|s| !s.is_empty()) {
+                    Some(name) if key == "done_resolution" => {
+                        push.done_resolution = name.to_owned()
+                    }
+                    Some(name) => push.cancel_resolution = name.to_owned(),
+                    None => self.warn(path, "must be a resolution's name, e.g. \"Done\""),
+                },
+                "transitions" => self.transitions(&path, value, &mut push.transitions),
+                "priority_map" => self.priority_map(&path, value, &mut push.priority_map),
+                "email" | "promote_default" | "subtask_issue_type" | "assistant_enabled" => {
+                    self.warn(path, "not used until promote arrives");
                 }
                 _ => self.warn(path, "unknown key; ignored"),
             }
+        }
+        // A close must read back as what it was (design 5.8): the cancel
+        // resolution is one that means cancelled, the done one is not.
+        let cancels = |list: &[String], r: &str| list.iter().any(|c| c.eq_ignore_ascii_case(r));
+        if !cancels(&cancelled, &push.cancel_resolution) {
+            self.warn(
+                format!("{at}.cancel_resolution"),
+                format!(
+                    "{:?} is not in cancelled_resolutions, so a cancel would read back as done; added to them",
+                    push.cancel_resolution
+                ),
+            );
+            cancelled.push(push.cancel_resolution.clone());
+        }
+        if cancels(&cancelled, &push.done_resolution) {
+            self.warn(
+                format!("{at}.done_resolution"),
+                format!(
+                    "{:?} is in cancelled_resolutions, so done would read back as cancelled; using \"Done\"",
+                    push.done_resolution
+                ),
+            );
+            push.done_resolution = "Done".to_owned();
         }
         let need = |name: &str, present: bool, this: &mut Self| {
             // A key given with a bad value has said so already.
@@ -627,7 +663,72 @@ impl<'a> Reader<'a> {
             poll_interactive: poll,
             poll_idle: POLL_IDLE.max(poll),
             cancelled_resolutions: cancelled,
+            push,
         })
+    }
+
+    /// `transitions = { todo = "Open", in_progress = "In Progress" }`: the
+    /// status each category's transition goes to (ADR-0007).
+    fn transitions(
+        &mut self,
+        path: &str,
+        value: toml::Value,
+        out: &mut BTreeMap<Category, String>,
+    ) {
+        let Some(t) = value.as_table() else {
+            return self.warn(path, "must be a table, e.g. { todo = \"Open\" }");
+        };
+        for (k, v) in t {
+            match (Category::from_name(k), v.as_str().map(str::trim)) {
+                (Some(c), Some(name)) if !name.is_empty() => {
+                    out.insert(c, name.to_owned());
+                }
+                (None, _) => self.warn(
+                    format!("{path}.{}", quote_key(k)),
+                    "must be todo, in_progress or done",
+                ),
+                _ => self.warn(
+                    format!("{path}.{}", quote_key(k)),
+                    "must be a status's name",
+                ),
+            }
+        }
+    }
+
+    /// `priority_map = { highest = "Blocker", high = "Critical" }`: which Jira
+    /// priority a local level sets (design 5.8).
+    fn priority_map(
+        &mut self,
+        path: &str,
+        value: toml::Value,
+        out: &mut BTreeMap<Priority, String>,
+    ) {
+        let Some(t) = value.as_table() else {
+            return self.warn(path, "must be a table, e.g. { highest = \"Blocker\" }");
+        };
+        for (k, v) in t {
+            let level = match k.as_str() {
+                "highest" => Some(Priority::Highest),
+                "high" => Some(Priority::High),
+                "medium" => Some(Priority::Medium),
+                "low" => Some(Priority::Low),
+                "lowest" => Some(Priority::Lowest),
+                _ => None,
+            };
+            match (level, v.as_str().map(str::trim)) {
+                (Some(l), Some(name)) if !name.is_empty() => {
+                    out.insert(l, name.to_owned());
+                }
+                (None, _) => self.warn(
+                    format!("{path}.{}", quote_key(k)),
+                    "must be highest, high, medium, low or lowest",
+                ),
+                _ => self.warn(
+                    format!("{path}.{}", quote_key(k)),
+                    "must be a priority's name",
+                ),
+            }
+        }
     }
 
     /// `scopes = [{ name, query }]`, not empty, names unique.
@@ -1052,6 +1153,68 @@ mod tests {
             "[[instances]]\nid = \"j\"\nkind = \"jira-dc\"\nbase_url = \"https://j.example.com\"\ncredential = \"env:X\"\n",
         );
         assert_eq!(plain.instances[0].scopes, default_scopes());
+        assert_eq!(plain.instances[0].push, Push::default());
+    }
+
+    #[test]
+    fn an_instance_reads_its_push_settings() {
+        let base = "[[instances]]\nid = \"j\"\nkind = \"jira-dc\"\nbase_url = \"https://j.example.com\"\ncredential = \"env:X\"\n";
+        let config = parse(&format!(
+            "{base}push = false\ndone_resolution = \"Completed\"\ncancel_resolution = \"Obsolete\"\n\
+             cancelled_resolutions = [\"Obsolete\"]\n\
+             transitions = {{ todo = \"Open\", in_progress = \"In Progress\" }}\n\
+             priority_map = {{ highest = \"Blocker\", medium = \"Normal\" }}\n"
+        ));
+        let p = &config.instances[0].push;
+        assert!(!p.enabled);
+        assert_eq!(
+            (p.done_resolution.as_str(), p.cancel_resolution.as_str()),
+            ("Completed", "Obsolete")
+        );
+        assert_eq!(
+            p.transitions,
+            [
+                (Category::Todo, "Open".to_owned()),
+                (Category::InProgress, "In Progress".to_owned())
+            ]
+            .into()
+        );
+        assert_eq!(
+            p.priority_map,
+            [
+                (Priority::Highest, "Blocker".to_owned()),
+                (Priority::Medium, "Normal".to_owned())
+            ]
+            .into()
+        );
+        // Bad values warn and keep the defaults; the instance still syncs.
+        let bad = format!(
+            "{base}push = \"yes\"\ndone_resolution = \"\"\ntransitions = {{ later = \"X\" }}\npriority_map = {{ urgent = \"P0\" }}\n"
+        );
+        assert_eq!(
+            warnings(&bad),
+            [
+                "instances[0].push: must be true or false; using true",
+                "instances[0].done_resolution: must be a resolution's name, e.g. \"Done\"",
+                "instances[0].transitions.later: must be todo, in_progress or done",
+                "instances[0].priority_map.urgent: must be highest, high, medium, low or lowest",
+            ]
+        );
+        assert_eq!(parse(&bad).instances[0].push, Push::default());
+        // A close must read back as itself: a cancel resolution not in the
+        // cancelled list joins it; a done one that is in it gives way.
+        let odd =
+            format!("{base}cancel_resolution = \"Obsolete\"\ndone_resolution = \"Duplicate\"\n");
+        assert_eq!(
+            warnings(&odd),
+            [
+                "instances[0].cancel_resolution: \"Obsolete\" is not in cancelled_resolutions, so a cancel would read back as done; added to them",
+                "instances[0].done_resolution: \"Duplicate\" is in cancelled_resolutions, so done would read back as cancelled; using \"Done\"",
+            ]
+        );
+        let i = &parse(&odd).instances[0];
+        assert!(i.cancelled_resolutions.iter().any(|r| r == "Obsolete"));
+        assert_eq!(i.push.done_resolution, "Done");
     }
 
     #[test]
@@ -1065,7 +1228,7 @@ mod tests {
                 "instances[0].kind: must be \"jira-dc\" (Jira Data Center); Jira Cloud is not built yet",
                 "instances[0].base_url: must be an https:// address, e.g. \"https://jira.example.com\" (http:// only to this machine)",
                 "instances[0].credential: vault: must be keychain:…, env:…, file:… or systemd:…",
-                "instances[0].email: not used until pushes and promote arrive",
+                "instances[0].email: not used until promote arrives",
                 "instances[0]: skipped: it does not sync until the errors above are fixed",
             ]
         );
