@@ -346,6 +346,7 @@ fn recurrence_req(id: &str, rule: Option<RecurrenceRule>) -> SetRecurrenceReques
         id: id.to_owned(),
         rule,
         expected_revision: None,
+        confirm_not_mine: false,
     }
 }
 

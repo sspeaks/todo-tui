@@ -224,6 +224,7 @@ fn record_of(row: &ExportRow) -> ex::Record {
             field: o.field,
             base_json: o.base_json.clone(),
             new_json: o.new_json.clone(),
+            sent_json: o.sent_json.clone(),
             state: o.state.clone(),
             attempts: o.attempts,
             next_attempt_at: o.next_attempt_at.map(timestamp_to_proto),
@@ -342,6 +343,7 @@ fn row_of(record: &ex::Record) -> Result<ExportRow, ConvertError> {
                 field: o.field,
                 base_json: o.base_json.clone(),
                 new_json: o.new_json.clone(),
+                sent_json: o.sent_json.clone(),
                 state: o.state.clone(),
                 attempts: o.attempts,
                 next_attempt_at: o

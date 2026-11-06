@@ -755,6 +755,18 @@ async fn someone_elses_issue_takes_a_pushed_edit_only_when_confirmed() {
     let err = client.update_item(edit(false)).await.unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition);
     assert_eq!(err.get_details_error_info().unwrap().reason, "NOT_MINE");
+    // A repeat rule sets the due date, which pushes: the same guard, and
+    // the same confirmation takes it.
+    let rule = |confirm| todo_proto::v1::SetRecurrenceRequest {
+        request_id: todo_core::new_ulid().to_string(),
+        id: id.clone(),
+        rule: Some((&todo_core::Rule::Daily).into()),
+        expected_revision: None,
+        confirm_not_mine: confirm,
+    };
+    let err = client.set_recurrence(rule(false)).await.unwrap_err();
+    assert_eq!(err.get_details_error_info().unwrap().reason, "NOT_MINE");
+    client.set_recurrence(rule(true)).await.unwrap();
     // Overlay stays theirs to touch freely; a confirmed edit pushes.
     client.update_item(edit(true)).await.unwrap();
     until(&r, "pushed", |items| {
@@ -762,5 +774,171 @@ async fn someone_elses_issue_takes_a_pushed_edit_only_when_confirmed() {
     })
     .await;
     assert_eq!(issues.lock().unwrap()[0]["fields"]["summary"], "mine now");
+    r.stop().await;
+}
+
+fn edit_title(id: &str, title: &str) -> UpdateItemRequest {
+    UpdateItemRequest {
+        request_id: todo_core::new_ulid().to_string(),
+        item: Some(Item {
+            id: id.to_owned(),
+            title: title.into(),
+            ..Item::default()
+        }),
+        update_mask: Some(prost_types::FieldMask {
+            paths: vec!["title".into()],
+        }),
+        ..UpdateItemRequest::default()
+    }
+}
+
+fn close(id: &str) -> todo_proto::v1::SetStatusRequest {
+    todo_proto::v1::SetStatusRequest {
+        request_id: todo_core::new_ulid().to_string(),
+        id: id.to_owned(),
+        status: Status::Done as i32,
+        ..Default::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_close_leaves_a_title_jira_took() {
+    let fake = FakeJira::start("pat").await;
+    let issues = Arc::new(Mutex::new(vec![issue_json(1, "old", "new", &at(1))]));
+    serve_writable(&fake, issues.clone());
+    // This workflow offers no way to close.
+    fake.route("/rest/api/2/issue/1/transitions", |_| {
+        (200, json!({"transitions": []}), vec![])
+    });
+    let r = start(&fake, "pat").await;
+    settled(&r, SyncState::Ok).await;
+    let before = linked(&r).await[0].clone();
+    let id = before.id.clone();
+    let mut client = ItemServiceClient::new(r.channel().await);
+    client.update_item(edit_title(&id, "new")).await.unwrap();
+    client.set_status(close(&id)).await.unwrap();
+    let items = until(&r, "refused", |items| items[0].has_push_failure).await;
+    assert_eq!(issues.lock().unwrap()[0]["fields"]["summary"], "new");
+    assert_eq!(items[0].title, "new");
+    assert_eq!(items[0].status, before.status, "Jira's status stands");
+    // Only the close failed (its category and kind), not the title.
+    let st = status(&r).await;
+    assert_eq!((st.failed_ops, st.pending_ops), (2, 0));
+    r.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rate_limit_stops_the_batch_and_the_retry_comes_when_due() {
+    let fake = FakeJira::start("pat").await;
+    let issues = Arc::new(Mutex::new(vec![
+        issue_json(1, "one", "new", &at(1)),
+        issue_json(2, "two", "new", &at(1)),
+    ]));
+    serve_writable(&fake, issues.clone());
+    let r = start(&fake, "pat").await;
+    settled(&r, SyncState::Ok).await;
+    // Jira asks for 2 s on the first PUT, then takes them.
+    let limited = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let puts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    {
+        let (issues, limited, puts) = (issues.clone(), limited.clone(), puts.clone());
+        fake.route("/rest/api/2/issue/*", move |seen| {
+            let id = seen
+                .target
+                .split('?')
+                .next()
+                .unwrap()
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .to_owned();
+            let mut all = issues.lock().unwrap();
+            let Some(issue) = all.iter_mut().find(|v| v["id"] == id.as_str()) else {
+                return (
+                    404,
+                    json!({"errorMessages": ["Issue Does Not Exist"]}),
+                    vec![],
+                );
+            };
+            if seen.method != "PUT" {
+                return (200, issue.clone(), vec![]);
+            }
+            if limited.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return (
+                    429,
+                    json!({"errorMessages": ["slow down"]}),
+                    vec![("Retry-After".into(), "2".into())],
+                );
+            }
+            puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body: Value = serde_json::from_str(&seen.body).unwrap_or_default();
+            issue["fields"]["summary"] = body["fields"]["summary"].clone();
+            issue["fields"]["updated"] = json!(at(9));
+            (204, Value::Null, vec![])
+        });
+    }
+    let mut client = ItemServiceClient::new(r.channel().await);
+    let items = linked(&r).await;
+    for (n, item) in items.iter().enumerate() {
+        client
+            .update_item(edit_title(&item.id, &format!("pushed {n}")))
+            .await
+            .unwrap();
+    }
+    // The 429 ends the pass Offline before the second Item is sent.
+    let st = settled(&r, SyncState::Offline).await;
+    assert!(st.last_error.contains("rate"), "{st:?}");
+    assert_eq!(puts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    // Then, without a sync now, both go once the wait is up.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while puts.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+        assert!(tokio::time::Instant::now() < deadline, "never retried");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    r.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_priority_jira_has_no_name_for_settles_as_the_one_it_reads_back_as() {
+    let fake = FakeJira::start("pat").await;
+    let issues = Arc::new(Mutex::new(vec![issue_json(1, "one", "new", &at(1))]));
+    serve_writable(&fake, issues.clone());
+    // Three priorities: High, Medium and Low read back as Highest, Medium
+    // and Lowest; local High pushes as "High" (its nearest).
+    fake.route("/rest/api/2/priority", |_| {
+        (
+            200,
+            json!([{"name": "High"}, {"name": "Medium"}, {"name": "Low"}]),
+            vec![],
+        )
+    });
+    issues.lock().unwrap()[0]["fields"]["priority"] = json!({"name": "Medium"});
+    let r = start(&fake, "pat").await;
+    settled(&r, SyncState::Ok).await;
+    let id = linked(&r).await[0].id.clone();
+    ItemServiceClient::new(r.channel().await)
+        .update_item(UpdateItemRequest {
+            request_id: todo_core::new_ulid().to_string(),
+            item: Some(Item {
+                id: id.clone(),
+                priority: todo_proto::v1::Priority::High as i32,
+                ..Item::default()
+            }),
+            update_mask: Some(prost_types::FieldMask {
+                paths: vec!["priority".into()],
+            }),
+            ..UpdateItemRequest::default()
+        })
+        .await
+        .unwrap();
+    let items = until(&r, "settled", |items| items[0].pending_fields.is_empty()).await;
+    assert_eq!(
+        issues.lock().unwrap()[0]["fields"]["priority"]["name"],
+        "High"
+    );
+    assert_eq!(items[0].priority, todo_proto::v1::Priority::Highest as i32);
+    assert!(!items[0].has_conflict, "no conflict with its own push");
+    let st = status(&r).await;
+    assert_eq!((st.pending_ops, st.failed_ops), (0, 0));
     r.stop().await;
 }

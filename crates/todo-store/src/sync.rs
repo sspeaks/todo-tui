@@ -54,6 +54,7 @@ pub(crate) fn linked(conn: &Connection, instance: &str, remote_id: &str) -> Resu
 }
 
 pub(crate) fn apply_page_tx(tx: &mut WriteTx<'_>, page: PullPage) -> Result<PullOutcome> {
+    let pushes = tx.pushes();
     let conn = tx.conn();
     let ctx = ApplyCtx {
         now: page.now,
@@ -120,7 +121,7 @@ pub(crate) fn apply_page_tx(tx: &mut WriteTx<'_>, page: PullPage) -> Result<Pull
                 };
                 // Waiting pushes first (design 5.6): the issue as the Item
                 // takes it, Jira's or, where a push still waits, the local.
-                let settled = crate::outbox::settle_pull(conn, &current, issue, page.now)?;
+                let settled = crate::outbox::settle_pull(conn, &current, issue, pushes, page.now)?;
                 suggested.extend(settled.suggested);
                 let (mut next, changes) =
                     update(&current, &settled.issue, parent, &scopes, page.now);
@@ -215,6 +216,7 @@ pub struct ReconcileOutcome {
 }
 
 pub(crate) fn reconcile_tx(tx: &mut WriteTx<'_>, input: Reconcile) -> Result<ReconcileOutcome> {
+    let pushes = tx.pushes();
     let conn = tx.conn();
     let ctx = ApplyCtx {
         now: input.now,
@@ -237,7 +239,7 @@ pub(crate) fn reconcile_tx(tx: &mut WriteTx<'_>, input: Reconcile) -> Result<Rec
             // out of every scope.
             Some(issue) => {
                 let parent = live_parent(conn, &input.instance_id, issue, &HashMap::new())?;
-                let settled = crate::outbox::settle_pull(conn, &current, issue, input.now)?;
+                let settled = crate::outbox::settle_pull(conn, &current, issue, pushes, input.now)?;
                 suggested.extend(settled.suggested);
                 let (mut next, changes) = update(&current, &settled.issue, parent, &[], input.now);
                 next.derived.pending_fields = crate::outbox::pending_fields(conn, *id)?;

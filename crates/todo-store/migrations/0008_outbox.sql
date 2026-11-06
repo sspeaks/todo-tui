@@ -6,7 +6,9 @@
 -- Item and field while it waits) or its status (kind 'transition', one per
 -- Item). `base` is the field's value when the first queued edit was made,
 -- which until then only a pull had written: Jira's. `new` is what the push
--- sets; JSON in the events' codec.
+-- sets; JSON in the events' codec. `sent` is the value the worker sent
+-- while the row is in flight: an edit meanwhile changes `new` only, and is
+-- pushed once Jira is read back at `sent`.
 CREATE TABLE outbox (
     id              TEXT PRIMARY KEY,
     item_id         TEXT NOT NULL REFERENCES items (id),
@@ -17,6 +19,7 @@ CREATE TABLE outbox (
     field           INTEGER NOT NULL,
     base_json       TEXT NOT NULL,
     new_json        TEXT NOT NULL,
+    sent_json       TEXT,
     state           TEXT NOT NULL
                     CHECK (state IN ('pending', 'in_flight', 'done', 'failed', 'cancelled')),
     attempts        INTEGER NOT NULL DEFAULT 0,

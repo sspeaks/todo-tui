@@ -1124,6 +1124,7 @@ mod tests {
                     id: item_id(),
                     rule: Some((&core::Rule::Daily).into()),
                     expected_revision: rev,
+                    confirm_not_mine: false,
                 }),
                 MutationOp::SetRecurrence {
                     rule: Some(core::Rule::Daily),
@@ -1209,6 +1210,7 @@ mod tests {
             id: id.to_owned(),
             rule,
             expected_revision: Some(4),
+            confirm_not_mine: false,
         };
         let good = id(1).to_string();
         let monthly = core::Rule::Monthly { day: 15 };

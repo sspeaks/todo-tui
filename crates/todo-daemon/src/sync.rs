@@ -55,6 +55,9 @@ impl SyncNow {
 
 struct State {
     tx: watch::Sender<BTreeMap<String, v1::SyncStatus>>,
+    /// Jira asked to wait (a 429's Retry-After, design 5.12): no pass
+    /// before then, whatever wakes the loop.
+    hold: std::sync::Mutex<Option<Timestamp>>,
 }
 
 impl State {
@@ -85,7 +88,10 @@ pub(crate) async fn run(
     status: watch::Sender<BTreeMap<String, v1::SyncStatus>>,
     mut stop: ShutdownSignal,
 ) {
-    let state = State { tx: status };
+    let state = State {
+        tx: status,
+        hold: std::sync::Mutex::new(None),
+    };
     let queued = store.pushes_queued();
     let mut last_reconcile: Option<Timestamp> = None;
     let mut offline_wait = Duration::from_secs(15);
@@ -113,7 +119,16 @@ pub(crate) async fn run(
                 let reconcile = last_reconcile.is_none_or(|at| {
                     Timestamp::now().duration_since(at).unsigned_abs() >= RECONCILE_EVERY
                 });
-                let outcome = pass(&store, i, &state, reconcile).await;
+                let held = state
+                    .hold
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .filter(|at| *at > Timestamp::now());
+                let outcome = match held {
+                    // Jira asked to wait: this wake-up waits too.
+                    Some(_) => Outcome::Held,
+                    None => pass(&store, i, &state, reconcile).await,
+                };
                 // Only once the pass is over: a caller waiting on its request
                 // reads served_request with the state the pass ended in.
                 state.set(&i.id, |st| st.served_request = served);
@@ -136,9 +151,40 @@ pub(crate) async fn run(
                     }
                     // Waits for the config (or a sync now) to change.
                     Outcome::Auth => None,
+                    // Until the hold ends (the retry's wake-up below).
+                    Outcome::Held => Some(i.poll_idle),
                     Outcome::Degraded => Some(i.poll_idle),
                 }
             }
+        };
+        // A push waiting on a retry wakes the loop when it is due, sooner
+        // than the poll (a 429's few seconds); never sooner than a second.
+        let retry = match &instance {
+            Some(i) if i.push.enabled => store.next_push_at(i.id.clone()).await.ok().flatten(),
+            _ => None,
+        }
+        .map(|at| {
+            // Already due (a negative wait): in a second.
+            Duration::try_from(at.duration_since(Timestamp::now()))
+                .unwrap_or_default()
+                .max(Duration::from_secs(1))
+        });
+        let held = state
+            .hold
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map(|at| {
+                Duration::try_from(at.duration_since(Timestamp::now()))
+                    .unwrap_or_default()
+                    .max(Duration::from_secs(1))
+            });
+        let retry = match (retry, held) {
+            (Some(r), Some(h)) => Some(r.max(h)),
+            (r, h) => r.or(h),
+        };
+        let wait = match (wait, retry) {
+            (Some(w), Some(r)) => Some(w.min(r)),
+            (w, r) => w.or(r),
         };
         let sleep = async {
             match wait {
@@ -172,6 +218,8 @@ enum Outcome {
     Offline,
     Auth,
     Degraded,
+    /// Skipped: Jira's Retry-After has not passed.
+    Held,
 }
 
 fn fail(state: &State, id: &str, e: &JiraError) -> Outcome {
@@ -181,6 +229,11 @@ fn fail(state: &State, id: &str, e: &JiraError) -> Outcome {
         _ => (v1::SyncState::Degraded, Outcome::Degraded),
     };
     tracing::warn!(instance = id, error = %e, "sync failed");
+    if let JiraError::RateLimited(wait) = e {
+        let until = Timestamp::now()
+            + jiff::SignedDuration::try_from(*wait).unwrap_or(jiff::SignedDuration::from_secs(60));
+        *state.hold.lock().unwrap_or_else(|e| e.into_inner()) = Some(until);
+    }
     state.set(id, |st| {
         st.state = s as i32;
         st.last_error = e.to_string();
@@ -463,18 +516,21 @@ const PUSH_RETRY: Duration = Duration::from_secs(15);
 /// Sends what the outbox has due (design 5.6, ADR-0007), after the pull, so
 /// the conflict rule ran on fresh data. Per Item: read the issue again and
 /// run the rule on what Jira has now (a lost answer, or a change since the
-/// pull); push what still waits, fields then the status; then read it back
-/// and apply it, which settles the rows. A transient failure retries with
-/// backoff (a 429's wait honoured); a refusal becomes a push_failed
-/// Suggestion and Jira's values stand; a 401 stops the pass as auth_error.
+/// pull); mark what still waits in flight with the value it sends; push the
+/// fields and the status as two units, each settled or refused on its own;
+/// then read the issue back, which settles what landed. A transient failure
+/// ends the batch (the pass ends Offline, and the rows retry with backoff,
+/// a 429's wait honoured); a refusal becomes a push_failed Suggestion and
+/// Jira's values stand; a 401 stops the pass as auth_error.
 async fn push(
     store: &Store,
     i: &Instance,
     adapter: &Adapter,
     state: &State,
 ) -> Result<(), Outcome> {
+    use todo_core::{FieldValue as V, ItemField as F};
     use todo_jira::{FieldPatch, PushError, Target};
-    use todo_store::outbox::PushResult;
+    use todo_store::outbox::{PushResult, Waiting};
     if !i.push.enabled {
         return Ok(());
     }
@@ -492,21 +548,7 @@ async fn push(
             Ok(Fetched::NotFound | Fetched::Forbidden) => continue,
             Err(JiraError::Auth) => return Err(fail(state, &i.id, &JiraError::Auth)),
             Err(e) if e.is_transient() => {
-                let at = retry_at(&e, d.attempts);
-                store
-                    .record_push(
-                        d.item_id,
-                        d.key.clone(),
-                        d.rows,
-                        PushResult::Retry {
-                            at,
-                            error: e.to_string(),
-                        },
-                        Timestamp::now(),
-                    )
-                    .await
-                    .map_err(sfail)?;
-                continue;
+                return later(store, i, state, d.rows.clone(), &d, e).await;
             }
             Err(e) => return Err(fail(state, &i.id, &e)),
         };
@@ -522,78 +564,145 @@ async fn push(
         let Some(d) = due.into_iter().find(|x| x.item_id == d.item_id) else {
             continue;
         };
+        // In flight, each with what it sends: a priority as the level Jira
+        // reads its name back as (one with no name of its own takes a
+        // neighbour's), so the read-back settles it.
+        let sends: Vec<(Waiting, V)> = d
+            .rows
+            .iter()
+            .map(|w| {
+                let send = match &w.new {
+                    V::Priority(p) => V::Priority(adapter.priority_read_back(*p).unwrap_or(*p)),
+                    v => v.clone(),
+                };
+                (w.clone(), send)
+            })
+            .collect();
+        let begun = store
+            .begin_push(sends.clone(), Timestamp::now())
+            .await
+            .map_err(sfail)?;
+        let rows: Vec<Waiting> = sends
+            .into_iter()
+            .filter(|(w, _)| begun.contains(&w.id))
+            .map(|(mut w, send)| {
+                w.sent = Some(send.clone());
+                w.new = send;
+                w
+            })
+            .collect();
+        let status = |w: &Waiting| matches!(w.field, F::StatusCategory | F::ResolutionKind);
+        let (moves, edits): (Vec<Waiting>, Vec<Waiting>) = rows.into_iter().partition(status);
         let mut fields = Vec::new();
-        let mut target = None;
-        let (mut category, mut kind) = (None, None);
-        for w in &d.rows {
-            use todo_core::{FieldValue as V, ItemField as F};
+        for w in &edits {
             match (w.field, &w.new) {
                 (F::Title, V::String(t)) => fields.push(FieldPatch::Title(t.clone())),
                 (F::Priority, V::Priority(p)) => fields.push(FieldPatch::Priority(*p)),
                 (F::Labels, V::StringSet(l)) => fields.push(FieldPatch::Labels(l.clone())),
                 (F::DueDate, V::Date(day)) => fields.push(FieldPatch::DueDate(Some(*day))),
                 (F::DueDate, V::Cleared) => fields.push(FieldPatch::DueDate(None)),
-                (F::StatusCategory, V::StatusCategory(c)) => category = Some(*c),
-                (F::ResolutionKind, V::ResolutionKind(k)) => kind = Some(*k),
                 _ => {}
             }
         }
-        if category.is_some() || kind.is_some() {
-            // A kind alone (done to cancelled) is a close again, into Done.
-            target = Some(match category.unwrap_or(todo_core::StatusCategory::Done) {
+        let (mut category, mut kind) = (None, None);
+        for w in &moves {
+            match &w.new {
+                V::StatusCategory(c) => category = Some(*c),
+                V::ResolutionKind(k) => kind = Some(*k),
+                _ => {}
+            }
+        }
+        // A kind alone (done to cancelled) is a close again, into Done.
+        let target = (category.is_some() || kind.is_some()).then(|| {
+            match category.unwrap_or(todo_core::StatusCategory::Done) {
                 todo_core::StatusCategory::Todo => Target::Todo,
                 todo_core::StatusCategory::InProgress => Target::InProgress,
                 todo_core::StatusCategory::Done => {
                     Target::Done(kind.unwrap_or(todo_core::ResolutionKind::Done))
                 }
-            });
-        }
-        let sent = async {
-            adapter.update_fields(&d.remote_id, &fields).await?;
-            if let Some(t) = target {
-                adapter.transition(&d.remote_id, t).await?;
             }
-            Ok::<(), PushError>(())
+        });
+        // A reopen goes first: a closed issue may take no edits.
+        let reopen = matches!(target, Some(Target::Todo | Target::InProgress));
+        let mut units: Vec<(Vec<Waiting>, Option<Target>)> = Vec::new();
+        if reopen {
+            units.push((moves, target));
+            units.push((edits, None));
+        } else {
+            units.push((edits, None));
+            units.push((moves, target));
         }
-        .await;
-        let result = match sent {
-            Ok(()) => PushResult::Sent,
-            Err(PushError::Jira(JiraError::Auth)) => {
-                return Err(fail(state, &i.id, &JiraError::Auth));
+        let mut read_back = false;
+        for (unit, target) in units {
+            if unit.is_empty() {
+                continue;
             }
-            Err(PushError::Jira(e)) if e.is_transient() => PushResult::Retry {
-                at: retry_at(&e, d.attempts),
-                error: e.to_string(),
-            },
-            Err(e) => PushResult::Refused {
-                error: e.to_string(),
-                jira: d.rows.iter().map(|w| (w.field, w.base.clone())).collect(),
-            },
-        };
-        let sent_ok = result == PushResult::Sent;
-        let refused = matches!(result, PushResult::Refused { .. });
-        store
-            .record_push(
-                d.item_id,
-                d.key.clone(),
-                d.rows.clone(),
-                result,
-                Timestamp::now(),
-            )
-            .await
-            .map_err(sfail)?;
-        // Read back what Jira has now: a sent push settles (Jira at new);
-        // a refused one puts Jira's values back on the Item.
-        if (sent_ok || refused)
-            && let Ok(Fetched::Found(issue)) = adapter.fetch(&d.remote_id).await
-        {
+            let sent = match target {
+                Some(t) => adapter.transition(&d.remote_id, t).await,
+                None => adapter.update_fields(&d.remote_id, &fields).await,
+            };
+            let result = match sent {
+                Ok(()) => PushResult::Sent,
+                Err(PushError::Jira(JiraError::Auth)) => {
+                    return Err(fail(state, &i.id, &JiraError::Auth));
+                }
+                Err(PushError::Jira(e)) if e.is_transient() => {
+                    return later(store, i, state, unit, &d, e).await;
+                }
+                Err(e) => PushResult::Refused {
+                    error: e.to_string(),
+                    jira: unit.iter().map(|w| (w.field, w.base.clone())).collect(),
+                },
+            };
             store
-                .apply_pull(page(i, vec![(*issue, Vec::new())], None, false))
+                .record_push(d.item_id, d.key.clone(), unit, result, Timestamp::now())
                 .await
                 .map_err(sfail)?;
+            read_back = true;
+        }
+        // Read back what Jira has now: a sent push settles (Jira at what was
+        // sent); a refused one puts Jira's values back on the Item. If this
+        // read fails, the Item is read again by id next pass.
+        if read_back {
+            match adapter.fetch(&d.remote_id).await {
+                Ok(Fetched::Found(issue)) => {
+                    store
+                        .apply_pull(page(i, vec![(*issue, Vec::new())], None, false))
+                        .await
+                        .map_err(sfail)?;
+                }
+                Ok(_) => {}
+                Err(e) => return Err(fail(state, &i.id, &e)),
+            }
         }
     }
     Ok(())
+}
+
+/// A transient failure of `d`'s push: `rows` wait for a retry (a 429's
+/// wait honoured), and the pass ends Offline, sending nothing more.
+async fn later(
+    store: &Store,
+    i: &Instance,
+    state: &State,
+    rows: Vec<todo_store::outbox::Waiting>,
+    d: &todo_store::outbox::DuePush,
+    e: JiraError,
+) -> Result<(), Outcome> {
+    store
+        .record_push(
+            d.item_id,
+            d.key.clone(),
+            rows,
+            todo_store::outbox::PushResult::Retry {
+                at: retry_at(&e, d.attempts),
+                error: e.to_string(),
+            },
+            Timestamp::now(),
+        )
+        .await
+        .map_err(|e| store_fail(state, &i.id, &e))?;
+    Err(fail(state, &i.id, &e))
 }
 
 /// When to try again after `e`: a 429's wait, else 15 s doubling with

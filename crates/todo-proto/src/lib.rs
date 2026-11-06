@@ -51,5 +51,5 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
 /// 21 added pushes (ADR-0007): Suggestion and Change.suggestion, SyncStatus's
 /// pending_ops and failed_ops; a linked Item takes edits of its pushed
 /// fields. 22 added the push worker's confirm_not_mine (UpdateItem,
-/// SetStatus, BatchMutate) and NOT_MINE.
+/// SetStatus, SetRecurrence, BatchMutate) and NOT_MINE.
 pub const API_MINOR: u32 = 22;

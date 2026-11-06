@@ -224,7 +224,7 @@ impl ItemService for Items {
                 &req.request_id,
                 OpKind::SetRecurrence,
                 Shape::SetRecurrence,
-                false,
+                req.confirm_not_mine,
                 |today| request::set_recurrence_from_proto(&req, today),
             )
             .await?;

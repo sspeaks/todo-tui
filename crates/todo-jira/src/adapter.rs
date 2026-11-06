@@ -122,6 +122,14 @@ impl Adapter {
         &self.discovery
     }
 
+    /// The level a push of `level` reads back as: the level of the Jira
+    /// priority it is sent as, which for a level Jira has no name of its
+    /// own for is a neighbour's (design 5.8). `None`: it cannot be sent.
+    pub fn priority_read_back(&self, level: Priority) -> Option<Priority> {
+        let name = self.discovery.priority_names.get(&level)?;
+        self.discovery.priorities.get(name).copied()
+    }
+
     /// The scope query for changes since `cursor` (minus the overlap), in
     /// the Jira user's time zone (design 5.3), oldest change first.
     ///

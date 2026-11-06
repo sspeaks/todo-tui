@@ -57,6 +57,7 @@ pub struct OutboxRecord {
     pub field: u32,
     pub base_json: String,
     pub new_json: String,
+    pub sent_json: Option<String>,
     pub state: String,
     pub attempts: u32,
     pub next_attempt_at: Option<Timestamp>,
@@ -209,7 +210,7 @@ pub(crate) fn export_tx(conn: &Connection, history: bool) -> Result<Export> {
     {
         let mut stmt = tx.prepare(
             "SELECT id, item_id, instance_id, op_id, kind, field, base_json, new_json, state,
-                    attempts, next_attempt_at, last_error, created_at, updated_at
+                    attempts, next_attempt_at, last_error, created_at, updated_at, sent_json
              FROM outbox WHERE state != 'done' ORDER BY created_at, id",
         )?;
         let mut q = stmt.query([])?;
@@ -226,6 +227,7 @@ pub(crate) fn export_tx(conn: &Connection, history: bool) -> Result<Export> {
                 field: row.get(5)?,
                 base_json: row.get(6)?,
                 new_json: row.get(7)?,
+                sent_json: row.get(14)?,
                 state: row.get(8)?,
                 attempts: row.get(9)?,
                 next_attempt_at: next.map(ts_from_sql).transpose()?,
@@ -528,8 +530,8 @@ fn put(conn: &Connection, row: ExportRow, items: &mut u64) -> Result<()> {
             conn.execute(
                 "INSERT INTO outbox (id, item_id, instance_id, op_id, kind, field, base_json,
                                      new_json, state, attempts, next_attempt_at, last_error,
-                                     created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                                     created_at, updated_at, sent_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     o.id,
                     o.item_id,
@@ -544,7 +546,8 @@ fn put(conn: &Connection, row: ExportRow, items: &mut u64) -> Result<()> {
                     o.next_attempt_at.map(ts_to_sql).transpose()?,
                     o.last_error,
                     ts_to_sql(o.created_at)?,
-                    ts_to_sql(o.updated_at)?
+                    ts_to_sql(o.updated_at)?,
+                    o.sent_json
                 ],
             )?;
         }

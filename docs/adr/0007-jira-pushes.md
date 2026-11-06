@@ -51,18 +51,31 @@ month), Overcome by Events 287 (190 of them in one two-week clean-up), Incomplet
   leave the issue resolved.
 - **Priorities** map both ways from one table: by rank, then `priority_map`, so a
   level pushed reads back as itself; a level with no Jira priority of its own pushes
-  as the nearest one.
+  as the nearest one, and takes the level that one reads back as (High on a Jira of
+  High, Medium and Low becomes Highest), so its own push is no conflict.
 - **Jira wins, yours is kept.** Each queued patch keeps the value it was made against
   (its base). When Jira's value has moved away from the base and is not the local one,
   Jira's value is applied and the local one becomes a `sync_conflict` Suggestion, one
   key to re-apply. A push Jira refuses (400, 403, no transition) restores Jira's value
-  and becomes a `push_failed` Suggestion with the reason.
+  and becomes a `push_failed` Suggestion with the reason. The fields (one `PUT`) and
+  the status (one transition) are two units, each settled or refused on its own: a
+  refused close does not undo a title Jira took. A reopen goes before the fields, as a
+  closed issue may take no edits.
+- **In flight.** The worker marks what it sends (each row's `sent`) before the call.
+  An edit made meanwhile changes only what waits: once Jira reads back at what was
+  sent, it is pushed from there, so a quick second edit is neither lost nor a conflict
+  with the first.
+- **Backoff.** A transient failure (offline, 5xx, 429) ends the pass, as a failed pull
+  does, rather than trying the rest of the batch; the rows retry with backoff from
+  15 s, and the loop wakes when the first is due. A 429's `Retry-After` holds the
+  whole instance, pulls included.
 - **Jira has no conditional update** (no `If-Match`), so the worker reads the issue
   again just before writing and runs the rule on that. The window left between the
   read and the write is accepted for a personal tool. A transition is not idempotent:
   a retry after a lost answer reads first, and finds it done.
 - **`push = false`** on an instance keeps M9's read-only behaviour, a switch for a
-  Jira one should not write to.
+  Jira one should not write to. What waits stays queued, and pulls show Jira's values
+  meanwhile; it goes once pushes are on again (or an undo or delete cancels it).
 
 ## Alternatives considered
 

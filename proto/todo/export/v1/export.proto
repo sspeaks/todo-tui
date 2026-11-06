@@ -92,6 +92,8 @@ message OutboxOp {
   optional string last_error = 12;
   google.protobuf.Timestamp created_at = 13;
   google.protobuf.Timestamp updated_at = 14;
+  // In flight: the value sent.
+  optional string sent_json = 15;
 }
 
 // A `suggestions` row and its `suggestion_patches`, as stored.

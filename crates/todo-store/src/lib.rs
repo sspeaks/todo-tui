@@ -982,6 +982,24 @@ impl Store {
             .await
     }
 
+    /// Marks `rows` in flight with the value each sends (design 5.6),
+    /// before the worker sends them; a row edited since it was read is left
+    /// for the next try. Returns the ids in flight.
+    pub async fn begin_push(
+        &self,
+        rows: Vec<(outbox::Waiting, todo_core::FieldValue)>,
+        now: Timestamp,
+    ) -> Result<Vec<String>> {
+        self.write(move |tx| outbox::begin(tx.conn(), &rows, now))
+            .await
+    }
+
+    /// When the first push of `instance` waiting on a retry is due.
+    pub async fn next_push_at(&self, instance: String) -> Result<Option<Timestamp>> {
+        self.read(move |conn| outbox::next_attempt(conn, &instance))
+            .await
+    }
+
     /// What pushing `rows` of `item` came to (design 5.6): sent (in flight
     /// until a pull reads it back), to retry, or refused (failed, with a
     /// push_failed Suggestion streamed). The pull that follows writes the

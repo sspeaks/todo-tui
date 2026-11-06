@@ -1195,3 +1195,243 @@ async fn a_pull_while_a_status_push_waits_leaves_the_item_as_it_was() {
         before.derived.staleness.status_entered_at
     );
 }
+
+/// The worker's steps for `item`, as the daemon runs them: what is due,
+/// marked in flight with `send` (its new value when `None`).
+async fn send(store: &Store, item: todo_core::ItemId) -> Vec<todo_store::outbox::Waiting> {
+    let due = store
+        .due_pushes("work-jira".into(), ts(5_000), 50)
+        .await
+        .unwrap();
+    let rows = due.into_iter().find(|d| d.item_id == item).unwrap().rows;
+    let sends = rows.iter().map(|w| (w.clone(), w.new.clone())).collect();
+    let begun = store.begin_push(sends, ts(5_000)).await.unwrap();
+    rows.into_iter()
+        .filter(|w| begun.contains(&w.id))
+        .map(|mut w| {
+            w.sent = Some(w.new.clone());
+            w
+        })
+        .collect()
+}
+
+fn titled(n: u32, title: &str, updated: i64) -> RemoteIssue {
+    RemoteIssue {
+        updated_at: ts(updated),
+        ..issue(n, title)
+    }
+}
+
+#[tokio::test]
+async fn an_edit_while_its_push_is_in_flight_goes_next_not_lost_or_a_conflict() {
+    let (_dir, store) = open();
+    store
+        .apply_pull(page(vec![issue(1, "one")], None))
+        .await
+        .unwrap();
+    let item = by_key(&store, "PLAT-1").await;
+    store.set_pushes(Some("work-jira"));
+    let edit = |t: &str| user_edit(item.id, ItemField::Title, FieldValue::String(t.into()));
+    store.mutate(edit("two")).await.unwrap();
+    let rows = send(&store, item.id).await;
+    // While "two" is on its way, the person types "three".
+    store.mutate(edit("three")).await.unwrap();
+    store
+        .record_push(
+            item.id,
+            "PLAT-1".into(),
+            rows,
+            todo_store::outbox::PushResult::Sent,
+            ts(5_001),
+        )
+        .await
+        .unwrap();
+    // Jira read back at "two": the push landed, and "three" goes next.
+    store
+        .apply_pull(page(vec![titled(1, "two", 300)], None))
+        .await
+        .unwrap();
+    let got = store.get_item(item.id, TODAY).await.unwrap().item;
+    assert_eq!(got.core.title, "three");
+    assert!(!got.derived.has_conflict);
+    let rows = outbox(&store, item.id).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1, "pending");
+    assert!(
+        rows[0].2.contains("two") && rows[0].3.contains("three"),
+        "{rows:?}"
+    );
+
+    // An edit back to the old value while a push is in flight is pushed
+    // too (Jira will have the sent one), not dropped.
+    let rows = send(&store, item.id).await;
+    store.mutate(edit("two")).await.unwrap();
+    store
+        .record_push(
+            item.id,
+            "PLAT-1".into(),
+            rows,
+            todo_store::outbox::PushResult::Sent,
+            ts(5_002),
+        )
+        .await
+        .unwrap();
+    store
+        .apply_pull(page(vec![titled(1, "three", 400)], None))
+        .await
+        .unwrap();
+    let rows = outbox(&store, item.id).await;
+    let waiting: Vec<_> = rows.iter().filter(|r| r.1 == "pending").collect();
+    assert_eq!(waiting.len(), 1, "{rows:?}");
+    assert!(waiting[0].2.contains("three") && waiting[0].3.contains("two"));
+    assert_eq!(
+        store
+            .get_item(item.id, TODAY)
+            .await
+            .unwrap()
+            .item
+            .core
+            .title,
+        "two"
+    );
+}
+
+#[tokio::test]
+async fn a_refusal_fails_only_what_was_sent_and_reads_the_item_again() {
+    let (_dir, store) = open();
+    store
+        .apply_pull(page(vec![issue(1, "one")], None))
+        .await
+        .unwrap();
+    let item = by_key(&store, "PLAT-1").await;
+    store.set_pushes(Some("work-jira"));
+    store
+        .mutate(user_edit(
+            item.id,
+            ItemField::Title,
+            FieldValue::String("bad".into()),
+        ))
+        .await
+        .unwrap();
+    let rows = send(&store, item.id).await;
+    store
+        .record_push(
+            item.id,
+            "PLAT-1".into(),
+            rows,
+            todo_store::outbox::PushResult::Refused {
+                error: "refused (400)".into(),
+                jira: vec![(ItemField::Title, FieldValue::String("one".into()))],
+            },
+            ts(5_001),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outbox(&store, item.id).await[0].1, "failed");
+    // Read again by id next pass, should the read-back fail.
+    let tracked = store.tracked("work-jira".into()).await.unwrap();
+    assert!(tracked.iter().any(|t| t.id == item.id && t.stale));
+
+    // Sent, edited meanwhile, then refused: the new value waits for its own
+    // try, and no Suggestion is made for it.
+    store
+        .mutate(user_edit(
+            item.id,
+            ItemField::Title,
+            FieldValue::String("bad again".into()),
+        ))
+        .await
+        .unwrap();
+    let rows = send(&store, item.id).await;
+    store
+        .mutate(user_edit(
+            item.id,
+            ItemField::Title,
+            FieldValue::String("good".into()),
+        ))
+        .await
+        .unwrap();
+    store
+        .record_push(
+            item.id,
+            "PLAT-1".into(),
+            rows,
+            todo_store::outbox::PushResult::Refused {
+                error: "refused (400)".into(),
+                jira: vec![(ItemField::Title, FieldValue::String("one".into()))],
+            },
+            ts(5_002),
+        )
+        .await
+        .unwrap();
+    let rows = outbox(&store, item.id).await;
+    assert_eq!(rows.last().unwrap().1, "pending", "{rows:?}");
+    assert!(rows.last().unwrap().3.contains("good"));
+}
+
+#[tokio::test]
+async fn with_pushes_off_a_pull_shows_jiras_value_and_the_edit_waits() {
+    let (_dir, store) = open();
+    store
+        .apply_pull(page(vec![issue(1, "one")], None))
+        .await
+        .unwrap();
+    let item = by_key(&store, "PLAT-1").await;
+    store.set_pushes(Some("work-jira"));
+    store
+        .mutate(user_edit(
+            item.id,
+            ItemField::Title,
+            FieldValue::String("mine".into()),
+        ))
+        .await
+        .unwrap();
+    // The kill switch: read-only as M9, Jira's value shows.
+    store.set_pushes(None);
+    store
+        .apply_pull(page(vec![titled(1, "jira's", 300)], None))
+        .await
+        .unwrap();
+    let got = store.get_item(item.id, TODAY).await.unwrap().item;
+    assert_eq!(got.core.title, "jira's");
+    assert!(!got.derived.has_conflict);
+    assert_eq!(outbox(&store, item.id).await[0].1, "pending");
+}
+
+#[tokio::test]
+async fn a_retry_due_is_when_the_loop_wakes() {
+    let (_dir, store) = open();
+    store
+        .apply_pull(page(vec![issue(1, "one")], None))
+        .await
+        .unwrap();
+    let item = by_key(&store, "PLAT-1").await;
+    store.set_pushes(Some("work-jira"));
+    assert_eq!(store.next_push_at("work-jira".into()).await.unwrap(), None);
+    store
+        .mutate(user_edit(
+            item.id,
+            ItemField::Title,
+            FieldValue::String("mine".into()),
+        ))
+        .await
+        .unwrap();
+    let rows = send(&store, item.id).await;
+    store
+        .record_push(
+            item.id,
+            "PLAT-1".into(),
+            rows,
+            todo_store::outbox::PushResult::Retry {
+                at: ts(5_010),
+                error: "rate limited".into(),
+            },
+            ts(5_000),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.next_push_at("work-jira".into()).await.unwrap(),
+        Some(ts(5_010))
+    );
+}

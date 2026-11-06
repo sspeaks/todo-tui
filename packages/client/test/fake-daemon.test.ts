@@ -590,5 +590,11 @@ describe("FakeDaemon on a linked Item (read-only sync, ADR-0006)", () => {
     expect(refusal?.reason).toBe("NOT_MINE");
     const confirmed = await items.updateItem({ requestId: ulid(), item: { id: theirs.id, title: "x" }, updateMask: { paths: ["title"] }, confirmNotMine: true });
     expect(confirmed.item?.title).toBe("x");
+    // A repeat rule sets the due date, which pushes: the same guard.
+    const daily = { kind: { case: "daily" as const, value: {} } };
+    const [rule] = (await failure(items.setRecurrence({ requestId: ulid(), id: theirs.id, rule: daily })))?.findDetails(ErrorInfoSchema) ?? [];
+    expect(rule?.reason).toBe("NOT_MINE");
+    const repeated = await items.setRecurrence({ requestId: ulid(), id: theirs.id, rule: daily, confirmNotMine: true });
+    expect(repeated.item?.recurrence).toBeDefined();
   });
 });

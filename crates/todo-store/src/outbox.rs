@@ -1,7 +1,10 @@
 //! The outbox (design 5.6, ADR-0007): a person's edit of a pushed field of a
 //! linked Item, queued in the op's own transaction for the push worker.
 //! Each (Item, field) has at most one waiting row: a later edit replaces its
-//! `new`, keeps its `base`, and an edit back to the base cancels it.
+//! `new`, keeps its `base`, and an edit back to the base cancels it. While
+//! a row is in flight its `sent` is the value on its way to Jira, and an
+//! edit meanwhile changes `new` only: once Jira reads back at `sent`, the
+//! row's base moves there and `new` is pushed in turn.
 
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -45,12 +48,14 @@ pub(crate) fn enqueue(
         };
         let id = item_id.to_string();
         let field = change.field.number();
-        let waiting: Option<(String, String)> = conn
+        let waiting: Option<(String, String, Option<String>)> = conn
             .prepare_cached(
-                "SELECT id, base_json FROM outbox
+                "SELECT id, base_json, sent_json FROM outbox
                  WHERE item_id = ?1 AND field = ?2 AND state IN ('pending', 'in_flight')",
             )?
-            .query_row(params![id, field], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_row(params![id, field], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
             .optional()?;
         let new = codec::value_to_sql(&change.new)?;
         // Labels are a set (Jira keeps them sorted): a reorder is no change.
@@ -58,19 +63,20 @@ pub(crate) fn enqueue(
             continue;
         }
         match waiting {
-            // Back where Jira has it: nothing to push. One in flight is
-            // left to finish (its answer is read back by the next pull).
-            Some((row, base)) if same_value(&codec::value_from_sql(&base)?, &change.new) => {
+            // Back where Jira has it, and nothing on its way: nothing to push.
+            Some((row, base, None)) if same_value(&codec::value_from_sql(&base)?, &change.new) => {
                 conn.prepare_cached(
-                    "UPDATE outbox SET state = 'cancelled', updated_at = ?2
-                     WHERE id = ?1 AND state = 'pending'",
+                    "UPDATE outbox SET state = 'cancelled', updated_at = ?2 WHERE id = ?1",
                 )?
                 .execute(params![row, now])?;
             }
-            Some((row, _)) => {
+            // A later value. One in flight keeps what it sent: the read-back
+            // of that moves its base, and this is pushed next (even back to
+            // the old base).
+            Some((row, _, _)) => {
                 conn.prepare_cached(
-                    "UPDATE outbox SET new_json = ?2, op_id = ?3, state = 'pending',
-                            attempts = 0, next_attempt_at = NULL, last_error = NULL, updated_at = ?4
+                    "UPDATE outbox SET new_json = ?2, op_id = ?3, attempts = 0,
+                            next_attempt_at = NULL, last_error = NULL, updated_at = ?4
                      WHERE id = ?1",
                 )?
                 .execute(params![row, new, op_id, now])?;
@@ -152,39 +158,95 @@ pub(crate) fn pending_fields(conn: &Connection, item: todo_core::ItemId) -> Resu
 #[derive(Debug, Clone, PartialEq)]
 pub struct Waiting {
     pub id: String,
+    pub instance_id: String,
     pub field: ItemField,
     pub base: FieldValue,
     pub new: FieldValue,
+    /// In flight: the value sent.
+    pub sent: Option<FieldValue>,
 }
 
 /// What `item` has waiting (pending or in flight).
 pub(crate) fn waiting(conn: &Connection, item: todo_core::ItemId) -> Result<Vec<Waiting>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT id, field, base_json, new_json FROM outbox
+        "SELECT id, instance_id, field, base_json, new_json, sent_json FROM outbox
          WHERE item_id = ?1 AND state IN ('pending', 'in_flight') ORDER BY field",
     )?;
     let rows = stmt.query_map([item.to_string()], |r| {
         Ok((
             r.get::<_, String>(0)?,
-            r.get::<_, u32>(1)?,
-            r.get::<_, String>(2)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, u32>(2)?,
             r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, Option<String>>(5)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, field, base, new) = row?;
+        let (id, instance_id, field, base, new, sent) = row?;
         let Some(field) = ItemField::from_number(field) else {
             continue;
         };
         out.push(Waiting {
             id,
+            instance_id,
             field,
             base: codec::value_from_sql(&base)?,
             new: codec::value_from_sql(&new)?,
+            sent: sent.as_deref().map(codec::value_from_sql).transpose()?,
         });
     }
     Ok(out)
+}
+
+/// The rows the worker is about to send, each with the value it sends
+/// (`new`, or what Jira will read it back as: a priority Jira has no name
+/// of its own for). A row edited since it was read is left out: its new
+/// value goes on the next try. Returns the ids now in flight.
+pub(crate) fn begin(
+    conn: &Connection,
+    rows: &[(Waiting, FieldValue)],
+    at: Timestamp,
+) -> Result<Vec<String>> {
+    let now = ts_to_sql(at)?;
+    let mut begun = Vec::new();
+    for (w, send) in rows {
+        let send = codec::value_to_sql(send)?;
+        let n = conn
+            .prepare_cached(
+                "UPDATE outbox SET state = 'in_flight', sent_json = ?3, new_json = ?3, updated_at = ?4
+                 WHERE id = ?1 AND new_json = ?2 AND state IN ('pending', 'in_flight')",
+            )?
+            .execute(params![w.id, codec::value_to_sql(&w.new)?, send, now])?;
+        if n == 1 {
+            begun.push(w.id.clone());
+        }
+    }
+    Ok(begun)
+}
+
+/// The earliest a retry of `instance`'s outbox is due, if one waits.
+pub(crate) fn next_attempt(conn: &Connection, instance: &str) -> Result<Option<Timestamp>> {
+    let at: Option<i64> = conn
+        .prepare_cached(
+            "SELECT MIN(next_attempt_at) FROM outbox
+             WHERE instance_id = ?1 AND state IN ('pending', 'in_flight')",
+        )?
+        .query_row([instance], |r| r.get(0))?;
+    at.map(codec::ts_from_sql).transpose()
+}
+
+/// A row in flight whose push Jira took, while `new` moved on: Jira is at
+/// what was sent, so that is the base `new` is pushed from.
+fn rebase(conn: &Connection, w: &Waiting, at: Timestamp) -> Result<()> {
+    let base = w.sent.as_ref().unwrap_or(&w.base);
+    conn.prepare_cached(
+        "UPDATE outbox SET base_json = ?2, sent_json = NULL, state = 'pending', updated_at = ?3
+         WHERE id = ?1",
+    )?
+    .execute(params![w.id, codec::value_to_sql(base)?, ts_to_sql(at)?])?;
+    Ok(())
 }
 
 /// Ends a waiting row: `done` (Jira has it) or `cancelled` (Jira won).
@@ -203,7 +265,7 @@ pub(crate) fn conflict(
     field: ItemField,
     jira: &FieldValue,
     mine: &FieldValue,
-    key: &str,
+    rationale: &str,
     at: Timestamp,
 ) -> Result<String> {
     let now = ts_to_sql(at)?;
@@ -215,7 +277,7 @@ pub(crate) fn conflict(
     .execute(params![
         id,
         item.to_string(),
-        format!("Jira changed {} on {key} while yours waited to push", field_word(field)),
+        rationale,
         now
     ])?;
     conn.prepare_cached(
@@ -350,10 +412,16 @@ pub(crate) struct Settled {
 /// local value becomes a `sync_conflict` Suggestion. The status (category
 /// and resolution kind) is judged as one pair, as one transition sets it.
 /// Labels compare as sets: Jira keeps them sorted.
+///
+/// A row in flight is judged on what was sent: Jira at it means the push
+/// landed, and a later edit (`new` moved on) is pushed from there. Rows of
+/// an instance that does not push (`pushes`, the kill switch) are left
+/// waiting and the pull applies Jira's values: they go when it pushes again.
 pub(crate) fn settle_pull(
     conn: &Connection,
     item: &Item,
     issue: &todo_core::remote::RemoteIssue,
+    pushes: todo_core::Pushes,
     at: Timestamp,
 ) -> Result<Settled> {
     use todo_core::remote::RemoteIssue;
@@ -361,7 +429,10 @@ pub(crate) fn settle_pull(
         issue: issue.clone(),
         suggested: Vec::new(),
     };
-    let rows = waiting(conn, item.id)?;
+    let rows: Vec<Waiting> = waiting(conn, item.id)?
+        .into_iter()
+        .filter(|w| pushes == todo_core::Pushes::instance(&w.instance_id))
+        .collect();
     if rows.is_empty() {
         return Ok(out);
     }
@@ -418,17 +489,40 @@ pub(crate) fn settle_pull(
             .iter()
             .map(|&f| value(find(f), f, |w| &w.new))
             .collect();
+        // What Jira has once the push lands: what was sent, while in flight.
+        let landed: Vec<FieldValue> = fields
+            .iter()
+            .map(|&f| value(find(f), f, |w| w.sent.as_ref().unwrap_or(&w.new)))
+            .collect();
+        let moved_on = unit
+            .iter()
+            .any(|w| w.sent.as_ref().is_some_and(|s| !same(s, &w.new)));
         let jira: Vec<FieldValue> = fields
             .iter()
             .map(|&f| jira_of(issue, f).unwrap_or(FieldValue::Cleared))
             .collect();
         let all = |a: &[FieldValue], b: &[FieldValue]| a.iter().zip(b).all(|(x, y)| same(x, y));
-        if all(&jira, &base) {
+        if all(&jira, &base) && all(&new, &base) {
+            // Edited back to where Jira is (after an edit that was sent):
+            // nothing left to push.
+            for w in &unit {
+                settle(conn, &w.id, "done", at)?;
+            }
+        } else if all(&jira, &landed) && moved_on {
+            // The push landed and the person edited again meanwhile: that
+            // goes next, from where Jira is now.
+            for w in &unit {
+                rebase(conn, w, at)?;
+            }
+            for (f, v) in fields.iter().zip(&new) {
+                put(&mut out.issue, *f, v);
+            }
+        } else if all(&jira, &base) {
             // Still waiting: the local value stands over the pull.
             for (f, v) in fields.iter().zip(&new) {
                 put(&mut out.issue, *f, v);
             }
-        } else if all(&jira, &new) {
+        } else if all(&jira, &landed) {
             for w in &unit {
                 settle(conn, &w.id, "done", at)?;
             }
@@ -439,8 +533,12 @@ pub(crate) fn settle_pull(
             // One Suggestion per unit; the status's carries the category,
             // with the resolution kind when the edit set one.
             let field = fields[0];
+            let why = format!(
+                "Jira changed {} on {key} while yours waited to push",
+                field_word(field)
+            );
             out.suggested
-                .push(conflict(conn, item.id, field, &jira[0], &new[0], &key, at)?);
+                .push(conflict(conn, item.id, field, &jira[0], &new[0], &why, at)?);
             if fields.len() == 2 && !same(&jira[1], &new[1]) {
                 add_patch(
                     conn,
@@ -551,24 +649,23 @@ pub(crate) fn due(
 /// What a push of one Item's rows came to.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PushResult {
-    /// Jira took it: the rows wait for the pull that reads it back (the
-    /// worker applies the fresh issue at once).
+    /// Jira took it: the rows wait in flight for the read-back that
+    /// settles them (the worker reads the issue again at once).
     Sent,
-    /// Not now (offline, 5xx, 429): try again at `at`.
+    /// Not now (offline, 5xx, 429): try again at `at`, reading first.
     Retry { at: Timestamp, error: String },
-    /// Jira refused it: the rows fail, the local values go back to Jira's
-    /// (`jira`, field by field), and a push_failed Suggestion offers yours.
+    /// Jira refused it: the rows fail, and a push_failed Suggestion offers
+    /// yours again over Jira's values (`jira`, field by field). A row
+    /// edited since it was sent waits for its own try instead.
     Refused {
         error: String,
         jira: Vec<(ItemField, FieldValue)>,
     },
 }
 
-/// Records `result` for the `rows` (by id) of `item`, sent at `at`.
-/// Refused: the rows fail, a `push_failed` Suggestion keeps each local
-/// value (expected_old Jira's), and the Item's fields take Jira's values,
-/// returned for the caller to write as a sync op. Returns the Suggestion's
-/// id, if one was made.
+/// Records `result` for the `rows` of `item` the worker sent (in flight,
+/// [`begin`]), at `at`. Returns the push_failed Suggestion's id, if one
+/// was made.
 pub(crate) fn record_result(
     conn: &Connection,
     item: todo_core::ItemId,
@@ -582,9 +679,9 @@ pub(crate) fn record_result(
         PushResult::Sent => {
             for w in rows {
                 conn.prepare_cached(
-                    "UPDATE outbox SET state = 'in_flight', attempts = attempts + 1,
-                            next_attempt_at = NULL, last_error = NULL, updated_at = ?2
-                     WHERE id = ?1 AND state IN ('pending', 'in_flight')",
+                    "UPDATE outbox SET attempts = attempts + 1, next_attempt_at = NULL,
+                            last_error = NULL, updated_at = ?2
+                     WHERE id = ?1 AND state = 'in_flight'",
                 )?
                 .execute(params![w.id, now])?;
             }
@@ -602,16 +699,40 @@ pub(crate) fn record_result(
             Ok(None)
         }
         PushResult::Refused { error, jira } => {
+            let mut failed = Vec::new();
             for w in rows {
-                conn.prepare_cached(
-                    "UPDATE outbox SET state = 'failed', attempts = attempts + 1, last_error = ?2,
-                            updated_at = ?3
-                     WHERE id = ?1 AND state IN ('pending', 'in_flight')",
-                )?
-                .execute(params![w.id, error, now])?;
+                // Edited again since it was sent: the new value is not what
+                // Jira refused, so it waits for its own try.
+                let n = conn
+                    .prepare_cached(
+                        "UPDATE outbox SET state = 'pending', sent_json = NULL, updated_at = ?2
+                         WHERE id = ?1 AND state = 'in_flight' AND new_json != sent_json",
+                    )?
+                    .execute(params![w.id, now])?;
+                if n == 1 {
+                    continue;
+                }
+                let n = conn
+                    .prepare_cached(
+                        "UPDATE outbox SET state = 'failed', attempts = attempts + 1, last_error = ?2,
+                                updated_at = ?3
+                         WHERE id = ?1 AND state IN ('pending', 'in_flight')",
+                    )?
+                    .execute(params![w.id, error, now])?;
+                if n == 1 {
+                    failed.push(w);
+                }
             }
+            let Some(first) = failed.first() else {
+                return Ok(None);
+            };
+            // Jira's values go back on the Item with the read-back that
+            // follows; should that fail, the next pass reads it by id.
+            conn.prepare_cached(
+                "UPDATE items SET remote_last_pulled_version = NULL WHERE id = ?1",
+            )?
+            .execute([item.to_string()])?;
             let id = new_ulid().to_string();
-            let what = rows.first().map_or("a change", |w| field_word(w.field));
             conn.prepare_cached(
                 "INSERT INTO suggestions (id, item_id, kind, source, rationale, error, state,
                                           created_at, updated_at)
@@ -620,11 +741,11 @@ pub(crate) fn record_result(
             .execute(params![
                 id,
                 item.to_string(),
-                format!("Jira refused {what} on {key}"),
+                format!("Jira refused {} on {key}", field_word(first.field)),
                 error,
                 now
             ])?;
-            for w in rows {
+            for w in failed {
                 let old = jira
                     .iter()
                     .find(|(f, _)| *f == w.field)

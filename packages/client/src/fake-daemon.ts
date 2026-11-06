@@ -577,7 +577,7 @@ export class FakeDaemon {
           return { ...rest, generated: generated[0] };
         },
         setRecurrence: (req) =>
-          this.single("SetRecurrence", OpKind.SET_RECURRENCE, req.requestId, () => planSetRecurrence(req, "", this.today())),
+          this.single("SetRecurrence", OpKind.SET_RECURRENCE, req.requestId, () => ({ ...planSetRecurrence(req, "", this.today()), confirmNotMine: req.confirmNotMine })),
         parseRecurrence: (req) => {
           this.check();
           return this.parseRecurrence(req);

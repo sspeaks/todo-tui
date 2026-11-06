@@ -474,6 +474,9 @@ message SetRecurrenceRequest {
   // Unset clears the rule.
   RecurrenceRule rule = 3;
   optional uint64 expected_revision = 4;
+  // As UpdateItemRequest's (design 5.9): a rule sets the due date, which
+  // pushes.
+  bool confirm_not_mine = 5;
 }
 
 message SetRecurrenceResponse {
