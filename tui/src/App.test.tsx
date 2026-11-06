@@ -334,7 +334,9 @@ describe("sizes", () => {
     expect(t.frame()).not.toContain("row 1");
     t.resize(120, 40);
     await t.waitFrame((f) => expect(f).toMatch(/row 1 .*│/));
-    expect(t.ui.getState().overlay.kind).toBe("none");
+    // The frame follows the window at once; the controller hears of the
+    // size in an effect after it, and closes the overlay then.
+    await vi.waitFor(() => expect(t.ui.getState().overlay.kind).toBe("none"));
     expect(t.selectedLine()).toMatch(/› ○ {5}row 0/);
     // Shrinking the rows keeps the selection in view.
     await t.press("j".repeat(30));
