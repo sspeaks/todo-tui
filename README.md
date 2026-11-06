@@ -756,9 +756,15 @@ can use it: the phone, and each laptop's `todo`, TUI and Claude Code tools
             enable = true;
             tailscaleServe = true;    # https://box.<tailnet>.ts.net
             settings.backup.retain_days = 30;
-            # Jira: credential = "env:TODO_JIRA_PAT" in settings.instances,
-            # the token in this file (never in settings: it is the Nix store).
-            # environmentFile = "/run/secrets/todo-tui.env";
+            # Jira, its token from sops-nix (or agenix): handed to the
+            # daemon as a systemd credential, never put in the Nix store.
+            credentials.jira = config.sops.secrets.jira-pat.path;
+            settings.instances = [{
+              id = "work-jira";
+              kind = "jira-dc";
+              base_url = "https://jira.example.com";
+              credential = "systemd:jira";
+            }];
           };
         }
       ];
@@ -766,6 +772,12 @@ can use it: the phone, and each laptop's `todo`, TUI and Claude Code tools
   };
 }
 ```
+
+`sops.secrets.jira-pat = { };` with sops-nix's defaults (root, 0400) is enough:
+the module passes it with `LoadCredential=`, so the secret needs no owner change.
+Add `restartUnits = [ "todo-tui.service" ];` to it to pick up a rotated token.
+`credential = "systemd:NAME"` works for any secret `credentials` names;
+`environmentFile` (with `env:NAME`) is there for the rest.
 
 It runs as its own `todo-tui` user with `/var/lib/todo-tui` as its home, the
 listener on `127.0.0.1:7743` and `tailscale serve` in front of it (tailnet HTTPS

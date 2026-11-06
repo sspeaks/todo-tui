@@ -18,7 +18,13 @@ pub enum CredentialRef {
     /// An environment variable (`env:TODO_JIRA_PAT`).
     Env(String),
     /// A file of mode 0600 or tighter (`file:~/.config/todo-tui/jira.token`).
+    /// A symlink is followed, and the mode checked is its target's (a
+    /// sops-nix or agenix secret is a link into /run).
     File(PathBuf),
+    /// A systemd credential (`systemd:jira`): `$CREDENTIALS_DIRECTORY/jira`,
+    /// which `LoadCredential=` gives the service, readable by it alone, from
+    /// a secret owned by root (sops-nix, agenix).
+    Systemd(String),
 }
 
 impl fmt::Debug for CredentialRef {
@@ -40,17 +46,18 @@ impl fmt::Display for CredentialRef {
             } => write!(f, "keychain:{service}"),
             CredentialRef::Env(name) => write!(f, "env:{name}"),
             CredentialRef::File(path) => write!(f, "file:{}", path.display()),
+            CredentialRef::Systemd(name) => write!(f, "systemd:{name}"),
         }
     }
 }
 
 impl CredentialRef {
-    /// Reads `keychain:service[/account]`, `env:NAME` or `file:PATH` (`~/`
-    /// for `home`).
+    /// Reads `keychain:service[/account]`, `env:NAME`, `file:PATH` (`~/`
+    /// for `home`) or `systemd:NAME`.
     pub fn parse(text: &str, home: Option<&Path>) -> Result<Self, String> {
         let (scheme, rest) = text
             .split_once(':')
-            .ok_or_else(|| "must be keychain:…, env:… or file:…".to_owned())?;
+            .ok_or_else(|| "must be keychain:…, env:…, file:… or systemd:…".to_owned())?;
         let rest = rest.trim();
         if rest.is_empty() {
             return Err(format!("{scheme}: needs a name after the colon"));
@@ -85,7 +92,22 @@ impl CredentialRef {
                 }
                 Ok(CredentialRef::File(path))
             }
-            other => Err(format!("{other}: must be keychain:…, env:… or file:…")),
+            "systemd" => {
+                if !rest.is_empty()
+                    && rest
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+                    && rest != "."
+                    && rest != ".."
+                {
+                    Ok(CredentialRef::Systemd(rest.to_owned()))
+                } else {
+                    Err("systemd: a credential name is letters, digits, _ - and .".to_owned())
+                }
+            }
+            other => Err(format!(
+                "{other}: must be keychain:…, env:…, file:… or systemd:…"
+            )),
         }
     }
 }
@@ -128,6 +150,11 @@ pub trait Secrets {
     /// The keychain's generic password, `None` when there is none.
     fn keychain(&self, service: &str, account: Option<&str>) -> Result<Option<String>, String>;
     fn env(&self, name: &str) -> Option<String>;
+    /// `$CREDENTIALS_DIRECTORY`, set by systemd for a service with
+    /// `LoadCredential=`.
+    fn credentials_dir(&self) -> Option<PathBuf> {
+        self.env("CREDENTIALS_DIRECTORY").map(PathBuf::from)
+    }
 }
 
 /// The real ones: `security` on macOS, the process environment.
@@ -169,17 +196,16 @@ pub fn resolve(r: &CredentialRef, secrets: &dyn Secrets) -> Result<Credential, C
         CredentialRef::Env(name) => secrets
             .env(name)
             .ok_or_else(|| CredentialError::NotFound(at.clone()))?,
-        CredentialRef::File(path) => {
-            let meta = std::fs::metadata(path).map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => CredentialError::NotFound(at.clone()),
-                _ => CredentialError::Unreadable(at.clone(), e.to_string()),
+        CredentialRef::File(path) => read_private(path, &at)?,
+        CredentialRef::Systemd(name) => {
+            let dir = secrets.credentials_dir().ok_or_else(|| {
+                CredentialError::Unreadable(
+                    at.clone(),
+                    "no $CREDENTIALS_DIRECTORY: not a systemd service with LoadCredential="
+                        .to_owned(),
+                )
             })?;
-            let mode = meta.permissions().mode() & 0o777;
-            if mode & 0o077 != 0 {
-                return Err(CredentialError::TooOpen(at, mode));
-            }
-            std::fs::read_to_string(path)
-                .map_err(|e| CredentialError::Unreadable(at.clone(), e.to_string()))?
+            read_private(&dir.join(name), &at)?
         }
     };
     let secret = raw.trim();
@@ -187,6 +213,21 @@ pub fn resolve(r: &CredentialRef, secrets: &dyn Secrets) -> Result<Credential, C
         return Err(CredentialError::Empty(at));
     }
     Ok(Credential::new(secret))
+}
+
+/// A secret file only its owner can read (0600, 0400): following links,
+/// so the mode is the secret's own.
+fn read_private(path: &Path, at: &str) -> Result<String, CredentialError> {
+    let meta = std::fs::metadata(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => CredentialError::NotFound(at.to_owned()),
+        _ => CredentialError::Unreadable(at.to_owned(), e.to_string()),
+    })?;
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(CredentialError::TooOpen(at.to_owned(), mode));
+    }
+    std::fs::read_to_string(path)
+        .map_err(|e| CredentialError::Unreadable(at.to_owned(), e.to_string()))
 }
 
 #[cfg(test)]
@@ -308,5 +349,79 @@ mod tests {
     #[test]
     fn debug_never_shows_the_secret() {
         assert_eq!(format!("{:?}", Credential::new("hunter2")), "Credential(…)");
+    }
+}
+
+#[cfg(test)]
+mod systemd_tests {
+    use std::collections::HashMap;
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    struct Dir(PathBuf);
+
+    impl Secrets for Dir {
+        fn keychain(&self, _: &str, _: Option<&str>) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+        fn env(&self, name: &str) -> Option<String> {
+            HashMap::from([("CREDENTIALS_DIRECTORY", self.0.display().to_string())])
+                .get(name)
+                .cloned()
+        }
+    }
+
+    #[test]
+    fn a_systemd_credential_and_a_sops_style_link_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        // LoadCredential= puts the secret here, 0400, the service's own.
+        let creds = dir.path().join("credentials");
+        std::fs::create_dir(&creds).unwrap();
+        std::fs::write(creds.join("jira"), "pat-from-sops\n").unwrap();
+        std::fs::set_permissions(creds.join("jira"), std::fs::Permissions::from_mode(0o400))
+            .unwrap();
+        let secrets = Dir(creds.clone());
+        assert_eq!(
+            CredentialRef::parse("systemd:jira", None),
+            Ok(CredentialRef::Systemd("jira".into()))
+        );
+        assert!(CredentialRef::parse("systemd:../x", None).is_err());
+        assert_eq!(
+            resolve(&CredentialRef::Systemd("jira".into()), &secrets)
+                .unwrap()
+                .expose(),
+            "pat-from-sops"
+        );
+        assert_eq!(
+            resolve(&CredentialRef::Systemd("nope".into()), &secrets),
+            Err(CredentialError::NotFound("systemd:nope".into()))
+        );
+        // Not a service: says so.
+        assert!(matches!(
+            resolve(&CredentialRef::Systemd("jira".into()), &SystemSecretsWithout),
+            Err(CredentialError::Unreadable(_, why)) if why.contains("CREDENTIALS_DIRECTORY")
+        ));
+        // file: through a symlink (sops-nix's /run/secrets/x -> /run/secrets.d/1/x):
+        // the target's mode counts.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(creds.join("jira"), &link).unwrap();
+        assert_eq!(
+            resolve(&CredentialRef::File(link), &secrets)
+                .unwrap()
+                .expose(),
+            "pat-from-sops"
+        );
+    }
+
+    struct SystemSecretsWithout;
+
+    impl Secrets for SystemSecretsWithout {
+        fn keychain(&self, _: &str, _: Option<&str>) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+        fn env(&self, _: &str) -> Option<String> {
+            None
+        }
     }
 }

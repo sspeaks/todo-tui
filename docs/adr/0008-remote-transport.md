@@ -56,7 +56,10 @@ over Tailscale.
   to loopback (a test, an SSH tunnel).
 - **Hosting.** `nixosModules.default` (`nix/module.nix`) runs the daemon as a
   system service: its own user, `/var/lib/todo-tui` as its home, `settings` as
-  its `config.toml`, secrets from an `environmentFile`, the listener on
+  its `config.toml`, secrets as systemd credentials (`credentials.jira =
+  config.sops.secrets.jira-pat.path`, read as `credential = "systemd:jira"`:
+  `LoadCredential=` copies a root-owned sops-nix or agenix secret for the
+  service alone, so it needs no owner change) or an `environmentFile`, the listener on
   loopback and, with `tailscaleServe`, `tailscale serve` in front of it.
   `todo-tui-admin` runs the CLI as that user on that home (`remote pair`). A VM
   test (`checks.<linux>.module`) exercises it.

@@ -365,7 +365,7 @@ impl<'a> Reader<'a> {
                 "credential" => match text.map(|s| CredentialRef::parse(s, home.as_deref())) {
                     Some(Ok(r)) => credential = Some(r),
                     Some(Err(why)) => self.warn(at, why),
-                    None => self.warn(at, "must be keychain:…, env:… or file:…"),
+                    None => self.warn(at, "must be keychain:…, env:…, file:… or systemd:…"),
                 },
                 _ => self.warn(at, "unknown key; ignored"),
             }
@@ -549,7 +549,7 @@ impl<'a> Reader<'a> {
                     }
                     None => {
                         ok = false;
-                        self.warn(path, "must be keychain:…, env:… or file:…");
+                        self.warn(path, "must be keychain:…, env:…, file:… or systemd:…");
                     }
                 },
                 "scopes" => match self.scopes(&path, value) {
@@ -1045,7 +1045,7 @@ mod tests {
                 "instances[0].id: must be a name of letters, digits, - and _, e.g. \"work-jira\"",
                 "instances[0].kind: must be \"jira-dc\" (Jira Data Center); Jira Cloud is not built yet",
                 "instances[0].base_url: must be an https:// address, e.g. \"https://jira.example.com\" (http:// only to this machine)",
-                "instances[0].credential: vault: must be keychain:…, env:… or file:…",
+                "instances[0].credential: vault: must be keychain:…, env:…, file:… or systemd:…",
                 "instances[0].email: not used until pushes and promote arrive",
                 "instances[0]: skipped: it does not sync until the errors above are fixed",
             ]

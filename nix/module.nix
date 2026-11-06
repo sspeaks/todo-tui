@@ -12,6 +12,15 @@
 # Then pair each device on the server: `sudo todo-tui-admin remote pair
 # --name laptop` (the app scans its QR code; a laptop puts the token in
 # its keychain and `[client] remote` in its config).
+#
+# Secrets (a Jira token) come from sops-nix, agenix or any root-owned file
+# through systemd credentials, never the Nix store:
+#
+#   sops.secrets.jira-pat = { };            # root:root 0400, the default
+#   services.todo-tui = {
+#     credentials.jira = config.sops.secrets.jira-pat.path;
+#     settings.instances = [{ ...; credential = "systemd:jira"; }];
+#   };
 self:
 {
   config,
@@ -95,13 +104,27 @@ in
       '';
     };
 
+    credentials = lib.mkOption {
+      type = lib.types.attrsOf lib.types.str;
+      default = { };
+      example = lib.literalExpression ''{ jira = config.sops.secrets.jira-pat.path; }'';
+      description = ''
+        Secrets the daemon reads as `systemd:NAME` in `settings`, by name:
+        each a path to a file (a sops-nix or agenix secret, owned by root,
+        mode 0400), passed with systemd's `LoadCredential=`, so the service
+        reads its own copy and the file needs no change of owner. Read at
+        start; a changed secret takes a restart (sops-nix's `restartUnits`).
+      '';
+    };
+
     environmentFile = lib.mkOption {
       type = lib.types.nullOr lib.types.path;
       default = null;
       example = "/run/secrets/todo-tui.env";
       description = ''
         A file of `NAME=value` lines for the daemon's environment, read at
-        start: the secrets `settings` names with `env:NAME` (a Jira token).
+        start: the secrets `settings` names with `env:NAME`. Prefer
+        `credentials`, which keeps a secret out of the environment.
       '';
     };
 
@@ -124,6 +147,12 @@ in
 
   config = lib.mkIf cfg.enable {
     assertions = [
+      {
+        assertion = lib.all (n: builtins.match "[A-Za-z0-9_.-]+" n != null && n != "." && n != "..") (
+          lib.attrNames cfg.credentials
+        );
+        message = "services.todo-tui.credentials: a name is letters, digits, _ - and .";
+      }
       {
         assertion = !cfg.tailscaleServe || config.services.tailscale.enable;
         message = "services.todo-tui.tailscaleServe needs services.tailscale.enable";
@@ -164,6 +193,7 @@ in
         User = cfg.user;
         Group = cfg.group;
         EnvironmentFile = lib.mkIf (cfg.environmentFile != null) cfg.environmentFile;
+        LoadCredential = lib.mapAttrsToList (name: path: "${name}:${path}") cfg.credentials;
         Restart = "on-failure";
         RestartSec = 5;
         UMask = "0077";
