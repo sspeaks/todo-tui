@@ -10,7 +10,7 @@ use todo_core::{Revision, Topic};
 use todo_proto::convert::EnumField;
 use todo_proto::v1::watch_service_server::WatchService;
 use todo_proto::v1::{
-    self, CaughtUp, ResyncRequired, SubscribeRequest, SubscribeResponse, change,
+    self, CaughtUp, Heartbeat, ResyncRequired, SubscribeRequest, SubscribeResponse, change,
     subscribe_response::Message,
 };
 use todo_store::{ChangeRow, ChangesSinceError, Resource, Store};
@@ -20,6 +20,11 @@ use tonic::{Request, Response, Status};
 use super::Ctx;
 use crate::config::ConfigHandle;
 use crate::error;
+
+/// How often a quiet stream gets a Heartbeat: well inside the 5 minutes
+/// a fetch body may sit idle in Node, so the remote listener's streams are
+/// not dropped for quiet, and their clients notice one that died.
+pub(crate) const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(25);
 
 pub(crate) struct Watch(pub(crate) Ctx);
 
@@ -46,6 +51,7 @@ impl WatchService for Watch {
         let config = self.0.config.clone();
         let mut sync = self.0.sync_status.clone();
         let mut shutdown = self.0.shutdown.signal();
+        let every = self.0.heartbeat;
         let stream = async_stream::stream! {
             let mut live = store.subscribe();
             let mut last = match req.since_revision {
@@ -79,9 +85,15 @@ impl WatchService for Watch {
                 yield Ok(sync_notice(status.clone()));
             }
             let mut sync_closed = false;
+            let mut beat = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+            beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             loop {
                 let next = tokio::select! {
+                    _ = beat.tick() => {
+                        yield Ok(message(Message::Heartbeat(Heartbeat {})));
+                        continue;
+                    }
                     next = live.recv() => next,
                     changed = sync.changed(), if !sync_closed => {
                         if changed.is_err() {
@@ -227,6 +239,43 @@ mod tests {
         }
     }
 
+    fn ctx(store: &Store, heartbeat: std::time::Duration) -> Ctx {
+        Ctx {
+            store: store.clone(),
+            clients: Clients::default(),
+            shutdown: ShutdownHandle::new(),
+            wake: Wake::default(),
+            config: ConfigHandle::new(Config::defaults("/c/config.toml".into())),
+            backups: "/c/backups".into(),
+            sync_status: crate::sync::status_channel().1,
+            sync_now: crate::sync::SyncNow::default(),
+            heartbeat,
+        }
+    }
+
+    /// A quiet stream gets a Heartbeat every interval, and a change still
+    /// comes through between them.
+    #[tokio::test]
+    async fn a_quiet_stream_gets_heartbeats() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("todo.db")).unwrap();
+        let every = std::time::Duration::from_millis(200);
+        let watch = Watch(ctx(&store, every));
+        let mut stream = watch
+            .subscribe(Request::new(SubscribeRequest::default()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(matches!(next(&mut stream).await, Message::CaughtUp(_)));
+        let start = std::time::Instant::now();
+        assert!(matches!(next(&mut stream).await, Message::Heartbeat(_)));
+        assert!(start.elapsed() >= every);
+        capture(&store, 1).await;
+        assert!(matches!(next(&mut stream).await, Message::Change(_)));
+        assert!(matches!(next(&mut stream).await, Message::Heartbeat(_)));
+        assert!(start.elapsed() >= every * 2);
+    }
+
     async fn next(stream: &mut SubscribeStream) -> Message {
         stream.next().await.unwrap().unwrap().message.unwrap()
     }
@@ -238,16 +287,7 @@ mod tests {
         const N: u64 = 3000;
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("todo.db")).unwrap();
-        let watch = Watch(Ctx {
-            store: store.clone(),
-            clients: Clients::default(),
-            shutdown: ShutdownHandle::new(),
-            wake: Wake::default(),
-            config: ConfigHandle::new(Config::defaults("/c/config.toml".into())),
-            backups: "/c/backups".into(),
-            sync_status: crate::sync::status_channel().1,
-            sync_now: crate::sync::SyncNow::default(),
-        });
+        let watch = Watch(ctx(&store, HEARTBEAT));
         let mut stream = watch
             .subscribe(Request::new(SubscribeRequest::default()))
             .await
@@ -274,16 +314,7 @@ mod tests {
     async fn view_changes_stream_and_replay_with_the_view() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("todo.db")).unwrap();
-        let watch = Watch(Ctx {
-            store: store.clone(),
-            clients: Clients::default(),
-            shutdown: ShutdownHandle::new(),
-            wake: Wake::default(),
-            config: ConfigHandle::new(Config::defaults("/c/config.toml".into())),
-            backups: "/c/backups".into(),
-            sync_status: crate::sync::status_channel().1,
-            sync_now: crate::sync::SyncNow::default(),
-        });
+        let watch = Watch(ctx(&store, HEARTBEAT));
         let subscribe = async |since_revision| {
             let req = SubscribeRequest {
                 since_revision,

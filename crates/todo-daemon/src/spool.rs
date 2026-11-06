@@ -69,19 +69,45 @@ impl SpoolEntry {
 /// with `TimedOut`). Creates the data directory (mode 0700) and the spool
 /// (mode 0600) as needed.
 pub fn append(paths: &Paths, entry: &SpoolEntry) -> io::Result<()> {
-    append_within(paths, entry, LOCK_WAIT)
+    append_within(paths, &paths.spool(), entry, LOCK_WAIT)
 }
 
-/// [`append`], waiting at most `wait` for the lock.
-fn append_within(paths: &Paths, entry: &SpoolEntry, wait: Duration) -> io::Result<()> {
+/// [`append`] to the spool for a daemon elsewhere ([`Paths::remote_spool`]).
+pub fn append_remote(paths: &Paths, entry: &SpoolEntry) -> io::Result<()> {
+    append_within(paths, &paths.remote_spool(), entry, LOCK_WAIT)
+}
+
+/// [`append`] to `spool`, waiting at most `wait` for the lock.
+fn append_within(
+    paths: &Paths,
+    spool: &Path,
+    entry: &SpoolEntry,
+    wait: Duration,
+) -> io::Result<()> {
     let mut line = serde_json::to_vec(entry)?;
     line.push(b'\n');
     DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(&paths.data)?;
-    let mut file = open_append(&paths.spool())?;
-    lock_within(&file, wait)?;
+    // A drain renames a new spool over the one it locked: once the lock is
+    // ours, the file must still be the one at the path.
+    let deadline = Instant::now() + wait;
+    let mut file = loop {
+        let file = open_append(spool)?;
+        lock_within(&file, deadline.saturating_duration_since(Instant::now())).map_err(
+            |e| match e.kind() {
+                io::ErrorKind::TimedOut => io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("the spool is still locked after {wait:?}"),
+                ),
+                _ => e,
+            },
+        )?;
+        if same_file(&file, spool)? {
+            break file;
+        }
+    };
     // A writer that died mid-line left it torn: end it first, or this entry
     // would join it and be rejected with it.
     if !ends_a_line(&file)? {
@@ -110,6 +136,17 @@ fn lock_within(file: &File, wait: Duration) -> io::Result<()> {
             }
             Err(TryLockError::Error(e)) => return Err(e),
         }
+    }
+}
+
+/// Whether `file` is the one at `path` now.
+fn same_file(file: &File, path: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+    let held = file.metadata()?;
+    match std::fs::metadata(path) {
+        Ok(now) => Ok(now.dev() == held.dev() && now.ino() == held.ino()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
@@ -435,6 +472,82 @@ mod tests {
         assert_eq!(line, over);
     }
 
+    #[tokio::test]
+    async fn a_drain_keeps_from_the_first_undelivered_and_only_the_remote_spool() {
+        let (_home, paths, store) = setup();
+        let texts = ["sent", "bad", "later", "after"];
+        for text in texts {
+            append_remote(&paths, &SpoolEntry::now(new_ulid(), text)).unwrap();
+        }
+        // A local daemon's import never sees the remote spool.
+        append(&paths, &SpoolEntry::now(new_ulid(), "local")).unwrap();
+        import(&paths, &store).await.unwrap();
+        assert_eq!(
+            titles(&store).await.into_keys().collect::<Vec<_>>(),
+            ["local"]
+        );
+
+        // Nothing went: the spool is untouched.
+        let before = std::fs::read(paths.remote_spool()).unwrap();
+        let sent = drain_with(&paths, |_| async { Drained::Later })
+            .await
+            .unwrap();
+        assert_eq!(sent, 0);
+        assert_eq!(std::fs::read(paths.remote_spool()).unwrap(), before);
+
+        let sent = drain_with(&paths, |e| async move {
+            match e.text.as_str() {
+                "sent" | "after" => Drained::Sent,
+                "bad" => Drained::Refused,
+                _ => Drained::Later,
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(sent, 1);
+        let kept: Vec<String> = std::fs::read_to_string(paths.remote_spool())
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<SpoolEntry>(l).unwrap().text)
+            .collect();
+        // "after" was not offered: it waits behind "later".
+        assert_eq!(kept, ["later", "after"]);
+        assert!(
+            std::fs::read_to_string(paths.spool_rejected())
+                .unwrap()
+                .contains("\"bad\"")
+        );
+        assert_eq!(mode(&paths.remote_spool()), 0o600);
+        assert!(!paths.remote_spool().with_extension("jsonl.tmp").exists());
+
+        // An append that waited on the lock while a drain renamed the spool
+        // lands in the new one.
+        let lock = File::open(paths.remote_spool()).unwrap();
+        lock.lock().unwrap();
+        let appender = {
+            let paths = paths.clone();
+            std::thread::spawn(move || {
+                append_remote(&paths, &SpoolEntry::now(new_ulid(), "racing"))
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        let tmp = paths.remote_spool().with_extension("jsonl.tmp");
+        std::fs::write(&tmp, "").unwrap();
+        std::fs::rename(&tmp, paths.remote_spool()).unwrap();
+        lock.unlock().unwrap();
+        appender.join().unwrap().unwrap();
+        assert!(
+            std::fs::read_to_string(paths.remote_spool())
+                .unwrap()
+                .contains("racing")
+        );
+    }
+
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
     #[test]
     fn an_append_gives_up_on_a_lock_held_too_long() {
         let home = tempfile::tempdir().unwrap();
@@ -447,7 +560,7 @@ mod tests {
         let wait = Duration::from_millis(200);
         let start = Instant::now();
         let entry = SpoolEntry::now(new_ulid(), "second");
-        let err = append_within(&paths, &entry, wait).unwrap_err();
+        let err = append_within(&paths, &paths.spool(), &entry, wait).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert_eq!(err.to_string(), "the spool is still locked after 200ms");
         assert!(start.elapsed() >= wait, "{:?}", start.elapsed());
@@ -458,7 +571,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
             holder.unlock().unwrap();
         });
-        append_within(&paths, &entry, Duration::from_secs(10)).unwrap();
+        append_within(&paths, &paths.spool(), &entry, Duration::from_secs(10)).unwrap();
         release.join().unwrap();
         let content = std::fs::read_to_string(paths.spool()).unwrap();
         assert_eq!(content.lines().count(), 2);
@@ -581,21 +694,28 @@ pub enum Drained {
     Later,
 }
 
-/// Hands every entry to `send`, which captures it elsewhere (a remote
-/// daemon, ADR-0008), holding the spool's lock. An entry sent is dropped,
-/// one refused goes to `spool.rejected.jsonl`, and at the first that could
-/// not be delivered the rest are kept in order for the next try. A line
-/// that is not an entry is rejected, as an import would. Returns how many
-/// were sent.
+/// Hands every entry in [`Paths::remote_spool`] to `send`, which captures
+/// it elsewhere (a remote daemon, ADR-0008), holding the spool's lock. An
+/// entry sent is dropped, one refused goes to `spool.rejected.jsonl`, and
+/// at the first that could not be delivered the rest are kept in order for
+/// the next try. A line that is not an entry is rejected, as an import
+/// would. Returns how many were sent.
+///
+/// The kept entries are written beside the spool, synced and renamed over
+/// it, so a failure on the way (a full disk) leaves the spool as it was:
+/// the entries sent meanwhile are sent again, with their spool ids, which
+/// the daemon takes as already captured.
 pub async fn drain_with<F, Fut>(paths: &Paths, mut send: F) -> anyhow::Result<usize>
 where
     F: FnMut(SpoolEntry) -> Fut,
     Fut: std::future::Future<Output = Drained>,
 {
-    let spool = paths.spool();
-    let read = tokio::task::spawn_blocking(move || lock_and_read(&spool)).await?;
-    let Some((file, content)) =
-        read.with_context(|| format!("reading {}", paths.spool().display()))?
+    let spool = paths.remote_spool();
+    let read = {
+        let spool = spool.clone();
+        tokio::task::spawn_blocking(move || lock_and_read(&spool)).await?
+    };
+    let Some((file, content)) = read.with_context(|| format!("reading {}", spool.display()))?
     else {
         return Ok(0);
     };
@@ -626,6 +746,10 @@ where
         to.extend_from_slice(line);
         to.push(b'\n');
     }
+    if sent == 0 && rejected.is_empty() {
+        // Nothing went: the spool stays as it is.
+        return Ok(0);
+    }
     let rejected_path = paths.spool_rejected();
     let finish = tokio::task::spawn_blocking(move || -> io::Result<()> {
         if !rejected.is_empty() {
@@ -633,9 +757,21 @@ where
             out.write_all(&rejected)?;
             out.sync_data()?;
         }
-        file.set_len(0)?;
-        file.write_all_at(&kept, 0)?;
-        file.sync_data()?;
+        let tmp = spool.with_extension("jsonl.tmp");
+        let mut out = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        out.write_all(&kept)?;
+        out.sync_data()?;
+        // An appender waiting on the old file's lock finds it renamed away
+        // and its entry lost: it reopens by path (append_within).
+        std::fs::rename(&tmp, &spool)?;
+        if let Some(dir) = spool.parent() {
+            File::open(dir)?.sync_all()?;
+        }
         file.unlock()
     });
     finish.await?.context("rewriting the spool")?;

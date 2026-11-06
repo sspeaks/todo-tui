@@ -121,6 +121,9 @@ export async function connect(opts: ConnectOptions = {}): Promise<TodoConnection
     // Missing is fine (the daemon creates it); anything unsafe is fatal.
     if (err instanceof UnsafeRuntimeDirError) throw err;
   }
+  // TODO_NO_SPAWN: a service starts the daemon (the NixOS module's); none of our own.
+  const noSpawn = !!env.TODO_NO_SPAWN && env.TODO_NO_SPAWN !== "0";
+  opts = noSpawn ? { ...opts, autoSpawn: false } : opts;
   const transport = createTodoTransport(socketPath, opts);
   const clients = createClients(transport);
   const requiredApiMinor = opts.requiredApiMinor ?? CLIENT_API_MINOR;

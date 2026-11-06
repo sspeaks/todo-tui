@@ -30,6 +30,7 @@ message SubscribeResponse {
     Notice notice = 2;
     ResyncRequired resync_required = 3;
     CaughtUp caught_up = 4;
+    Heartbeat heartbeat = 5;
   }
 }
 
@@ -95,3 +96,9 @@ message ResyncRequired {
 message CaughtUp {
   uint64 revision = 1;
 }
+
+// Sent every 25 s or so, among the other messages: nothing to say. Added
+// after api_minor 20 shipped, so no api_minor promises it. A client that has seen one can take a stream silent for a few
+// intervals as dead (a laptop that slept, a network that changed) and
+// resubscribe; one that never has must not, the daemon being older.
+message Heartbeat {}

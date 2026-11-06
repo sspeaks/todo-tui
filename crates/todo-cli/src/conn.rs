@@ -90,14 +90,41 @@ impl Conn {
     }
 }
 
-/// The URL of the daemon elsewhere this machine's clients use, if any,
-/// without reading its token: `TODO_REMOTE`, else `[client] remote`.
-pub(crate) fn remote_url_of(paths: &Paths) -> Option<String> {
+/// The daemon elsewhere this machine's clients use, if any, said for a
+/// message and without reading its token: `TODO_REMOTE`, else `[client]
+/// remote`, or a `[client]` table that is broken (so nothing here falls
+/// back to a daemon of its own).
+pub(crate) fn elsewhere(paths: &Paths) -> Option<String> {
     match std::env::var("TODO_REMOTE") {
-        Ok(url) if !url.trim().is_empty() => Some(url.trim().to_owned()),
-        _ => Config::load_or_defaults(&paths.config)
-            .client
-            .map(|c| c.url),
+        Ok(url) if !url.trim().is_empty() => Some(format!("the daemon at {}", url.trim())),
+        _ => match client_config(paths) {
+            Ok(client) => client.map(|c| format!("the daemon at {}", c.url)),
+            Err(why) => Some(format!(
+                "the daemon [client] names in {}, which is broken: {why}",
+                paths.config.display()
+            )),
+        },
+    }
+}
+
+/// `[client]` in the config: `None` when there is none, an error saying why
+/// when there is one that names no daemon (a missing credential, a typo),
+/// or when the file is not TOML and has a `[client]` line.
+fn client_config(paths: &Paths) -> Result<Option<ClientRemote>, String> {
+    match Config::load(&paths.config) {
+        Ok(Config {
+            client: Some(client),
+            ..
+        }) => Ok(Some(client)),
+        Ok(config) => config.client_error.map_or(Ok(None), Err),
+        Err(e) => {
+            let text = std::fs::read_to_string(&paths.config).unwrap_or_default();
+            if text.lines().any(|l| l.trim_start().starts_with("[client]")) {
+                Err(e.message)
+            } else {
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -115,7 +142,8 @@ pub(crate) fn remote_of(paths: &Paths) -> anyhow::Result<Option<(String, String)
             .ok_or_else(|| anyhow::anyhow!("TODO_REMOTE is set without TODO_REMOTE_TOKEN"))?;
         return Ok(Some((url, token.trim().to_owned())));
     }
-    let Some(ClientRemote { url, credential }) = Config::load_or_defaults(&paths.config).client
+    let Some(ClientRemote { url, credential }) = client_config(paths)
+        .map_err(|why| anyhow::anyhow!("{} [client]: {why}", paths.config.display()))?
     else {
         return Ok(None);
     };

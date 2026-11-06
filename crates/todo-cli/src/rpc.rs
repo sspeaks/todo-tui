@@ -92,6 +92,11 @@ async fn upgrade(
         "the running daemon is outdated (api_minor {}, this todo needs {API_MINOR})",
         old.api_minor
     );
+    if spawn::no_spawn() {
+        return Err(Why::Outdated(format!(
+            "{outdated}: restart its service (systemctl restart todo-tui)"
+        )));
+    }
     let Some(pid) = spawn::daemon_pid(paths) else {
         return Err(Why::Outdated(format!(
             "{outdated} and cannot be restarted: no pid in {}",

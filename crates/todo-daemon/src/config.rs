@@ -53,6 +53,9 @@ pub struct Config {
     /// (ADR-0008), not one of their own. Read by the clients, not the
     /// daemon.
     pub client: Option<ClientRemote>,
+    /// Why a `[client]` table there is did not name a daemon elsewhere: the
+    /// clients refuse rather than use a daemon of their own (ADR-0008).
+    pub client_error: Option<String>,
     pub warnings: Vec<Warning>,
     pub loaded_at: Timestamp,
 }
@@ -171,6 +174,7 @@ impl Config {
             meetings: true,
             instances: Vec::new(),
             client: None,
+            client_error: None,
             warnings: Vec::new(),
             loaded_at: Timestamp::now(),
         }
@@ -333,7 +337,21 @@ impl<'a> Reader<'a> {
                 // The daemon's own (ADR-0008), read by remote::read_config;
                 // checked there, at start.
                 "remote" => {}
-                "client" => self.section("client", value, Reader::client),
+                "client" => {
+                    let before = self.config.warnings.len();
+                    self.section("client", value, Reader::client);
+                    if self.config.client.is_none() {
+                        let why: Vec<String> = self.config.warnings[before..]
+                            .iter()
+                            .map(|w| format!("{}: {}", w.key, w.message))
+                            .collect();
+                        self.config.client_error = Some(if why.is_empty() {
+                            "client.remote: is required: the daemon's https:// address".to_owned()
+                        } else {
+                            why.join("; ")
+                        });
+                    }
+                }
                 "assistant" => self.warn(key, "not used until the Claude assistant (P3)"),
                 "stale" => self.warn(key, "not used until stale reviews (P4)"),
                 _ => self.warn(quote_key(&key), "unknown key; ignored"),
@@ -378,6 +396,7 @@ impl<'a> Reader<'a> {
                 format!("{path}.credential"),
                 "is required with remote: the token `todo remote pair` printed",
             ),
+            // A bad `remote` warned already.
             _ => {}
         }
     }
@@ -1111,10 +1130,36 @@ mod tests {
             warnings("[client]\nremote = \"https://box.ts.net\"\n"),
             ["client.credential: is required with remote: the token `todo remote pair` printed"]
         );
+        let config = parse("[client]\nremote = \"https://box.ts.net\"\n");
+        assert_eq!(config.client, None);
         assert_eq!(
-            parse("[client]\nremote = \"https://box.ts.net\"\n").client,
-            None
+            config.client_error.as_deref(),
+            Some(
+                "client.credential: is required with remote: the token `todo remote pair` printed"
+            )
         );
+        // Each way a [client] table fails to name one says why.
+        for (text, why) in [
+            (
+                "[client]\nremote = \"http://box.ts.net\"\ncredential = \"env:X\"\n",
+                "client.remote: ",
+            ),
+            (
+                "[client]\nremote = \"https://box.ts.net\"\ncredentail = \"env:X\"\n",
+                "client.credentail: unknown key",
+            ),
+            (
+                "[client]\ncredential = \"env:X\"\n",
+                "client.remote: is required",
+            ),
+            ("client = 1\n", "client: must be a table"),
+        ] {
+            let config = parse(text);
+            assert_eq!(config.client, None, "{text}");
+            let error = config.client_error.unwrap_or_default();
+            assert!(error.contains(why), "{text}: {error}");
+        }
+        assert_eq!(parse("[ui]\n").client_error, None);
     }
 
     #[test]

@@ -26,4 +26,6 @@ pub(crate) struct Ctx {
     /// The sync state, by instance (design 5.11).
     pub(crate) sync_status: crate::sync::Status,
     pub(crate) sync_now: crate::sync::SyncNow,
+    /// How often a quiet Subscribe stream gets a Heartbeat.
+    pub(crate) heartbeat: std::time::Duration,
 }

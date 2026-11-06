@@ -951,6 +951,7 @@ fn enum_names(field: ItemField) -> Vec<&'static str> {
             "restore",
             "split",
             "recurrence",
+            "mobile",
         ],
         F::ArchivedReason => vec!["user", "left_scope", "remote_unavailable", "auto_done"],
         F::RemoteLinkLinkState => vec!["pending", "ok", "broken"],

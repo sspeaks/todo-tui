@@ -159,7 +159,10 @@ pub(crate) async fn restore(paths: &Paths, from: &Path, yes: bool) -> anyhow::Re
     put?;
     drop(lock);
 
-    spawn::spawn_and_wait(paths).await?;
+    // A service's daemon (TODO_NO_SPAWN) is started by the service.
+    if !spawn::no_spawn() {
+        spawn::spawn_and_wait(paths).await?;
+    }
     print_out(format!(
         "restored {} ({} items)",
         from.display(),

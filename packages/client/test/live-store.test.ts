@@ -194,6 +194,27 @@ describe("LiveStore", () => {
     expect(store.getConnection().revision).toBe(seen + 1n);
   });
 
+  it("takes a stream silent past its heartbeats as dead and resubscribes; one with none is left alone", async () => {
+    const { daemon, store } = setup(1, { silentMs: 60 });
+    store.view();
+    store.start();
+    await waitFor(() => store.getConnection().state === "live");
+    // No heartbeat yet (an older daemon): quiet is fine.
+    await sleep(150);
+    expect(daemon.calls.subscribe.length).toBe(1);
+    // Heartbeats keep it.
+    for (let i = 0; i < 4; i++) {
+      daemon.heartbeat();
+      await sleep(30);
+    }
+    expect(daemon.calls.subscribe.length).toBe(1);
+    // Then silence: a dead stream, so it subscribes again from where it was.
+    const seen = store.getConnection().revision;
+    await waitFor(() => daemon.calls.subscribe.length === 2);
+    expect(daemon.calls.subscribe.at(-1)).toBe(seen);
+    await waitFor(() => store.getConnection().state === "live");
+  });
+
   it("retries with backoff and asks for the daemon once per outage", async () => {
     let spawned = 0;
     const { daemon, store } = setup(1, {

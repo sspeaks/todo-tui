@@ -4,7 +4,7 @@
 use std::io::{BufRead as _, IsTerminal as _, Read as _};
 use std::process::ExitCode;
 
-use crate::conn::Conn;
+use crate::conn::{self, Conn};
 use anyhow::Context as _;
 use todo_core::{MAX_CAPTURE_BYTES, new_ulid};
 use todo_daemon::paths::Paths;
@@ -223,7 +223,18 @@ async fn drain_spool(paths: &Paths, items: &mut ItemServiceClient<Conn>) {
             };
             match call(items.capture_item(request)).await {
                 Ok(_) => spool::Drained::Sent,
-                Err(status) if is_transport(&status) => spool::Drained::Later,
+                // Only the entry's own fault (its text, its ids) is final,
+                // as for the daemon's import; anything else (a server out
+                // of disk, a revoked token) is for a later try.
+                Err(status) if status.code() != tonic::Code::InvalidArgument => {
+                    if !is_transport(&status) {
+                        print_err(format_args!(
+                            "todo: spooled captures are kept for the next try: {}",
+                            describe(&status)
+                        ));
+                    }
+                    spool::Drained::Later
+                }
                 Err(status) => {
                     print_err(format_args!(
                         "todo: error: a spooled capture was refused, moved to {}: {}: {}",
@@ -242,7 +253,7 @@ async fn drain_spool(paths: &Paths, items: &mut ItemServiceClient<Conn>) {
         Ok(n) => print_err(format_args!(
             "todo: sent {n} spooled capture(s) to the remote daemon"
         )),
-        Err(e) => print_err(format_args!("todo: could not read the spool: {e:#}")),
+        Err(e) => print_err(format_args!("todo: could not drain the spool: {e:#}")),
     }
 }
 
@@ -373,13 +384,27 @@ fn parsed_fields(draft: &CaptureDraft) -> Vec<String> {
 /// stderr also says why captures are spooled, and where once one is.
 /// Returns false if the capture was lost.
 fn spool_one(paths: &Paths, capture: &Capture, why: &Why, told: &mut Told) -> bool {
-    let path = paths.spool();
-    match spool::append(paths, &SpoolEntry::now(capture.id, capture.text.as_str())) {
+    let entry = SpoolEntry::now(capture.id, capture.text.as_str());
+    // A daemon elsewhere (ADR-0008) cannot read this machine's spool: its
+    // own file, which no local daemon imports, sent by the next `todo add`.
+    let (path, appended, when) = match conn::elsewhere(paths) {
+        Some(there) => (
+            paths.remote_spool(),
+            spool::append_remote(paths, &entry),
+            format!("it will be sent to {there} by the next `todo add` that reaches it"),
+        ),
+        None => (
+            paths.spool(),
+            spool::append(paths, &entry),
+            "it will be imported once the daemon is running again".to_owned(),
+        ),
+    };
+    match appended {
         Ok(()) => {
             print_out(format_args!("spooled  {}", capture.text));
             if *told < Told::Where {
                 print_err(format_args!(
-                    "todo: {why}; spooled to {}; it will be imported once the daemon is running again",
+                    "todo: {why}; spooled to {}; {when}",
                     path.display()
                 ));
                 *told = Told::Where;

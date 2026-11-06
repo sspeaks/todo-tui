@@ -220,6 +220,13 @@ impl Paths {
         self.data.join("spool.jsonl")
     }
 
+    /// Captures the CLI could not deliver to a daemon elsewhere (ADR-0008):
+    /// apart from [`Paths::spool`], so a daemon of this machine's never
+    /// imports them; the next `todo add` that reaches the remote sends them.
+    pub fn remote_spool(&self) -> PathBuf {
+        self.data.join("spool.remote.jsonl")
+    }
+
     /// Spool lines the daemon could not import, kept verbatim.
     pub fn spool_rejected(&self) -> PathBuf {
         self.data.join("spool.rejected.jsonl")

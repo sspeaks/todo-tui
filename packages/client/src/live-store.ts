@@ -102,6 +102,12 @@ export interface LiveStoreOptions {
   respawnMs?: number;
   /** How long an unobserved view is kept before it is dropped (default 5000). */
   viewGraceMs?: number;
+  /**
+   * How long a stream that has sent a Heartbeat may then stay silent before
+   * it is taken as dead and resubscribed (default 75000: three of the
+   * daemon's). A daemon that sends none is never timed out.
+   */
+  silentMs?: number;
 }
 
 type Listener = () => void;
@@ -513,55 +519,83 @@ export class LiveStore {
   }
 
   /** Subscribes from the current revision; `onHealthy` runs when the stream gets its first message. */
-  private async consume(signal: AbortSignal, onHealthy: () => void): Promise<void> {
+  private async consume(outer: AbortSignal, onHealthy: () => void): Promise<void> {
     let healthy = false;
+    // Once the daemon has sent a Heartbeat, a stream silent past a few of
+    // them is dead (a laptop that slept, a network that changed): aborting
+    // it ends this call as a connection failure, and run() resubscribes.
+    // (By hand, not AbortSignal.any: the phone's runtime may lack it.)
+    const silent = new AbortController();
+    const onOuter = () => silent.abort();
+    outer.addEventListener("abort", onOuter);
+    if (outer.aborted) silent.abort();
+    const signal = silent.signal;
+    let wentSilent = false;
+    const silentMs = this.opts.silentMs ?? 75_000;
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
     const stream = this.watchClient.subscribe({ sinceRevision: this.revision ?? 0n, topics: [] }, { signal });
-    for await (const res of stream) {
-      // A message that arrives as the store stops is dropped: applying it
-      // would set the re-query timers stop() has just cleared.
-      if (signal.aborted) break;
-      if (!healthy) {
-        healthy = true;
-        onHealthy();
+    try {
+      for await (const res of stream) {
+        if (watchdog !== undefined || res.message.case === "heartbeat") {
+          clearTimeout(watchdog);
+          watchdog = setTimeout(() => {
+            wentSilent = true;
+            silent.abort();
+          }, silentMs);
+        }
+        if (res.message.case === "heartbeat") continue;
+        // A message that arrives as the store stops is dropped: applying it
+        // would set the re-query timers stop() has just cleared.
+        if (signal.aborted) break;
+        if (!healthy) {
+          healthy = true;
+          onHealthy();
+        }
+        const msg = res.message;
+        switch (msg.case) {
+          case "change":
+            this.applyChange(msg.value);
+            break;
+          case "caughtUp":
+            if (this.revision === undefined || msg.value.revision > this.revision) this.revision = msg.value.revision;
+            this.setConn({ state: "live", attempt: 0 });
+            if (this.syncSnap.size) {
+              this.syncSnap = new Map();
+              this.bump();
+            }
+            if (this.pendingResync) {
+              void this.reloadAll(this.revision);
+            } else {
+              for (const v of this.views.values()) if (v.needsLoad) void v.load();
+              if (this.savedSnap.status !== "ready") void this.loadSavedViews();
+              if (this.configSnap.status !== "ready") void this.loadConfig().catch(() => {});
+              if (this.liveCounts.wanted && this.liveCounts.needsLoad) void this.liveCounts.load();
+              if (this.undoState.wanted && this.undoState.needsLoad) void this.undoState.load();
+            }
+            break;
+          case "resyncRequired":
+            // The server's history no longer connects to ours (changes expired,
+            // or the database was replaced and its revision went backwards), so
+            // per-id revisions from before mean nothing: forget them.
+            this.revision = msg.value.currentRevision;
+            this.seen.clear();
+            this.seenViews.clear();
+            this.configSnap = { ...this.configSnap, revision: 0n };
+            this.pendingResync = true;
+            break;
+          case "notice":
+            if (msg.value.kind.case === "syncStatus") this.applySyncStatus(msg.value.kind.value);
+            for (const l of [...this.noticeListeners]) l(msg.value);
+            break;
+        }
       }
-      const msg = res.message;
-      switch (msg.case) {
-        case "change":
-          this.applyChange(msg.value);
-          break;
-        case "caughtUp":
-          if (this.revision === undefined || msg.value.revision > this.revision) this.revision = msg.value.revision;
-          this.setConn({ state: "live", attempt: 0 });
-          if (this.syncSnap.size) {
-            this.syncSnap = new Map();
-            this.bump();
-          }
-          if (this.pendingResync) {
-            void this.reloadAll(this.revision);
-          } else {
-            for (const v of this.views.values()) if (v.needsLoad) void v.load();
-            if (this.savedSnap.status !== "ready") void this.loadSavedViews();
-            if (this.configSnap.status !== "ready") void this.loadConfig().catch(() => {});
-            if (this.liveCounts.wanted && this.liveCounts.needsLoad) void this.liveCounts.load();
-            if (this.undoState.wanted && this.undoState.needsLoad) void this.undoState.load();
-          }
-          break;
-        case "resyncRequired":
-          // The server's history no longer connects to ours (changes expired,
-          // or the database was replaced and its revision went backwards), so
-          // per-id revisions from before mean nothing: forget them.
-          this.revision = msg.value.currentRevision;
-          this.seen.clear();
-          this.seenViews.clear();
-          this.configSnap = { ...this.configSnap, revision: 0n };
-          this.pendingResync = true;
-          break;
-        case "notice":
-          if (msg.value.kind.case === "syncStatus") this.applySyncStatus(msg.value.kind.value);
-          for (const l of [...this.noticeListeners]) l(msg.value);
-          break;
-      }
+    } catch (err) {
+      if (!wentSilent || outer.aborted) throw err;
+    } finally {
+      clearTimeout(watchdog);
+      outer.removeEventListener("abort", onOuter);
     }
+    if (wentSilent && !outer.aborted) throw new ConnectError("the watch stream went silent", Code.Unavailable);
   }
 
   private applySyncStatus(s: SyncStatus): void {

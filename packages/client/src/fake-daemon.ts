@@ -793,6 +793,11 @@ export class FakeDaemon {
   }
 
   /** Fails every open Subscribe stream, as if the connection dropped. */
+  /** Sends every open stream a Heartbeat, as the daemon does on a quiet one. */
+  heartbeat(): void {
+    for (const w of [...this.watchers]) w(msg({ case: "heartbeat", value: {} }));
+  }
+
   dropStreams(code = Code.Unavailable): void {
     for (const w of [...this.watchers]) w(new ConnectError("stream dropped", code));
   }

@@ -219,7 +219,12 @@ async fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
     let paths = Paths::resolve(&Env::from_process())?;
     // With a daemon elsewhere (ADR-0008), what works on this machine's own
     // daemon or its files is refused rather than done to the wrong one.
+    // Stopping one left running here is still allowed.
     let local_only = match &command {
+        Command::Daemon {
+            action: Some(DaemonAction::Stop),
+            ..
+        } => None,
         Command::Daemon { .. } => Some("todo daemon"),
         Command::Restore { .. } => Some("todo restore"),
         Command::Backup {
@@ -229,10 +234,10 @@ async fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
         _ => None,
     };
     if let Some(what) = local_only
-        && let Some(url) = conn::remote_url_of(&paths)
+        && let Some(there) = conn::elsewhere(&paths)
     {
         anyhow::bail!(
-            "{what} acts on this machine's daemon, but this machine uses the one at {url} \
+            "{what} acts on this machine's daemon, but this machine uses {there} \
              ([client] remote, or TODO_REMOTE): run it there"
         );
     }
@@ -292,6 +297,14 @@ async fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
         }
         Command::Daemon { detach: false, .. } => {
             if todo_daemon::run(paths).await? == todo_daemon::Exit::AlreadyRunning {
+                // A service (TODO_NO_SPAWN) that lost the lock to a daemon
+                // started some other way has failed: it is not the one
+                // running.
+                if spawn::no_spawn() {
+                    anyhow::bail!(
+                        "another daemon holds the lock: stop it (`todo daemon stop`), then start this one"
+                    );
+                }
                 println!("todo daemon: already running");
             }
         }

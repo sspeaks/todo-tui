@@ -13,6 +13,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { type TodoConnection, connect, connectAny } from "../src/connect.js";
 import { ClientKind } from "../src/gen/todo/v1/system_service_pb.js";
 import { CreatedVia } from "../src/gen/todo/v1/item_pb.js";
+import { isConnectionFailure } from "../src/errors.js";
 import type { LiveStore } from "../src/live-store.js";
 import { captureItem } from "../src/mutations.js";
 import { REMOTE_API_MINOR, type RemoteConnection, connectRemote, createRemoteLiveStore, isUnreachable, parsePairingLink } from "../src/remote.js";
@@ -146,6 +147,19 @@ describe.skipIf(!TODO_BIN)("remote listener against $TODO_BIN", { timeout: 60_00
 
     await h.add("from the laptop");
     await waitFor(() => titles().includes("from the laptop"));
+  });
+
+  it("a connection dropped mid-call is a connection failure, so a capture is retried, not repeated", async () => {
+    // Reads the request, then closes the socket: the call may have reached the daemon.
+    const server = createServer((socket) => socket.once("data", () => socket.destroy()));
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    cleanups.push(() => new Promise<void>((r) => server.close(() => r())));
+    const port = (server.address() as { port: number }).port;
+    const err = await connectRemote({ baseUrl: `http://127.0.0.1:${port}`, token: "todo_x" }).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(isConnectionFailure(err)).toBe(true);
   });
 
   it("is unreachable, not unauthenticated, when nothing listens", async () => {

@@ -205,7 +205,13 @@ pub fn resolve(r: &CredentialRef, secrets: &dyn Secrets) -> Result<Credential, C
                         .to_owned(),
                 )
             })?;
-            read_private(&dir.join(name), &at)?
+            // systemd owns this file, root's and 0400 with an ACL for the
+            // service user (so stat says 0440): no mode for us to check.
+            let path = dir.join(name);
+            std::fs::read_to_string(&path).map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => CredentialError::NotFound(at.clone()),
+                _ => CredentialError::Unreadable(at.clone(), e.to_string()),
+            })?
         }
     };
     let secret = raw.trim();
@@ -397,6 +403,18 @@ mod systemd_tests {
             resolve(&CredentialRef::Systemd("nope".into()), &secrets),
             Err(CredentialError::NotFound("systemd:nope".into()))
         );
+        // The ACL systemd gives the service user shows as group bits
+        // (0440): still the service's own.
+        std::fs::set_permissions(creds.join("jira"), std::fs::Permissions::from_mode(0o440))
+            .unwrap();
+        assert_eq!(
+            resolve(&CredentialRef::Systemd("jira".into()), &secrets)
+                .unwrap()
+                .expose(),
+            "pat-from-sops"
+        );
+        std::fs::set_permissions(creds.join("jira"), std::fs::Permissions::from_mode(0o400))
+            .unwrap();
         // Not a service: says so.
         assert!(matches!(
             resolve(&CredentialRef::Systemd("jira".into()), &SystemSecretsWithout),

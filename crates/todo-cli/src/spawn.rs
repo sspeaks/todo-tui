@@ -26,6 +26,13 @@ pub(crate) async fn is_listening(socket: &Path) -> bool {
     dial(socket).await.is_ok()
 }
 
+/// `TODO_NO_SPAWN` is set (to anything but empty or `0`): the daemon is a
+/// service's to start (the NixOS module's), so no command starts one of
+/// its own, which would run outside the service.
+pub(crate) fn no_spawn() -> bool {
+    std::env::var("TODO_NO_SPAWN").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
 /// Connects to the daemon, spawning one if nothing is listening.
 pub(crate) async fn connect_or_spawn(paths: &Paths) -> anyhow::Result<Channel> {
     match dial(&paths.socket).await {
@@ -43,6 +50,13 @@ pub(crate) async fn connect_or_spawn(paths: &Paths) -> anyhow::Result<Channel> {
 /// Starts `todo daemon` detached and waits (20ms doubling to 200ms, up to
 /// ~2s) until the socket accepts connections.
 pub(crate) async fn spawn_and_wait(paths: &Paths) -> anyhow::Result<()> {
+    if no_spawn() {
+        bail!(
+            "the daemon is not running on {}, and TODO_NO_SPAWN says its service starts it: \
+             start the service (systemctl start todo-tui)",
+            paths.socket.display()
+        );
+    }
     let mut child = spawn_detached(paths)?;
     let listening = wait_until_listening(paths, &mut child).await;
     // Reap the daemon whenever it exits. While this process runs on (`todo

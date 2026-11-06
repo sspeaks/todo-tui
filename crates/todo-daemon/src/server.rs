@@ -58,6 +58,8 @@ pub struct DaemonOptions {
     /// How often the backup task looks whether a backup is due, between
     /// config changes (1 h).
     pub backup_check: Duration,
+    /// How often a quiet Subscribe stream gets a Heartbeat (25 s).
+    pub heartbeat: Duration,
     /// Test hook: the scheduler's first this many runs panic at once.
     #[doc(hidden)]
     pub scheduler_panics: u32,
@@ -71,6 +73,7 @@ impl Default for DaemonOptions {
             spool_interval: spool::INTERVAL,
             restart_after: Backoff::default().first,
             backup_check: crate::backup::CHECK,
+            heartbeat: crate::service::watch::HEARTBEAT,
             scheduler_panics: 0,
         }
     }
@@ -294,6 +297,7 @@ impl Daemon {
             shutdown: shutdown.clone(),
             wake,
             config,
+            heartbeat: options.heartbeat,
         };
         let remote_clients = clients.clone();
 

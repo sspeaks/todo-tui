@@ -1,5 +1,6 @@
 import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, it } from "vitest";
+import { isConnectionFailure } from "../src/errors.js";
 import { isUnreachable, parsePairingLink } from "../src/remote.js";
 
 describe("parsePairingLink", () => {
@@ -34,5 +35,20 @@ describe("isUnreachable", () => {
     expect(isUnreachable(new ConnectError("no", Code.Unauthenticated))).toBe(false);
     expect(isUnreachable(new ConnectError("boom", Code.Unknown))).toBe(false);
     expect(isUnreachable(new Error("x"))).toBe(false);
+  });
+});
+
+describe("isConnectionFailure over fetch", () => {
+  it("is a dropped network, so the call is retried with its request id", () => {
+    const fetchFailed = (code: string) =>
+      new ConnectError("fetch failed", Code.Unknown, undefined, undefined, Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error(code), { code }) }));
+    for (const code of ["ENOTFOUND", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_SOCKET", "ECONNREFUSED"]) {
+      expect(isConnectionFailure(fetchFailed(code)), code).toBe(true);
+    }
+    // fetch's TypeError with no cause: still the network.
+    expect(isConnectionFailure(new ConnectError("fetch failed", Code.Unknown, undefined, undefined, new TypeError("fetch failed")))).toBe(true);
+    // An answer is not.
+    expect(isConnectionFailure(new ConnectError("no", Code.Unauthenticated))).toBe(false);
+    expect(isConnectionFailure(new ConnectError("boom", Code.Unknown))).toBe(false);
   });
 });

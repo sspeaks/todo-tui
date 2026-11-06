@@ -303,6 +303,34 @@ fn add_auto_spawns_the_daemon_then_stop_stops_it() {
 }
 
 #[test]
+fn with_todo_no_spawn_nothing_starts_a_daemon_and_one_that_loses_the_lock_fails() {
+    let h = Home::new();
+    let status = h
+        .command(&["status"])
+        .env("TODO_NO_SPAWN", "1")
+        .output()
+        .unwrap();
+    assert!(!status.status.success());
+    assert!(
+        text(&status.stderr).contains("systemctl start"),
+        "{}",
+        text(&status.stderr)
+    );
+    assert!(!socket_in(&h.home.join("run")));
+    // As a service, a `todo daemon` that finds another one holding the lock
+    // has failed.
+    h.ok(&["daemon", "--detach"]);
+    let second = h
+        .command(&["daemon"])
+        .env("TODO_NO_SPAWN", "1")
+        .output()
+        .unwrap();
+    assert!(!second.status.success());
+    assert!(text(&second.stderr).contains("another daemon holds the lock"));
+    h.ok(&["daemon", "stop"]);
+}
+
+#[test]
 fn parallel_detach_leaves_one_daemon() {
     let h = Home::new();
     std::thread::scope(|s| {
@@ -1550,7 +1578,7 @@ fn a_client_uses_a_daemon_elsewhere_through_its_remote_listener() {
     // A capture spooled here before (the remote was out of reach).
     let spooled = SpoolEntry::now(todo_core::new_ulid(), "from the spool");
     let paths = client.paths();
-    todo_daemon::spool::append(&paths, &spooled).unwrap();
+    todo_daemon::spool::append_remote(&paths, &spooled).unwrap();
 
     let added = client.todo(&["add", "from the laptop"]);
     assert!(added.status.success(), "{}", text(&added.stderr));
@@ -1569,16 +1597,20 @@ fn a_client_uses_a_daemon_elsewhere_through_its_remote_listener() {
     assert!(client.ok(&["status"]).contains("Inbox: 2"));
     client.ok(&["undo"]);
     assert_eq!(titles(&server.items()), ["from the spool"]);
-    // What acts on this machine's own daemon refuses.
+    // What acts on this machine's own daemon refuses; stopping one left
+    // running here does not.
+    let stop = client.todo(&["daemon", "stop"]);
+    assert!(stop.status.success(), "{}", text(&stop.stderr));
+    assert!(text(&stop.stdout).contains("not running"));
     for args in [
-        &["daemon", "stop"][..],
+        &["daemon"][..],
         &["restore", "x.db"][..],
         &["remote", "list"][..],
     ] {
         let out = client.todo(args);
         assert!(!out.status.success(), "{args:?}");
         assert!(
-            text(&out.stderr).contains("uses the one at"),
+            text(&out.stderr).contains("uses the daemon at"),
             "{args:?}: {}",
             text(&out.stderr)
         );
@@ -1591,4 +1623,59 @@ fn a_client_uses_a_daemon_elsewhere_through_its_remote_listener() {
         .output()
         .unwrap();
     assert!(!bad.status.success());
+    // `--short` has nothing quick to ask: it prints nothing.
+    let short = client.todo(&["status", "--short"]);
+    assert!(short.status.success());
+    assert_eq!(text(&short.stdout), "");
+
+    // Out of reach: spooled for the remote, where no daemon here imports it.
+    let away = client
+        .command(&["add", "while away"])
+        .env("TODO_REMOTE", format!("http://127.0.0.1:{}", free_port()))
+        .env("TODO_REMOTE_TOKEN", &token)
+        .output()
+        .unwrap();
+    assert!(away.status.success(), "{}", text(&away.stderr));
+    assert!(
+        text(&away.stderr).contains("by the next `todo add` that reaches it"),
+        "{}",
+        text(&away.stderr)
+    );
+    assert!(!paths.spool().exists());
+    assert!(
+        std::fs::read_to_string(paths.remote_spool())
+            .unwrap()
+            .contains("while away")
+    );
+    let back = client.todo(&["add", "back"]);
+    assert!(
+        text(&back.stderr).contains("sent 1 spooled capture"),
+        "{}",
+        text(&back.stderr)
+    );
+    assert!(titles(&server.items()).contains(&"while away"));
+
+    // A broken [client] refuses, rather than capture into a daemon of this
+    // machine's own.
+    for config in [
+        format!("[client]\nremote = \"http://127.0.0.1:{port}\"\n"),
+        format!("[client]\nremote = \"http://127.0.0.1:{port}\"\ncredentail = \"file:x\"\n"),
+        "[client]\nremote = \"http://box.example.com\"\ncredential = \"env:X\"\n".to_owned(),
+        "[client]\nremote = \"https://box.example.com\"\ncredential = \"env:X\"\n[ui\n".to_owned(),
+    ] {
+        std::fs::write(client.home.join("config.toml"), &config).unwrap();
+        let out = client.todo(&["status"]);
+        assert!(!out.status.success(), "{config}");
+        assert!(
+            text(&out.stderr).contains("[client]"),
+            "{config}: {}",
+            text(&out.stderr)
+        );
+        let out = client.todo(&["daemon", "--detach"]);
+        assert!(!out.status.success(), "{config}");
+        assert!(
+            !socket_in(&client.home.join("run")),
+            "{config}: no daemon of its own"
+        );
+    }
 }

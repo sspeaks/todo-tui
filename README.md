@@ -294,7 +294,8 @@ count. `todo status` starts the daemon if needed, as `todo add` does.
 `todo status --short` prints one line for a shell prompt or tmux status line, such
 as `📥3 ⏰2`, leaving out zero counts. It never starts the daemon and gives up after
 40 ms: with no daemon, a slow one or any error it prints nothing, and it always
-exits 0. In bash (in zsh, `setopt prompt_subst` first):
+exits 0. On a machine that uses a daemon elsewhere (below) it prints nothing:
+reaching that daemon takes longer than a prompt can wait. In bash (in zsh, `setopt prompt_subst` first):
 
 ```sh
 PS1='$(todo status --short) '"$PS1"
@@ -746,15 +747,19 @@ can use it: the phone, and each laptop's `todo`, TUI and Claude Code tools
 ```nix
 {
   inputs.todo-tui.url = "github:sspeaks/todo-tui";
-  outputs = { nixpkgs, todo-tui, ... }: {
+  inputs.sops-nix.url = "github:Mic92/sops-nix";
+  outputs = { nixpkgs, todo-tui, sops-nix, ... }: {
     nixosConfigurations.box = nixpkgs.lib.nixosSystem {
       modules = [
         todo-tui.nixosModules.default
-        {
+        sops-nix.nixosModules.sops    # with your sops.defaultSopsFile and keys
+        ({ config, ... }: {
           services.tailscale.enable = true;
+          sops.secrets.jira-pat = { restartUnits = [ "todo-tui.service" ]; };
           services.todo-tui = {
             enable = true;
             tailscaleServe = true;    # https://box.<tailnet>.ts.net
+            timeZone = "America/Los_Angeles";    # yours: see below
             settings.backup.retain_days = 30;
             # Jira, its token from sops-nix (or agenix): handed to the
             # daemon as a systemd credential, never put in the Nix store.
@@ -766,24 +771,32 @@ can use it: the phone, and each laptop's `todo`, TUI and Claude Code tools
               credential = "systemd:jira";
             }];
           };
-        }
+        })
       ];
     };
   };
 }
 ```
 
-`sops.secrets.jira-pat = { };` with sops-nix's defaults (root, 0400) is enough:
-the module passes it with `LoadCredential=`, so the secret needs no owner change.
-Add `restartUnits = [ "todo-tui.service" ];` to it to pick up a rotated token.
+The secret keeps sops-nix's defaults (root, 0400): the module passes it with
+`LoadCredential=`, so it needs no owner change. `restartUnits` picks up a rotated
+token.
 `credential = "systemd:NAME"` works for any secret `credentials` names;
 `environmentFile` (with `env:NAME`) is there for the rest.
 
 It runs as its own `todo-tui` user with `/var/lib/todo-tui` as its home, the
 listener on `127.0.0.1:7743` and `tailscale serve` in front of it (tailnet HTTPS
-certificates must be on). `systemctl reload todo-tui` rereads the config. On the
-box, `sudo todo-tui-admin …` runs `todo` as the service, so pair each device with
-`sudo todo-tui-admin remote pair --name laptop` (the phone scans the QR code).
+certificates must be on; the serve unit waits for tailscale to log in, and keeps
+retrying). `systemctl reload todo-tui` rereads the config. On the box,
+`sudo todo-tui-admin …` runs `todo` as the service, so pair each device with
+`sudo todo-tui-admin remote pair --name laptop` (the phone scans the QR code). It
+never starts a daemon of its own: `todo-tui-admin daemon stop` and `restore` go
+through `systemctl`, and with the service stopped the rest say so.
+
+The daemon works out relative dates (`^tom`, `^fri`) and "today" (Today, overdue,
+L48) in its own time zone, for every device: set `timeZone` (or the box's
+`time.timeZone`; NixOS defaults to UTC) to yours, or an evening capture lands a
+day late.
 
 **Use it from a laptop:** keep the token in the keychain and point the config at
 the box:
@@ -802,9 +815,12 @@ credential = "keychain:todo-tui/remote"
 Then `todo`, `todo add`, `todo status`, `todo mcp` and the rest use the box; no
 daemon starts on the laptop. `TODO_REMOTE` and `TODO_REMOTE_TOKEN` do the same for
 one shell. What acts on a machine's own daemon (`todo daemon`, `restore`,
-`backup list`, `remote`) refuses there: run it on the box. A capture made while
-the box was out of reach is spooled on the laptop and sent with the next
-`todo add`.
+`backup list`, `remote`) refuses there: run it on the box. `todo daemon stop`
+still stops one left running on the laptop. A `[client]` table that is broken (no
+credential, a typo, a bad address) is refused too, rather than quietly using a
+daemon on the laptop. A capture made while the box was out of reach is spooled on
+the laptop (in `spool.remote.jsonl`) and sent with the next `todo add` that
+reaches it; the TUI and Claude Code tools do not send it.
 
 ### The daemon
 

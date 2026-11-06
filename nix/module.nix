@@ -37,11 +37,37 @@ let
   } cfg.settings;
   configFile = toml.generate "todo-tui-config.toml" settings;
   # The CLI as the service's user, on the service's home: `remote pair`,
-  # `status`, `export`, `backup now` and the rest, on this machine.
+  # `status`, `export`, `backup now` and the rest, on this machine. It never
+  # starts a daemon of its own (TODO_NO_SPAWN), which would run outside the
+  # service; the daemon's own commands go through systemd.
+  systemctl = lib.getExe' config.systemd.package "systemctl";
   admin = pkgs.writeShellScriptBin "todo-tui-admin" ''
-    exec ${lib.getExe' pkgs.util-linux "runuser"} -u ${cfg.user} -- \
-      env TODO_TUI_HOME=${home} ${lib.getExe cfg.package} "$@"
+    todo() {
+      ${lib.getExe' pkgs.util-linux "runuser"} -u ${cfg.user} -- \
+        env TODO_TUI_HOME=${home} TODO_NO_SPAWN=1 ${lib.getExe cfg.package} "$@"
+    }
+    case "''${1-}" in
+      daemon)
+        case "''${2-}" in
+          stop) exec ${systemctl} stop todo-tui.service ;;
+          *)
+            echo "todo-tui-admin: the daemon is todo-tui.service: systemctl start|stop|restart|status todo-tui" >&2
+            exit 2
+            ;;
+        esac
+        ;;
+      restore)
+        # The service stopped for the swap, and started again after it.
+        ${systemctl} stop todo-tui.service || exit
+        todo "$@"
+        status=$?
+        ${systemctl} start todo-tui.service
+        exit $status
+        ;;
+    esac
+    todo "$@"
   '';
+  socket = "${toString cfg.dataDir}/run/daemon.sock";
 in
 {
   options.services.todo-tui = {
@@ -138,6 +164,18 @@ in
       '';
     };
 
+    timeZone = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "America/Los_Angeles";
+      description = ''
+        The daemon's time zone (its TZ), when not the system's
+        (`time.timeZone`, UTC when unset). The daemon resolves relative
+        dates (`^tom`, `^fri`) and "today" (Today, overdue, L48) in it,
+        for every device, the phone's captures included: make it yours.
+      '';
+    };
+
     httpsPort = lib.mkOption {
       type = lib.types.port;
       default = 443;
@@ -156,6 +194,12 @@ in
       {
         assertion = !cfg.tailscaleServe || config.services.tailscale.enable;
         message = "services.todo-tui.tailscaleServe needs services.tailscale.enable";
+      }
+      {
+        # Longer, and the daemon would put its socket under /tmp, which the
+        # service's PrivateTmp hides from todo-tui-admin.
+        assertion = lib.stringLength socket <= 100;
+        message = "services.todo-tui.dataDir is too long: ${socket} must be at most 100 bytes";
       }
     ];
 
@@ -185,7 +229,16 @@ in
       wantedBy = [ "multi-user.target" ];
       after = [ "network.target" ];
       restartTriggers = [ configFile ];
-      environment.TODO_TUI_HOME = home;
+      environment = {
+        TODO_TUI_HOME = home;
+        # The service starts the daemon, and a `todo daemon` that finds
+        # another holding the lock fails rather than look like this one.
+        TODO_NO_SPAWN = "1";
+      }
+      // lib.optionalAttrs (cfg.timeZone != null) {
+        TZ = cfg.timeZone;
+        TZDIR = "${pkgs.tzdata}/share/zoneinfo";
+      };
       serviceConfig = {
         ExecStart = "${lib.getExe cfg.package} daemon";
         # SIGHUP reloads config.toml (design 8.2).
@@ -194,7 +247,8 @@ in
         Group = cfg.group;
         EnvironmentFile = lib.mkIf (cfg.environmentFile != null) cfg.environmentFile;
         LoadCredential = lib.mapAttrsToList (name: path: "${name}:${path}") cfg.credentials;
-        Restart = "on-failure";
+        # Always: a Shutdown RPC exits 0, and the phone needs it back.
+        Restart = "always";
         RestartSec = 5;
         UMask = "0077";
         # Hardening: it needs its home, loopback and outbound HTTPS (Jira).
@@ -221,19 +275,43 @@ in
       };
     };
 
+    # `serve --bg` keeps its config in tailscaled across reboots: this sets
+    # it once tailscale is logged in, and retries until it is. Turning
+    # tailscaleServe off leaves it set (`tailscale serve --https=443 off`).
     systemd.services.todo-tui-tailscale-serve = lib.mkIf cfg.tailscaleServe {
       description = "tailscale serve in front of the todo-tui listener";
       wantedBy = [ "multi-user.target" ];
       after = [
         "tailscaled.service"
         "todo-tui.service"
+        "network-online.target"
+      ]
+      ++ lib.optional (config.services.tailscale.authKeyFile != null) "tailscaled-autoconnect.service";
+      wants = [
+        "tailscaled.service"
+        "network-online.target"
       ];
-      wants = [ "tailscaled.service" ];
+      # Retries forever, every 10s: logging in can come much later.
+      startLimitIntervalSec = 0;
+      path = [
+        config.services.tailscale.package
+        pkgs.jq
+      ];
+      script = ''
+        # Logged in, with the machine's name (and so its certificate).
+        until tailscale status --json | jq -e '.BackendState == "Running" and .Self.DNSName != ""' >/dev/null; do
+          sleep 2
+        done
+        tailscale serve --bg --https=${toString cfg.httpsPort} http://127.0.0.1:${toString cfg.port} </dev/null
+      '';
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
-        ExecStart = "${lib.getExe config.services.tailscale.package} serve --bg --https=${toString cfg.httpsPort} http://127.0.0.1:${toString cfg.port}";
-        ExecStop = "${lib.getExe config.services.tailscale.package} serve --https=${toString cfg.httpsPort} off";
+        Restart = "on-failure";
+        RestartSec = 10;
+        # Waiting for a login, or for HTTPS to be turned on in the tailnet
+        # (serve then prints a link and waits): a retry later.
+        TimeoutStartSec = 120;
       };
     };
   };

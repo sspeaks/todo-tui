@@ -51,18 +51,39 @@ over Tailscale.
   the TUI and MCP bundles `TODO_REMOTE*`, and they connect through
   `connectAny`. Such a machine never spawns or restarts a daemon: a remote one
   too old says so. `todo daemon`, `restore`, `backup list` and `remote` act on
-  this machine's own daemon or files, so they refuse. `todo add` sends what this
-  machine's spool holds first, each with its spool id. `http://` is allowed only
-  to loopback (a test, an SSH tunnel).
+  this machine's own daemon or files, so they refuse (`todo daemon stop` does
+  not, for one left running). A `[client]` table that names no daemon (a missing
+  credential, a typo, a bad address) is an error, not a fall-back to a local
+  daemon. A capture made while the remote is out of reach goes to
+  `spool.remote.jsonl`, which no local daemon imports, and the next `todo add`
+  that reaches it sends it first, each with its spool id; only a capture the
+  daemon refuses as bad (INVALID_ARGUMENT) is set aside. `todo status --short`
+  prints nothing there. `http://` is allowed only to loopback (a test, an SSH
+  tunnel).
+- **Time zones.** The daemon resolves relative dates (`^tom`) and "today" in
+  its own zone, for every client, the phone included: the module's `timeZone`
+  sets it. A client sending its own zone with each request is left for later
+  (it changes the API).
+- **Keepalive.** The listener speaks HTTP/1.1, so HTTP/2 pings do not reach
+  it. `Subscribe` sends a `Heartbeat` every 25 s on a quiet stream; a LiveStore
+  that has seen one takes a stream silent for 75 s as dead and resubscribes (a
+  laptop that slept, a network that changed), and the heartbeats keep Node's
+  fetch from timing out a quiet stream after 5 minutes.
 - **Hosting.** `nixosModules.default` (`nix/module.nix`) runs the daemon as a
   system service: its own user, `/var/lib/todo-tui` as its home, `settings` as
   its `config.toml`, secrets as systemd credentials (`credentials.jira =
   config.sops.secrets.jira-pat.path`, read as `credential = "systemd:jira"`:
   `LoadCredential=` copies a root-owned sops-nix or agenix secret for the
-  service alone, so it needs no owner change) or an `environmentFile`, the listener on
-  loopback and, with `tailscaleServe`, `tailscale serve` in front of it.
-  `todo-tui-admin` runs the CLI as that user on that home (`remote pair`). A VM
-  test (`checks.<linux>.module`) exercises it.
+  service alone, so it needs no owner change; systemd gives the service user
+  read access by an ACL, so the file shows 0440 and the daemon does not check a
+  `systemd:` credential's mode) or an `environmentFile`, the listener on
+  loopback and, with `tailscaleServe`, `tailscale serve` in front of it, set
+  once tailscale is logged in and retried until it is. `Restart=always`: a
+  Shutdown RPC exits 0. `todo-tui-admin` runs the CLI as that user on that home
+  (`remote pair`) with `TODO_NO_SPAWN=1`, so it never starts a daemon outside
+  the service; its `daemon stop` and `restore` go through `systemctl`. A
+  `todo daemon` with `TODO_NO_SPAWN` that finds the lock held fails. A VM test
+  (`checks.<linux>.module`) exercises it.
 - **Scope.** The phone is a thin client of one daemon. When the laptop is asleep the
   app has no data. This is not multi-device sync, which stays a non-goal.
 

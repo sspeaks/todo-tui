@@ -22,7 +22,9 @@ const SHORT_DEADLINE: Duration = Duration::from_millis(40);
 /// handshaking with or restarting the daemon. Zero counts are left out.
 /// Prints nothing when every count is zero or anything goes wrong (no
 /// daemon, no answer in time, an older daemon without the RPC), and
-/// always succeeds.
+/// always succeeds. A machine that uses a daemon elsewhere (ADR-0008)
+/// prints nothing: a token and a TLS handshake do not fit the deadline,
+/// and this machine's own socket is not the daemon it uses.
 pub(crate) fn short() -> ExitCode {
     // One call needs no more than the current thread.
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -38,6 +40,9 @@ pub(crate) fn short() -> ExitCode {
 
 async fn short_line() -> Option<String> {
     let paths = Paths::resolve(&Env::from_process()).ok()?;
+    if crate::conn::elsewhere(&paths).is_some() {
+        return None;
+    }
     let ask = async {
         let channel = todo_daemon::client::connect(&paths.socket).await.ok()?;
         let request = GetStatusCountsRequest::default();
