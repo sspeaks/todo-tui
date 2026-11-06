@@ -154,6 +154,9 @@ pub struct ApplyCtx {
     /// field (ADR-0007): they are queued for the tracker. Elsewhere every
     /// Core field stays read-only (ADR-0006).
     pub pushes: Pushes,
+    /// The person confirmed changing, in the tracker, an Item assigned to
+    /// someone else (design 5.9); without it such an edit is refused.
+    pub confirm_not_mine: bool,
 }
 
 /// Which instance pushes (ADR-0007), as the store knows it: one syncs
@@ -237,6 +240,10 @@ pub enum MutationError {
     /// ADR-0007): the tracker owns it, and the next pull would undo the edit.
     #[error("{0:?} is the tracker's: change it there")]
     LinkedReadOnly(ItemField),
+    /// A pushed edit of an issue assigned to someone else, unconfirmed
+    /// (design 5.9).
+    #[error("{0:?}: the issue is assigned to someone else; confirm to change it in the tracker")]
+    NotMine(ItemField),
 }
 
 impl MutationError {
@@ -251,7 +258,8 @@ impl MutationError {
             | MutationError::WrongType { field, .. }
             | MutationError::Invalid { field, .. }
             | MutationError::Unsupported { field, .. }
-            | MutationError::LinkedReadOnly(field) => Some(*field),
+            | MutationError::LinkedReadOnly(field)
+            | MutationError::NotMine(field) => Some(*field),
             MutationError::Deleted | MutationError::Closed => None,
         }
     }
@@ -357,6 +365,16 @@ pub fn apply(item: &Item, op: &MutationOp, ctx: &ApplyCtx) -> Result<Applied, Mu
             .find(|c| is_core(c.field) && !(pushed(c.field) && pushes(item, ctx)))
     {
         return Err(MutationError::LinkedReadOnly(c.field));
+    }
+    // Not theirs (design 5.9): a pushed edit of someone else's issue needs
+    // the person's say-so, as it changes the ticket the assignee sees.
+    if item.is_linked()
+        && !item.derived.is_mine
+        && !ctx.confirm_not_mine
+        && matches!(ctx.actor, Actor::User | Actor::Suggestion(_))
+        && let Some(c) = changes.iter().find(|c| is_core(c.field))
+    {
+        return Err(MutationError::NotMine(c.field));
     }
     maintain_derived(item, &mut next, ctx);
     Ok(Applied {
@@ -933,6 +951,7 @@ mod tests {
             now: now(),
             actor,
             pushes: Pushes::None,
+            confirm_not_mine: false,
         }
     }
 
@@ -1386,6 +1405,7 @@ mod tests {
                     now: Timestamp::from_second(10).unwrap(),
                     actor: Actor::Sync,
                     pushes: Pushes::None,
+                    confirm_not_mine: false,
                 };
                 apply(
                     item,
@@ -2201,6 +2221,7 @@ mod tests {
                 now: ts(9_000),
                 actor: Actor::User,
                 pushes: Pushes::None,
+                confirm_not_mine: false,
             },
         )
         .unwrap();
@@ -2864,6 +2885,7 @@ mod linked_tests {
             now: Timestamp::from_second(10).unwrap(),
             actor: Actor::User,
             pushes: Pushes::None,
+            confirm_not_mine: false,
         }
     }
 

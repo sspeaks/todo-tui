@@ -286,7 +286,7 @@ impl Shape<'_> {
                 self.in_batch(
                     index,
                     format!(
-                        "{} is the tracker's: the item is linked, and edits reach the tracker only once pushes arrive",
+                        "{} is the tracker's: the item is linked and the field does not push; change it there",
                         item_field_path(*field)
                     ),
                 ),
@@ -295,6 +295,20 @@ impl Shape<'_> {
                 ]
                 .into_iter()
                 .chain(id.map(|id| ("item_id", id.to_string()))),
+            ),
+            MutationError::NotMine(field) => error_info(
+                Code::FailedPrecondition,
+                "NOT_MINE",
+                self.in_batch(
+                    index,
+                    format!(
+                        "{} would change in the tracker an issue assigned to someone else: confirm to change it (confirm_not_mine)",
+                        item_field_path(*field)
+                    ),
+                ),
+                [("field", item_field_path(*field).to_owned())]
+                    .into_iter()
+                    .chain(id.map(|id| ("item_id", id.to_string()))),
             ),
             _ => bad_request(&self.path(index, error), describe(error)),
         }
@@ -408,7 +422,8 @@ fn describe(error: &MutationError) -> String {
         ),
         MutationError::Deleted => "the item is deleted".to_owned(),
         MutationError::Closed => "the item is done or cancelled: reopen it first".to_owned(),
-        MutationError::LinkedReadOnly(_) => "is the tracker's until pushes arrive".to_owned(),
+        MutationError::LinkedReadOnly(_) => "is the tracker's: change it there".to_owned(),
+        MutationError::NotMine(_) => "is someone else's issue: confirm to change it".to_owned(),
     }
 }
 

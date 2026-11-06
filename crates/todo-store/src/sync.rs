@@ -59,6 +59,7 @@ pub(crate) fn apply_page_tx(tx: &mut WriteTx<'_>, page: PullPage) -> Result<Pull
         now: page.now,
         actor: Actor::Sync,
         pushes: todo_core::Pushes::None,
+        confirm_not_mine: false,
     };
     let mut batch = Batch::default();
     let mut out = PullOutcome::default();
@@ -126,6 +127,8 @@ pub(crate) fn apply_page_tx(tx: &mut WriteTx<'_>, page: PullPage) -> Result<Pull
                 let mut changes = changes;
                 next.derived.pending_fields = crate::outbox::pending_fields(conn, id)?;
                 next.derived.has_conflict = crate::outbox::has_pending(conn, id, "sync_conflict")?;
+                next.derived.has_push_failure =
+                    crate::outbox::has_pending(conn, id, "push_failed")?;
                 // Back in a scope, or readable again: a left_scope or
                 // remote_unavailable archive lifts (5.5 step 3); one still in
                 // no scope is archived left_scope instead, as 5.3 has it.
@@ -217,6 +220,7 @@ pub(crate) fn reconcile_tx(tx: &mut WriteTx<'_>, input: Reconcile) -> Result<Rec
         now: input.now,
         actor: Actor::Sync,
         pushes: todo_core::Pushes::None,
+        confirm_not_mine: false,
     };
     let mut batch = Batch::default();
     let mut out = ReconcileOutcome::default();
@@ -238,6 +242,8 @@ pub(crate) fn reconcile_tx(tx: &mut WriteTx<'_>, input: Reconcile) -> Result<Rec
                 let (mut next, changes) = update(&current, &settled.issue, parent, &[], input.now);
                 next.derived.pending_fields = crate::outbox::pending_fields(conn, *id)?;
                 next.derived.has_conflict = crate::outbox::has_pending(conn, *id, "sync_conflict")?;
+                next.derived.has_push_failure =
+                    crate::outbox::has_pending(conn, *id, "push_failed")?;
                 (next, changes)
             }
             None => {

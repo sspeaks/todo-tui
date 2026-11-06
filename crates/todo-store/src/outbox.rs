@@ -493,3 +493,146 @@ fn add_patch(
     ])?;
     Ok(())
 }
+
+/// One Item's waiting pushes, due now: what the worker sends (design 5.6).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DuePush {
+    pub item_id: todo_core::ItemId,
+    pub remote_id: String,
+    pub key: String,
+    /// Its rows, field order.
+    pub rows: Vec<Waiting>,
+    /// The most tries any of them has had, for the backoff.
+    pub attempts: u32,
+}
+
+/// The Items of `instance` with rows waiting and due by `now`, oldest
+/// first, at most `limit`. In flight counts: a push sent whose answer was
+/// lost is read back before it is sent again. A deleted Item or a broken
+/// link has none due: its rows were cancelled, or wait for the link.
+pub(crate) fn due(
+    conn: &Connection,
+    instance: &str,
+    now: Timestamp,
+    limit: usize,
+) -> Result<Vec<DuePush>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT o.item_id, i.remote_id, i.remote_key, MIN(o.created_at) AS first, MAX(o.attempts)
+         FROM outbox o JOIN items i ON i.id = o.item_id
+         WHERE o.instance_id = ?1 AND o.state IN ('pending', 'in_flight')
+           AND (o.next_attempt_at IS NULL OR o.next_attempt_at <= ?2)
+           AND i.deleted_at IS NULL AND i.remote_link_state = 'ok'
+         GROUP BY o.item_id ORDER BY first LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(params![instance, ts_to_sql(now)?, limit as i64], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, Option<String>>(2)?,
+            r.get::<_, u32>(4)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (item, remote, key, attempts) = row?;
+        let item_id = codec::item_id_from_str(&item)?;
+        let rows = waiting(conn, item_id)?;
+        out.push(DuePush {
+            item_id,
+            remote_id: remote.unwrap_or_default(),
+            key: key.unwrap_or_default(),
+            rows,
+            attempts,
+        });
+    }
+    Ok(out)
+}
+
+/// What a push of one Item's rows came to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PushResult {
+    /// Jira took it: the rows wait for the pull that reads it back (the
+    /// worker applies the fresh issue at once).
+    Sent,
+    /// Not now (offline, 5xx, 429): try again at `at`.
+    Retry { at: Timestamp, error: String },
+    /// Jira refused it: the rows fail, the local values go back to Jira's
+    /// (`jira`, field by field), and a push_failed Suggestion offers yours.
+    Refused {
+        error: String,
+        jira: Vec<(ItemField, FieldValue)>,
+    },
+}
+
+/// Records `result` for the `rows` (by id) of `item`, sent at `at`.
+/// Refused: the rows fail, a `push_failed` Suggestion keeps each local
+/// value (expected_old Jira's), and the Item's fields take Jira's values,
+/// returned for the caller to write as a sync op. Returns the Suggestion's
+/// id, if one was made.
+pub(crate) fn record_result(
+    conn: &Connection,
+    item: todo_core::ItemId,
+    key: &str,
+    rows: &[Waiting],
+    result: &PushResult,
+    at: Timestamp,
+) -> Result<Option<String>> {
+    let now = ts_to_sql(at)?;
+    match result {
+        PushResult::Sent => {
+            for w in rows {
+                conn.prepare_cached(
+                    "UPDATE outbox SET state = 'in_flight', attempts = attempts + 1,
+                            next_attempt_at = NULL, last_error = NULL, updated_at = ?2
+                     WHERE id = ?1 AND state IN ('pending', 'in_flight')",
+                )?
+                .execute(params![w.id, now])?;
+            }
+            Ok(None)
+        }
+        PushResult::Retry { at: next, error } => {
+            for w in rows {
+                conn.prepare_cached(
+                    "UPDATE outbox SET attempts = attempts + 1, next_attempt_at = ?2,
+                            last_error = ?3, updated_at = ?4
+                     WHERE id = ?1 AND state IN ('pending', 'in_flight')",
+                )?
+                .execute(params![w.id, ts_to_sql(*next)?, error, now])?;
+            }
+            Ok(None)
+        }
+        PushResult::Refused { error, jira } => {
+            for w in rows {
+                conn.prepare_cached(
+                    "UPDATE outbox SET state = 'failed', attempts = attempts + 1, last_error = ?2,
+                            updated_at = ?3
+                     WHERE id = ?1 AND state IN ('pending', 'in_flight')",
+                )?
+                .execute(params![w.id, error, now])?;
+            }
+            let id = new_ulid().to_string();
+            let what = rows.first().map_or("a change", |w| field_word(w.field));
+            conn.prepare_cached(
+                "INSERT INTO suggestions (id, item_id, kind, source, rationale, error, state,
+                                          created_at, updated_at)
+                 VALUES (?1, ?2, 'push_failed', 'sync', ?3, ?4, 'pending', ?5, ?5)",
+            )?
+            .execute(params![
+                id,
+                item.to_string(),
+                format!("Jira refused {what} on {key}"),
+                error,
+                now
+            ])?;
+            for w in rows {
+                let old = jira
+                    .iter()
+                    .find(|(f, _)| *f == w.field)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| w.base.clone());
+                add_patch(conn, &id, w.field, &old, &w.new)?;
+            }
+            Ok(Some(id))
+        }
+    }
+}

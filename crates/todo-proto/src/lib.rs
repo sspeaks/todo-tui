@@ -50,5 +50,6 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
 /// remote listener (ADR-0008; the phone-app branch numbered it 9).
 /// 21 added pushes (ADR-0007): Suggestion and Change.suggestion, SyncStatus's
 /// pending_ops and failed_ops; a linked Item takes edits of its pushed
-/// fields.
-pub const API_MINOR: u32 = 21;
+/// fields. 22 added the push worker's confirm_not_mine (UpdateItem,
+/// SetStatus, BatchMutate) and NOT_MINE.
+pub const API_MINOR: u32 = 22;

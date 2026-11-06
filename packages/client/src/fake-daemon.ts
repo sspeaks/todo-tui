@@ -184,6 +184,8 @@ interface Planned {
   idPath: string;
   /** Whether it is part of a BatchMutate, whose precondition failures name `idPath`. */
   batched: boolean;
+  /** The person confirmed a pushed edit of someone else's issue (design 5.9). */
+  confirmNotMine?: boolean;
   /** UpdateItem: the mask's paths, in order, and the request's values for them, by path. */
   mask?: { paths: readonly string[]; values: Fields };
   /** SetStatus: the target. */
@@ -458,7 +460,7 @@ export class FakeDaemon {
   maxPageSize = MAX_PAGE_SIZE;
   /** Runs before every ListItems; throw from it to fail that call. */
   onListItems: ((req: ListItemsRequest) => void) | undefined;
-  apiMinor = 21;
+  apiMinor = 22;
   /** What Export streams, as one batch; unset, Export is UNIMPLEMENTED (the format is the daemon's). */
   exportLines: string[] | undefined;
   /** What GetConfig serves; change it with {@link setConfig}. */
@@ -564,10 +566,14 @@ export class FakeDaemon {
           this.check();
           return { item: this.present(this.get(idOf("id", req.id)), this.today()), revision: this.revision };
         },
-        updateItem: (req) => this.single("UpdateItem", OpKind.UPDATE, req.requestId, () => planUpdate(req, "", this.today())),
+        updateItem: (req) =>
+          this.single("UpdateItem", OpKind.UPDATE, req.requestId, () => ({ ...planUpdate(req, "", this.today()), confirmNotMine: req.confirmNotMine })),
         setStatus: (req) => {
           // Closing an instance creates at most one next instance (design 3.8).
-          const { generated, ...rest } = this.single("SetStatus", OpKind.SET_STATUS, req.requestId, () => planSetStatus(req, ""));
+          const { generated, ...rest } = this.single("SetStatus", OpKind.SET_STATUS, req.requestId, () => ({
+            ...planSetStatus(req, ""),
+            confirmNotMine: req.confirmNotMine,
+          }));
           return { ...rest, generated: generated[0] };
         },
         setRecurrence: (req) =>
@@ -605,7 +611,7 @@ export class FakeDaemon {
             throw badRequest("mutations", `must hold 1 to ${MAX_BATCH} mutations`);
           }
           const today = this.today();
-          const planned = req.mutations.map((m, i) => planMutation(m, `mutations[${i}].`, today));
+          const planned = req.mutations.map((m, i) => ({ ...planMutation(m, `mutations[${i}].`, today), confirmNotMine: req.confirmNotMine }));
           return this.mutate("BatchMutate", OpKind.BATCH, requestId, planned);
         },
         undo: (req) => this.undoTx("Undo", req, false),
@@ -1396,6 +1402,17 @@ export class FakeDaemon {
           Code.FailedPrecondition,
           "LINKED_READ_ONLY",
           inBatch(p, `${path} is the tracker's: the item is linked; change it there`),
+          { field: path, item_id: p.id },
+        );
+      }
+      // Someone else's issue (design 5.9): a pushed edit needs the say-so.
+      const theirs = item.remoteLink !== undefined && !item.isMine && !p.confirmNotMine ? changes.find((c) => CORE_FIELDS.has(c.field)) : undefined;
+      if (theirs) {
+        const path = CORE_PATHS[theirs.field]!;
+        throw errorInfo(
+          Code.FailedPrecondition,
+          "NOT_MINE",
+          inBatch(p, `${path} would change in the tracker an issue assigned to someone else: confirm to change it (confirm_not_mine)`),
           { field: path, item_id: p.id },
         );
       }

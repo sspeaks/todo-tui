@@ -565,3 +565,202 @@ async fn an_item_outside_every_scope_follows_jira_by_jiras_own_clock() {
     assert_eq!(linked(&r).await[0].title, "edited outside");
     r.stop().await;
 }
+
+/// serve(), with writes taken as BRME's workflow takes them (ADR-0007).
+fn serve_writable(fake: &FakeJira, issues: Arc<Mutex<Vec<Value>>>) {
+    serve(fake, issues.clone());
+    let n = Arc::new(std::sync::atomic::AtomicU32::new(10));
+    fake.serve_writes(issues, move || {
+        let h = n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        format!("2026-11-04T{h:02}:00:00.000+0000")
+    });
+}
+
+/// Waits until `check` holds of the linked Items, syncing now meanwhile.
+async fn until(r: &Running, what: &str, check: impl Fn(&[Item]) -> bool) -> Vec<Item> {
+    for _ in 0..40 {
+        let items = linked(r).await;
+        if check(&items) {
+            return items;
+        }
+        sync_now(r).await;
+    }
+    panic!("never {what}: {:?}", linked(r).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_edit_and_a_close_reach_jira_and_read_back() {
+    let fake = FakeJira::start("pat").await;
+    let issues = Arc::new(Mutex::new(vec![issue_json(1, "old title", "new", &at(1))]));
+    serve_writable(&fake, issues.clone());
+    let r = start(&fake, "pat").await;
+    settled(&r, SyncState::Ok).await;
+    let id = linked(&r).await[0].id.clone();
+    let mut client = ItemServiceClient::new(r.channel().await);
+    client
+        .update_item(UpdateItemRequest {
+            request_id: todo_core::new_ulid().to_string(),
+            item: Some(Item {
+                id: id.clone(),
+                title: "new title".into(),
+                ..Item::default()
+            }),
+            update_mask: Some(prost_types::FieldMask {
+                paths: vec!["title".into()],
+            }),
+            ..UpdateItemRequest::default()
+        })
+        .await
+        .unwrap();
+    client
+        .set_status(todo_proto::v1::SetStatusRequest {
+            request_id: todo_core::new_ulid().to_string(),
+            id: id.clone(),
+            status: Status::Done as i32,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    // The edit woke the loop; Jira has both, and the pull reads them back.
+    let items = until(&r, "pushed", |items| items[0].pending_fields.is_empty()).await;
+    let jira = issues.lock().unwrap()[0].clone();
+    assert_eq!(jira["fields"]["summary"], "new title");
+    assert_eq!(jira["fields"]["status"]["name"], "Closed");
+    assert_eq!(jira["fields"]["resolution"]["name"], "Done");
+    assert_eq!(
+        (items[0].title.as_str(), items[0].status),
+        ("new title", Status::Done as i32)
+    );
+    assert_eq!(status(&r).await.pending_ops, 0);
+    r.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_push_jira_refuses_becomes_a_failure_and_jiras_value_stands() {
+    let fake = FakeJira::start("pat").await;
+    let issues = Arc::new(Mutex::new(vec![issue_json(1, "kept", "new", &at(1))]));
+    serve_writable(&fake, issues.clone());
+    // This Jira refuses any due date.
+    fake.route("/rest/api/2/issue/1", |seen| {
+        if seen.method == "PUT" {
+            (
+                400,
+                json!({"errorMessages": [], "errors": {"duedate": "You cannot set a due date"}}),
+                vec![],
+            )
+        } else {
+            (200, issue_json(1, "kept", "new", &at(1)), vec![])
+        }
+    });
+    let r = start(&fake, "pat").await;
+    settled(&r, SyncState::Ok).await;
+    let id = linked(&r).await[0].id.clone();
+    ItemServiceClient::new(r.channel().await)
+        .update_item(UpdateItemRequest {
+            request_id: todo_core::new_ulid().to_string(),
+            item: Some(Item {
+                id: id.clone(),
+                due_date: Some(todo_proto::google::r#type::Date {
+                    year: 2026,
+                    month: 12,
+                    day: 1,
+                }),
+                ..Item::default()
+            }),
+            update_mask: Some(prost_types::FieldMask {
+                paths: vec!["due_date".into()],
+            }),
+            ..UpdateItemRequest::default()
+        })
+        .await
+        .unwrap();
+    let items = until(&r, "refused", |items| items[0].has_push_failure).await;
+    assert_eq!(items[0].due_date, None, "Jira's value stands");
+    assert!(items[0].pending_fields.is_empty());
+    assert_eq!(status(&r).await.failed_ops, 1);
+    r.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_close_whose_answer_was_lost_is_read_back_not_sent_twice() {
+    let fake = FakeJira::start("pat").await;
+    let issues = Arc::new(Mutex::new(vec![issue_json(1, "once", "new", &at(1))]));
+    serve_writable(&fake, issues.clone());
+    let r = start(&fake, "pat").await;
+    settled(&r, SyncState::Ok).await;
+    let id = linked(&r).await[0].id.clone();
+    // Jira applies the first close but its answer is lost (a 502 after the
+    // write), as a proxy timing out would.
+    let closes = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    {
+        let (issues, closes) = (issues.clone(), closes.clone());
+        fake.route("/rest/api/2/issue/1/transitions", move |seen| {
+            if seen.method == "POST" {
+                closes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut all = issues.lock().unwrap();
+                let f = &mut all[0]["fields"];
+                f["status"] = json!({"name": "Closed", "statusCategory": {"key": "done"}});
+                f["resolution"] = json!({"name": "Done"});
+                f["updated"] = json!(at(5));
+                return (502, json!({"errorMessages": ["bad gateway"]}), vec![]);
+            }
+            (200, json!({"transitions": [{"id": "71", "name": "Closed",
+                "to": {"name": "Closed", "statusCategory": {"key": "done"}},
+                "fields": {"resolution": {"required": true, "allowedValues": [{"id": "10000", "name": "Done"}]}}}]}), vec![])
+        });
+    }
+    ItemServiceClient::new(r.channel().await)
+        .set_status(todo_proto::v1::SetStatusRequest {
+            request_id: todo_core::new_ulid().to_string(),
+            id,
+            status: Status::Done as i32,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    // The retry reads first, finds it closed, and settles.
+    until(&r, "settled", |items| {
+        items[0].pending_fields.is_empty() && items[0].status == Status::Done as i32
+    })
+    .await;
+    assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    r.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn someone_elses_issue_takes_a_pushed_edit_only_when_confirmed() {
+    let fake = FakeJira::start("pat").await;
+    let mut theirs = issue_json(1, "theirs", "new", &at(1));
+    theirs["fields"]["assignee"] =
+        json!({"key": "JIRAUSER2", "name": "alex", "displayName": "Alex"});
+    let issues = Arc::new(Mutex::new(vec![theirs]));
+    serve_writable(&fake, issues.clone());
+    let r = start(&fake, "pat").await;
+    settled(&r, SyncState::Ok).await;
+    let id = linked(&r).await[0].id.clone();
+    let mut client = ItemServiceClient::new(r.channel().await);
+    let edit = |confirm| UpdateItemRequest {
+        request_id: todo_core::new_ulid().to_string(),
+        item: Some(Item {
+            id: id.clone(),
+            title: "mine now".into(),
+            ..Item::default()
+        }),
+        update_mask: Some(prost_types::FieldMask {
+            paths: vec!["title".into()],
+        }),
+        confirm_not_mine: confirm,
+        ..UpdateItemRequest::default()
+    };
+    let err = client.update_item(edit(false)).await.unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert_eq!(err.get_details_error_info().unwrap().reason, "NOT_MINE");
+    // Overlay stays theirs to touch freely; a confirmed edit pushes.
+    client.update_item(edit(true)).await.unwrap();
+    until(&r, "pushed", |items| {
+        items[0].pending_fields.is_empty() && items[0].title == "mine now"
+    })
+    .await;
+    assert_eq!(issues.lock().unwrap()[0]["fields"]["summary"], "mine now");
+    r.stop().await;
+}

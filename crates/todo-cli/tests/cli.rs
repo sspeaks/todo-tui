@@ -896,6 +896,7 @@ fn undo_hides_a_capture_and_redo_brings_it_back() {
             id: id.clone(),
             status: Status::Done.into(),
             expected_revision: None,
+            confirm_not_mine: false,
         };
         items.set_status(request).await.unwrap();
     });
@@ -944,6 +945,7 @@ fn undo_reports_the_changes_it_leaves_alone() {
             }],
             now,
             today,
+            confirm_not_mine: false,
         };
         let done = set_status(Actor::User, todo_core::Status::Done);
         store.mutate(done).await.unwrap();
@@ -1039,6 +1041,7 @@ fn status_counts_the_inbox_due_and_each_view() {
             id: overdue.id.clone(),
             status: Status::Done.into(),
             expected_revision: None,
+            confirm_not_mine: false,
         };
         items.set_status(request).await.unwrap();
     });

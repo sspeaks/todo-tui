@@ -97,6 +97,7 @@ fn user_edit(id: todo_core::ItemId, field: ItemField, value: FieldValue) -> Muta
         }],
         now: ts(2_000),
         today: TODAY,
+        confirm_not_mine: false,
     }
 }
 

@@ -570,7 +570,11 @@ describe("FakeDaemon on a linked Item (read-only sync, ADR-0006)", () => {
 
   it("with the instance pushing, takes the pushed fields and still refuses the rest (ADR-0007)", async () => {
     const link = { trackerKind: "jira", instanceId: "work-jira", remoteId: "10001", key: "PLAT-1", url: "https://jira.example.com/browse/PLAT-1" };
-    const daemon = new FakeDaemon([{ title: "PLAT-1", remoteLink: link }, { title: "PLAT-2", remoteLink: { ...link, remoteId: "2", key: "PLAT-2", linkState: LinkState.BROKEN } }]);
+    const daemon = new FakeDaemon([
+      { title: "PLAT-1", remoteLink: link, isMine: true },
+      { title: "PLAT-2", remoteLink: { ...link, remoteId: "2", key: "PLAT-2", linkState: LinkState.BROKEN }, isMine: true },
+      { title: "PLAT-3", remoteLink: { ...link, remoteId: "3", key: "PLAT-3" } },
+    ]);
     daemon.setConfig({ instances: [{ id: "work-jira", kind: "jira-dc", push: true }] });
     const [ok, broken] = [...daemon.items.values()];
     const items = createClient(ItemService, daemon.transport);
@@ -580,5 +584,11 @@ describe("FakeDaemon on a linked Item (read-only sync, ADR-0006)", () => {
     expect([info?.reason, info?.metadata.field]).toEqual(["LINKED_READ_ONLY", "description"]);
     // A broken link stays read-only.
     expect((await failure(updateItem(items, { id: broken!.id, title: "x" }, ["title"])))?.code).toBe(Code.FailedPrecondition);
+    // Someone else's issue takes a pushed edit only when confirmed (design 5.9).
+    const theirs = [...daemon.items.values()][2]!;
+    const [refusal] = (await failure(updateItem(items, { id: theirs.id, title: "x" }, ["title"])))?.findDetails(ErrorInfoSchema) ?? [];
+    expect(refusal?.reason).toBe("NOT_MINE");
+    const confirmed = await items.updateItem({ requestId: ulid(), item: { id: theirs.id, title: "x" }, updateMask: { paths: ["title"] }, confirmNotMine: true });
+    expect(confirmed.item?.title).toBe("x");
   });
 });

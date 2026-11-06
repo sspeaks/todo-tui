@@ -176,6 +176,7 @@ fn update_req(id: &str, item: Item, paths: &[&str]) -> UpdateItemRequest {
         }),
         update_mask: Some(mask(paths)),
         expected_revision: None,
+        confirm_not_mine: false,
     }
 }
 
@@ -185,6 +186,7 @@ fn status_req(id: &str, status: Status) -> SetStatusRequest {
         id: id.to_owned(),
         status: status.into(),
         expected_revision: None,
+        confirm_not_mine: false,
     }
 }
 
@@ -240,6 +242,7 @@ fn batch_req(mutations: Vec<Mutation>) -> BatchMutateRequest {
     BatchMutateRequest {
         request_id: rid(),
         mutations,
+        confirm_not_mine: false,
     }
 }
 
@@ -302,7 +305,7 @@ async fn handshake_reports_version_and_api_minor() {
         .into_inner();
     assert_eq!(info.daemon_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(info.api_minor, todo_proto::API_MINOR);
-    assert_eq!(info.api_minor, 21);
+    assert_eq!(info.api_minor, 22);
     d.stop().await;
 }
 
@@ -2614,6 +2617,7 @@ async fn a_request_id_replays_its_own_request_only() {
             .batch_mutate(BatchMutateRequest {
                 request_id: req.request_id.clone(),
                 mutations: vec![batched(mutation::Kind::SetStatus(req.clone()))],
+                confirm_not_mine: false,
             })
             .await
             .unwrap_err(),
@@ -2776,6 +2780,7 @@ async fn batch_mutate_applies_all_or_nothing() {
     let req = BatchMutateRequest {
         request_id: "nope".into(),
         mutations: vec![done()],
+        confirm_not_mine: false,
     };
     let status = items.batch_mutate(req).await.unwrap_err();
     assert_eq!(violation(&status).0, "request_id");
@@ -3682,6 +3687,7 @@ async fn undo_reports_the_changes_it_leaves_alone() {
         }],
         now,
         today,
+        confirm_not_mine: false,
     };
     let done = store
         .mutate(set_status(Actor::User, todo_core::Status::Done))

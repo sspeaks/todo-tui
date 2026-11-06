@@ -473,6 +473,7 @@ mod tests {
             now: Timestamp::from_second(5_000).unwrap(),
             actor: core::Actor::Sync,
             pushes: core::Pushes::None,
+            confirm_not_mine: false,
         };
         core::apply(item, &MutationOp::Update(updates), &ctx)
     }
@@ -880,6 +881,7 @@ mod tests {
             item: Some(full_item()),
             update_mask: Some(mask(&["title", "due_date"])),
             expected_revision: Some(7),
+            confirm_not_mine: false,
         }
     }
 
@@ -951,6 +953,7 @@ mod tests {
             id: id.to_owned(),
             status,
             expected_revision: Some(4),
+            confirm_not_mine: false,
         };
         let good = id(1).to_string();
         let statuses = [
@@ -1074,6 +1077,7 @@ mod tests {
                     id: item_id(),
                     status: v1::Status::Done as i32,
                     expected_revision: rev,
+                    confirm_not_mine: false,
                 }),
                 MutationOp::SetStatus(core::Status::Done),
             ),

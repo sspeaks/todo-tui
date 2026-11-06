@@ -439,6 +439,10 @@ message UpdateItemRequest {
   // description has no limit of its own.
   google.protobuf.FieldMask update_mask = 3;
   optional uint64 expected_revision = 4;
+  // A pushed edit of a linked Item assigned to someone else is refused
+  // (FAILED_PRECONDITION / NOT_MINE) unless this is set: the person
+  // confirmed changing their ticket in the tracker (design 5.9).
+  bool confirm_not_mine = 5;
 }
 
 message UpdateItemResponse {
@@ -453,6 +457,8 @@ message SetStatusRequest {
   string id = 2;
   Status status = 3;
   optional uint64 expected_revision = 4;
+  // As UpdateItemRequest's (design 5.9).
+  bool confirm_not_mine = 5;
 }
 
 message SetStatusResponse {
@@ -530,6 +536,8 @@ message BatchMutateRequest {
   // each expected_revision is checked against the Item as it was before the
   // batch.
   repeated Mutation mutations = 2;
+  // For the whole batch: a mutation's own flag is ignored (design 5.9).
+  bool confirm_not_mine = 3;
 }
 
 // One single-item mutation within a batch. The nested request_id must be

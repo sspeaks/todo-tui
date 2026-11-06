@@ -80,6 +80,7 @@ pub(crate) fn undo_tx(tx: &mut WriteTx<'_>, input: UndoInput, redo: bool) -> Res
         now: input.now,
         actor: Actor::User,
         pushes: todo_core::Pushes::None,
+        confirm_not_mine: false,
     };
     // The parent rule (design 3.7) holds where the undo leaves the Items, as
     // for a batch, not after each step: a batch may pass through a live Item

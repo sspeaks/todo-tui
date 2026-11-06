@@ -795,6 +795,7 @@ fn mutate(kind: OpKind, mutations: Vec<Mutation>) -> MutateInput {
         mutations,
         now: ts(1_000),
         today: today(),
+        confirm_not_mine: false,
     }
 }
 

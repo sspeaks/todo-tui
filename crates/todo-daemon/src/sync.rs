@@ -86,6 +86,7 @@ pub(crate) async fn run(
     mut stop: ShutdownSignal,
 ) {
     let state = State { tx: status };
+    let queued = store.pushes_queued();
     let mut last_reconcile: Option<Timestamp> = None;
     let mut offline_wait = Duration::from_secs(15);
     loop {
@@ -152,6 +153,9 @@ pub(crate) async fn run(
             () = now.0.notified() => last_reconcile = None,
             // A TUI arriving moves to its cadence now (design 5.4).
             () = clients.interactive_arrived() => {}
+            // An edit queued a push: a pass now (pull first, then push),
+            // with no reconciliation.
+            () = queued.notified() => {}
             changed = config.changed() => {
                 if changed.is_err() {
                     return;
@@ -246,6 +250,10 @@ async fn pass(store: &Store, i: &Instance, state: &State, reconcile: bool) -> Ou
         }
     }
     if let Err(o) = tracked_and_reconcile(store, i, &adapter, state, reconcile, &seen).await {
+        return o;
+    }
+    // Then the outbox, on data just pulled (design 5.11: pull first).
+    if let Err(o) = push(store, i, &adapter, state).await {
         return o;
     }
     let items = store
@@ -444,4 +452,159 @@ async fn tracked_and_reconcile(
             .map_err(sfail)?;
     }
     Ok(())
+}
+
+/// Items whose pushes one pass sends at most: more wait for the next one.
+const PUSH_BATCH: usize = 50;
+
+/// The first retry after a transient failure; it doubles, to [`OFFLINE_MAX`].
+const PUSH_RETRY: Duration = Duration::from_secs(15);
+
+/// Sends what the outbox has due (design 5.6, ADR-0007), after the pull, so
+/// the conflict rule ran on fresh data. Per Item: read the issue again and
+/// run the rule on what Jira has now (a lost answer, or a change since the
+/// pull); push what still waits, fields then the status; then read it back
+/// and apply it, which settles the rows. A transient failure retries with
+/// backoff (a 429's wait honoured); a refusal becomes a push_failed
+/// Suggestion and Jira's values stand; a 401 stops the pass as auth_error.
+async fn push(
+    store: &Store,
+    i: &Instance,
+    adapter: &Adapter,
+    state: &State,
+) -> Result<(), Outcome> {
+    use todo_jira::{FieldPatch, PushError, Target};
+    use todo_store::outbox::PushResult;
+    if !i.push.enabled {
+        return Ok(());
+    }
+    let sfail = |e: todo_store::StoreError| store_fail(state, &i.id, &e);
+    let due = store
+        .due_pushes(i.id.clone(), Timestamp::now(), PUSH_BATCH)
+        .await
+        .map_err(sfail)?;
+    for d in due {
+        // Fresh first: the rule on what Jira has now (5.6).
+        let issue = match adapter.fetch(&d.remote_id).await {
+            Ok(Fetched::Found(issue)) => *issue,
+            // Gone or forbidden: the reconciliation breaks the link; the rows
+            // wait for it to heal.
+            Ok(Fetched::NotFound | Fetched::Forbidden) => continue,
+            Err(JiraError::Auth) => return Err(fail(state, &i.id, &JiraError::Auth)),
+            Err(e) if e.is_transient() => {
+                let at = retry_at(&e, d.attempts);
+                store
+                    .record_push(
+                        d.item_id,
+                        d.key.clone(),
+                        d.rows,
+                        PushResult::Retry {
+                            at,
+                            error: e.to_string(),
+                        },
+                        Timestamp::now(),
+                    )
+                    .await
+                    .map_err(sfail)?;
+                continue;
+            }
+            Err(e) => return Err(fail(state, &i.id, &e)),
+        };
+        store
+            .apply_pull(page(i, vec![(issue, Vec::new())], None, false))
+            .await
+            .map_err(sfail)?;
+        // What still waits after the rule: Jira at the base.
+        let due = store
+            .due_pushes(i.id.clone(), Timestamp::now(), PUSH_BATCH)
+            .await
+            .map_err(sfail)?;
+        let Some(d) = due.into_iter().find(|x| x.item_id == d.item_id) else {
+            continue;
+        };
+        let mut fields = Vec::new();
+        let mut target = None;
+        let (mut category, mut kind) = (None, None);
+        for w in &d.rows {
+            use todo_core::{FieldValue as V, ItemField as F};
+            match (w.field, &w.new) {
+                (F::Title, V::String(t)) => fields.push(FieldPatch::Title(t.clone())),
+                (F::Priority, V::Priority(p)) => fields.push(FieldPatch::Priority(*p)),
+                (F::Labels, V::StringSet(l)) => fields.push(FieldPatch::Labels(l.clone())),
+                (F::DueDate, V::Date(day)) => fields.push(FieldPatch::DueDate(Some(*day))),
+                (F::DueDate, V::Cleared) => fields.push(FieldPatch::DueDate(None)),
+                (F::StatusCategory, V::StatusCategory(c)) => category = Some(*c),
+                (F::ResolutionKind, V::ResolutionKind(k)) => kind = Some(*k),
+                _ => {}
+            }
+        }
+        if category.is_some() || kind.is_some() {
+            // A kind alone (done to cancelled) is a close again, into Done.
+            target = Some(match category.unwrap_or(todo_core::StatusCategory::Done) {
+                todo_core::StatusCategory::Todo => Target::Todo,
+                todo_core::StatusCategory::InProgress => Target::InProgress,
+                todo_core::StatusCategory::Done => {
+                    Target::Done(kind.unwrap_or(todo_core::ResolutionKind::Done))
+                }
+            });
+        }
+        let sent = async {
+            adapter.update_fields(&d.remote_id, &fields).await?;
+            if let Some(t) = target {
+                adapter.transition(&d.remote_id, t).await?;
+            }
+            Ok::<(), PushError>(())
+        }
+        .await;
+        let result = match sent {
+            Ok(()) => PushResult::Sent,
+            Err(PushError::Jira(JiraError::Auth)) => {
+                return Err(fail(state, &i.id, &JiraError::Auth));
+            }
+            Err(PushError::Jira(e)) if e.is_transient() => PushResult::Retry {
+                at: retry_at(&e, d.attempts),
+                error: e.to_string(),
+            },
+            Err(e) => PushResult::Refused {
+                error: e.to_string(),
+                jira: d.rows.iter().map(|w| (w.field, w.base.clone())).collect(),
+            },
+        };
+        let sent_ok = result == PushResult::Sent;
+        let refused = matches!(result, PushResult::Refused { .. });
+        store
+            .record_push(
+                d.item_id,
+                d.key.clone(),
+                d.rows.clone(),
+                result,
+                Timestamp::now(),
+            )
+            .await
+            .map_err(sfail)?;
+        // Read back what Jira has now: a sent push settles (Jira at new);
+        // a refused one puts Jira's values back on the Item.
+        if (sent_ok || refused)
+            && let Ok(Fetched::Found(issue)) = adapter.fetch(&d.remote_id).await
+        {
+            store
+                .apply_pull(page(i, vec![(*issue, Vec::new())], None, false))
+                .await
+                .map_err(sfail)?;
+        }
+    }
+    Ok(())
+}
+
+/// When to try again after `e`: a 429's wait, else 15 s doubling with
+/// each attempt, up to ten minutes.
+fn retry_at(e: &JiraError, attempts: u32) -> Timestamp {
+    let wait = match e {
+        JiraError::RateLimited(d) => *d,
+        _ => PUSH_RETRY
+            .saturating_mul(1u32 << attempts.min(6))
+            .min(OFFLINE_MAX),
+    };
+    Timestamp::now()
+        + jiff::SignedDuration::try_from(wait).unwrap_or(jiff::SignedDuration::from_secs(600))
 }

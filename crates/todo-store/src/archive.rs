@@ -53,6 +53,7 @@ pub(crate) fn auto_archive_tx(
         now: input.now,
         actor: Actor::System,
         pushes: todo_core::Pushes::None,
+        confirm_not_mine: false,
     };
     let unarchive = MutationOp::Unarchive;
     let archive = MutationOp::Archive(ArchiveReason::AutoDone);

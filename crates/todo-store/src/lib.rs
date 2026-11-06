@@ -8,7 +8,7 @@ mod archive;
 mod codec;
 mod export;
 mod hierarchy;
-mod outbox;
+pub mod outbox;
 mod query;
 mod relation;
 mod report;
@@ -299,6 +299,9 @@ pub struct MutateInput {
     pub now: Timestamp,
     /// "Today" in the user's zone, for `is_overdue` on the returned Items.
     pub today: Date,
+    /// The person confirmed changing, in the tracker, Items assigned to
+    /// someone else (design 5.9).
+    pub confirm_not_mine: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -490,6 +493,8 @@ pub struct WriteTx<'conn> {
     next_revision: Revision,
     /// Whether pushed fields are editable on linked Items (ADR-0007).
     pushes: todo_core::Pushes,
+    /// This write queued a push: the sync loop is woken after the commit.
+    queued: bool,
 }
 
 impl WriteTx<'_> {
@@ -578,6 +583,8 @@ struct Shared {
     /// The instance whose linked Items take a person's edit of their pushed
     /// fields, queued for it (ADR-0007), as the config says; none, read-only.
     pushes: Mutex<todo_core::Pushes>,
+    /// Notified when an op queued a push, after its commit.
+    queued: Arc<tokio::sync::Notify>,
 }
 
 struct Inner {
@@ -657,6 +664,7 @@ impl Store {
             revision: AtomicU64::new(revision),
             changes: broadcast::channel(BROADCAST_CAPACITY).0,
             pushes: Mutex::new(todo_core::Pushes::None),
+            queued: Arc::new(tokio::sync::Notify::new()),
         });
         run_write(&mut writer_conn, &shared, view::seed_tx)?;
         let (jobs, rx) = mpsc::channel::<Job>();
@@ -963,6 +971,44 @@ impl Store {
             .await
     }
 
+    /// The Items of `instance` with pushes due (design 5.6), oldest first.
+    pub async fn due_pushes(
+        &self,
+        instance: String,
+        now: Timestamp,
+        limit: usize,
+    ) -> Result<Vec<outbox::DuePush>> {
+        self.read(move |conn| outbox::due(conn, &instance, now, limit))
+            .await
+    }
+
+    /// What pushing `rows` of `item` came to (design 5.6): sent (in flight
+    /// until a pull reads it back), to retry, or refused (failed, with a
+    /// push_failed Suggestion streamed). The pull that follows writes the
+    /// Item's own fields.
+    pub async fn record_push(
+        &self,
+        item: ItemId,
+        key: String,
+        rows: Vec<outbox::Waiting>,
+        result: outbox::PushResult,
+        now: Timestamp,
+    ) -> Result<()> {
+        self.write(move |tx| {
+            let made = outbox::record_result(tx.conn(), item, &key, &rows, &result, now)?;
+            if let Some(id) = made {
+                outbox::record_suggestion(tx, &id)?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// A push is waiting (ADR-0007): the sync loop wakes on it.
+    pub fn pushes_queued(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.inner.shared.queued)
+    }
+
     /// The outbox of `instance`: changes waiting to push, and those Jira
     /// refused (design 5.11).
     pub async fn outbox_counts(&self, instance: String) -> Result<(u32, u32)> {
@@ -1025,9 +1071,15 @@ where
         changes: Vec::new(),
         next_revision: shared.revision.load(Ordering::Acquire) + 1,
         pushes: *shared.pushes.lock().unwrap_or_else(|e| e.into_inner()),
+        queued: false,
     };
     let value = f(&mut wtx)?;
-    let WriteTx { tx, changes, .. } = wtx;
+    let WriteTx {
+        tx,
+        changes,
+        queued,
+        ..
+    } = wtx;
     let last = changes.last().map(|c| c.revision);
     if let Some(last) = last {
         tx.execute("UPDATE meta SET revision = ?1", [rev_to_sql(last)?])?;
@@ -1039,6 +1091,9 @@ where
     for change in changes {
         // No receivers is fine.
         let _ = shared.changes.send(change);
+    }
+    if queued {
+        shared.queued.notify_one();
     }
     Ok(value)
 }
@@ -1884,6 +1939,7 @@ fn write_op(
         let by_id = |id: ItemId| batch.slots.get(&id).map(|&s| batch.items[s].clone());
         let mut queued =
             outbox::enqueue(conn, &op.id.to_string(), &batch.events, by_id, create, at)?;
+        let woke = !queued.is_empty();
         for &slot in &touched {
             let item = &batch.items[slot];
             if item.remote_link.is_some() && item.is_deleted() && !batch.loaded[slot].is_deleted() {
@@ -1897,6 +1953,7 @@ fn write_op(
                 batch.items[slot].derived.pending_fields = outbox::pending_fields(conn, id)?;
             }
         }
+        tx.queued |= woke;
     }
     for item in &mut batch.items {
         item.derived.is_overdue = is_overdue(item, Some(today));
@@ -2047,6 +2104,7 @@ fn mutate_tx(tx: &mut WriteTx<'_>, input: MutateInput) -> Result<MutateOutput> {
         now: input.now,
         actor: input.actor,
         pushes: tx.pushes(),
+        confirm_not_mine: input.confirm_not_mine,
     };
     let conn = tx.conn();
     let mut batch = Batch::default();

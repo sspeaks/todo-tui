@@ -181,9 +181,13 @@ impl ItemService for Items {
     ) -> Result<Response<UpdateItemResponse>, Status> {
         let req = request.into_inner();
         let (item, result, _) = self
-            .single(&req.request_id, OpKind::Update, Shape::Update, |today| {
-                request::update_item_from_proto(&req, today)
-            })
+            .single(
+                &req.request_id,
+                OpKind::Update,
+                Shape::Update,
+                req.confirm_not_mine,
+                |today| request::update_item_from_proto(&req, today),
+            )
             .await?;
         Ok(Response::new(UpdateItemResponse { item, result }))
     }
@@ -194,9 +198,13 @@ impl ItemService for Items {
     ) -> Result<Response<SetStatusResponse>, Status> {
         let req = request.into_inner();
         let (item, result, generated) = self
-            .single(&req.request_id, OpKind::SetStatus, Shape::SetStatus, |_| {
-                request::set_status_from_proto(&req)
-            })
+            .single(
+                &req.request_id,
+                OpKind::SetStatus,
+                Shape::SetStatus,
+                req.confirm_not_mine,
+                |_| request::set_status_from_proto(&req),
+            )
             .await?;
         // Closing an instance creates at most one next instance (design 3.8).
         Ok(Response::new(SetStatusResponse {
@@ -216,6 +224,7 @@ impl ItemService for Items {
                 &req.request_id,
                 OpKind::SetRecurrence,
                 Shape::SetRecurrence,
+                false,
                 |today| request::set_recurrence_from_proto(&req, today),
             )
             .await?;
@@ -246,9 +255,13 @@ impl ItemService for Items {
     ) -> Result<Response<ArchiveItemResponse>, Status> {
         let req = request.into_inner();
         let (item, result, _) = self
-            .single(&req.request_id, OpKind::Archive, Shape::ItemOp, |_| {
-                request::archive_item_from_proto(&req)
-            })
+            .single(
+                &req.request_id,
+                OpKind::Archive,
+                Shape::ItemOp,
+                false,
+                |_| request::archive_item_from_proto(&req),
+            )
             .await?;
         Ok(Response::new(ArchiveItemResponse { item, result }))
     }
@@ -259,9 +272,13 @@ impl ItemService for Items {
     ) -> Result<Response<UnarchiveItemResponse>, Status> {
         let req = request.into_inner();
         let (item, result, _) = self
-            .single(&req.request_id, OpKind::Unarchive, Shape::ItemOp, |_| {
-                request::unarchive_item_from_proto(&req)
-            })
+            .single(
+                &req.request_id,
+                OpKind::Unarchive,
+                Shape::ItemOp,
+                false,
+                |_| request::unarchive_item_from_proto(&req),
+            )
             .await?;
         Ok(Response::new(UnarchiveItemResponse { item, result }))
     }
@@ -272,9 +289,13 @@ impl ItemService for Items {
     ) -> Result<Response<DeleteItemResponse>, Status> {
         let req = request.into_inner();
         let (item, result, _) = self
-            .single(&req.request_id, OpKind::Delete, Shape::ItemOp, |_| {
-                request::delete_item_from_proto(&req)
-            })
+            .single(
+                &req.request_id,
+                OpKind::Delete,
+                Shape::ItemOp,
+                false,
+                |_| request::delete_item_from_proto(&req),
+            )
             .await?;
         Ok(Response::new(DeleteItemResponse { item, result }))
     }
@@ -285,9 +306,13 @@ impl ItemService for Items {
     ) -> Result<Response<UndeleteItemResponse>, Status> {
         let req = request.into_inner();
         let (item, result, _) = self
-            .single(&req.request_id, OpKind::Undelete, Shape::ItemOp, |_| {
-                request::undelete_item_from_proto(&req)
-            })
+            .single(
+                &req.request_id,
+                OpKind::Undelete,
+                Shape::ItemOp,
+                false,
+                |_| request::undelete_item_from_proto(&req),
+            )
             .await?;
         Ok(Response::new(UndeleteItemResponse { item, result }))
     }
@@ -317,7 +342,14 @@ impl ItemService for Items {
             .map_err(error::convert)?;
         let shape = Shape::Batch(&req.mutations);
         let out = self
-            .mutate(&request_id, OpKind::Batch, mutations, &now, &shape)
+            .mutate(
+                &request_id,
+                OpKind::Batch,
+                mutations,
+                &now,
+                &shape,
+                req.confirm_not_mine,
+            )
             .await?;
         Ok(Response::new(BatchMutateResponse {
             items: out.items.into_iter().map(v1::Item::from).collect(),
@@ -592,13 +624,21 @@ impl Items {
         request_id: &str,
         kind: OpKind,
         shape: Shape<'static>,
+        confirm_not_mine: bool,
         convert: impl FnOnce(Date) -> Result<Mutation, ConvertError>,
     ) -> Result<Single, Status> {
         let request_id = check_request_id(request_id)?;
         let now = Zoned::now();
         let mutation = convert(now.date()).map_err(error::convert)?;
         let out = self
-            .mutate(&request_id, kind, vec![mutation], &now, &shape)
+            .mutate(
+                &request_id,
+                kind,
+                vec![mutation],
+                &now,
+                &shape,
+                confirm_not_mine,
+            )
             .await?;
         let item = out.items.into_iter().next().map(v1::Item::from);
         let generated = out.generated.into_iter().map(v1::Item::from).collect();
@@ -735,6 +775,7 @@ impl Items {
         mutations: Vec<Mutation>,
         now: &Zoned,
         shape: &Shape<'_>,
+        confirm_not_mine: bool,
     ) -> Result<MutateOutput, Status> {
         let ids: Vec<ItemId> = mutations.iter().map(|m| m.id).collect();
         let input = MutateInput {
@@ -744,6 +785,7 @@ impl Items {
             mutations,
             now: now.timestamp(),
             today: now.date(),
+            confirm_not_mine,
         };
         let out = self
             .0
