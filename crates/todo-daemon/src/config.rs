@@ -269,6 +269,7 @@ impl From<&Config> for v1::ConfigSnapshot {
                         .collect(),
                     poll_seconds: u32::try_from(i.poll_interactive.as_secs()).unwrap_or(u32::MAX),
                     idle_poll_seconds: u32::try_from(i.poll_idle.as_secs()).unwrap_or(u32::MAX),
+                    push: i.push.enabled,
                 })
                 .collect(),
             meetings: Some(v1::MeetingsConfig {

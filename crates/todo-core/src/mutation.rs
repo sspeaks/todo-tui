@@ -150,6 +150,35 @@ pub struct Mutation {
 pub struct ApplyCtx {
     pub now: Timestamp,
     pub actor: Actor,
+    /// The instances whose linked Items take a person's edit of a pushed
+    /// field (ADR-0007): they are queued for the tracker. Elsewhere every
+    /// Core field stays read-only (ADR-0006).
+    pub pushes: Pushes,
+}
+
+/// Which instance pushes (ADR-0007), as the store knows it: one syncs
+/// today. Copy, so it holds the instance id's hash ([`Pushes::instance`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Pushes {
+    /// None: read-only sync.
+    #[default]
+    None,
+    /// The linked Items of this instance whose link is whole.
+    Instance(u64),
+}
+
+impl Pushes {
+    /// The instance `id` pushes.
+    pub fn instance(id: &str) -> Self {
+        Pushes::Instance(instance_hash(id))
+    }
+}
+
+/// FNV-1a: stable across runs (unlike the std hasher's seed).
+fn instance_hash(id: &str) -> u64 {
+    id.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+    })
 }
 
 /// One field's change, recorded as an event.
@@ -204,9 +233,9 @@ pub enum MutationError {
     Closed,
     #[error("{field:?}: {reason}")]
     Unsupported { field: ItemField, reason: String },
-    /// A Core field of a linked Item, before pushes exist (ADR-0006): the
-    /// tracker owns it, and the next pull would undo the edit.
-    #[error("{0:?} is the tracker's until pushes arrive")]
+    /// A Core field of a linked Item that does not push (ADR-0006,
+    /// ADR-0007): the tracker owns it, and the next pull would undo the edit.
+    #[error("{0:?} is the tracker's: change it there")]
     LinkedReadOnly(ItemField),
 }
 
@@ -318,11 +347,14 @@ pub fn apply(item: &Item, op: &MutationOp, ctx: &ApplyCtx) -> Result<Applied, Mu
             skipped: Vec::new(),
         });
     }
-    // Read-only sync (ADR-0006): on a linked Item a person changes only
-    // Overlay fields. Sync writes Core; undo restores what it recorded.
+    // On a linked Item a person changes Overlay fields, and the pushed
+    // ones while its instance pushes and its link is whole (ADR-0006,
+    // ADR-0007). Sync writes Core; undo restores what it recorded.
     if item.is_linked()
         && matches!(ctx.actor, Actor::User | Actor::Suggestion(_))
-        && let Some(c) = changes.iter().find(|c| is_core(c.field))
+        && let Some(c) = changes
+            .iter()
+            .find(|c| is_core(c.field) && !(pushed(c.field) && pushes(item, ctx)))
     {
         return Err(MutationError::LinkedReadOnly(c.field));
     }
@@ -334,9 +366,27 @@ pub fn apply(item: &Item, op: &MutationOp, ctx: &ApplyCtx) -> Result<Applied, Mu
     })
 }
 
+/// Whether a person's edit of `item`'s pushed fields goes to the tracker.
+fn pushes(item: &Item, ctx: &ApplyCtx) -> bool {
+    item.remote_link.as_ref().is_some_and(|l| {
+        l.link_state == crate::item::LinkState::Ok && ctx.pushes == Pushes::instance(&l.instance_id)
+    })
+}
+
+/// A Core field a push sends (ADR-0007): the status (category and
+/// resolution kind, through SetStatus) and the title, priority, labels and
+/// due date. The rest stay the tracker's alone.
+pub fn pushed(field: ItemField) -> bool {
+    use ItemField as F;
+    matches!(
+        field,
+        F::Title | F::Priority | F::Labels | F::DueDate | F::StatusCategory | F::ResolutionKind
+    )
+}
+
 /// A Core field (design 3.2): the tracker's once the Item is linked. The
 /// status category and resolution kind are Core; the refinement is not.
-fn is_core(field: ItemField) -> bool {
+pub fn is_core(field: ItemField) -> bool {
     use ItemField as F;
     matches!(
         field,
@@ -466,6 +516,17 @@ fn restore_unit(item: &Item, unit: &RestoreUnit) -> Result<(Item, Vec<FieldChang
         ));
     }
     Ok((next, changes))
+}
+
+/// Writes `value` into `item`'s `field` as a restore does, with no events
+/// and no derived upkeep: for the sync engine, which keeps a pushed
+/// field's local value over a pull while its push waits (design 5.6).
+pub fn write_field(
+    item: &mut Item,
+    field: ItemField,
+    value: &FieldValue,
+) -> Result<(), MutationError> {
+    restore_field(item, field, value)
 }
 
 /// Like [`set_field`], and also writes the fields only `Restore` may write.
@@ -868,7 +929,11 @@ mod tests {
     }
 
     fn ctx(actor: Actor) -> ApplyCtx {
-        ApplyCtx { now: now(), actor }
+        ApplyCtx {
+            now: now(),
+            actor,
+            pushes: Pushes::None,
+        }
     }
 
     fn item() -> Item {
@@ -1320,6 +1385,7 @@ mod tests {
                 let ctx = ApplyCtx {
                     now: Timestamp::from_second(10).unwrap(),
                     actor: Actor::Sync,
+                    pushes: Pushes::None,
                 };
                 apply(
                     item,
@@ -2134,6 +2200,7 @@ mod tests {
             &ApplyCtx {
                 now: ts(9_000),
                 actor: Actor::User,
+                pushes: Pushes::None,
             },
         )
         .unwrap();
@@ -2796,6 +2863,7 @@ mod linked_tests {
         ApplyCtx {
             now: Timestamp::from_second(10).unwrap(),
             actor: Actor::User,
+            pushes: Pushes::None,
         }
     }
 

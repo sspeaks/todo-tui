@@ -90,6 +90,14 @@ pub(crate) async fn run(
     let mut offline_wait = Duration::from_secs(15);
     loop {
         let instance = config.borrow_and_update().instances.first().cloned();
+        // A person may edit a linked Item's pushed fields only while its
+        // instance pushes (ADR-0007).
+        store.set_pushes(
+            instance
+                .as_ref()
+                .filter(|i| i.push.enabled)
+                .map(|i| i.id.as_str()),
+        );
         // Only the configured instances have a status.
         state
             .tx
@@ -245,7 +253,10 @@ async fn pass(store: &Store, i: &Instance, state: &State, reconcile: bool) -> Ou
         .await
         .map(|t| t.len())
         .unwrap_or(0);
+    let (pending, failed) = store.outbox_counts(i.id.clone()).await.unwrap_or((0, 0));
     state.set(&i.id, |st| {
+        st.pending_ops = pending;
+        st.failed_ops = failed;
         st.state = v1::SyncState::Ok as i32;
         st.last_error.clear();
         st.last_successful_pull_at = Some(timestamp_to_proto(Timestamp::now()));

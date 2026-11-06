@@ -226,6 +226,8 @@ mod tests {
             items: 12,
             pulled: 0,
             served_request: 0,
+            pending_ops: 0,
+            failed_ops: 0,
         }
     }
 

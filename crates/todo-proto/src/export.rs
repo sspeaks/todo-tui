@@ -9,7 +9,9 @@ use prost_reflect::{
     DescriptorPool, DeserializeOptions, DynamicMessage, MessageDescriptor, SerializeOptions,
 };
 use todo_core::FieldValue;
-use todo_store::{EventRecord, EventValue, ExportRow, OpRecord};
+use todo_store::{
+    EventRecord, EventValue, ExportRow, OpRecord, OutboxRecord, PatchRecord, SuggestionRecord,
+};
 
 use crate::convert::{
     ConvertError, EnumField as _, field_value_from_proto, timestamp_from_proto, timestamp_to_proto,
@@ -133,7 +135,7 @@ pub fn read_record(line: &str) -> Result<ExportRow, LineError> {
     row_of(&record).map_err(|e| LineError(e.to_string()))
 }
 
-const RECORD_TYPES: [&str; 7] = [
+const RECORD_TYPES: [&str; 9] = [
     "item",
     "relation",
     "view",
@@ -141,6 +143,8 @@ const RECORD_TYPES: [&str; 7] = [
     "op",
     "event",
     "sync_cursor",
+    "outbox_op",
+    "suggestion",
 ];
 
 fn snake(s: &str) -> String {
@@ -210,6 +214,44 @@ fn record_of(row: &ExportRow) -> ex::Record {
             instance_id: instance_id.clone(),
             scope: scope.clone(),
             cursor_at: Some(timestamp_to_proto(*cursor_at)),
+        }),
+        ExportRow::Outbox(o) => R::OutboxOp(ex::OutboxOp {
+            id: o.id.clone(),
+            item_id: o.item_id.clone(),
+            instance_id: o.instance_id.clone(),
+            op_id: o.op_id.clone(),
+            kind: o.kind.clone(),
+            field: o.field,
+            base_json: o.base_json.clone(),
+            new_json: o.new_json.clone(),
+            state: o.state.clone(),
+            attempts: o.attempts,
+            next_attempt_at: o.next_attempt_at.map(timestamp_to_proto),
+            last_error: o.last_error.clone(),
+            created_at: Some(timestamp_to_proto(o.created_at)),
+            updated_at: Some(timestamp_to_proto(o.updated_at)),
+        }),
+        ExportRow::Suggestion(s) => R::Suggestion(ex::SuggestionRecord {
+            id: s.id.clone(),
+            item_id: s.item_id.clone(),
+            kind: s.kind.clone(),
+            source: s.source.clone(),
+            rationale: s.rationale.clone(),
+            error: s.error.clone(),
+            state: s.state.clone(),
+            created_at: Some(timestamp_to_proto(s.created_at)),
+            updated_at: Some(timestamp_to_proto(s.updated_at)),
+            patches: s
+                .patches
+                .iter()
+                .map(|p| ex::SuggestionPatchRecord {
+                    id: p.id.clone(),
+                    field: p.field,
+                    expected_old_json: p.expected_old_json.clone(),
+                    new_json: p.new_json.clone(),
+                    state: p.state.clone(),
+                })
+                .collect(),
         }),
         ExportRow::Op(op) => R::Op(ex::Op {
             id: op.id.clone(),
@@ -291,6 +333,48 @@ fn row_of(record: &ex::Record) -> Result<ExportRow, ConvertError> {
                 scope: c.scope.clone(),
                 cursor_at: ts("cursor_at", &c.cursor_at)?,
             },
+            R::OutboxOp(o) => ExportRow::Outbox(Box::new(OutboxRecord {
+                id: o.id.clone(),
+                item_id: o.item_id.clone(),
+                instance_id: o.instance_id.clone(),
+                op_id: o.op_id.clone(),
+                kind: o.kind.clone(),
+                field: o.field,
+                base_json: o.base_json.clone(),
+                new_json: o.new_json.clone(),
+                state: o.state.clone(),
+                attempts: o.attempts,
+                next_attempt_at: o
+                    .next_attempt_at
+                    .as_ref()
+                    .map(|t| timestamp_from_proto("next_attempt_at", t))
+                    .transpose()?,
+                last_error: o.last_error.clone(),
+                created_at: ts("created_at", &o.created_at)?,
+                updated_at: ts("updated_at", &o.updated_at)?,
+            })),
+            R::Suggestion(s) => ExportRow::Suggestion(Box::new(SuggestionRecord {
+                id: s.id.clone(),
+                item_id: s.item_id.clone(),
+                kind: s.kind.clone(),
+                source: s.source.clone(),
+                rationale: s.rationale.clone(),
+                error: s.error.clone(),
+                state: s.state.clone(),
+                created_at: ts("created_at", &s.created_at)?,
+                updated_at: ts("updated_at", &s.updated_at)?,
+                patches: s
+                    .patches
+                    .iter()
+                    .map(|p| PatchRecord {
+                        id: p.id.clone(),
+                        field: p.field,
+                        expected_old_json: p.expected_old_json.clone(),
+                        new_json: p.new_json.clone(),
+                        state: p.state.clone(),
+                    })
+                    .collect(),
+            })),
             R::Op(op) => ExportRow::Op(Box::new(OpRecord {
                 id: op.id.clone(),
                 kind: op.kind.clone(),

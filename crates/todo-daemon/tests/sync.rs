@@ -14,9 +14,8 @@ use todo_proto::v1::item_service_client::ItemServiceClient;
 use todo_proto::v1::sync_service_client::SyncServiceClient;
 use todo_proto::v1::watch_service_client::WatchServiceClient;
 use todo_proto::v1::{
-    Filter, GetSyncStatusRequest, Item, ListItemsRequest, SetStatusRequest, Status,
-    SubscribeRequest, SyncNowRequest, SyncState, SyncStatus, UpdateItemRequest, notice,
-    subscribe_response::Message,
+    Filter, GetSyncStatusRequest, Item, ListItemsRequest, Status, SubscribeRequest, SyncNowRequest,
+    SyncState, SyncStatus, UpdateItemRequest, notice, subscribe_response::Message,
 };
 use tonic::Code;
 use tonic::transport::Channel;
@@ -227,14 +226,20 @@ async fn the_first_pass_imports_the_scope_and_later_ones_follow_it() {
     issues.lock().unwrap()[0]["fields"]["updated"] = json!(at(3));
     sync_now(&r).await;
     assert_eq!(linked(&r).await[0].title, "Fix the flaky login test");
-    // The read-only guard holds end to end.
+    // The guard holds end to end for what does not push (ADR-0007).
     let mut client = ItemServiceClient::new(r.channel().await);
     let err = client
-        .set_status(SetStatusRequest {
+        .update_item(UpdateItemRequest {
             request_id: todo_core::new_ulid().to_string(),
-            id: items[0].id.clone(),
-            status: Status::Done as i32,
-            ..SetStatusRequest::default()
+            item: Some(Item {
+                id: items[0].id.clone(),
+                description: "mine".into(),
+                ..Item::default()
+            }),
+            update_mask: Some(prost_types::FieldMask {
+                paths: vec!["description".into()],
+            }),
+            ..UpdateItemRequest::default()
         })
         .await
         .unwrap_err();

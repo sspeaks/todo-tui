@@ -44,6 +44,9 @@ message InstanceConfig {
   // Between pulls with a TUI connected, and otherwise.
   uint32 poll_seconds = 5;
   uint32 idle_poll_seconds = 6;
+  // Edits of the pushed fields reach the tracker (ADR-0007); false keeps
+  // the instance read-only.
+  bool push = 7;
 }
 
 message ScopeConfig {

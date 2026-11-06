@@ -191,6 +191,9 @@ fn change_message(row: ChangeRow, config: &ConfigHandle) -> SubscribeResponse {
         Some(Resource::Item(item)) => {
             Some(change::Resource::Item(Box::new(v1::Item::from(&*item))))
         }
+        Some(Resource::Suggestion(s)) => {
+            Some(change::Resource::Suggestion(v1::Suggestion::from(&*s)))
+        }
         Some(Resource::View(view)) => {
             Some(change::Resource::View(Box::new(v1::View::from(&*view))))
         }

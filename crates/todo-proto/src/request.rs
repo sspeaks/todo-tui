@@ -472,6 +472,7 @@ mod tests {
         let ctx = core::ApplyCtx {
             now: Timestamp::from_second(5_000).unwrap(),
             actor: core::Actor::Sync,
+            pushes: core::Pushes::None,
         };
         core::apply(item, &MutationOp::Update(updates), &ctx)
     }

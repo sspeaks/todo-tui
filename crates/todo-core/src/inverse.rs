@@ -621,6 +621,7 @@ mod tests {
         let ctx = ApplyCtx {
             now,
             actor: Actor::User,
+            pushes: crate::mutation::Pushes::None,
         };
         let mut skipped = Vec::new();
         let mut applied = Vec::new();
@@ -659,6 +660,7 @@ mod tests {
         ApplyCtx {
             now,
             actor: Actor::User,
+            pushes: crate::mutation::Pushes::None,
         }
     }
 
@@ -807,6 +809,7 @@ mod tests {
         let system = ApplyCtx {
             now: ts(2_500),
             actor: Actor::System,
+            pushes: crate::mutation::Pushes::None,
         };
         let (deleted, _) = run(&edited, &[MutationOp::Delete], system);
 
@@ -882,6 +885,7 @@ mod tests {
         let system = ApplyCtx {
             now: ts(2_500),
             actor: Actor::System,
+            pushes: crate::mutation::Pushes::None,
         };
         let moved = MutationOp::Update(vec![FieldUpdate {
             field: F::DueDate,
@@ -953,6 +957,7 @@ mod tests {
         let system = ApplyCtx {
             now: ts(2_500),
             actor: Actor::System,
+            pushes: crate::mutation::Pushes::None,
         };
         let (changed, _) = run(
             &edited,

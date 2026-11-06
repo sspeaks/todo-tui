@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package todo.v1;
+
+import "google/protobuf/timestamp.proto";
+import "todo/v1/field.proto";
+import "todo/v1/field_value.proto";
+
+// A proposed change, never applied without a person (design 3.11). P2
+// writes the sync kinds: what Jira's value won over (sync_conflict), and a
+// push Jira refused (push_failed).
+message Suggestion {
+  string id = 1;
+  // The Item it proposes a change to.
+  string item_id = 2;
+  SuggestionKind kind = 3;
+  SuggestionSource source = 4;
+  // One or two sentences, for the pane.
+  string rationale = 5;
+  // push_failed: what Jira said.
+  string error = 6;
+  SuggestionState state = 7;
+  repeated Patch patches = 8;
+  google.protobuf.Timestamp created_at = 9;
+}
+
+// One checkbox: set `field` to `new` while it still holds `expected_old`.
+message Patch {
+  string id = 1;
+  ItemField field = 2;
+  FieldValue expected_old = 3;
+  FieldValue new = 4;
+  PatchState state = 5;
+}
+
+enum SuggestionKind {
+  SUGGESTION_KIND_UNSPECIFIED = 0;
+  SUGGESTION_KIND_SYNC_CONFLICT = 1;
+  SUGGESTION_KIND_PUSH_FAILED = 2;
+}
+
+enum SuggestionSource {
+  SUGGESTION_SOURCE_UNSPECIFIED = 0;
+  SUGGESTION_SOURCE_SYNC = 1;
+}
+
+enum SuggestionState {
+  SUGGESTION_STATE_UNSPECIFIED = 0;
+  SUGGESTION_STATE_PENDING = 1;
+  SUGGESTION_STATE_APPLIED = 2;
+  SUGGESTION_STATE_PARTIALLY_APPLIED = 3;
+  SUGGESTION_STATE_REJECTED = 4;
+  SUGGESTION_STATE_EXPIRED = 5;
+}
+
+enum PatchState {
+  PATCH_STATE_UNSPECIFIED = 0;
+  PATCH_STATE_PENDING = 1;
+  PATCH_STATE_APPLIED = 2;
+  PATCH_STATE_REJECTED = 3;
+  // Its field no longer holds expected_old: it cannot be applied.
+  PATCH_STATE_STALE = 4;
+}

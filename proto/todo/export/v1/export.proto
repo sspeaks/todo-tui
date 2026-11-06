@@ -48,6 +48,10 @@ message Record {
     // A sync scope's cursor (design 5.3, 7.4), so a restore resumes
     // sync without pulling everything again.
     SyncCursor sync_cursor = 7;
+    // A change waiting to reach the tracker (design 5.6), done ones left
+    // out; and a Suggestion with its patches (design 3.11).
+    OutboxOp outbox_op = 8;
+    SuggestionRecord suggestion = 9;
   }
 }
 
@@ -69,6 +73,47 @@ message SyncCursor {
   string instance_id = 1;
   string scope = 2;
   google.protobuf.Timestamp cursor_at = 3;
+}
+
+// An `outbox` row, as stored: values in the events' JSON, the field by its
+// number (todo.v1.ItemField), kind and state in the store's words.
+message OutboxOp {
+  string id = 1;
+  string item_id = 2;
+  string instance_id = 3;
+  optional string op_id = 4;
+  string kind = 5;
+  uint32 field = 6;
+  string base_json = 7;
+  string new_json = 8;
+  string state = 9;
+  uint32 attempts = 10;
+  google.protobuf.Timestamp next_attempt_at = 11;
+  optional string last_error = 12;
+  google.protobuf.Timestamp created_at = 13;
+  google.protobuf.Timestamp updated_at = 14;
+}
+
+// A `suggestions` row and its `suggestion_patches`, as stored.
+message SuggestionRecord {
+  string id = 1;
+  string item_id = 2;
+  string kind = 3;
+  string source = 4;
+  string rationale = 5;
+  optional string error = 6;
+  string state = 7;
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp updated_at = 9;
+  repeated SuggestionPatchRecord patches = 10;
+}
+
+message SuggestionPatchRecord {
+  string id = 1;
+  uint32 field = 2;
+  string expected_old_json = 3;
+  string new_json = 4;
+  string state = 5;
 }
 
 // A row of the op log (design 3.10), as stored: kinds, actors and undo

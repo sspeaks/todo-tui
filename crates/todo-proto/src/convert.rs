@@ -842,6 +842,47 @@ impl TryFrom<v1::Item> for core::Item {
 
 // ---- field values -------------------------------------------------------
 
+impl From<&core::suggestion::Suggestion> for v1::Suggestion {
+    fn from(s: &core::suggestion::Suggestion) -> Self {
+        use core::suggestion::{PatchState as P, SuggestionKind as K, SuggestionState as S};
+        v1::Suggestion {
+            id: s.id.clone(),
+            item_id: s.item_id.to_string(),
+            kind: match s.kind {
+                K::SyncConflict => v1::SuggestionKind::SyncConflict,
+                K::PushFailed => v1::SuggestionKind::PushFailed,
+            } as i32,
+            source: v1::SuggestionSource::Sync as i32,
+            rationale: s.rationale.clone(),
+            error: s.error.clone().unwrap_or_default(),
+            state: match s.state {
+                S::Pending => v1::SuggestionState::Pending,
+                S::Applied => v1::SuggestionState::Applied,
+                S::PartiallyApplied => v1::SuggestionState::PartiallyApplied,
+                S::Rejected => v1::SuggestionState::Rejected,
+                S::Expired => v1::SuggestionState::Expired,
+            } as i32,
+            patches: s
+                .patches
+                .iter()
+                .map(|p| v1::Patch {
+                    id: p.id.clone(),
+                    field: p.field.to_i32(),
+                    expected_old: Some((&p.expected_old).into()),
+                    new: Some((&p.new).into()),
+                    state: match p.state {
+                        P::Pending => v1::PatchState::Pending,
+                        P::Applied => v1::PatchState::Applied,
+                        P::Rejected => v1::PatchState::Rejected,
+                        P::Stale => v1::PatchState::Stale,
+                    } as i32,
+                })
+                .collect(),
+            created_at: Some(timestamp_to_proto(s.created_at)),
+        }
+    }
+}
+
 impl From<&core::FieldValue> for v1::FieldValue {
     fn from(v: &core::FieldValue) -> Self {
         use core::FieldValue as V;

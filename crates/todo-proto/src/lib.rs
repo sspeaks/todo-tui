@@ -48,4 +48,7 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
 /// added SyncNowResponse.request and SyncStatus.served_request. 20 added
 /// ClientKind.MOBILE and CreatedVia.MOBILE for the phone app and the
 /// remote listener (ADR-0008; the phone-app branch numbered it 9).
-pub const API_MINOR: u32 = 20;
+/// 21 added pushes (ADR-0007): Suggestion and Change.suggestion, SyncStatus's
+/// pending_ops and failed_ops; a linked Item takes edits of its pushed
+/// fields.
+pub const API_MINOR: u32 = 21;

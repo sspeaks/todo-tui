@@ -38,6 +38,7 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0007_created_via_mobile.sql"),
         rebuilds: true,
     },
+    plain(include_str!("../migrations/0008_outbox.sql")),
 ];
 
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;

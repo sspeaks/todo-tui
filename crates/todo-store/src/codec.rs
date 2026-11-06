@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use jiff::civil::Date;
 use jiff::{SignedDuration, Timestamp};
 use rusqlite::{Connection, OptionalExtension, Row, ToSql, named_params};
+use todo_core::suggestion::{PatchState, SuggestionKind, SuggestionState};
 use todo_core::{
     Actor, ArchiveReason, Archived, CoreFields, CreatedVia, DerivedFields, Energy, FieldValue,
     Item, ItemField, ItemId, ItemRecurrence, LinkState, OverlayFields, PersonRef, Priority,
@@ -61,6 +62,23 @@ sql_enum!(CreatedVia, "created_via", {
     CreatedVia::Split => "split",
     CreatedVia::Recurrence => "recurrence",
     CreatedVia::Mobile => "mobile",
+});
+sql_enum!(SuggestionKind, "suggestion_kind", {
+    SuggestionKind::SyncConflict => "sync_conflict",
+    SuggestionKind::PushFailed => "push_failed",
+});
+sql_enum!(SuggestionState, "suggestion_state", {
+    SuggestionState::Pending => "pending",
+    SuggestionState::Applied => "applied",
+    SuggestionState::PartiallyApplied => "partially_applied",
+    SuggestionState::Rejected => "rejected",
+    SuggestionState::Expired => "expired",
+});
+sql_enum!(PatchState, "patch_state", {
+    PatchState::Pending => "pending",
+    PatchState::Applied => "applied",
+    PatchState::Rejected => "rejected",
+    PatchState::Stale => "stale",
 });
 sql_enum!(StatusCategory, "status_category", {
     StatusCategory::Todo => "todo",

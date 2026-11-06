@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { BadRequestSchema, ErrorInfoSchema } from "../src/gen/google/rpc/error_details_pb.js";
 import { Topic } from "../src/gen/todo/v1/common_pb.js";
 import { ItemField } from "../src/gen/todo/v1/field_pb.js";
-import { ArchiveReason, CreatedVia, Priority, ResolutionKind, Status, StatusCategory } from "../src/gen/todo/v1/item_pb.js";
+import { ArchiveReason, CreatedVia, LinkState, Priority, ResolutionKind, Status, StatusCategory } from "../src/gen/todo/v1/item_pb.js";
 import { ItemService } from "../src/gen/todo/v1/item_service_pb.js";
 import { OpKind, UndoSkipReason, UndoSkipSchema } from "../src/gen/todo/v1/op_pb.js";
 import { RelationKind } from "../src/gen/todo/v1/relation_pb.js";
@@ -566,5 +566,19 @@ describe("FakeDaemon on a linked Item (read-only sync, ADR-0006)", () => {
     // The refinement and the Overlay are local.
     expect((await setStatus(items, item!.id, Status.SOMEDAY)).item?.status).toBe(Status.SOMEDAY);
     expect((await updateItem(items, { id: item!.id, privateNotes: "mine" }, ["private_notes"])).item?.privateNotes).toBe("mine");
+  });
+
+  it("with the instance pushing, takes the pushed fields and still refuses the rest (ADR-0007)", async () => {
+    const link = { trackerKind: "jira", instanceId: "work-jira", remoteId: "10001", key: "PLAT-1", url: "https://jira.example.com/browse/PLAT-1" };
+    const daemon = new FakeDaemon([{ title: "PLAT-1", remoteLink: link }, { title: "PLAT-2", remoteLink: { ...link, remoteId: "2", key: "PLAT-2", linkState: LinkState.BROKEN } }]);
+    daemon.setConfig({ instances: [{ id: "work-jira", kind: "jira-dc", push: true }] });
+    const [ok, broken] = [...daemon.items.values()];
+    const items = createClient(ItemService, daemon.transport);
+    expect((await updateItem(items, { id: ok!.id, title: "mine" }, ["title"])).item?.title).toBe("mine");
+    expect((await setStatus(items, ok!.id, Status.DONE)).item?.status).toBe(Status.DONE);
+    const [info] = (await failure(updateItem(items, { id: ok!.id, description: "d" }, ["description"])))?.findDetails(ErrorInfoSchema) ?? [];
+    expect([info?.reason, info?.metadata.field]).toEqual(["LINKED_READ_ONLY", "description"]);
+    // A broken link stays read-only.
+    expect((await failure(updateItem(items, { id: broken!.id, title: "x" }, ["title"])))?.code).toBe(Code.FailedPrecondition);
   });
 });

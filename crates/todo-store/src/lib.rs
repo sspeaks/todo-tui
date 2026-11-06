@@ -8,6 +8,7 @@ mod archive;
 mod codec;
 mod export;
 mod hierarchy;
+mod outbox;
 mod query;
 mod relation;
 mod report;
@@ -40,7 +41,10 @@ use tokio::sync::{Semaphore, broadcast, oneshot};
 use ulid::Ulid;
 
 use codec::{SqlEnum, is_overdue, load_item, rev_from_sql, rev_to_sql, ts_to_sql};
-pub use export::{EventRecord, EventValue, Export, ExportRow, ImportOutput, OpRecord};
+pub use export::{
+    EventRecord, EventValue, Export, ExportRow, ImportOutput, OpRecord, OutboxRecord, PatchRecord,
+    SuggestionRecord,
+};
 pub use report::{MAX_NEXT, Report, ReportInput, ReportLine};
 pub use restore::{DbInfo, backup_file, inspect, prepare_restored};
 pub use schema::{SCHEMA_VERSION, free_backup_path};
@@ -196,6 +200,7 @@ pub const CONFIG_ID: &str = "config";
 pub enum Resource {
     Item(Arc<Item>),
     View(Arc<View>),
+    Suggestion(Arc<todo_core::suggestion::Suggestion>),
 }
 
 /// One row of the `changes` table: one revision (D9) for one resource.
@@ -483,9 +488,16 @@ pub struct WriteTx<'conn> {
     tx: rusqlite::Transaction<'conn>,
     changes: Vec<ChangeRow>,
     next_revision: Revision,
+    /// Whether pushed fields are editable on linked Items (ADR-0007).
+    pushes: todo_core::Pushes,
 }
 
 impl WriteTx<'_> {
+    /// Whether pushed fields are editable on linked Items (ADR-0007).
+    pub fn pushes(&self) -> todo_core::Pushes {
+        self.pushes
+    }
+
     /// The open transaction, for SQL the helpers don't cover.
     pub fn conn(&self) -> &rusqlite::Connection {
         &self.tx
@@ -563,6 +575,9 @@ const PARENT_IS_DELETED: &str = "the parent is deleted";
 struct Shared {
     revision: AtomicU64,
     changes: broadcast::Sender<ChangeRow>,
+    /// The instance whose linked Items take a person's edit of their pushed
+    /// fields, queued for it (ADR-0007), as the config says; none, read-only.
+    pushes: Mutex<todo_core::Pushes>,
 }
 
 struct Inner {
@@ -607,6 +622,19 @@ impl Drop for Pooled {
 }
 
 impl Store {
+    /// The instance whose linked Items take a person's edit of their pushed
+    /// fields, to be queued for it (ADR-0007): the daemon sets it from the
+    /// config's `push`. None (read-only, ADR-0006) until set.
+    pub fn set_pushes(&self, instance: Option<&str>) {
+        let to = instance.map_or(todo_core::Pushes::None, todo_core::Pushes::instance);
+        *self
+            .inner
+            .shared
+            .pushes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = to;
+    }
+
     /// Opens (creating if needed) the database at `path`: WAL mode, runs
     /// pending migrations (D10), seeds the default views not seeded yet (in
     /// one transaction, a revision each), starts the writer thread and read
@@ -628,6 +656,7 @@ impl Store {
         let shared = Arc::new(Shared {
             revision: AtomicU64::new(revision),
             changes: broadcast::channel(BROADCAST_CAPACITY).0,
+            pushes: Mutex::new(todo_core::Pushes::None),
         });
         run_write(&mut writer_conn, &shared, view::seed_tx)?;
         let (jobs, rx) = mpsc::channel::<Job>();
@@ -934,6 +963,12 @@ impl Store {
             .await
     }
 
+    /// The outbox of `instance`: changes waiting to push, and those Jira
+    /// refused (design 5.11).
+    pub async fn outbox_counts(&self, instance: String) -> Result<(u32, u32)> {
+        self.read(move |conn| outbox::counts(conn, &instance)).await
+    }
+
     /// A scope's cursor, `None` before its first pull.
     pub async fn sync_cursor(&self, instance: String, scope: String) -> Result<Option<Timestamp>> {
         self.read(move |conn| sync::cursor_tx(conn, &instance, &scope))
@@ -989,6 +1024,7 @@ where
         tx,
         changes: Vec::new(),
         next_revision: shared.revision.load(Ordering::Acquire) + 1,
+        pushes: *shared.pushes.lock().unwrap_or_else(|e| e.into_inner()),
     };
     let value = f(&mut wtx)?;
     let WriteTx { tx, changes, .. } = wtx;
@@ -1028,6 +1064,9 @@ struct OpRow<'a> {
     /// Whether the op becomes an undo stack entry once it writes an event:
     /// its actor is the user or a suggestion, and it is not an undo or redo.
     stackable: bool,
+    /// By a person (the user or a suggestion, undo and redo too): its edits
+    /// of a linked Item's pushed fields are queued (ADR-0007).
+    by_person: bool,
     /// When the write happened (wall clock), for `ops`, `events` and
     /// `request_ids`.
     at: i64,
@@ -1055,6 +1094,7 @@ impl<'a> OpRow<'a> {
             actor: codec::actor_to_sql(actor),
             stackable: matches!(actor, Actor::User | Actor::Suggestion(_))
                 && !matches!(kind, OpKind::Undo | OpKind::Redo),
+            by_person: matches!(actor, Actor::User | Actor::Suggestion(_)),
             at: ts_to_sql(Timestamp::now())?,
             request_id: (!request_id.is_empty()).then_some(request_id),
             summary: String::new(),
@@ -1833,6 +1873,31 @@ fn write_op(
     let first = tx.next_revision();
     let revision = first + touched.len() as Revision - 1;
     op.insert(tx.conn(), revision, batch.events.len() + derived.len())?;
+    // Pushes (ADR-0007): a person's changes of pushed fields queue (only
+    // with pushes on: a waiting row is updated or cancelled either way, as
+    // undo restores without the guard), a delete cancels what waits; each
+    // Item whose outbox changed has its pending fields again.
+    if op.by_person {
+        let at = Timestamp::now();
+        let conn = tx.conn();
+        let create = tx.pushes();
+        let by_id = |id: ItemId| batch.slots.get(&id).map(|&s| batch.items[s].clone());
+        let mut queued =
+            outbox::enqueue(conn, &op.id.to_string(), &batch.events, by_id, create, at)?;
+        for &slot in &touched {
+            let item = &batch.items[slot];
+            if item.remote_link.is_some() && item.is_deleted() && !batch.loaded[slot].is_deleted() {
+                outbox::cancel_item(conn, item.id, at)?;
+                queued.push(item.id);
+            }
+        }
+        // Only where the outbox changed: elsewhere the column stands.
+        for id in queued {
+            if let Some(&slot) = batch.slots.get(&id) {
+                batch.items[slot].derived.pending_fields = outbox::pending_fields(conn, id)?;
+            }
+        }
+    }
     for item in &mut batch.items {
         item.derived.is_overdue = is_overdue(item, Some(today));
     }
@@ -1981,7 +2046,9 @@ fn mutate_tx(tx: &mut WriteTx<'_>, input: MutateInput) -> Result<MutateOutput> {
     let ctx = ApplyCtx {
         now: input.now,
         actor: input.actor,
+        pushes: tx.pushes(),
     };
+    let conn = tx.conn();
     let mut batch = Batch::default();
     let mut slots = Vec::with_capacity(input.mutations.len());
     // For the summary: the Items a cascade took along that no mutation
@@ -2252,6 +2319,13 @@ fn changes_since_tx(
                 deleted = view.is_none();
                 view.map_or(Replayed::None, Replayed::View)
             }
+            Topic::Suggestion if !deleted => match outbox::load_suggestion(&tx, &id)? {
+                Some(s) => Replayed::Suggestion(Arc::new(s)),
+                None => {
+                    deleted = true;
+                    Replayed::None
+                }
+            },
             _ => Replayed::None,
         };
         changes.push((revision, topic, id, deleted, replayed));
@@ -2268,6 +2342,7 @@ fn changes_since_tx(
             resource: match replayed {
                 Replayed::Item(slot) => Some(Resource::Item(Arc::clone(&items[slot]))),
                 Replayed::View(view) => Some(Resource::View(view)),
+                Replayed::Suggestion(s) => Some(Resource::Suggestion(s)),
                 Replayed::None => None,
             },
         })
@@ -2279,5 +2354,6 @@ enum Replayed {
     /// The slot of the Item, loaded once per replay.
     Item(usize),
     View(Arc<View>),
+    Suggestion(Arc<todo_core::suggestion::Suggestion>),
     None,
 }

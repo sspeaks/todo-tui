@@ -58,9 +58,12 @@ pub(crate) fn apply_page_tx(tx: &mut WriteTx<'_>, page: PullPage) -> Result<Pull
     let ctx = ApplyCtx {
         now: page.now,
         actor: Actor::Sync,
+        pushes: todo_core::Pushes::None,
     };
     let mut batch = Batch::default();
     let mut out = PullOutcome::default();
+    // Suggestions a conflict made, streamed after the op.
+    let mut suggested: Vec<String> = Vec::new();
     // Every issue's Item first, existing or to be imported, so a subtask
     // finds its parent at any depth and in any order (design 3.6).
     let issues = page.issues;
@@ -114,11 +117,18 @@ pub(crate) fn apply_page_tx(tx: &mut WriteTx<'_>, page: PullPage) -> Result<Pull
                     );
                     all
                 };
-                let (mut next, changes) = update(&current, issue, parent, &scopes, page.now);
+                // Waiting pushes first (design 5.6): the issue as the Item
+                // takes it, Jira's or, where a push still waits, the local.
+                let settled = crate::outbox::settle_pull(conn, &current, issue, page.now)?;
+                suggested.extend(settled.suggested);
+                let (mut next, changes) =
+                    update(&current, &settled.issue, parent, &scopes, page.now);
+                let mut changes = changes;
+                next.derived.pending_fields = crate::outbox::pending_fields(conn, id)?;
+                next.derived.has_conflict = crate::outbox::has_pending(conn, id, "sync_conflict")?;
                 // Back in a scope, or readable again: a left_scope or
                 // remote_unavailable archive lifts (5.5 step 3); one still in
                 // no scope is archived left_scope instead, as 5.3 has it.
-                let mut changes = changes;
                 let unavailable = next
                     .overlay
                     .archived
@@ -165,11 +175,17 @@ pub(crate) fn apply_page_tx(tx: &mut WriteTx<'_>, page: PullPage) -> Result<Pull
         set_cursor(conn, &page.instance_id, scope, *at)?;
     }
     if batch.touched().is_empty() {
+        for id in &suggested {
+            crate::outbox::record_suggestion(tx, id)?;
+        }
         return Ok(out);
     }
     let mut op = OpRow::new(OpKind::Sync, Actor::Sync, "")?;
     op.summary = summary(out.imported.len(), out.updated.len());
-    let (revision, _) = write_op(tx, &op, &mut batch, page.today)?;
+    let (mut revision, _) = write_op(tx, &op, &mut batch, page.today)?;
+    for id in suggested {
+        revision = crate::outbox::record_suggestion(tx, &id)?;
+    }
     out.result = Some(MutationResult {
         op_id: op.id,
         revision,
@@ -200,10 +216,12 @@ pub(crate) fn reconcile_tx(tx: &mut WriteTx<'_>, input: Reconcile) -> Result<Rec
     let ctx = ApplyCtx {
         now: input.now,
         actor: Actor::Sync,
+        pushes: todo_core::Pushes::None,
     };
     let mut batch = Batch::default();
     let mut out = ReconcileOutcome::default();
     let mut forget = Vec::new();
+    let mut suggested: Vec<String> = Vec::new();
     for (id, fetched) in &input.out_of_scope {
         let slot = batch.load(conn, *id, input.today)?;
         let current = batch.items[slot].clone();
@@ -215,7 +233,12 @@ pub(crate) fn reconcile_tx(tx: &mut WriteTx<'_>, input: Reconcile) -> Result<Rec
             // out of every scope.
             Some(issue) => {
                 let parent = live_parent(conn, &input.instance_id, issue, &HashMap::new())?;
-                update(&current, issue, parent, &[], input.now)
+                let settled = crate::outbox::settle_pull(conn, &current, issue, input.now)?;
+                suggested.extend(settled.suggested);
+                let (mut next, changes) = update(&current, &settled.issue, parent, &[], input.now);
+                next.derived.pending_fields = crate::outbox::pending_fields(conn, *id)?;
+                next.derived.has_conflict = crate::outbox::has_pending(conn, *id, "sync_conflict")?;
+                (next, changes)
             }
             None => {
                 // Read again by id each pass (`stale`), so that it heals
@@ -262,14 +285,21 @@ pub(crate) fn reconcile_tx(tx: &mut WriteTx<'_>, input: Reconcile) -> Result<Rec
             record(&mut batch, slot, next, changes);
         }
     }
-    if !batch.touched().is_empty() {
+    if batch.touched().is_empty() {
+        for id in &suggested {
+            crate::outbox::record_suggestion(tx, id)?;
+        }
+    } else {
         let mut op = OpRow::new(OpKind::Sync, Actor::Sync, "")?;
         op.summary = format!(
             "sync: {} left scope, {} unavailable",
             out.left_scope.len(),
             out.broken.len()
         );
-        let (revision, _) = write_op(tx, &op, &mut batch, input.today)?;
+        let (mut revision, _) = write_op(tx, &op, &mut batch, input.today)?;
+        for id in &suggested {
+            revision = crate::outbox::record_suggestion(tx, id)?;
+        }
         out.result = Some(MutationResult {
             op_id: op.id,
             revision,

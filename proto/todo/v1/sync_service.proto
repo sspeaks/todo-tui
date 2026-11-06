@@ -49,6 +49,10 @@ message SyncStatus {
   // what changed before it, so once served_request reaches a caller's
   // request and the state is no longer SYNCING, its pull is done.
   uint64 served_request = 7;
+  // Changes waiting to reach the tracker, and those it refused (design
+  // 5.11): the outbox, by Item and field.
+  uint32 pending_ops = 8;
+  uint32 failed_ops = 9;
 }
 
 enum SyncState {

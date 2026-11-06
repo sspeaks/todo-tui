@@ -16,6 +16,7 @@ pub mod relation;
 pub mod remote;
 pub mod report;
 pub mod status;
+pub mod suggestion;
 pub mod value;
 pub mod view;
 
@@ -32,7 +33,7 @@ pub use item::{
 };
 pub use mutation::{
     Actor, Applied, ApplyCtx, FieldChange, FieldRestore, FieldUpdate, Mutation, MutationError,
-    MutationOp, RestoreSkip, RestoreUnit, SkipReason, apply,
+    MutationOp, Pushes, RestoreSkip, RestoreUnit, SkipReason, apply, is_core, pushed, write_field,
 };
 pub use query::{MAX_QUERY_BYTES, ParsedQuery, Query, QueryError, parse_query, print_query};
 pub use recurrence::{

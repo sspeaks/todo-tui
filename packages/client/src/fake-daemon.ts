@@ -24,6 +24,7 @@ import {
   ItemRecurrenceSchema,
   Energy,
   ItemSchema,
+  LinkState,
   Priority,
   RecurrenceRuleSchema,
   ResolutionKind,
@@ -457,7 +458,7 @@ export class FakeDaemon {
   maxPageSize = MAX_PAGE_SIZE;
   /** Runs before every ListItems; throw from it to fail that call. */
   onListItems: ((req: ListItemsRequest) => void) | undefined;
-  apiMinor = 20;
+  apiMinor = 21;
   /** What Export streams, as one batch; unset, Export is UNIMPLEMENTED (the format is the daemon's). */
   exportLines: string[] | undefined;
   /** What GetConfig serves; change it with {@link setConfig}. */
@@ -1378,15 +1379,23 @@ export class FakeDaemon {
       // Read before the undelete replaces it.
       const deletedBy = p.kind === "undelete" ? batch.deletedBy(p.id) : undefined;
       const { next, changes } = applyPatch(item, patchOf(p, item, now));
-      // Read-only sync (ADR-0006): a person changes only Overlay fields of a
-      // linked Item, as todo_core's apply refuses.
-      const core = item.remoteLink !== undefined ? changes.find((c) => CORE_FIELDS.has(c.field)) : undefined;
+      // On a linked Item a person changes Overlay fields, and the pushed ones
+      // while its instance pushes and its link is whole (ADR-0006, ADR-0007),
+      // as todo_core's apply refuses.
+      const pushes =
+        // A fixture's link without a state is whole, as the daemon writes it.
+        [LinkState.OK, LinkState.UNSPECIFIED].includes(item.remoteLink?.linkState ?? LinkState.OK) &&
+        this.config.instances.some((i) => i.id === item.remoteLink?.instanceId && i.push);
+      const core =
+        item.remoteLink !== undefined
+          ? changes.find((c) => CORE_FIELDS.has(c.field) && !(pushes && PUSHED_FIELDS.has(c.field)))
+          : undefined;
       if (core) {
         const path = CORE_PATHS[core.field]!;
         throw errorInfo(
           Code.FailedPrecondition,
           "LINKED_READ_ONLY",
-          inBatch(p, `${path} is the tracker's: the item is linked, and edits reach the tracker only once pushes arrive`),
+          inBatch(p, `${path} is the tracker's: the item is linked; change it there`),
           { field: path, item_id: p.id },
         );
       }
@@ -2787,6 +2796,8 @@ const CORE_PATHS: Record<string, string> = {
   remainingEstimate: "remaining_estimate",
 };
 const CORE_FIELDS = new Set(Object.keys(CORE_PATHS));
+/** The Core fields a push sends (ADR-0007), as todo_core's `pushed`. */
+const PUSHED_FIELDS = new Set(["title", "priority", "labels", "dueDate", "statusCategory", "resolutionKind"]);
 
 /** The Item fields whose own fields are mask paths too ("waiting.reason"), as ItemField names them. */
 const NESTED_PATHS = new Set(["waiting", "archived", "remote_link", "recurrence", "staleness"]);

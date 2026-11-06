@@ -457,7 +457,7 @@ else
     [[ -n $port ]] || fail "the fake Jira did not start"
     printf 'smoke-pat' >"$jhome/jira.token"
     chmod 600 "$jhome/jira.token"
-    printf '[[instances]]\nid = "work-jira"\nkind = "jira-dc"\nbase_url = "http://127.0.0.1:%s"\ncredential = "file:%s"\nscopes = [{ name = "mine", query = "assignee = currentUser()" }]\n' \
+    printf '[[instances]]\nid = "work-jira"\nkind = "jira-dc"\nbase_url = "http://127.0.0.1:%s"\ncredential = "file:%s"\nscopes = [{ name = "mine", query = "assignee = currentUser()" }]\npush = false\n' \
       "$port" "$jhome/jira.token" >"$jhome/config.toml"
     out=$(TODO_TUI_HOME=$jhome "$TODO_BIN" sync check) || fail "sync check failed: $out"
     [[ $out == "work-jira: ok as Dana Example (JIRAUSER10100), time zone UTC" ]] || fail "unexpected sync check: $out"
@@ -486,6 +486,7 @@ else
     ksee '^[› ] ◐ .*smoke jira report +PLAT-2 ' "the in-progress issue in Next"
     ksee 'Jira +PLAT-[12] ·' "the selected issue's key in the detail"
     tmx send-keys -t tui:jira x
+    # push = false keeps it read-only (ADR-0007's switch).
     ksee 'PLAT-[12] is a Jira issue: edits reach Jira when pushes arrive' "the read-only refusal"
     tmx send-keys -t tui:jira q
     kill "$jira_pid" 2>/dev/null || true

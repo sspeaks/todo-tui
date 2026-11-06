@@ -5,6 +5,7 @@ package todo.v1;
 import "todo/v1/common.proto";
 import "todo/v1/config.proto";
 import "todo/v1/item.proto";
+import "todo/v1/suggestion.proto";
 import "todo/v1/sync_service.proto";
 import "todo/v1/view.proto";
 
@@ -52,7 +53,8 @@ message Change {
   // The full resource, unless deleted.
   oneof resource {
     Item item = 10;
-    // Allocated: Suggestion suggestion = 11;
+    // TOPIC_SUGGESTION: a Suggestion, new or changed (design 3.11).
+    Suggestion suggestion = 11;
     View view = 12;
     // Allocated: Person person = 13;
     // Allocated: ReviewSession review = 15;

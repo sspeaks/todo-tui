@@ -40,6 +40,54 @@ pub enum ExportRow {
         scope: String,
         cursor_at: Timestamp,
     },
+    /// An `outbox` row not done (design 5.6).
+    Outbox(Box<OutboxRecord>),
+    /// A `suggestions` row with its patches (design 3.11).
+    Suggestion(Box<SuggestionRecord>),
+}
+
+/// An `outbox` row, as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboxRecord {
+    pub id: String,
+    pub item_id: String,
+    pub instance_id: String,
+    pub op_id: Option<String>,
+    pub kind: String,
+    pub field: u32,
+    pub base_json: String,
+    pub new_json: String,
+    pub state: String,
+    pub attempts: u32,
+    pub next_attempt_at: Option<Timestamp>,
+    pub last_error: Option<String>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+}
+
+/// A `suggestions` row and its patches, as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuggestionRecord {
+    pub id: String,
+    pub item_id: String,
+    pub kind: String,
+    pub source: String,
+    pub rationale: String,
+    pub error: Option<String>,
+    pub state: String,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    pub patches: Vec<PatchRecord>,
+}
+
+/// A `suggestion_patches` row, as stored (its `ord` is its place).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchRecord {
+    pub id: String,
+    pub field: u32,
+    pub expected_old_json: String,
+    pub new_json: String,
+    pub state: String,
 }
 
 /// An `ops` row, as stored.
@@ -156,6 +204,72 @@ pub(crate) fn export_tx(conn: &Connection, history: bool) -> Result<Export> {
                 scope: row.get(1)?,
                 cursor_at: ts_from_sql(row.get(2)?)?,
             });
+        }
+    }
+    {
+        let mut stmt = tx.prepare(
+            "SELECT id, item_id, instance_id, op_id, kind, field, base_json, new_json, state,
+                    attempts, next_attempt_at, last_error, created_at, updated_at
+             FROM outbox WHERE state != 'done' ORDER BY created_at, id",
+        )?;
+        let mut q = stmt.query([])?;
+        while let Some(row) = q.next()? {
+            let next: Option<i64> = row.get(10)?;
+            let op_id: Option<String> = row.get(3)?;
+            rows.push(ExportRow::Outbox(Box::new(OutboxRecord {
+                id: row.get(0)?,
+                item_id: row.get(1)?,
+                instance_id: row.get(2)?,
+                // Without the history its op is not in the file.
+                op_id: op_id.filter(|_| history),
+                kind: row.get(4)?,
+                field: row.get(5)?,
+                base_json: row.get(6)?,
+                new_json: row.get(7)?,
+                state: row.get(8)?,
+                attempts: row.get(9)?,
+                next_attempt_at: next.map(ts_from_sql).transpose()?,
+                last_error: row.get(11)?,
+                created_at: ts_from_sql(row.get(12)?)?,
+                updated_at: ts_from_sql(row.get(13)?)?,
+            })));
+        }
+    }
+    {
+        let mut stmt = tx.prepare(
+            "SELECT id, item_id, kind, source, rationale, error, state, created_at, updated_at
+             FROM suggestions ORDER BY created_at, id",
+        )?;
+        let mut patches = tx.prepare(
+            "SELECT id, field, expected_old_json, new_json, state FROM suggestion_patches
+             WHERE suggestion_id = ?1 ORDER BY ord",
+        )?;
+        let mut q = stmt.query([])?;
+        while let Some(row) = q.next()? {
+            let id: String = row.get(0)?;
+            let list = patches
+                .query_map([&id], |p| {
+                    Ok(PatchRecord {
+                        id: p.get(0)?,
+                        field: p.get(1)?,
+                        expected_old_json: p.get(2)?,
+                        new_json: p.get(3)?,
+                        state: p.get(4)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows.push(ExportRow::Suggestion(Box::new(SuggestionRecord {
+                id,
+                item_id: row.get(1)?,
+                kind: row.get(2)?,
+                source: row.get(3)?,
+                rationale: row.get(4)?,
+                error: row.get(5)?,
+                state: row.get(6)?,
+                created_at: ts_from_sql(row.get(7)?)?,
+                updated_at: ts_from_sql(row.get(8)?)?,
+                patches: list,
+            })));
         }
     }
 
@@ -327,18 +441,32 @@ pub(crate) fn import_tx(
         return Err(StoreError::NotEmpty);
     }
     conn.execute_batch(
-        "DELETE FROM events; DELETE FROM relations; DELETE FROM items; DELETE FROM ops;
+        "DELETE FROM suggestion_patches; DELETE FROM suggestions; DELETE FROM outbox;
+         DELETE FROM events; DELETE FROM relations; DELETE FROM items; DELETE FROM ops;
          DELETE FROM sync_cursors;
          DELETE FROM views; DELETE FROM view_seeds; DELETE FROM changes;",
     )?;
     let mut items = 0;
+    let mut ops_of: Vec<(String, String)> = Vec::new();
     let records = rows.len() as u64;
     for (i, row) in rows.into_iter().enumerate() {
         let at = |e: StoreError| StoreError::Import {
             record: i,
             error: e.to_string(),
         };
+        if let ExportRow::Outbox(o) = &row
+            && let Some(op) = &o.op_id
+        {
+            ops_of.push((o.id.clone(), op.clone()));
+        }
         put(conn, row, &mut items).map_err(at)?;
+    }
+    // The outbox's ops, those the export brought.
+    for (row, op) in ops_of {
+        conn.execute(
+            "UPDATE outbox SET op_id = ?2 WHERE id = ?1 AND EXISTS (SELECT 1 FROM ops WHERE id = ?2)",
+            params![row, op],
+        )?;
     }
     // Inside the writer's transaction, so the next write numbers after it.
     // One revision skipped, so that even past an export older than this
@@ -392,6 +520,67 @@ fn put(conn: &Connection, row: ExportRow, items: &mut u64) -> Result<()> {
                 "INSERT INTO sync_cursors (instance_id, scope, cursor_at) VALUES (?1, ?2, ?3)",
                 params![instance_id, scope, ts_to_sql(cursor_at)?],
             )?;
+        }
+        ExportRow::Outbox(o) => {
+            // Its op comes later in the file (with the history), so the
+            // reference is set once every record is in (`relink`).
+            let op_id: Option<&str> = None;
+            conn.execute(
+                "INSERT INTO outbox (id, item_id, instance_id, op_id, kind, field, base_json,
+                                     new_json, state, attempts, next_attempt_at, last_error,
+                                     created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![
+                    o.id,
+                    o.item_id,
+                    o.instance_id,
+                    op_id,
+                    o.kind,
+                    o.field,
+                    o.base_json,
+                    o.new_json,
+                    o.state,
+                    o.attempts,
+                    o.next_attempt_at.map(ts_to_sql).transpose()?,
+                    o.last_error,
+                    ts_to_sql(o.created_at)?,
+                    ts_to_sql(o.updated_at)?
+                ],
+            )?;
+        }
+        ExportRow::Suggestion(s) => {
+            conn.execute(
+                "INSERT INTO suggestions (id, item_id, kind, source, rationale, error, state,
+                                          created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    s.id,
+                    s.item_id,
+                    s.kind,
+                    s.source,
+                    s.rationale,
+                    s.error,
+                    s.state,
+                    ts_to_sql(s.created_at)?,
+                    ts_to_sql(s.updated_at)?
+                ],
+            )?;
+            for (ord, p) in s.patches.iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO suggestion_patches (id, suggestion_id, ord, field,
+                                                     expected_old_json, new_json, state)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        p.id,
+                        s.id,
+                        ord as i64,
+                        p.field,
+                        p.expected_old_json,
+                        p.new_json,
+                        p.state
+                    ],
+                )?;
+            }
         }
         ExportRow::Op(op) => {
             conn.execute(
