@@ -174,6 +174,15 @@
         };
       });
 
+      # The daemon as a NixOS service, for the phone app and remote clients
+      # (ADR-0008): see nix/module.nix.
+      nixosModules.default = import ./nix/module.nix self;
+
+      # The module's VM test, Linux only (it needs KVM).
+      checks = lib.genAttrs [ "x86_64-linux" "aarch64-linux" ] (system: {
+        module = import ./nix/module-test.nix self { pkgs = nixpkgs.legacyPackages.${system}; };
+      });
+
       formatter = forAllSystems (pkgs: pkgs.nixfmt);
     };
 }

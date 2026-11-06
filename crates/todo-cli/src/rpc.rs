@@ -15,6 +15,7 @@ use tonic::transport::Channel;
 use tonic::{Code, Response, Status};
 use tonic_types::StatusExt as _;
 
+use crate::conn::{self, Conn};
 use crate::spawn;
 
 /// How long any one RPC may take, so a wedged daemon cannot hang a command.
@@ -37,26 +38,44 @@ impl std::fmt::Display for Why {
     }
 }
 
-/// A channel to a daemon that serves this build's API: connects (spawning
-/// the daemon if needed), handshakes, and restarts an outdated daemon.
-pub(crate) async fn ready(paths: &Paths) -> Result<Channel, Why> {
+/// A connection to a daemon that serves this build's API: the one
+/// elsewhere when this machine uses a remote daemon (ADR-0008), else the
+/// local one, connected (spawning it if needed), handshaken, and an
+/// outdated one restarted. A remote daemon is never spawned or restarted
+/// from here: one that is too old says so.
+pub(crate) async fn ready(paths: &Paths) -> Result<Conn, Why> {
+    if let Some((url, token)) =
+        conn::remote_of(paths).map_err(|e| Why::Unavailable(format!("{e:#}")))?
+    {
+        let remote =
+            Conn::remote(&url, token).map_err(|e| Why::Unavailable(format!("{url}: {e:#}")))?;
+        let info = handshake(&remote).await?;
+        if info.api_minor < API_MINOR {
+            return Err(Why::Outdated(format!(
+                "the daemon at {url} is outdated (api_minor {}, this todo needs {API_MINOR}): update it there",
+                info.api_minor
+            )));
+        }
+        return Ok(remote);
+    }
     let channel = spawn::connect_or_spawn(paths)
         .await
         .map_err(|e| Why::Unavailable(format!("{e:#}")))?;
-    let info = handshake(&channel).await?;
+    let local = Conn::local(channel.clone());
+    let info = handshake(&local).await?;
     if info.api_minor >= API_MINOR {
-        return Ok(channel);
+        return Ok(local);
     }
-    upgrade(paths, channel, &info).await
+    upgrade(paths, channel, &info).await.map(Conn::local)
 }
 
-async fn handshake(channel: &Channel) -> Result<GetServerInfoResponse, Why> {
+async fn handshake(conn: &Conn) -> Result<GetServerInfoResponse, Why> {
     let request = GetServerInfoRequest {
         client_kind: ClientKind::Oneshot.into(),
         client_version: env!("CARGO_PKG_VERSION").to_owned(),
         required_api_minor: API_MINOR,
     };
-    call(SystemServiceClient::new(channel.clone()).get_server_info(request))
+    call(SystemServiceClient::new(conn.clone()).get_server_info(request))
         .await
         .map_err(|s| Why::Unavailable(format!("handshake failed: {}", describe(&s))))
 }
@@ -108,7 +127,7 @@ async fn upgrade(
     let channel = restart
         .await
         .map_err(|e| Why::Outdated(format!("{outdated} and restarting it failed: {e:#}")))?;
-    let info = handshake(&channel).await?;
+    let info = handshake(&Conn::local(channel.clone())).await?;
     if info.api_minor < API_MINOR {
         return Err(Why::Outdated(format!(
             "the daemon is still outdated after a restart (api_minor {}, this todo needs {API_MINOR})",

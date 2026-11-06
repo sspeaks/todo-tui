@@ -22,7 +22,6 @@ todo-jira.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 futures-util.workspace = true
-hyper-util.workspace = true
 jiff.workspace = true
 qrcode.workspace = true
 rustix.workspace = true
@@ -30,6 +29,9 @@ serde_json.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 tonic-types.workspace = true
+tonic-web.workspace = true
+hyper-util = { workspace = true, features = ["client-legacy", "http1"] }
+hyper-rustls.workspace = true
 tower.workspace = true
 tracing.workspace = true
 ulid.workspace = true

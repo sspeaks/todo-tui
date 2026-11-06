@@ -1,4 +1,4 @@
-import { ClientKind, FakeDaemon, LiveStore, connect, createClients } from "@todo-tui/client";
+import { ClientKind, FakeDaemon, LiveStore, connectAny, createClients } from "@todo-tui/client";
 import { render } from "ink";
 import { Tui } from "./App.js";
 import { Controller } from "./controller/controller.js";
@@ -46,7 +46,7 @@ async function main(args: string[]): Promise<number> {
     return 2;
   }
 
-  const conn = await connect({ clientKind: ClientKind.INTERACTIVE });
+  const conn = await connectAny({ clientKind: ClientKind.INTERACTIVE });
   const store = new LiveStore({ transport: conn.transport, ensureDaemon: conn.ensureDaemon });
   const controller = new Controller({ store, items: conn.items });
   store.start();

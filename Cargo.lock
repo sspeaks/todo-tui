@@ -738,6 +738,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rustls",
+ "rustls-platform-verifier",
  "tokio",
  "tokio-rustls",
  "tower-service",
@@ -2025,6 +2026,7 @@ dependencies = [
  "anyhow",
  "clap",
  "futures-util",
+ "hyper-rustls",
  "hyper-util",
  "jiff",
  "qrcode",
@@ -2041,6 +2043,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tonic-types",
+ "tonic-web",
  "tower",
  "tracing",
  "ulid",
@@ -2091,6 +2094,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ulid",
+ "url",
 ]
 
 [[package]]

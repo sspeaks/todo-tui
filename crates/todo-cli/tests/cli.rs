@@ -1488,3 +1488,107 @@ fn sync_now_pulls_and_status_reports_it() {
     );
     drop(fake);
 }
+
+/// A free loopback port, for a daemon's remote listener.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// `todo` on one machine against a daemon elsewhere (ADR-0008): its remote
+/// listener on loopback stands in for `tailscale serve`. The client home
+/// has `[client] remote` and never starts a daemon of its own; captures,
+/// counts and undo go to the other one, a spooled capture is sent there,
+/// and the local-only commands refuse.
+#[test]
+fn a_client_uses_a_daemon_elsewhere_through_its_remote_listener() {
+    let server = Home::new();
+    let port = free_port();
+    std::fs::create_dir_all(&server.home).unwrap();
+    std::fs::write(
+        server.home.join("config.toml"),
+        format!("[remote]\nlisten = \"127.0.0.1:{port}\"\n"),
+    )
+    .unwrap();
+    server.ok(&["daemon", "--detach"]);
+    let paired = server.ok(&[
+        "remote",
+        "pair",
+        "--name",
+        "laptop",
+        "--url",
+        "http://127.0.0.1",
+        "--no-qr",
+    ]);
+    let token = paired
+        .lines()
+        .find_map(|l| l.strip_prefix("Token:"))
+        .unwrap_or_else(|| panic!("no token in {paired:?}"))
+        .trim()
+        .to_owned();
+
+    let client = Home::new();
+    std::fs::create_dir_all(&client.home).unwrap();
+    let token_file = client.home.join("remote.token");
+    std::fs::write(&token_file, &token).unwrap();
+    std::fs::set_permissions(
+        &token_file,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
+    std::fs::write(
+        client.home.join("config.toml"),
+        format!(
+            "[client]\nremote = \"http://127.0.0.1:{port}\"\ncredential = \"file:{}\"\n",
+            token_file.display()
+        ),
+    )
+    .unwrap();
+    // A capture spooled here before (the remote was out of reach).
+    let spooled = SpoolEntry::now(todo_core::new_ulid(), "from the spool");
+    let paths = client.paths();
+    todo_daemon::spool::append(&paths, &spooled).unwrap();
+
+    let added = client.todo(&["add", "from the laptop"]);
+    assert!(added.status.success(), "{}", text(&added.stderr));
+    assert!(
+        text(&added.stderr).contains("sent 1 spooled capture"),
+        "{}",
+        text(&added.stderr)
+    );
+    assert!(!socket_in(&client.home.join("run")), "no daemon of its own");
+    let mut on_server = titles(&server.items())
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    on_server.sort();
+    assert_eq!(on_server, ["from the laptop", "from the spool"]);
+    assert!(client.ok(&["status"]).contains("Inbox: 2"));
+    client.ok(&["undo"]);
+    assert_eq!(titles(&server.items()), ["from the spool"]);
+    // What acts on this machine's own daemon refuses.
+    for args in [
+        &["daemon", "stop"][..],
+        &["restore", "x.db"][..],
+        &["remote", "list"][..],
+    ] {
+        let out = client.todo(args);
+        assert!(!out.status.success(), "{args:?}");
+        assert!(
+            text(&out.stderr).contains("uses the one at"),
+            "{args:?}: {}",
+            text(&out.stderr)
+        );
+    }
+    // A wrong token is refused, and says so.
+    let bad = client
+        .command(&["status"])
+        .env("TODO_REMOTE", format!("http://127.0.0.1:{port}"))
+        .env("TODO_REMOTE_TOKEN", "nope")
+        .output()
+        .unwrap();
+    assert!(!bad.status.success());
+}

@@ -49,8 +49,52 @@ pub struct Config {
     pub meetings: bool,
     /// `[[instances]]` (design 8.2, ADR-0006): at most one is used in M9.
     pub instances: Vec<Instance>,
+    /// `[client] remote`: the clients on this machine use a daemon elsewhere
+    /// (ADR-0008), not one of their own. Read by the clients, not the
+    /// daemon.
+    pub client: Option<ClientRemote>,
     pub warnings: Vec<Warning>,
     pub loaded_at: Timestamp,
+}
+
+/// A daemon elsewhere the clients use (ADR-0008): its listener's origin,
+/// and the token `todo remote pair` printed there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientRemote {
+    pub url: String,
+    pub credential: CredentialRef,
+}
+
+/// The remote listener's origin: `https://host[:port]`, or `http://` to
+/// this machine (a test, or an SSH tunnel), with no path, query or user.
+pub fn remote_url(text: &str) -> Result<String, String> {
+    let url = url::Url::parse(text.trim()).map_err(|e| format!("not a URL: {e}"))?;
+    let loopback = url.host_str().is_some_and(|h| {
+        h == "localhost"
+            || h.trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
+    match url.scheme() {
+        "https" => {}
+        "http" if loopback => {}
+        _ => return Err("must be https:// (http:// only to this machine)".to_owned()),
+    }
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("must be an origin: no user, query or fragment".to_owned());
+    }
+    if !url.path().is_empty() && url.path() != "/" {
+        return Err("must be an origin, with no path".to_owned());
+    }
+    let mut out = format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default());
+    if let Some(port) = url.port() {
+        out.push_str(&format!(":{port}"));
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +170,7 @@ impl Config {
             l48: ReportConfig::default(),
             meetings: true,
             instances: Vec::new(),
+            client: None,
             warnings: Vec::new(),
             loaded_at: Timestamp::now(),
         }
@@ -285,10 +330,55 @@ impl<'a> Reader<'a> {
                 "l48" => self.section("l48", value, Reader::l48),
                 "meetings" => self.section("meetings", value, Reader::meetings),
                 "instances" => self.instances(value),
+                // The daemon's own (ADR-0008), read by remote::read_config;
+                // checked there, at start.
+                "remote" => {}
+                "client" => self.section("client", value, Reader::client),
                 "assistant" => self.warn(key, "not used until the Claude assistant (P3)"),
                 "stale" => self.warn(key, "not used until stale reviews (P4)"),
                 _ => self.warn(quote_key(&key), "unknown key; ignored"),
             }
+        }
+    }
+
+    /// `[client] remote = "https://host.tailnet.ts.net"`, `credential =
+    /// "keychain:…"`: a daemon elsewhere (ADR-0008).
+    fn client(&mut self, table: toml::Table) {
+        let path = "client";
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|h| h.is_absolute());
+        let mut url = None;
+        let mut credential = None;
+        for (key, value) in table {
+            let at = format!("{path}.{}", quote_key(&key));
+            let text = value.as_str().map(str::trim);
+            match key.as_str() {
+                "remote" => match text.map(remote_url) {
+                    Some(Ok(u)) => url = Some(u),
+                    Some(Err(why)) => self.warn(at, why),
+                    None => self.warn(
+                        at,
+                        "must be an https:// address, e.g. \"https://host.tailnet.ts.net\"",
+                    ),
+                },
+                "credential" => match text.map(|s| CredentialRef::parse(s, home.as_deref())) {
+                    Some(Ok(r)) => credential = Some(r),
+                    Some(Err(why)) => self.warn(at, why),
+                    None => self.warn(at, "must be keychain:…, env:… or file:…"),
+                },
+                _ => self.warn(at, "unknown key; ignored"),
+            }
+        }
+        match (url, credential) {
+            (Some(url), Some(credential)) => {
+                self.config.client = Some(ClientRemote { url, credential })
+            }
+            (Some(_), None) => self.warn(
+                format!("{path}.credential"),
+                "is required with remote: the token `todo remote pair` printed",
+            ),
+            _ => {}
         }
     }
 
@@ -988,6 +1078,42 @@ mod tests {
         assert_eq!(
             warnings("instances = 3"),
             ["instances: must be a list of tables ([[instances]])"]
+        );
+    }
+
+    #[test]
+    fn a_client_names_a_daemon_elsewhere_and_remote_is_the_daemons() {
+        let config = parse(
+            "[remote]\nlisten = \"127.0.0.1:7743\"\n[client]\nremote = \"https://box.tail1234.ts.net/\"\ncredential = \"env:TODO_REMOTE_PAT\"\n",
+        );
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+        assert_eq!(
+            config.client,
+            Some(ClientRemote {
+                url: "https://box.tail1234.ts.net".into(),
+                credential: CredentialRef::Env("TODO_REMOTE_PAT".into()),
+            })
+        );
+        assert_eq!(
+            remote_url("http://127.0.0.1:7743"),
+            Ok("http://127.0.0.1:7743".into())
+        );
+        for bad in [
+            "http://box.ts.net",
+            "https://u:p@box",
+            "https://box/path",
+            "https://box?q=1",
+            "ftp://box",
+        ] {
+            assert!(remote_url(bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            warnings("[client]\nremote = \"https://box.ts.net\"\n"),
+            ["client.credential: is required with remote: the token `todo remote pair` printed"]
+        );
+        assert_eq!(
+            parse("[client]\nremote = \"https://box.ts.net\"\n").client,
+            None
         );
     }
 

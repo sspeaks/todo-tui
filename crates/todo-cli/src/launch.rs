@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{anyhow, bail};
+use todo_daemon::paths::{Env, Paths};
 
 /// A JavaScript client the binary ships alongside it.
 #[derive(Clone, Copy)]
@@ -47,6 +48,15 @@ fn checkout() -> &'static Path {
 /// `TODO_BIN` set to this binary unless it is set already, so the client
 /// starts this build's daemon. Returns only on failure.
 pub(crate) fn launch(bundle: Bundle, args: &[&str]) -> anyhow::Error {
+    // A daemon elsewhere (ADR-0008): resolved here, the token read once
+    // (from the keychain, say), and handed to the bundle in its env.
+    let remote = match Paths::resolve(&Env::from_process())
+        .map_err(anyhow::Error::from)
+        .and_then(|p| crate::conn::remote_of(&p))
+    {
+        Ok(remote) => remote,
+        Err(e) => return e,
+    };
     let exe = std::env::current_exe();
     let entry = match find_entry(
         bundle,
@@ -59,6 +69,9 @@ pub(crate) fn launch(bundle: Bundle, args: &[&str]) -> anyhow::Error {
     };
     let mut node = Command::new("node");
     node.arg(&entry).args(args);
+    if let Some((url, token)) = remote {
+        node.env("TODO_REMOTE", url).env("TODO_REMOTE_TOKEN", token);
+    }
     if std::env::var_os("TODO_BIN").is_none_or(|bin| bin.is_empty())
         && let Ok(exe) = exe
     {

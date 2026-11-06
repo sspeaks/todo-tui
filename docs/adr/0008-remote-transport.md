@@ -37,9 +37,29 @@ over Tailscale.
   `PERMISSION_DENIED`: the laptop's clients own the daemon's lifecycle.
 - **The phone is its own client.** `ClientKind.MOBILE` (an interactive client, so
   an upgrade restart waits for it) and `CreatedVia.MOBILE` (a user capture). The
-  CHECK on `items.created_via` cannot be altered in place, so migration 0005
+  CHECK on `items.created_via` cannot be altered in place, so a migration
   rebuilds `items` the way SQLite documents, with foreign keys off for that one
-  migration and `foreign_key_check` run before it commits (`schema.rs`).
+  migration and `foreign_key_check` run before it commits (`schema.rs`). On the
+  phone-app branch it was 0005; merged after energy and sync, it is 0007, and a
+  database that branch's daemon made is recognised and caught up.
+- **Every client, not only the phone** (added at the merge). A laptop's `todo`,
+  TUI and MCP server use a daemon elsewhere when its config says
+  `[client] remote = "https://box.<tailnet>.ts.net"` with `credential =
+  "keychain:…"` (or `env:`/`file:`, as Jira's), or when `TODO_REMOTE` and
+  `TODO_REMOTE_TOKEN` are set. The CLI speaks gRPC-Web to the listener (tonic-web
+  over rustls, the platform's roots); `todo` resolves the token once and hands
+  the TUI and MCP bundles `TODO_REMOTE*`, and they connect through
+  `connectAny`. Such a machine never spawns or restarts a daemon: a remote one
+  too old says so. `todo daemon`, `restore`, `backup list` and `remote` act on
+  this machine's own daemon or files, so they refuse. `todo add` sends what this
+  machine's spool holds first, each with its spool id. `http://` is allowed only
+  to loopback (a test, an SSH tunnel).
+- **Hosting.** `nixosModules.default` (`nix/module.nix`) runs the daemon as a
+  system service: its own user, `/var/lib/todo-tui` as its home, `settings` as
+  its `config.toml`, secrets from an `environmentFile`, the listener on
+  loopback and, with `tailscaleServe`, `tailscale serve` in front of it.
+  `todo-tui-admin` runs the CLI as that user on that home (`remote pair`). A VM
+  test (`checks.<linux>.module`) exercises it.
 - **Scope.** The phone is a thin client of one daemon. When the laptop is asleep the
   app has no data. This is not multi-device sync, which stays a non-goal.
 
@@ -54,7 +74,7 @@ over Tailscale.
 
 ## Consequences
 
-- `api_minor` 9.
+- `api_minor` 20 (9 on the phone-app branch).
 - The tokens file is daemon state that the CLI writes, not configuration. The
   daemon still never writes `config.toml`.
 - The client side is `@todo-tui/client/portable` (no Node APIs, checked by

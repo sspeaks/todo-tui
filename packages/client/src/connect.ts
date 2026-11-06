@@ -6,6 +6,7 @@ import { ClientKind, type GetServerInfoResponse, SystemService } from "./gen/tod
 import { ViewService } from "./gen/todo/v1/view_service_pb.js";
 import { WatchService } from "./gen/todo/v1/watch_service_pb.js";
 import { type TodoClients, createClients } from "./clients.js";
+import { connectRemote } from "./remote.js";
 import { LiveStore, type LiveStoreOptions } from "./live-store.js";
 import { errorReason } from "./mutations.js";
 import { defaultSocketPath, envFromProcess, resolvePaths } from "./paths.js";
@@ -181,4 +182,39 @@ export function createLiveStore(conn: TodoConnection, opts: Omit<LiveStoreOption
   const store = new LiveStore({ ensureDaemon: conn.ensureDaemon, ...opts, transport: conn.transport });
   store.start();
   return store;
+}
+
+/** A daemon, local or elsewhere (ADR-0008), as the TUI and MCP use one. */
+export interface AnyConnection extends TodoClients {
+  transport: Transport;
+  serverInfo: GetServerInfoResponse;
+  /** Spawns the local daemon again; nothing for a remote one. */
+  ensureDaemon: () => Promise<void>;
+  close(): void;
+  /** The daemon is elsewhere. */
+  remote: boolean;
+}
+
+/**
+ * The daemon this machine's clients use (ADR-0008): the one elsewhere when
+ * `TODO_REMOTE` and `TODO_REMOTE_TOKEN` are set (`todo` resolves them from
+ * `[client] remote` before it starts the TUI or MCP), else the local one
+ * through connect(). A remote daemon is never spawned or restarted.
+ */
+export async function connectAny(opts: ConnectOptions = {}): Promise<AnyConnection> {
+  const env = opts.env ?? process.env;
+  const url = env.TODO_REMOTE?.trim();
+  if (url) {
+    const token = env.TODO_REMOTE_TOKEN?.trim();
+    if (!token) throw new Error("TODO_REMOTE is set without TODO_REMOTE_TOKEN");
+    const remote = await connectRemote({
+      baseUrl: url,
+      token,
+      clientKind: opts.clientKind ?? ClientKind.INTERACTIVE,
+      clientVersion: opts.clientVersion ?? CLIENT_VERSION,
+      requiredApiMinor: opts.requiredApiMinor ?? CLIENT_API_MINOR,
+    });
+    return { ...remote, ensureDaemon: () => Promise.resolve(), close: () => {}, remote: true };
+  }
+  return { ...(await connect(opts)), remote: false };
 }

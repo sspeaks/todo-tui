@@ -71,3 +71,11 @@ jobs:
         run: nix build .#default -L
       - name: todo runs
         run: ./result/bin/todo --help
+      # The NixOS module's VM test (nix/module-test.nix): Linux runners have
+      # KVM; macOS cannot run NixOS VMs.
+      - name: NixOS module test
+        if: runner.os == 'Linux'
+        run: |
+          sudo chmod 666 /dev/kvm
+          nix build .#checks.$(nix eval --raw --impure --expr builtins.currentSystem).module -L \
+            --option system-features "nixos-test benchmark big-parallel kvm"

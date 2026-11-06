@@ -735,6 +735,65 @@ it as an app of its own:
   --profile production` from `apps/mobile`, then `npx eas-cli@latest submit -p ios`
   (`eas.json` has the profiles).
 
+### A daemon on another machine
+
+The daemon can live on an always-on machine on your tailnet, and every client
+can use it: the phone, and each laptop's `todo`, TUI and Claude Code tools
+([ADR-0008](docs/adr/0008-remote-transport.md)).
+
+**Host it on NixOS** with the flake's module:
+
+```nix
+{
+  inputs.todo-tui.url = "github:sspeaks/todo-tui";
+  outputs = { nixpkgs, todo-tui, ... }: {
+    nixosConfigurations.box = nixpkgs.lib.nixosSystem {
+      modules = [
+        todo-tui.nixosModules.default
+        {
+          services.tailscale.enable = true;
+          services.todo-tui = {
+            enable = true;
+            tailscaleServe = true;    # https://box.<tailnet>.ts.net
+            settings.backup.retain_days = 30;
+            # Jira: credential = "env:TODO_JIRA_PAT" in settings.instances,
+            # the token in this file (never in settings: it is the Nix store).
+            # environmentFile = "/run/secrets/todo-tui.env";
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+It runs as its own `todo-tui` user with `/var/lib/todo-tui` as its home, the
+listener on `127.0.0.1:7743` and `tailscale serve` in front of it (tailnet HTTPS
+certificates must be on). `systemctl reload todo-tui` rereads the config. On the
+box, `sudo todo-tui-admin …` runs `todo` as the service, so pair each device with
+`sudo todo-tui-admin remote pair --name laptop` (the phone scans the QR code).
+
+**Use it from a laptop:** keep the token in the keychain and point the config at
+the box:
+
+```sh
+security add-generic-password -s todo-tui -a remote -w      # paste the token
+```
+
+```toml
+# ~/.config/todo-tui/config.toml
+[client]
+remote = "https://box.<tailnet>.ts.net"
+credential = "keychain:todo-tui/remote"
+```
+
+Then `todo`, `todo add`, `todo status`, `todo mcp` and the rest use the box; no
+daemon starts on the laptop. `TODO_REMOTE` and `TODO_REMOTE_TOKEN` do the same for
+one shell. What acts on a machine's own daemon (`todo daemon`, `restore`,
+`backup list`, `remote`) refuses there: run it on the box. A capture made while
+the box was out of reach is spooled on the laptop and sent with the next
+`todo add`.
+
 ### The daemon
 
 You rarely need to manage it: `todo add`, `todo undo`, `todo redo`, `todo status`,

@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { afterEach, describe, expect, it } from "vitest";
-import { type TodoConnection, connect } from "../src/connect.js";
+import { type TodoConnection, connect, connectAny } from "../src/connect.js";
 import { ClientKind } from "../src/gen/todo/v1/system_service_pb.js";
 import { CreatedVia } from "../src/gen/todo/v1/item_pb.js";
 import type { LiveStore } from "../src/live-store.js";
@@ -88,6 +88,26 @@ function track(store: LiveStore) {
 const code = (p: Promise<unknown>) => p.then(() => undefined, (e: unknown) => ConnectError.from(e).code);
 
 describe.skipIf(!TODO_BIN)("remote listener against $TODO_BIN", { timeout: 60_000 }, () => {
+  it("connectAny takes the daemon TODO_REMOTE names, as the TUI and MCP do, and spawns none", async () => {
+    const h = await home();
+    const token = await h.pair("laptop");
+    // A home of its own with no daemon: TODO_REMOTE wins.
+    const elsewhere = mkdtempSync(join(tmpdir(), "todo-client-"));
+    cleanups.push(() => rmSync(elsewhere, { recursive: true, force: true }));
+    const conn = await connectAny({
+      env: { ...process.env, TODO_TUI_HOME: elsewhere, TODO_REMOTE: h.baseUrl, TODO_REMOTE_TOKEN: token },
+      clientKind: ClientKind.INTERACTIVE,
+      todoBin: TODO_BIN!,
+    });
+    expect(conn.remote).toBe(true);
+    await captureItem(conn.items, "from the TUI's way in", { createdVia: CreatedVia.TUI });
+    const listed = await h.local.items.listItems({});
+    expect(listed.items.map((i) => i.title)).toContain("from the TUI's way in");
+    await expect(
+      connectAny({ env: { ...process.env, TODO_TUI_HOME: elsewhere, TODO_REMOTE: h.baseUrl } }),
+    ).rejects.toThrow(/TODO_REMOTE_TOKEN/);
+  });
+
   it("says hello with a paired token, and refuses a bad, missing or revoked one", async () => {
     const h = await home();
     const conn = await h.remote();

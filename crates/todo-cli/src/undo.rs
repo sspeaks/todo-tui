@@ -4,13 +4,13 @@
 
 use std::process::ExitCode;
 
+use crate::conn::Conn;
 use todo_core::new_ulid;
 use todo_daemon::paths::Paths;
 use todo_proto::convert::item_field_path;
 use todo_proto::v1::item_service_client::ItemServiceClient;
 use todo_proto::v1::{OpSummary, RedoRequest, RelationKind, UndoRequest, UndoSkip};
 use tonic::Status;
-use tonic::transport::Channel;
 
 use crate::rpc::{call, describe, is_transport, ready};
 use crate::{print_out, short_id};
@@ -37,7 +37,7 @@ const ATTEMPTS: usize = 3;
 pub(crate) async fn undo(paths: &Paths, direction: Direction) -> anyhow::Result<ExitCode> {
     let request_id = new_ulid().to_string();
     let connect = async || ready(paths).await.map_err(|why| why.to_string());
-    let send = async |channel: Channel| {
+    let send = async |channel: Conn| {
         // As for a capture: the reply to an undo the daemon applied must
         // always decode, however many Items it carries.
         let mut items = ItemServiceClient::new(channel).max_decoding_message_size(usize::MAX);

@@ -3,7 +3,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { CLIENT_VERSION, ClientKind, connect } from "@todo-tui/client/core";
+import { CLIENT_VERSION, ClientKind, connectAny } from "@todo-tui/client/core";
 import { registerTools } from "./tools.js";
 
 const args = process.argv.slice(2);
@@ -15,7 +15,7 @@ if (unknown.length > 0) {
 const readOnly = args.includes("--read-only");
 
 try {
-  const conn = await connect({ clientKind: ClientKind.MCP });
+  const conn = await connectAny({ clientKind: ClientKind.MCP });
   const server = new McpServer({ name: "todo", version: CLIENT_VERSION });
   registerTools(server, conn, { readOnly });
   const transport = new StdioServerTransport();

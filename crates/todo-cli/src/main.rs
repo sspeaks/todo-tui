@@ -3,6 +3,7 @@
 mod add;
 mod backup;
 mod config;
+mod conn;
 mod export;
 mod launch;
 mod remote;
@@ -216,6 +217,25 @@ fn main() -> ExitCode {
 
 async fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
     let paths = Paths::resolve(&Env::from_process())?;
+    // With a daemon elsewhere (ADR-0008), what works on this machine's own
+    // daemon or its files is refused rather than done to the wrong one.
+    let local_only = match &command {
+        Command::Daemon { .. } => Some("todo daemon"),
+        Command::Restore { .. } => Some("todo restore"),
+        Command::Backup {
+            action: BackupAction::List,
+        } => Some("todo backup list"),
+        Command::Remote { .. } => Some("todo remote"),
+        _ => None,
+    };
+    if let Some(what) = local_only
+        && let Some(url) = conn::remote_url_of(&paths)
+    {
+        anyhow::bail!(
+            "{what} acts on this machine's daemon, but this machine uses the one at {url} \
+             ([client] remote, or TODO_REMOTE): run it there"
+        );
+    }
     match command {
         Command::Add { text } => return add::add(&paths, text).await,
         Command::Undo => return undo::undo(&paths, undo::Direction::Undo).await,

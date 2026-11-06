@@ -4,6 +4,7 @@
 use std::io::{BufRead as _, IsTerminal as _, Read as _};
 use std::process::ExitCode;
 
+use crate::conn::Conn;
 use anyhow::Context as _;
 use todo_core::{MAX_CAPTURE_BYTES, new_ulid};
 use todo_daemon::paths::Paths;
@@ -14,7 +15,6 @@ use todo_proto::v1::{
     CaptureDraft, CaptureItemRequest, CaptureItemResponse, CreatedVia, Energy, Priority,
     Status as ItemStatus, person_ref,
 };
-use tonic::transport::Channel;
 use ulid::Ulid;
 
 use crate::rpc::{Why, call, describe, is_transport, ready};
@@ -101,7 +101,7 @@ struct Sink<'a> {
 enum To {
     /// Nothing was sent yet.
     Unconnected,
-    Daemon(ItemServiceClient<Channel>),
+    Daemon(ItemServiceClient<Conn>),
     Spool {
         why: Why,
         told: Told,
@@ -148,9 +148,16 @@ impl<'a> Sink<'a> {
                 // The daemon bounds what it accepts. The reply to a capture
                 // it stored must always decode, or the capture would look
                 // lost.
-                Ok(channel) => To::Daemon(
-                    ItemServiceClient::new(channel).max_decoding_message_size(usize::MAX),
-                ),
+                Ok(conn) => {
+                    let mut items =
+                        ItemServiceClient::new(conn.clone()).max_decoding_message_size(usize::MAX);
+                    // A remote daemon cannot read this machine's spool:
+                    // what waits there is sent first, as it was captured.
+                    if conn.remote {
+                        drain_spool(self.paths, &mut items).await;
+                    }
+                    To::Daemon(items)
+                }
                 Err(why) => To::Spool {
                     why,
                     told: Told::Nothing,
@@ -191,6 +198,51 @@ impl<'a> Sink<'a> {
         if let To::Spool { why, told } = &mut self.to {
             self.ok &= spool_one(self.paths, &capture, why, told);
         }
+    }
+}
+
+/// Sends what this machine's spool holds to a remote daemon (ADR-0008),
+/// each entry with its spool id (so none is captured twice) and its capture
+/// time; stops at the first it cannot send, keeping it and the rest.
+async fn drain_spool(paths: &Paths, items: &mut ItemServiceClient<Conn>) {
+    let sent = spool::drain_with(paths, |entry| {
+        let mut items = items.clone();
+        async move {
+            let at = entry
+                .captured_at
+                .parse::<jiff::Timestamp>()
+                .ok()
+                .map(todo_proto::convert::timestamp_to_proto);
+            let request = CaptureItemRequest {
+                request_id: entry.spool_id.clone(),
+                text: entry.text.clone(),
+                created_via: CreatedVia::Cli.into(),
+                reference_time: at,
+                spool_id: Some(entry.spool_id.clone()),
+                ..Default::default()
+            };
+            match call(items.capture_item(request)).await {
+                Ok(_) => spool::Drained::Sent,
+                Err(status) if is_transport(&status) => spool::Drained::Later,
+                Err(status) => {
+                    print_err(format_args!(
+                        "todo: error: a spooled capture was refused, moved to {}: {}: {}",
+                        paths.spool_rejected().display(),
+                        excerpt(&entry.text),
+                        status.message()
+                    ));
+                    spool::Drained::Refused
+                }
+            }
+        }
+    })
+    .await;
+    match sent {
+        Ok(0) => {}
+        Ok(n) => print_err(format_args!(
+            "todo: sent {n} spooled capture(s) to the remote daemon"
+        )),
+        Err(e) => print_err(format_args!("todo: could not read the spool: {e:#}")),
     }
 }
 

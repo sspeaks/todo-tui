@@ -568,3 +568,76 @@ mod tests {
         assert_eq!(titles(&store).await.len(), 2);
     }
 }
+
+/// What became of one entry [`drain_with`] handed over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Drained {
+    /// Captured: dropped from the spool.
+    Sent,
+    /// Refused by the daemon: moved to `spool.rejected.jsonl`, as an import
+    /// does.
+    Refused,
+    /// Not delivered (unreachable): kept, with every entry after it.
+    Later,
+}
+
+/// Hands every entry to `send`, which captures it elsewhere (a remote
+/// daemon, ADR-0008), holding the spool's lock. An entry sent is dropped,
+/// one refused goes to `spool.rejected.jsonl`, and at the first that could
+/// not be delivered the rest are kept in order for the next try. A line
+/// that is not an entry is rejected, as an import would. Returns how many
+/// were sent.
+pub async fn drain_with<F, Fut>(paths: &Paths, mut send: F) -> anyhow::Result<usize>
+where
+    F: FnMut(SpoolEntry) -> Fut,
+    Fut: std::future::Future<Output = Drained>,
+{
+    let spool = paths.spool();
+    let read = tokio::task::spawn_blocking(move || lock_and_read(&spool)).await?;
+    let Some((file, content)) =
+        read.with_context(|| format!("reading {}", paths.spool().display()))?
+    else {
+        return Ok(0);
+    };
+    let mut kept: Vec<u8> = Vec::new();
+    let mut rejected: Vec<u8> = Vec::new();
+    let mut sent = 0;
+    let mut stopped = false;
+    for line in content.split(|&b| b == b'\n') {
+        if line.trim_ascii().is_empty() {
+            continue;
+        }
+        let outcome = match serde_json::from_slice::<SpoolEntry>(line) {
+            _ if stopped => Drained::Later,
+            Ok(entry) => send(entry).await,
+            Err(_) => Drained::Refused,
+        };
+        let to = match outcome {
+            Drained::Sent => {
+                sent += 1;
+                continue;
+            }
+            Drained::Refused => &mut rejected,
+            Drained::Later => {
+                stopped = true;
+                &mut kept
+            }
+        };
+        to.extend_from_slice(line);
+        to.push(b'\n');
+    }
+    let rejected_path = paths.spool_rejected();
+    let finish = tokio::task::spawn_blocking(move || -> io::Result<()> {
+        if !rejected.is_empty() {
+            let mut out = open_append(&rejected_path)?;
+            out.write_all(&rejected)?;
+            out.sync_data()?;
+        }
+        file.set_len(0)?;
+        file.write_all_at(&kept, 0)?;
+        file.sync_data()?;
+        file.unlock()
+    });
+    finish.await?.context("rewriting the spool")?;
+    Ok(sent)
+}
