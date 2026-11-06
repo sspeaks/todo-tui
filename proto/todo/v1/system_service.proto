@@ -37,6 +37,8 @@ enum ClientKind {
   CLIENT_KIND_INTERACTIVE = 1;
   CLIENT_KIND_ONESHOT = 2;
   CLIENT_KIND_MCP = 3;
+  // The phone app, over the remote listener (ADR-0008). Interactive.
+  CLIENT_KIND_MOBILE = 4;
 }
 
 message GetServerInfoRequest {

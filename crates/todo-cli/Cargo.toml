@@ -24,7 +24,9 @@ clap.workspace = true
 futures-util.workspace = true
 hyper-util.workspace = true
 jiff.workspace = true
+qrcode.workspace = true
 rustix.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 tonic-types.workspace = true
@@ -36,7 +38,6 @@ ulid.workspace = true
 todo-jira = { workspace = true, features = ["testing"] }
 rusqlite.workspace = true
 rustix = { workspace = true, features = ["pty"] }
-serde_json.workspace = true
 tempfile.workspace = true
 
 [lints]

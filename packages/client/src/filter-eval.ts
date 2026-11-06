@@ -7,6 +7,7 @@
 // not read is.
 
 import { clone, create, toBinary } from "@bufbuild/protobuf";
+import { base64Decode, base64Encode } from "@bufbuild/protobuf/wire";
 import type { Duration, Timestamp } from "@bufbuild/protobuf/wkt";
 import type { PersonRef } from "./gen/todo/v1/common_pb.js";
 import { ItemField } from "./gen/todo/v1/field_pb.js";
@@ -1041,14 +1042,14 @@ export function encodeCursor(c: PageCursor): string {
   const json = JSON.stringify({ f: c.fingerprint, t: c.today, a: c.after.map((v) => v ?? null) }, (_, v: unknown) =>
     typeof v === "bigint" ? { big: v.toString() } : v,
   );
-  return TOKEN_PREFIX + Buffer.from(json).toString("base64url");
+  return TOKEN_PREFIX + base64Encode(new TextEncoder().encode(json), "url");
 }
 
 /** A token encodeCursor made, or undefined for anything else. */
 export function decodeCursor(token: string): PageCursor | undefined {
   if (!token.startsWith(TOKEN_PREFIX)) return undefined;
   try {
-    const json = Buffer.from(token.slice(TOKEN_PREFIX.length), "base64url").toString();
+    const json = new TextDecoder().decode(base64Decode(token.slice(TOKEN_PREFIX.length)));
     const raw = JSON.parse(json, (_, v: unknown) => (v !== null && typeof v === "object" && "big" in v ? BigInt((v as { big: string }).big) : v)) as {
       f: unknown;
       t: unknown;

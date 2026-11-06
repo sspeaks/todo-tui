@@ -7,6 +7,7 @@ mod conn;
 mod error;
 mod logging;
 pub mod paths;
+pub mod remote;
 mod scheduler;
 mod server;
 mod service;

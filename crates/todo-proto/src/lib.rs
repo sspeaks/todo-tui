@@ -45,5 +45,7 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
 /// added BuildMeetingLink and the [meetings] config. 17 added the
 /// [[instances]] of the config (P2, ADR-0006). 18 added the SyncService
 /// (GetSyncStatus, SyncNow), Notice.sync_status and OP_KIND_SYNC. 19
-/// added SyncNowResponse.request and SyncStatus.served_request.
-pub const API_MINOR: u32 = 19;
+/// added SyncNowResponse.request and SyncStatus.served_request. 20 added
+/// ClientKind.MOBILE and CreatedVia.MOBILE for the phone app and the
+/// remote listener (ADR-0008; the phone-app branch numbered it 9).
+pub const API_MINOR: u32 = 20;

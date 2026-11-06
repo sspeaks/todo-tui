@@ -10,7 +10,6 @@ use std::task::{Context, Poll};
 
 use todo_proto::v1::ClientKind;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::UnixStream;
 use tonic::transport::server::Connected;
 
 /// Request extension identifying the connection a call arrived on.
@@ -27,7 +26,7 @@ pub(crate) struct Clients {
 }
 
 impl Clients {
-    pub(crate) fn accept(&self, io: UnixStream) -> Conn {
+    pub(crate) fn accept<IO>(&self, io: IO) -> Conn<IO> {
         let id = ConnId(self.next_id.fetch_add(1, Ordering::Relaxed));
         self.lock().insert(id, ClientKind::Unspecified);
         Conn {
@@ -58,7 +57,9 @@ impl Clients {
     pub(crate) fn other_interactive(&self, except: Option<ConnId>) -> usize {
         self.lock()
             .iter()
-            .filter(|&(id, kind)| Some(*id) != except && *kind == ClientKind::Interactive)
+            .filter(|&(id, kind)| {
+                Some(*id) != except && matches!(kind, ClientKind::Interactive | ClientKind::Mobile)
+            })
             .count()
     }
 
@@ -78,13 +79,14 @@ impl Drop for ConnGuard {
     }
 }
 
-/// A Unix stream that unregisters itself from [`Clients`] when hyper drops it.
-pub(crate) struct Conn {
-    io: UnixStream,
+/// A stream (the Unix socket's, or the remote listener's TCP) that
+/// unregisters itself from [`Clients`] when hyper drops it.
+pub(crate) struct Conn<IO> {
+    io: IO,
     guard: ConnGuard,
 }
 
-impl Connected for Conn {
+impl<IO> Connected for Conn<IO> {
     type ConnectInfo = ConnId;
 
     fn connect_info(&self) -> ConnId {
@@ -92,7 +94,7 @@ impl Connected for Conn {
     }
 }
 
-impl AsyncRead for Conn {
+impl<IO: AsyncRead + Unpin> AsyncRead for Conn<IO> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -102,7 +104,7 @@ impl AsyncRead for Conn {
     }
 }
 
-impl AsyncWrite for Conn {
+impl<IO: AsyncWrite + Unpin> AsyncWrite for Conn<IO> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,

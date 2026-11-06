@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "dist",
+    "noEmit": true,
+    // No Node types: what the phone app bundles cannot use Node APIs. React
+    // Native has the web's timers, fetch, AbortController and TextEncoder.
+    "types": [],
+    "lib": ["es2024", "dom"]
+  },
+  "include": ["src", "test"]
+}

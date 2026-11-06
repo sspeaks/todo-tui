@@ -55,11 +55,11 @@ impl ItemService for Items {
             CreatedVia::from_i32("created_via", req.created_via).map_err(error::convert)?;
         if !matches!(
             created_via,
-            CreatedVia::Tui | CreatedVia::Cli | CreatedVia::Mcp
+            CreatedVia::Tui | CreatedVia::Cli | CreatedVia::Mcp | CreatedVia::Mobile
         ) {
             return Err(error::bad_request(
                 "created_via",
-                "must be TUI, CLI or MCP; the other values are reserved for the daemon",
+                "must be TUI, CLI, MCP or MOBILE; the other values are reserved for the daemon",
             ));
         }
         let now = Zoned::now();

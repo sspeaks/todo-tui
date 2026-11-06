@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { Latest } from "./latest.js";
+import { Latest } from "../src/latest.js";
 
 describe("Latest", () => {
   it("keeps one request in flight and sends only the newest input after it", async () => {

@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { connect as netConnect } from "node:net";
-import { Code, ConnectError } from "@connectrpc/connect";
+import { isConnectionFailure, sleep } from "./errors.js";
 
 /** `$TODO_BIN`, else `todo` from PATH. */
 export function resolveTodoBin(vars: NodeJS.ProcessEnv = process.env): string {
@@ -43,19 +43,7 @@ export function spawnDaemon(opts: SpawnOptions = {}): Promise<void> {
   });
 }
 
-const CONNECTION_ERRNOS = new Set(["ENOENT", "ECONNREFUSED", "ECONNRESET", "EPIPE", "ENOTSOCK"]);
-
-/** True when an RPC failed because no daemon is listening on the socket. */
-export function isConnectionFailure(err: unknown): boolean {
-  if (err instanceof ConnectError && err.code === Code.Unavailable) return true;
-  for (let e: unknown = err, depth = 0; e != null && depth < 8; depth++) {
-    if (typeof e === "object" && "code" in e && CONNECTION_ERRNOS.has(String(e.code))) return true;
-    e = typeof e === "object" && "cause" in e ? e.cause : undefined;
-  }
-  return false;
-}
-
-export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+export { isConnectionFailure, sleep };
 
 /** The pid the running daemon recorded in its lock file (Paths.lock), as the Rust CLI reads it. */
 export function readDaemonPid(lockPath: string): number | undefined {

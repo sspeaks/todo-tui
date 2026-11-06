@@ -26,7 +26,9 @@ on items (`%low`, `e`), `h` / `l` between views, the L48 / N48 scrum report
 [Your scrum report: L48 / N48](#your-scrum-report-l48--n48) and
 [Meetings](#meetings). The first P2 milestone is done: read-only sync from
 Jira Data Center (`todo sync check|now|status`, `⇅` in the status bar, `o`);
-see [Jira sync (read-only)](#jira-sync-read-only). The CLI captures, undoes and counts;
+see [Jira sync (read-only)](#jira-sync-read-only). A phone app (Expo) can
+capture, browse the views and complete items over Tailscale; see
+[Phone app](#phone-app). The CLI captures, undoes and counts;
 listing, editing and completing items happen in the TUI or through Claude Code.
 
 ## Quick start
@@ -656,6 +658,83 @@ if needed.
 teaches Claude the capture syntax, the views, recurrence and, for later, Jira-linked
 items. To use it everywhere: `ln -s ~/todo-tui/claude/skills/todo ~/.claude/skills/todo`.
 
+### Phone app
+
+`apps/mobile` is an Expo (React Native) app that talks to the daemon on your
+computer over [Tailscale](https://tailscale.com) ([ADR-0008](docs/adr/0008-remote-transport.md)).
+It shows the views as tabs with the same rows as the TUI. To add an item, tap the
+round + button, type a title and set the rest with one tap each (due, priority,
+status, repeat, the labels and names you use), or type the capture syntax; a preview
+shows what will be captured. The item screen has the same one-tap choices.
+Tap ○ (or swipe right) to complete an item and ● to reopen it; swipe left to delete.
+The tab bar has the list, Search, and Settings (the connection and pairing).
+What you add while your computer is out of reach is kept on the phone and sent
+once it is back. Tap an item to edit its title, status,
+priority, due date, repeat, labels, waiting on and follow-up, hide-until date and
+notes, or to delete it. Every change can be undone from the snackbar. It is a thin client: it shows nothing while your
+computer is asleep or off the tailnet.
+
+Set it up once on the computer:
+
+1. Turn the remote listener on: add this to `~/.config/todo-tui/config.toml`
+   (`$XDG_CONFIG_HOME/todo-tui/` if set, on macOS too; `todo remote status` prints
+   the path), then `todo daemon stop`. The next `todo` command starts the daemon
+   again with the listener on.
+
+   ```toml
+   [remote]
+   listen = "127.0.0.1:7743"
+   ```
+
+2. Give it HTTPS on your tailnet. The listener is loopback only; Tailscale adds the
+   certificate and keeps it to your devices:
+
+   ```sh
+   tailscale serve --bg --https=443 http://127.0.0.1:7743
+   ```
+
+   With the macOS Tailscale app, the CLI is
+   `/Applications/Tailscale.app/Contents/MacOS/Tailscale`. The flake's dev shell has a
+   `tailscale` CLI too, but on macOS it only reaches an open-source `tailscaled`, not
+   the app.
+
+3. Pair the phone: `todo remote pair --name phone` prints a QR code, the server
+   (`https://<computer>.<tailnet>.ts.net`, found with `tailscale status`; `--url`
+   overrides it) and a token, which is shown only once.
+
+Then run the app (the phone needs Tailscale on, and Expo Go from the App Store or
+Play Store):
+
+```sh
+pnpm -C apps/mobile start     # scan the Expo QR code with the phone's camera
+```
+
+In the app, tap **Scan QR code** and scan the pairing code. `todo remote list` shows
+the paired devices and `todo remote revoke phone` unpairs one at once; the app then
+asks to pair again. `todo remote status` checks the setup. Every call needs the
+token, and the phone cannot stop the daemon.
+
+#### Install it on your iPhone (no dev server)
+
+With Expo Go the app runs only while `pnpm -C apps/mobile start` does. To install
+it as an app of its own:
+
+- **Free, with Xcode** (the install lasts 7 days, then run it again): install
+  CocoaPods once (`brew install cocoapods`), plug the iPhone in, turn on Developer
+  Mode (Settings › Privacy & Security), then
+
+  ```sh
+  pnpm -C apps/mobile ios:device    # expo run:ios --device --configuration Release
+  ```
+
+  Pick the iPhone, and your Apple ID as the team when asked. The first time, trust
+  the developer in Settings › General › VPN & Device Management. With an install of
+  its own, `todo-tui://pair` links from `todo remote pair` open the app.
+
+- **TestFlight** (Apple Developer Program): `npx eas-cli@latest build -p ios
+  --profile production` from `apps/mobile`, then `npx eas-cli@latest submit -p ios`
+  (`eas.json` has the profiles).
+
 ### The daemon
 
 You rarely need to manage it: `todo add`, `todo undo`, `todo redo`, `todo status`,
@@ -705,8 +784,11 @@ rm -rf "$TODO_TUI_HOME"; unset TODO_TUI_HOME
 
 - `proto/` — the `todo.v1` contract (Buf)
 - `crates/` — Rust workspace: core, store, sync, jira, assistant, proto, daemon, cli
-- `packages/client/` — shared TypeScript client (Connect-ES)
+- `packages/client/` — shared TypeScript client (Connect-ES); `./portable` is the
+  Node-free part, with the gRPC-Web client for the remote listener
+- `packages/present/` — how items read, shared by the TUI and the phone app
 - `tui/`, `mcp/` — the Ink TUI and the MCP server
+- `apps/mobile/` — the phone app (Expo)
 - `claude/skills/todo/` — the Claude Code skill for managing todos through the MCP server (not in `skills/`, which symposium would sync into `.claude/skills/`)
 - `scripts/smoke.sh` — end-to-end smoke test
 

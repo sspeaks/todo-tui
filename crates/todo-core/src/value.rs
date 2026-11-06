@@ -685,6 +685,7 @@ mod tests {
             (V::CreatedVia(CreatedVia::Restore), "restore"),
             (V::CreatedVia(CreatedVia::Split), "split"),
             (V::CreatedVia(CreatedVia::Recurrence), "recurrence"),
+            (V::CreatedVia(CreatedVia::Mobile), "mobile"),
             (V::ArchiveReason(ArchiveReason::User), "user"),
             (V::ArchiveReason(ArchiveReason::LeftScope), "left_scope"),
             (

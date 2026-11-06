@@ -36,9 +36,9 @@
       version = (lib.importTOML ./Cargo.toml).workspace.package.version;
       # Per system: see the maintenance notes above.
       pnpmDepsHash = {
-        x86_64-linux = "sha256-J9fU109O0t2DdPwzzehAWrqnIPBdM98Uh2uhAGqMK7k=";
-        aarch64-linux = "sha256-J9fU109O0t2DdPwzzehAWrqnIPBdM98Uh2uhAGqMK7k=";
-        aarch64-darwin = "sha256-GD0k69V28HOBnQrUXKOfaYzyMW3rS9mVsZlZV2q1HRA=";
+        x86_64-linux = "sha256-qsfe6f/wSneDegKmQiABmOs2QcKqRABAeEYyoJPVFck=";
+        aarch64-linux = "sha256-qsfe6f/wSneDegKmQiABmOs2QcKqRABAeEYyoJPVFck=";
+        aarch64-darwin = "sha256-eSJ/Jppg3pdpNQA4VRoKDelsYvF/x3iRVdudQSujboo=";
       };
 
       # Each part sees only the files it builds from, so a README edit
@@ -97,8 +97,15 @@
               pnpm
               pkgs.pnpmConfigHook
             ];
+            # Only what the bundles need: not apps/mobile's Expo and React
+            # Native (`...` adds each project's workspace dependencies).
+            pnpmWorkspaces = [
+              "todo-tui"
+              "@todo-tui/tui..."
+              "@todo-tui/mcp..."
+            ];
             pnpmDeps = pkgs.fetchPnpmDeps {
-              inherit (finalAttrs) pname version src;
+              inherit (finalAttrs) pname version src pnpmWorkspaces;
               inherit pnpm;
               fetcherVersion = 4;
               hash = pnpmDepsHash.${pkgs.stdenv.hostPlatform.system};
@@ -158,6 +165,10 @@
             pkgs.nodejs_24
             pkgs.pnpm_12
             pkgs.buf
+            # `tailscale serve` fronts the daemon's remote listener for the
+            # phone app (ADR-0004). This is the CLI only: it talks to the
+            # tailscaled already running on the machine.
+            pkgs.tailscale
           ];
           RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
         };

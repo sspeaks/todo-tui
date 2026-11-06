@@ -17,6 +17,7 @@ use super::Ctx;
 use crate::config::ReloadError;
 use crate::conn::ConnId;
 use crate::error;
+use crate::remote::Remote;
 
 pub(crate) struct System(pub(crate) Ctx);
 
@@ -55,6 +56,11 @@ impl SystemService for System {
         &self,
         request: Request<ShutdownRequest>,
     ) -> Result<Response<ShutdownResponse>, Status> {
+        if request.extensions().get::<Remote>().is_some() {
+            return Err(Status::permission_denied(
+                "the daemon cannot be stopped over the remote listener",
+            ));
+        }
         let conn = request.extensions().get::<ConnId>().copied();
         if request.get_ref().restart {
             let others = self.0.clients.other_interactive(conn);

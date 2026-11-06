@@ -2,14 +2,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { monotonicUlid, ulid } from "../src/ulid.js";
 
 /** When `byte` is set, getRandomValues fills buffers with it instead of random bytes. */
-const fixedRandom = vi.hoisted(() => ({ byte: undefined as number | undefined }));
-vi.mock("node:crypto", async (importOriginal) => {
-  const crypto = await importOriginal<typeof import("node:crypto")>();
-  return {
-    ...crypto,
-    getRandomValues: (buf: Uint8Array) => (fixedRandom.byte === undefined ? crypto.getRandomValues(buf) : buf.fill(fixedRandom.byte)),
-  };
-});
+const fixedRandom = { byte: undefined as number | undefined };
+const realGetRandomValues = globalThis.crypto.getRandomValues.bind(globalThis.crypto);
+vi.spyOn(globalThis.crypto, "getRandomValues").mockImplementation(((buf: Uint8Array) =>
+  fixedRandom.byte === undefined ? realGetRandomValues(buf) : buf.fill(fixedRandom.byte)) as typeof globalThis.crypto.getRandomValues);
 afterEach(() => {
   fixedRandom.byte = undefined;
 });

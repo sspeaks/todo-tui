@@ -457,7 +457,7 @@ export class FakeDaemon {
   maxPageSize = MAX_PAGE_SIZE;
   /** Runs before every ListItems; throw from it to fail that call. */
   onListItems: ((req: ListItemsRequest) => void) | undefined;
-  apiMinor = 19;
+  apiMinor = 20;
   /** What Export streams, as one batch; unset, Export is UNIMPLEMENTED (the format is the daemon's). */
   exportLines: string[] | undefined;
   /** What GetConfig serves; change it with {@link setConfig}. */
@@ -2200,6 +2200,8 @@ function patchOf(p: Planned, item: Item, now: Timestamp): Fields {
         const known = field === "energy" ? Energy : field === "priority" || field === "localPriorityOverride" ? Priority : undefined;
         if (known && typeof value === "number" && (value === 0 || !(value in known))) throw badRequest(where, value === 0 ? "is unspecified" : `unknown enum value ${value}`);
         if (field === "parentId" && value === item.id) throw badRequest(where, "an Item cannot be its own parent");
+        // Priority's domain has a "none": unset clears it to that, as the daemon does.
+        if (field === "priority" && (value === undefined || value === Priority.UNSPECIFIED)) value = Priority.NONE;
         if (field === "labels" && Array.isArray(value)) {
           if (value.some((l: string) => l === "" || BAD_LABEL.test(l))) {
             throw badRequest(where, "labels must be non-empty and contain no whitespace or control characters");
@@ -2607,12 +2609,12 @@ function requestIdOf(requestId: string): string {
   return id;
 }
 
-/** CaptureItem's created_via, converted and checked as the daemon does: TUI, CLI or MCP. */
+/** CaptureItem's created_via, converted and checked as the daemon does: TUI, CLI, MCP or MOBILE. */
 function checkCreatedVia(via: CreatedVia): void {
   if (via === CreatedVia.UNSPECIFIED) throw badRequest("created_via", "value must not be UNSPECIFIED");
   if (CreatedVia[via] === undefined) throw badRequest("created_via", `unknown enum value ${via}`);
-  if (via !== CreatedVia.TUI && via !== CreatedVia.CLI && via !== CreatedVia.MCP) {
-    throw badRequest("created_via", "must be TUI, CLI or MCP; the other values are reserved for the daemon");
+  if (via !== CreatedVia.TUI && via !== CreatedVia.CLI && via !== CreatedVia.MCP && via !== CreatedVia.MOBILE) {
+    throw badRequest("created_via", "must be TUI, CLI, MCP or MOBILE; the other values are reserved for the daemon");
   }
 }
 
