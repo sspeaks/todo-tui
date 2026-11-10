@@ -2,7 +2,22 @@
 // §3.2): errors mapped to a sentence, and the undo and redo results in
 // the CLI's words (crates/todo-cli/src/undo.rs).
 
-import { BadRequestSchema, Code, ConnectError, type Item, type RedoResponse, type UndoResponse, errorReason, isConnectionFailure } from "@todo-tui/client";
+import {
+  BadRequestSchema,
+  Code,
+  ConnectError,
+  ErrorInfoSchema,
+  type Item,
+  type RedoResponse,
+  type UndoResponse,
+  errorReason,
+  isConnectionFailure,
+} from "@todo-tui/client";
+
+/** The field an ErrorInfo names (metadata `field`), e.g. LINKED_READ_ONLY's. */
+function errorField(err: unknown): string | undefined {
+  return err instanceof ConnectError ? err.findDetails(ErrorInfoSchema)[0]?.metadata.field : undefined;
+}
 import { singleLine, truncate } from "../format/text.js";
 
 /** An action gave up waiting for the daemon after a connection failure. */
@@ -18,17 +33,67 @@ export const quoted = (title: string): string => `“${truncate(singleLine(title
 /** What an op did, as OpSummary words it: `mark done "x"`. */
 export const opText = (verb: string, title: string): string => `${verb} "${truncate(singleLine(title), 40)}"`;
 
-/** The refusal of a Core edit on a linked Item (ADR-0006), naming its key. */
-export const readOnlyText = (key: string | undefined): string =>
-  `${key ? singleLine(key) : "It"} is a Jira issue: edits reach Jira when pushes arrive`;
+/**
+ * The refusal of a Core edit on a linked Item that does not push
+ * (ADR-0006, ADR-0007), naming its key and, when the daemon said which,
+ * the field: "the description is Jira's: change it there".
+ */
+export function readOnlyText(key: string | undefined, field?: string, openKey?: string): string {
+  const what = field ? fieldWords(field) : "that";
+  return `${key ? `${singleLine(key)}: ` : ""}${what} is Jira's: change it there${openKey ? ` (${openKey} opens it)` : ""}`;
+}
+
+/** An Item field path as a person reads it: "the description", "the assignee". */
+function fieldWords(path: string): string {
+  const words: Record<string, string> = {
+    description: "the description",
+    item_type: "the issue type",
+    assignee: "the assignee",
+    components: "the components",
+    fix_versions: "the fix versions",
+    parent_id: "the parent",
+    story_points: "the story points",
+    original_estimate: "the estimate",
+    remaining_estimate: "the remaining estimate",
+    status_category: "the status",
+    resolution_kind: "the status",
+    title: "the title",
+    priority: "the priority",
+    labels: "the labels",
+    due_date: "the due date",
+  };
+  return words[path] ?? path.replace(/_/g, " ");
+}
+
+/**
+ * The NOT_MINE question (design 5.9): "PLAT-412 is assigned to Alex: change
+ * it in Jira? y/N"; with `others` (a batch) how many of the Items are not
+ * the person's.
+ */
+export function notMineText(item: Pick<Item, "title" | "remoteLink" | "assignee"> | undefined, others?: number): string {
+  if (others !== undefined && others > 1) return `${others} of these Jira issues are assigned to someone else: change them in Jira? y/N`;
+  const key = item?.remoteLink?.key ? singleLine(item.remoteLink.key) : "This issue";
+  // An Item the store lacks is someone else's, as the daemon said: never "no one".
+  const who = item?.assignee?.ref.case === "freeText" ? singleLine(item.assignee.ref.value) : item && !item.assignee ? "no one" : "someone else";
+  return `${key} is assigned to ${who}: change it in Jira? y/N`;
+}
 
 /** One line for an action's error; `about` is the Item it acted on, or its title. */
+/**
+ * The key `open_remote` runs now, for "(o opens it)": the controller keeps
+ * it as the keymap changes, and clears it where o does nothing (the
+ * Suggestions pane). Undefined: no hint.
+ */
+export const hints: { openKey?: string } = {};
+
 export function errorText(err: unknown, about?: string | Pick<Item, "title" | "remoteLink">): string {
   if (err instanceof DaemonUnavailable) return "Not saved: daemon unavailable";
   const title = typeof about === "string" ? about : about?.title;
   switch (errorReason(err)) {
     case "LINKED_READ_ONLY":
-      return readOnlyText(typeof about === "string" ? undefined : about?.remoteLink?.key);
+      return readOnlyText(typeof about === "string" ? undefined : about?.remoteLink?.key, errorField(err), hints.openKey);
+    case "NOT_MINE":
+      return `${typeof about === "string" || !about?.remoteLink ? "It" : singleLine(about.remoteLink.key)} is someone else's issue: not changed`;
     case "ITEM_DELETED":
     case "ITEM_NOT_FOUND":
       return title === undefined ? "The Item was deleted elsewhere" : `${quoted(title)} was deleted elsewhere`;

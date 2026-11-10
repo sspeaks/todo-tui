@@ -9,6 +9,8 @@ import type { FilterSchema, SortKeySchema } from "./gen/todo/v1/filter_pb.js";
 import type { Item } from "./gen/todo/v1/item_pb.js";
 import { ItemService, type ListItemsRequest, ListItemsRequestSchema, type StatusCounts } from "./gen/todo/v1/item_service_pb.js";
 import type { OpSummary } from "./gen/todo/v1/op_pb.js";
+import { type Suggestion, SuggestionState } from "./gen/todo/v1/suggestion_pb.js";
+import { SuggestionService } from "./gen/todo/v1/suggestion_service_pb.js";
 import { SyncState, type SyncStatus } from "./gen/todo/v1/sync_service_pb.js";
 import { SystemService } from "./gen/todo/v1/system_service_pb.js";
 import type { View } from "./gen/todo/v1/view_pb.js";
@@ -72,6 +74,16 @@ export interface CountsSnapshot {
   readonly today?: ProtoDate;
   /** Revision the counts were read at. */
   readonly revision: bigint;
+  readonly error?: unknown;
+}
+
+/**
+ * The Suggestions that wait (ListSuggestions, then TOPIC_SUGGESTION
+ * changes), kept while observed: oldest first.
+ */
+export interface SuggestionsSnapshot {
+  readonly status: "loading" | "ready" | "error";
+  readonly suggestions: readonly Suggestion[];
   readonly error?: unknown;
 }
 
@@ -156,6 +168,8 @@ export class LiveStore {
   private readonly viewsClient: Client<typeof ViewService>;
   private readonly systemClient: Client<typeof SystemService>;
   private readonly watchClient: Client<typeof WatchService>;
+  /** The SuggestionService client the store reads Suggestions with, for the pane's apply and reject. */
+  readonly suggestionsClient: Client<typeof SuggestionService>;
   private revision: bigint | undefined;
   /** Set while a ResyncRequired reload has not completed; retried on CaughtUp. */
   private pendingResync = false;
@@ -169,17 +183,21 @@ export class LiveStore {
   readonly viewGraceMs: number;
   /** The undo and redo entries, kept live while observed (useUndoState). */
   readonly undoState: LiveUndoState;
+  /** The Suggestions that wait, kept live while observed (useSuggestions). */
+  readonly suggestions: LiveSuggestions;
 
   constructor(private readonly opts: LiveStoreOptions) {
     this.itemsClient = createClient(ItemService, opts.transport);
     this.viewsClient = createClient(ViewService, opts.transport);
     this.systemClient = createClient(SystemService, opts.transport);
     this.watchClient = createClient(WatchService, opts.transport);
+    this.suggestionsClient = createClient(SuggestionService, opts.transport);
     this.debounceMs = opts.debounceMs ?? 150;
     this.pageSize = opts.pageSize ?? MAX_PAGE_SIZE;
     this.viewGraceMs = opts.viewGraceMs ?? 5_000;
     this.liveCounts = new LiveCounts(this);
     this.undoState = new LiveUndoState(this);
+    this.suggestions = new LiveSuggestions(this);
   }
 
   /** The transport the store reads through, for clients beside it. */
@@ -205,6 +223,7 @@ export class LiveStore {
     for (const v of this.views.values()) v.cancelTimers();
     this.liveCounts.cancelTimers();
     this.undoState.cancelTimers();
+    this.suggestions.cancelTimers();
     await this.runLoop;
     this.setConn({ state: "closed" });
   }
@@ -366,6 +385,11 @@ export class LiveStore {
   /** @internal */
   fetchUndoState() {
     return this.itemsClient.getUndoState({}, this.callOptions());
+  }
+
+  /** @internal */
+  fetchSuggestions() {
+    return this.suggestionsClient.listSuggestions({}, this.callOptions());
   }
 
   private callOptions() {
@@ -571,6 +595,7 @@ export class LiveStore {
               if (this.configSnap.status !== "ready") void this.loadConfig().catch(() => {});
               if (this.liveCounts.wanted && this.liveCounts.needsLoad) void this.liveCounts.load();
               if (this.undoState.wanted && this.undoState.needsLoad) void this.undoState.load();
+              if (this.suggestions.wanted && this.suggestions.needsLoad) void this.suggestions.load();
             }
             break;
           case "resyncRequired":
@@ -580,6 +605,7 @@ export class LiveStore {
             this.revision = msg.value.currentRevision;
             this.seen.clear();
             this.seenViews.clear();
+            this.suggestions.forgetSeen();
             this.configSnap = { ...this.configSnap, revision: 0n };
             this.pendingResync = true;
             break;
@@ -622,6 +648,11 @@ export class LiveStore {
       this.bump();
       return;
     }
+    if (change.topic === Topic.SUGGESTION) {
+      this.conn = { ...this.conn, revision: this.revision };
+      this.suggestions.apply(change);
+      return;
+    }
     if (change.topic !== Topic.ITEM) {
       this.conn = { ...this.conn, revision: this.revision };
       return;
@@ -629,11 +660,16 @@ export class LiveStore {
     const seen = this.seen.get(change.id);
     if (seen === undefined || change.revision >= seen) {
       this.seen.set(change.id, change.revision);
+      const was = this.items.get(change.id);
       // A hard removal. A soft delete is an ordinary change with deleted_at set.
       if (change.deleted) {
         this.items.delete(change.id);
       } else if (change.resource.case === "item") {
         this.items.set(change.id, change.resource.value);
+        // ListSuggestions leaves a deleted Item's out, and no Suggestion
+        // change says so: a delete or an undelete re-reads them.
+        const now = change.resource.value;
+        if (was && (was.deletedAt === undefined) !== (now.deletedAt === undefined)) this.suggestions.scheduleRequery();
       }
     }
     this.conn = { ...this.conn, revision: this.revision };
@@ -672,6 +708,8 @@ export class LiveStore {
     if (this.liveCounts.wanted) loads.push(this.liveCounts.load(true));
     else this.liveCounts.reload();
     this.undoState.invalidate();
+    if (this.suggestions.wanted) loads.push(this.suggestions.load(true));
+    else this.suggestions.invalidate();
     return loads;
   }
 
@@ -1053,6 +1091,145 @@ export class LiveUndoState {
   };
 
   getSnapshot = (): UndoSnapshot => this.snap;
+}
+
+/**
+ * ListSuggestions kept live by its LiveStore while observed: loaded on
+ * first observe and with every baseline, then each TOPIC_SUGGESTION change
+ * replaces (or, once it no longer waits, drops) its Suggestion. A
+ * Suggestion of an Item deleted meanwhile stays until a reload, which
+ * leaves it out.
+ */
+export class LiveSuggestions {
+  private readonly byId = new Map<string, Suggestion>();
+  /** The revision each was last seen at: an older read never undoes a change. */
+  private readonly seen = new Map<string, bigint>();
+  private snap: SuggestionsSnapshot = { status: "loading", suggestions: [] };
+  private loaded = false;
+  private stale = false;
+  private seq = 0;
+  private refs = 0;
+  private debounce: ReturnType<typeof setTimeout> | undefined;
+
+  constructor(private readonly store: LiveStore) {}
+
+  /** @internal */
+  get wanted(): boolean {
+    return this.refs > 0;
+  }
+
+  /** @internal */
+  get needsLoad(): boolean {
+    return !this.loaded || this.snap.status === "error" || this.stale;
+  }
+
+  /** @internal Runs ListSuggestions; out-of-order answers are discarded. Returns the read revision. */
+  async load(rethrow = false): Promise<bigint> {
+    const seq = ++this.seq;
+    try {
+      const res = await this.store.fetchSuggestions();
+      if (seq === this.seq) {
+        const listed = new Set(res.suggestions.map((s) => s.id));
+        for (const s of res.suggestions) {
+          if ((this.seen.get(s.id) ?? 0n) <= res.revision) {
+            this.byId.set(s.id, s);
+            this.seen.set(s.id, res.revision);
+          }
+        }
+        for (const id of [...this.byId.keys()]) {
+          if (!listed.has(id) && (this.seen.get(id) ?? 0n) <= res.revision) this.byId.delete(id);
+        }
+        this.loaded = true;
+        this.stale = false;
+        this.publish("ready");
+      }
+      return res.revision;
+    } catch (err) {
+      if (seq === this.seq) {
+        if (this.loaded) this.stale = true;
+        else {
+          this.snap = { ...this.snap, status: "error", error: err };
+          this.store.bump();
+        }
+      }
+      // As the other loads: a baseline leaves a failed read out of its
+      // subscribe point (an older daemon answers UNIMPLEMENTED).
+      if (rethrow) throw err;
+      return 0n;
+    }
+  }
+
+  /** @internal A TOPIC_SUGGESTION change. */
+  apply(change: Change): void {
+    if ((this.seen.get(change.id) ?? 0n) > change.revision) return;
+    this.seen.set(change.id, change.revision);
+    const s = change.resource.case === "suggestion" ? change.resource.value : undefined;
+    const waits = s && (s.state === SuggestionState.PENDING || s.state === SuggestionState.PARTIALLY_APPLIED);
+    if (waits) this.byId.set(change.id, s);
+    else this.byId.delete(change.id);
+    if (this.loaded) this.publish("ready");
+  }
+
+  /**
+   * Re-reads now, observed or not: resolves once this read (or a newer
+   * one) is applied, or has failed.
+   */
+  async reload(): Promise<void> {
+    await this.load();
+  }
+
+  /** @internal After a baseline or a resync, unobserved: the next observer reloads. */
+  invalidate(): void {
+    this.stale = true;
+  }
+
+  /**
+   * @internal After ResyncRequired: the revisions seen before mean nothing
+   * (the database was replaced), so the next load's answer stands whole.
+   */
+  forgetSeen(): void {
+    this.seen.clear();
+  }
+
+  /** @internal An Item deleted or undeleted: re-reads, debounced, while observed; else the next observer does. */
+  scheduleRequery(): void {
+    if (!this.wanted) {
+      this.stale = true;
+      return;
+    }
+    if (this.debounce) clearTimeout(this.debounce);
+    this.debounce = setTimeout(() => {
+      this.debounce = undefined;
+      void this.load();
+    }, this.store.debounceMs);
+  }
+
+  /** @internal */
+  cancelTimers(): void {
+    if (this.debounce) clearTimeout(this.debounce);
+    this.debounce = undefined;
+  }
+
+  private publish(status: SuggestionsSnapshot["status"]): void {
+    const suggestions = [...this.byId.values()].sort(
+      (a, b) => Number((a.createdAt?.seconds ?? 0n) - (b.createdAt?.seconds ?? 0n)) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+    );
+    this.snap = { status, suggestions };
+    this.store.bump();
+  }
+
+  /** Observes the Suggestions: they load, and stay live, only while observed. */
+  subscribe = (listener: () => void): (() => void) => {
+    this.refs++;
+    const unsub = this.store.subscribe(listener);
+    if (this.refs === 1 && this.needsLoad && this.store.loaded) void this.load();
+    return () => {
+      unsub();
+      this.refs--;
+    };
+  };
+
+  getSnapshot = (): SuggestionsSnapshot => this.snap;
 }
 
 /** Whether ListItems failed because its view_id names no saved view. */

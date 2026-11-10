@@ -8,6 +8,7 @@ import type {
   LiveConfigSnapshot,
   LiveStore,
   SavedViewsSnapshot,
+  SuggestionsSnapshot,
   UndoSnapshot,
   ViewQuery,
   ViewSnapshot,
@@ -105,4 +106,13 @@ export function useStatusCounts(): CountsSnapshot {
 export function useUndoState(): UndoSnapshot {
   const store = useLiveStore();
   return useSyncExternalStore(store.undoState.subscribe, store.undoState.getSnapshot);
+}
+
+/**
+ * The Suggestions that wait (ListSuggestions), kept live from
+ * TOPIC_SUGGESTION changes while a component observes them.
+ */
+export function useSuggestions(): SuggestionsSnapshot {
+  const store = useLiveStore();
+  return useSyncExternalStore(store.suggestions.subscribe, store.suggestions.getSnapshot);
 }

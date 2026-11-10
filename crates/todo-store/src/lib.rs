@@ -14,6 +14,7 @@ mod relation;
 mod report;
 mod restore;
 mod schema;
+mod suggestion;
 mod summary;
 mod sync;
 mod undo;
@@ -48,6 +49,7 @@ pub use export::{
 pub use report::{MAX_NEXT, Report, ReportInput, ReportLine};
 pub use restore::{DbInfo, backup_file, inspect, prepare_restored};
 pub use schema::{SCHEMA_VERSION, free_backup_path};
+pub use suggestion::{ApplyInput, ApplyOutput, MAX_PATCHES, RejectOutput};
 use summary::Action;
 pub use sync::{PullOutcome, PullPage, Reconcile, ReconcileOutcome, Tracked};
 pub use view::{
@@ -149,6 +151,23 @@ pub enum StoreError {
     RelationEnd {
         item_id: ItemId,
         problem: EndProblem,
+    },
+    /// No Suggestion has the patch. The daemon maps it to NOT_FOUND with
+    /// ErrorInfo `PATCH_NOT_FOUND` (`patch_id`).
+    #[error("no suggestion has the patch {0}")]
+    PatchNotFound(String),
+    /// The daemon maps it to NOT_FOUND with ErrorInfo `SUGGESTION_NOT_FOUND`
+    /// (`suggestion_id`).
+    #[error("suggestion {0} not found")]
+    SuggestionNotFound(String),
+    /// A patch's value is refused on `item_id` as a direct edit would be
+    /// (ADR-0007: a field that no longer pushes; design 5.9: someone else's
+    /// issue, unconfirmed). Nothing is applied.
+    #[error("item {item_id}: {error}")]
+    PatchRefused {
+        item_id: ItemId,
+        #[source]
+        error: MutationError,
     },
     /// [`Store::mutate`] was handed something that is not a mutation: a
     /// [`MutationOp::Restore`] (internal to undo and redo) or an [`OpKind`]
@@ -267,6 +286,11 @@ pub enum OpKind {
     /// [`Store::apply_remote`]: a page of a tracker pull (design 5.4). Actor
     /// sync, so never an undo stack entry.
     Sync,
+    /// [`Store::apply_suggestion_patches`] (design 3.11): an undo stack
+    /// entry when it changed a field.
+    ApplySuggestion,
+    /// [`Store::reject_suggestion`]: never an undo stack entry.
+    RejectSuggestion,
 }
 
 impl OpKind {
@@ -1031,6 +1055,40 @@ impl Store {
     /// refused (design 5.11).
     pub async fn outbox_counts(&self, instance: String) -> Result<(u32, u32)> {
         self.read(move |conn| outbox::counts(conn, &instance)).await
+    }
+
+    /// What waits to push, and what was refused while its Suggestion waits
+    /// (design 5.6), oldest first; `instance` only, when given.
+    pub async fn outbox(&self, instance: Option<String>) -> Result<Vec<outbox::Entry>> {
+        self.read(move |conn| outbox::entries(conn, instance.as_deref()))
+            .await
+    }
+
+    /// The Suggestions that wait (design 3.11), oldest first, with the
+    /// revision they were read at; `item`'s only, when given.
+    pub async fn list_suggestions(
+        &self,
+        item: Option<ItemId>,
+    ) -> Result<(Vec<todo_core::suggestion::Suggestion>, Revision)> {
+        self.read(move |conn| suggestion::list_tx(conn, item)).await
+    }
+
+    /// Applies the patches named as one op by the person (design 3.11):
+    /// see `suggestion_service.proto`.
+    pub async fn apply_suggestion_patches(&self, input: ApplyInput) -> Result<ApplyOutput> {
+        self.write(move |tx| suggestion::apply_tx(tx, input)).await
+    }
+
+    /// Rejects what waits of the Suggestion `id`.
+    pub async fn reject_suggestion(
+        &self,
+        request_id: String,
+        id: String,
+        now: Timestamp,
+        today: Date,
+    ) -> Result<RejectOutput> {
+        self.write(move |tx| suggestion::reject_tx(tx, request_id, id, now, today))
+            .await
     }
 
     /// A scope's cursor, `None` before its first pull.

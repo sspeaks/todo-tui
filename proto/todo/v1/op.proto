@@ -34,6 +34,11 @@ enum OpKind {
   // A pull from a tracker (design 5.4): imports and Core updates, actor
   // sync. Never an undo stack entry.
   OP_KIND_SYNC = 19;
+  // SuggestionService.ApplySuggestionPatches (design 3.11): an undo stack
+  // entry when it changed a field.
+  OP_KIND_APPLY_SUGGESTION = 20;
+  // SuggestionService.RejectSuggestion. Never an undo stack entry.
+  OP_KIND_REJECT_SUGGESTION = 21;
 }
 
 // An entry of the undo stack (design 3.10).

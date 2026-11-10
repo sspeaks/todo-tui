@@ -75,7 +75,10 @@ import {
   ViewService,
 } from "./gen/todo/v1/view_service_pb.js";
 import { type Change, ChangeSchema, type SubscribeResponse, SubscribeResponseSchema, WatchService } from "./gen/todo/v1/watch_service_pb.js";
-import { type SyncStatus, SyncStatusSchema, SyncService } from "./gen/todo/v1/sync_service_pb.js";
+import { type FieldValue } from "./gen/todo/v1/field_value_pb.js";
+import { type Patch, PatchState, type Suggestion, SuggestionKind, SuggestionSchema, SuggestionState } from "./gen/todo/v1/suggestion_pb.js";
+import { SuggestionService } from "./gen/todo/v1/suggestion_service_pb.js";
+import { type OutboxEntry, OutboxEntrySchema, type SyncStatus, SyncStatusSchema, SyncService } from "./gen/todo/v1/sync_service_pb.js";
 import { parseCaptureText } from "./capture.js";
 import { meeting, teamsUrl } from "./meeting.js";
 import { civil, dayIn, dayOf, epochMs, isDate, parseDateExpr, protoDate, rustTrim, weekday } from "./dates.js";
@@ -460,7 +463,7 @@ export class FakeDaemon {
   maxPageSize = MAX_PAGE_SIZE;
   /** Runs before every ListItems; throw from it to fail that call. */
   onListItems: ((req: ListItemsRequest) => void) | undefined;
-  apiMinor = 22;
+  apiMinor = 23;
   /** What Export streams, as one batch; unset, Export is UNIMPLEMENTED (the format is the daemon's). */
   exportLines: string[] | undefined;
   /** What GetConfig serves; change it with {@link setConfig}. */
@@ -479,6 +482,12 @@ export class FakeDaemon {
   private syncStatus = new Map<string, SyncStatus>();
   /** SyncNow calls, by instance ("" for all). */
   readonly syncNows: string[] = [];
+  /** The Suggestions, by id: putSuggestion's, as the RPCs leave them. */
+  readonly suggestions = new Map<string, Suggestion>();
+  /** What ListOutbox answers: setOutbox's. */
+  private outbox: OutboxEntry[] = [];
+  /** The patches each apply op applied, by op id: its undo reopens them, a redo applies them again. */
+  private readonly appliedBy = new Map<string, Patch[]>();
   private activityReport: MessageInitShape<typeof GetActivityReportResponseSchema> = { text: "L48:\n- (nothing)\nN48:\n- (nothing)\n" };
   /** What ParseQuery reads, by text: the default views' and defineQuery's. */
   private readonly queries = new Map<string, { filter: Filter; sort: SortKey[]; showCount: boolean }>();
@@ -638,6 +647,22 @@ export class FakeDaemon {
           this.syncNows.push(req.instanceId);
           return { request: BigInt(this.syncNows.length) };
         },
+        listOutbox: (req) => {
+          this.check();
+          return { entries: this.outbox.filter((e) => !req.instanceId || e.instanceId === req.instanceId) };
+        },
+      });
+      service(SuggestionService, {
+        listSuggestions: (req) => {
+          this.check();
+          const item = req.itemId ? idOf("item_id", req.itemId) : undefined;
+          const waiting = [...this.suggestions.values()].filter(
+            (s) => waits(s) && (item === undefined || s.itemId === item) && this.items.get(s.itemId)?.deletedAt === undefined,
+          );
+          return { suggestions: waiting, revision: this.revision };
+        },
+        applySuggestionPatches: (req) => this.applyPatches(req.requestId, req.patchIds, req.confirmNotMine),
+        rejectSuggestion: (req) => this.rejectSuggestion(req.requestId, req.id),
       });
       service(ViewService, {
         listViews: () => {
@@ -824,6 +849,8 @@ export class FakeDaemon {
     this.spools.clear();
     this.statusEnteredAt.clear();
     this.statusEnteredBy.clear();
+    this.suggestions.clear();
+    this.appliedBy.clear();
     for (const item of items) {
       this.items.set(item.id, this.settle(item));
       for (const r of item.relations) this.relations.set(relationKey(r), clone(RelationSchema, r));
@@ -874,6 +901,174 @@ export class FakeDaemon {
    */
   forgetSyncStatus(instanceId: string): void {
     this.syncStatus.delete(instanceId);
+  }
+
+  /**
+   * Adds (or replaces) a Suggestion, as sync makes one, and publishes its
+   * change; the Item's has_conflict or has_push_failure follows what waits.
+   * Patches without an id get one; a missing state is pending.
+   */
+  putSuggestion(init: MessageInitShape<typeof SuggestionSchema>): Suggestion {
+    const s = create(SuggestionSchema, { state: SuggestionState.PENDING, createdAt: this.stamp(), ...init });
+    s.id ||= ulid();
+    for (const p of s.patches) {
+      p.id ||= ulid();
+      if (p.state === PatchState.UNSPECIFIED) p.state = PatchState.PENDING;
+    }
+    this.suggestions.set(s.id, s);
+    this.revision++;
+    this.publish({ revision: this.revision, topic: Topic.SUGGESTION, id: s.id, resource: { case: "suggestion", value: s } });
+    this.flag(s.itemId);
+    return s;
+  }
+
+  /** What ListOutbox answers from now on. */
+  setOutbox(entries: readonly MessageInitShape<typeof OutboxEntrySchema>[]): void {
+    this.outbox = entries.map((e) => create(OutboxEntrySchema, e));
+  }
+
+  /** The Item's has_conflict and has_push_failure from what waits; a change of either is published. */
+  private flag(itemId: string): void {
+    const item = this.items.get(itemId);
+    if (!item) return;
+    const kinds = [...this.suggestions.values()].filter((s) => s.itemId === itemId && waits(s)).map((s) => s.kind);
+    const conflict = kinds.includes(SuggestionKind.SYNC_CONFLICT);
+    const failure = kinds.includes(SuggestionKind.PUSH_FAILED);
+    if (item.hasConflict === conflict && item.hasPushFailure === failure) return;
+    this.put({ id: itemId, hasConflict: conflict, hasPushFailure: failure });
+  }
+
+  /**
+   * ApplySuggestionPatches as the daemon runs it: one op by the person for
+   * every patch that still holds expected_old (a status pair as one
+   * SetStatus), through the guard a direct edit goes through; the others
+   * are marked stale and skipped, as are patches no longer pending.
+   */
+  private applyPatches(requestId: string, patchIds: readonly string[], confirmNotMine: boolean) {
+    this.check();
+    const key = requestIdOf(requestId);
+    if (patchIds.length < 1 || patchIds.length > MAX_BATCH) throw badRequest("patch_ids", `must hold 1 to ${MAX_BATCH} ids`);
+    // Patch ids are ULIDs, as the daemon checks them before looking them up.
+    const named = [...new Set(patchIds.map((id, i) => {
+      const canonical = canonicalUlid(id);
+      if (canonical === null) throw badRequest(`patch_ids[${i}]`, "must be a ULID");
+      return canonical;
+    }))];
+    const found = named.map((id) => {
+      for (const s of this.suggestions.values()) {
+        const p = s.patches.find((x) => x.id === id);
+        if (p) return { s, p };
+      }
+      throw errorInfo(Code.NotFound, "PATCH_NOT_FOUND", `no suggestion has the patch ${id}`, { patch_id: id });
+    });
+    const recorded = this.recorded("ApplySuggestionPatches", key);
+    if (recorded) {
+      // As the daemon's replay: what that op applied, not what the patches hold now.
+      const applied = new Set((this.appliedBy.get(recorded.op.id) ?? []).map((p) => p.id));
+      const touched = itemIdsOf(recorded.op.events);
+      return {
+        result: recorded.result,
+        items: touched.map((id) => this.present(this.get(id), this.today())),
+        suggestions: [...new Set(found.map((f) => f.s))],
+        skippedPatchIds: named.filter((id) => !applied.has(id)),
+      };
+    }
+    const status = (f: ItemField) => f === ItemField.STATUS_CATEGORY || f === ItemField.RESOLUTION_KIND;
+    // Each named status patch brings the other half of its pair.
+    const chosen = [...found];
+    for (const { s, p } of found) {
+      if (!status(p.field) || p.state !== PatchState.PENDING) continue;
+      for (const q of s.patches) if (status(q.field) && q.state === PatchState.PENDING && !chosen.some((c) => c.p === q)) chosen.push({ s, p: q });
+    }
+    const planned: Planned[] = [];
+    const applied: Patch[] = [];
+    const stale: Patch[] = [];
+    for (const itemId of new Set(chosen.map((c) => c.s.itemId))) {
+      const stored = this.items.get(itemId);
+      if (!stored || stored.deletedAt !== undefined) continue;
+      // As apply_tx: field patches one at a time, then each Suggestion's
+      // status pair, each checked on the Item as the earlier ones left it.
+      let item = stored;
+      const holds = (p: Patch) => matches(localOf(p.field), (item as unknown as Fields)[localOf(p.field)], valueOfField(p.field, p.expectedOld));
+      const mine = chosen.filter((c) => c.s.itemId === itemId && c.p.state === PatchState.PENDING);
+      const values: Fields = {};
+      const paths: string[] = [];
+      for (const c of mine.filter((c) => !status(c.p.field))) {
+        if (!holds(c.p)) {
+          stale.push(c.p);
+          continue;
+        }
+        const path = PATH_OF_NUMBER.get(c.p.field)!;
+        const value = valueOfField(c.p.field, c.p.new);
+        if (!paths.includes(path)) paths.push(path);
+        values[path] = value;
+        item = { ...item, [localOf(c.p.field)]: value } as Item;
+        applied.push(c.p);
+      }
+      if (paths.length) {
+        planned.push({ kind: "update", id: itemId, expectedRevision: undefined, prefix: "", idPath: "patch_ids", batched: false, confirmNotMine, mask: { paths, values } });
+      }
+      for (const s of new Set(mine.filter((c) => status(c.p.field)).map((c) => c.s))) {
+        const pair = mine.filter((c) => c.s === s && status(c.p.field));
+        if (!pair.every((c) => holds(c.p))) {
+          stale.push(...pair.map((c) => c.p));
+          continue;
+        }
+        const category = valueOfField(ItemField.STATUS_CATEGORY, pair.find((c) => c.p.field === ItemField.STATUS_CATEGORY)?.p.new) as StatusCategory | undefined;
+        const kind = valueOfField(ItemField.RESOLUTION_KIND, pair.find((c) => c.p.field === ItemField.RESOLUTION_KIND)?.p.new) as ResolutionKind | undefined;
+        const target = statusFor(item, category ?? item.statusCategory, kind);
+        planned.push({ kind: "setStatus", id: itemId, expectedRevision: undefined, prefix: "", idPath: "patch_ids", batched: false, confirmNotMine, status: target });
+        item = { ...item, ...withStatus(item, target), status: target } as Item;
+        applied.push(...pair.map((c) => c.p));
+      }
+    }
+    // An apply never generates a series' next instance (apply_tx runs no recurrence pass).
+    const done = planned.length
+      ? this.mutate("ApplySuggestionPatches", OpKind.APPLY_SUGGESTION, key, planned, { generate: false })
+      : undefined;
+    const opResult = done?.result ?? this.record("ApplySuggestionPatches", key, "", this.log({ kind: OpKind.APPLY_SUGGESTION, actor: "user", summary: "apply nothing", events: [] }));
+    for (const p of applied) p.state = PatchState.APPLIED;
+    for (const p of stale) p.state = PatchState.STALE;
+    const recordedOp = this.requests.get(key)?.op;
+    if (recordedOp) this.appliedBy.set(recordedOp.id, applied);
+    const touched = [...new Set(chosen.map((c) => c.s))].filter((s) => s.patches.some((p) => applied.includes(p) || stale.includes(p)));
+    for (const s of touched) {
+      s.state = settledState(s);
+      this.revision++;
+      this.publish({ revision: this.revision, topic: Topic.SUGGESTION, id: s.id, resource: { case: "suggestion", value: s } });
+    }
+    for (const id of new Set(chosen.map((c) => c.s.itemId))) this.flag(id);
+    // The flags and the Suggestion changes are the op's: its result names the last revision.
+    const result = { ...opResult, revision: this.revision };
+    const req = this.requests.get(key);
+    if (req) req.result = result;
+    return {
+      result,
+      items: (done?.items ?? []).map((i) => this.present(this.get(i.id), this.today())),
+      suggestions: [...new Set(chosen.map((c) => c.s))],
+      skippedPatchIds: named.filter((id) => !applied.some((p) => p.id === id)),
+    };
+  }
+
+  /** RejectSuggestion: every pending patch rejected; never an undo stack entry. */
+  private rejectSuggestion(requestId: string, given: string) {
+    this.check();
+    const key = requestIdOf(requestId);
+    const id = canonicalUlid(given);
+    if (id === null) throw badRequest("id", "must be a ULID");
+    const s = this.suggestions.get(id);
+    if (!s) throw errorInfo(Code.NotFound, "SUGGESTION_NOT_FOUND", `suggestion ${id} not found`, { suggestion_id: id });
+    const recorded = this.recorded("RejectSuggestion", key, id);
+    if (recorded) return { suggestion: s, result: recorded.result };
+    if (s.patches.some((p) => p.state === PatchState.PENDING)) {
+      for (const p of s.patches) if (p.state === PatchState.PENDING) p.state = PatchState.REJECTED;
+      s.state = settledState(s);
+      this.revision++;
+      this.publish({ revision: this.revision, topic: Topic.SUGGESTION, id: s.id, resource: { case: "suggestion", value: s } });
+      this.flag(s.itemId);
+    }
+    const op = this.log({ kind: OpKind.REJECT_SUGGESTION, actor: "system", summary: "reject suggestion", events: [] });
+    return { suggestion: s, result: this.record("RejectSuggestion", key, id, op) };
   }
 
   /** What GetActivityReport answers from now on; the revision and today are the fake's. */
@@ -1350,7 +1545,13 @@ export class FakeDaemon {
    * recurrence post-pass ({@link generate}) creates the next instances.
    * A replay also answers the instances the op created, as they are now.
    */
-  private mutate(rpc: string, kind: OpKind, requestId: string, planned: Planned[]): { items: Item[]; result: MutationResult; generated: Item[] } {
+  private mutate(
+    rpc: string,
+    kind: OpKind,
+    requestId: string,
+    planned: Planned[],
+    opts: { generate?: boolean } = {},
+  ): { items: Item[]; result: MutationResult; generated: Item[] } {
     const today = this.today();
     // A single-item op names its Item, so the same request id on another Item
     // is a different request; a batch is matched by its RPC alone.
@@ -1453,7 +1654,7 @@ export class FakeDaemon {
       const message = `item ${id} cannot be undeleted while its parent ${parentId} is deleted: undelete the parent first`;
       throw errorInfo(Code.FailedPrecondition, "PARENT_DELETED", inBatch(p, message), { item_id: id, parent_id: parentId });
     }
-    const generated = this.generate(batch, slots, today, now);
+    const generated = opts.generate === false ? [] : this.generate(batch, slots, today, now);
     const actions = planned.map((p, i) => ({
       verb: verbOf(p),
       parens: p.kind === "setStatus" || p.kind === "setRecurrence",
@@ -1461,7 +1662,8 @@ export class FakeDaemon {
       title: batch.items[slots[i]!]!.title,
     }));
     const dates = generated.map((s) => dayOf(batch.items[s]!.dueDate!));
-    const op = this.commit(batch, kind, mutationSummary(actions, subtasks.size, dates, today), now);
+    const summary = kind === OpKind.APPLY_SUGGESTION ? applySummary(actions) : mutationSummary(actions, subtasks.size, dates, today);
+    const op = this.commit(batch, kind, summary, now);
     const result = this.record(rpc, requestId, planned[0]!.id, op);
     return {
       items: slots.map((s) => this.present(batch.items[s]!, today)),
@@ -1558,8 +1760,31 @@ export class FakeDaemon {
     const op = this.commit(batch, kind, summary, now, { entryOp: entry.id, skipped });
     this.noteEntered(op, this.enteredRestores(source, pass.statusRestored));
     entry.undoState = redo ? "done" : "undone";
-    const items = itemIdsOf(batch.events).map((id) => batch.items[batch.slots.get(id)!]!);
-    return { result: this.record(rpc, requestId, "", op), entry: summarized, items, skipped };
+    // As on_undo: each patch the apply applied whose field the undo restored
+    // waits again (a status pair as one unit); a redo applies it again.
+    const [from, to] = redo ? [PatchState.PENDING, PatchState.APPLIED] : [PatchState.APPLIED, PatchState.PENDING];
+    const moved: Patch[] = [];
+    for (const p of this.appliedBy.get(entry.id) ?? []) {
+      const s = [...this.suggestions.values()].find((x) => x.patches.includes(p));
+      const fields = s && pass.fieldsRestored.get(s.itemId);
+      const field = localOf(p.field);
+      const back = fields !== undefined && (fields.has(field) || (TRIPLE.includes(field) && [...fields].some((f) => TRIPLE.includes(f))));
+      if (back && p.state === from) {
+        p.state = to;
+        moved.push(p);
+      }
+    }
+    const suggestions = [...this.suggestions.values()].filter((s) => s.patches.some((p) => moved.includes(p)));
+    for (const s of suggestions) {
+      s.state = settledState(s);
+      this.revision++;
+      this.publish({ revision: this.revision, topic: Topic.SUGGESTION, id: s.id, resource: { case: "suggestion", value: s } });
+      this.flag(s.itemId);
+    }
+    // The flags are the op's: its Items answer with them, at its last revision.
+    const items = itemIdsOf(batch.events).map((id) => this.items.get(id) ?? batch.items[batch.slots.get(id)!]!);
+    const result = this.record(rpc, requestId, "", op);
+    return { result: { ...result, revision: this.revision }, entry: summarized, items, skipped };
   }
 
   /**
@@ -1580,6 +1805,8 @@ export class FakeDaemon {
     const deleted = new Map<string, number>();
     // The Items whose status a unit restored, for their status_entered_at.
     const statusRestored = new Set<string>();
+    // The fields each Item had restored: an apply's patches wait again only for these.
+    const fieldsRestored = new Map<string, Set<string>>();
     let changed = false;
     for (const [at, step] of steps.entries()) {
       if (step.kind === "restore") {
@@ -1595,6 +1822,9 @@ export class FakeDaemon {
         }
         changed = true;
         if (unit.some((r) => TRIPLE.includes(r.field))) statusRestored.add(itemId);
+        const fields = fieldsRestored.get(itemId) ?? new Set<string>();
+        for (const r of unit) fields.add(r.field);
+        fieldsRestored.set(itemId, fields);
         for (const r of unit) {
           if (r.field === "deletedAt" && r.value !== undefined) deleted.set(itemId, at);
           else if (r.field === "deletedAt" || r.field === "parentId") placed.set(itemId, at);
@@ -1629,7 +1859,7 @@ export class FakeDaemon {
       }
       return out;
     };
-    return { batch, skipped, changed, relations, broken, statusRestored };
+    return { batch, skipped, changed, relations, broken, statusRestored, fieldsRestored };
   }
 
   /**
@@ -2947,3 +3177,51 @@ function withWaitingField(waiting: Waiting, path: string, value: unknown, prefix
   return out;
 }
 
+
+/** A Suggestion waits while it is pending or partly applied. */
+const waits = (s: Suggestion): boolean => s.state === SuggestionState.PENDING || s.state === SuggestionState.PARTIALLY_APPLIED;
+
+/** A Suggestion's state from its patches, as suggestion.rs settles it. */
+function settledState(s: Suggestion): SuggestionState {
+  const count = (st: PatchState) => s.patches.filter((p) => p.state === st).length;
+  const [pending, applied, rejected] = [count(PatchState.PENDING), count(PatchState.APPLIED), count(PatchState.REJECTED)];
+  if (pending && applied) return SuggestionState.PARTIALLY_APPLIED;
+  if (pending) return SuggestionState.PENDING;
+  if (applied) return SuggestionState.APPLIED;
+  if (rejected) return SuggestionState.REJECTED;
+  return SuggestionState.EXPIRED;
+}
+
+/** The Item field's update path ("title", "due_date"), by its ItemField number. */
+const PATH_OF_NUMBER = new Map(ItemSchema.fields.map((f) => [f.number, f.name]));
+
+/** The Item field's localName, by its ItemField number. */
+const localOf = (n: ItemField): string => ItemSchema.fields.find((f) => f.number === n)?.localName ?? "";
+
+/** A patch value as the Item field holds it: cleared is unset. */
+function valueOfField(_field: ItemField, v: FieldValue | undefined): unknown {
+  const k = v?.kind;
+  if (!k || k.case === "cleared" || k.case === undefined) return undefined;
+  if (k.case === "stringSet") return [...k.value.values];
+  return k.value;
+}
+
+/** The status a status pair sets on `item`, as suggestion.rs's target_status. */
+function statusFor(item: Item, category: StatusCategory, kind: ResolutionKind | undefined): Status {
+  switch (category) {
+    case StatusCategory.TODO:
+      return item.todoRefinement === TodoRefinement.NEXT ? Status.NEXT : item.todoRefinement === TodoRefinement.SOMEDAY ? Status.SOMEDAY : Status.INBOX;
+    case StatusCategory.IN_PROGRESS:
+      return Status.IN_PROGRESS;
+    default:
+      return kind === ResolutionKind.CANCELLED ? Status.CANCELLED : Status.DONE;
+  }
+}
+
+/** An apply's toast text, as suggestion.rs's summary words it. */
+function applySummary(actions: readonly { id: string; title: string }[]): string {
+  const ids = new Set(actions.map((a) => a.id));
+  const [first] = actions;
+  if (!first) return "apply nothing";
+  return ids.size === 1 ? `apply suggestion ${quoted(first.title)}` : `apply suggestions (${ids.size} items)`;
+}

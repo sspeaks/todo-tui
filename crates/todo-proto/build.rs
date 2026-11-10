@@ -12,6 +12,7 @@ const PROTOS: &[&str] = &[
     "todo/v1/op.proto",
     "todo/v1/relation.proto",
     "todo/v1/suggestion.proto",
+    "todo/v1/suggestion_service.proto",
     "todo/v1/sync_service.proto",
     "todo/v1/system_service.proto",
     "todo/v1/view.proto",

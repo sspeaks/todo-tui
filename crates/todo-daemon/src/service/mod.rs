@@ -1,6 +1,7 @@
 //! tonic service implementations over a shared [`Ctx`].
 
 pub(crate) mod item;
+pub(crate) mod suggestion;
 pub(crate) mod sync;
 pub(crate) mod system;
 pub(crate) mod view;

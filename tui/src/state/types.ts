@@ -99,13 +99,32 @@ export type Mode =
       /** The view's query on the server after a conflict, which the next enter overwrites. */
       readonly conflict?: string;
     }
-  | { readonly kind: "command"; readonly line: LineState }
+  /** `back`: the pane it was opened from, which :w applies and esc returns to. */
+  | { readonly kind: "command"; readonly line: LineState; readonly back?: Extract<Mode, { kind: "suggestions" }> }
   /** `/`: the text narrowing the tab, live as it is typed. */
   | { readonly kind: "search"; readonly line: LineState }
   /** `pending`: a prefix of one of help's own bindings (gg), when one is typed. */
   | { readonly kind: "help"; readonly scroll: number; readonly pending?: readonly KeyToken[] }
   /** :l48: the report's text, scrolled; `y` copies it. */
-  | { readonly kind: "report"; readonly scroll: number; readonly text: string; readonly pending?: readonly KeyToken[] };
+  | { readonly kind: "report"; readonly scroll: number; readonly text: string; readonly pending?: readonly KeyToken[] }
+  /**
+   * S: the Suggestions pane (design 2.6). `cursor` is a row of paneRows;
+   * `ticked` the patch ids enter ticked, applied by ctrl-s.
+   */
+  | {
+      readonly kind: "suggestions";
+      readonly cursor: number;
+      /** The row the cursor is on (rowKey): it follows that row when others come or go. */
+      readonly at?: string;
+      readonly ticked: ReadonlySet<string>;
+      readonly pending?: readonly KeyToken[];
+    }
+  /**
+   * An edit of someone else's issue (design 5.9): y sends it again with
+   * confirm_not_mine; any other key drops it. `back` is the mode to return
+   * to (the pane), else normal.
+   */
+  | { readonly kind: "confirm"; readonly text: string; readonly action: "not_mine"; readonly back?: Mode };
 
 export type ModeKind = Mode["kind"];
 

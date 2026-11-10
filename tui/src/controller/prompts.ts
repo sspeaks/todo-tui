@@ -16,6 +16,7 @@ import {
   Operator,
   type ParseDateResponse,
   type ParseRecurrenceResponse,
+  type UpdateItemResponse,
   type ProtoDate,
   ProtoDateSchema,
   type RecurrenceRule,
@@ -49,7 +50,7 @@ import { Bulk, type BulkStep, bulkText, stepsOf, updateStep } from "./bulk.js";
 import type { Controller } from "./controller.js";
 import { Latest } from "./latest.js";
 import { errorText, opText, quoted } from "./messages.js";
-import { single } from "./pipeline.js";
+import { type Outcome, single } from "./pipeline.js";
 
 type Prompt = Extract<Mode, { kind: "prompt" }>;
 
@@ -470,9 +471,16 @@ export class Prompts {
     same: (a: string, b: string) => boolean = (a, b) => a === b,
   ): Promise<void> {
     let base = mode.base ?? { value: valueOf(item), revision: item.revision };
+    // A yes to someone else's issue holds for the rebases of this edit.
+    let confirmed = false;
     for (let rebases = 0; ; rebases++) {
       const expectedRevision = base.revision;
-      const out = await this.c.pipeline.run({ call: (opts) => updateItem(this.c.items, patch, paths, { ...opts, expectedRevision }), items: single });
+      const out: Outcome<UpdateItemResponse> = await this.c.pipeline.run({
+        call: (opts) => updateItem(this.c.items, patch, paths, { ...opts, expectedRevision }),
+        items: single,
+        confirmed,
+      });
+      confirmed = out.confirmed;
       if (out.ok) {
         this.c.setMode(normalMode);
         return this.c.toastIfLeft(item.id, out.res.result?.opId, opText("edit", patch.title ?? item.title));

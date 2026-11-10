@@ -1,7 +1,19 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { ArchiveReason, FakeDaemon, ItemField, LinkState, Priority, Status, SyncState, createClients, timestampFromDate } from "@todo-tui/client/core";
+import {
+  ArchiveReason,
+  FakeDaemon,
+  ItemField,
+  LinkState,
+  Priority,
+  Status,
+  SuggestionKind,
+  SuggestionSource,
+  SyncState,
+  createClients,
+  timestampFromDate,
+} from "@todo-tui/client/core";
 import { describe, expect, it } from "vitest";
 import { registerTools } from "../src/tools.js";
 
@@ -175,8 +187,9 @@ describe("todo mcp tools", () => {
         },
       ],
     });
-    await expect(call("todo_update", { id: "0000JRA2", title: "Renamed" })).rejects.toThrow(/is a Jira issue, synced read-only/);
-    await expect(call("todo_set_status", { id: "0000JRA2", status: "done" })).rejects.toThrow(/Change them in Jira/);
+    // Pushes off (no push key): every Jira field is Jira's.
+    await expect(call("todo_update", { id: "0000JRA2", title: "Renamed" })).rejects.toThrow(/^title: this item is a Jira issue and that field is Jira's: change it in Jira/);
+    await expect(call("todo_set_status", { id: "0000JRA2", status: "done" })).rejects.toThrow(/only while sync pushes \(push = true\)/);
     const broken = await call("todo_list", { text: "PLAT-9", include_done: true });
     expect(broken.items[0]).toMatchObject({ archived: "remote_unavailable", jira: { key: "PLAT-9", unavailable: true } });
     await call("todo_update", { id: "0000JRA2", private_notes: "mine" });
@@ -240,7 +253,51 @@ describe("todo mcp tools", () => {
   it("registers only the read tools when read-only", async () => {
     const { client } = await harness({ readOnly: true });
     const { tools } = await client.listTools();
-    expect(tools.map((t) => t.name).sort()).toEqual(["todo_get", "todo_l48", "todo_list", "todo_meeting_link", "todo_status", "todo_views"]);
+    expect(tools.map((t) => t.name).sort()).toEqual(["todo_get", "todo_l48", "todo_list", "todo_meeting_link", "todo_status", "todo_suggestions", "todo_views"]);
     expect(tools.every((t) => t.annotations?.readOnlyHint)).toBe(true);
+  });
+});
+
+describe("todo mcp tools with pushes (ADR-0007)", () => {
+  const link = { trackerKind: "jira", instanceId: "work-jira", remoteId: "1", key: "PLAT-1", url: "https://jira.example.com/browse/PLAT-1" };
+
+  it("pushes the title and a close, refuses the description by name, and asks for someone else's issue", async () => {
+    const { call, daemon } = await harness({
+      items: [
+        { id: "01JBQ00000000000000000JRA2", title: "Linked", status: Status.NEXT, remoteLink: link, isMine: true },
+        { id: "01JBQ00000000000000000JRA4", title: "Theirs", status: Status.NEXT, remoteLink: { ...link, remoteId: "4", key: "PLAT-4" } },
+      ],
+    });
+    daemon.setConfig({ instances: [{ id: "work-jira", kind: "jira-dc", push: true }] });
+    expect((await call("todo_update", { id: "0000JRA2", title: "Renamed" })).title).toBe("Renamed");
+    expect((await call("todo_set_status", { id: "0000JRA2", status: "done" })).item.status).toBe("done");
+    await expect(call("todo_update", { id: "0000JRA2", description: "d" })).rejects.toThrow(/^description: this item is a Jira issue and that field is Jira's/);
+    await expect(call("todo_update", { id: "0000JRA4", title: "x" })).rejects.toThrow(/assigned to someone else.*confirm_not_mine: true/);
+    expect((await call("todo_update", { id: "0000JRA4", title: "x", confirm_not_mine: true })).title).toBe("x");
+    expect((await call("todo_set_status", { id: "0000JRA4", status: "cancelled", confirm_not_mine: true })).item.status).toBe("cancelled");
+  });
+
+  it("todo_suggestions lists what sync left to review, and todo_status counts the outbox", async () => {
+    const { call, daemon } = await harness({ items: [{ id: "01JBQ00000000000000000JRA2", title: "theirs", remoteLink: link, isMine: true }] });
+    daemon.putSuggestion({
+      itemId: "01JBQ00000000000000000JRA2",
+      kind: SuggestionKind.PUSH_FAILED,
+      source: SuggestionSource.SYNC,
+      rationale: "Jira refused the due date on PLAT-1",
+      error: "You cannot set a due date",
+      patches: [{ field: ItemField.DUE_DATE, expectedOld: { kind: { case: "cleared", value: {} } }, new: { kind: { case: "dateValue", value: { year: 2026, month: 12, day: 1 } } } }],
+    });
+    expect(await call("todo_suggestions")).toEqual([
+      {
+        item: { short_id: "0000JRA2", title: "theirs", jira: "PLAT-1" },
+        kind: "push_failed",
+        why: "Jira refused the due date on PLAT-1",
+        jira_said: "You cannot set a due date",
+        changes: [{ field: "due_date", jira: null, yours: "2026-12-01" }],
+      },
+    ]);
+    daemon.setSyncStatus({ instanceId: "work-jira", state: SyncState.OK, items: 1, pendingOps: 2, failedOps: 1 });
+    const { sync } = await call("todo_status");
+    expect(sync[0]).toMatchObject({ to_push: 2, refused: 1 });
   });
 });

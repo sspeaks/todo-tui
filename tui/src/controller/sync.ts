@@ -1,9 +1,22 @@
-// Jira sync from the TUI (design 5.11, ADR-0006): `o` opens the selected
-// Item's issue, `gs` and `:sync [instance]` start a pull, and `:sync
-// status` says how each instance stands.
-// Read-only: nothing here writes to Jira.
+// Jira sync from the TUI (design 5.11, ADR-0006, ADR-0007): `o` opens the
+// selected Item's issue, `gs` and `:sync [instance]` start a pull, `:sync
+// status` says how each instance stands, and `:sync outbox` what waits to
+// reach Jira. Nothing here writes to Jira; the edits do, through the outbox.
 
-import { type Client, SyncService, SyncState, type SyncStatus, createClient, errorReason, isConnectionFailure, timestampDate } from "@todo-tui/client";
+import {
+  type Client,
+  ItemField,
+  type OutboxEntry,
+  OutboxState,
+  SyncService,
+  SyncState,
+  type SyncStatus,
+  createClient,
+  errorReason,
+  isConnectionFailure,
+  timestampDate,
+} from "@todo-tui/client";
+import { fieldWord } from "../format/suggestion.js";
 import { singleLine } from "../format/text.js";
 import type { Controller } from "./controller.js";
 import { type UrlOpener, systemOpener } from "./meeting.js";
@@ -64,7 +77,8 @@ export function statusLine(status: SyncStatus, now: Date): string {
               ? "starting"
               : "ok";
   const error = status.lastError && status.state !== SyncState.OK ? ` (${singleLine(status.lastError)})` : "";
-  return `${singleLine(status.instanceId)}: ${word}${error} · ${status.items} item${status.items === 1 ? "" : "s"} · ${last}`;
+  const outbox = [status.pendingOps ? `${status.pendingOps} to push` : "", status.failedOps ? `${status.failedOps} refused (S)` : ""].filter(Boolean).join(", ");
+  return `${singleLine(status.instanceId)}: ${word}${error} · ${status.items} item${status.items === 1 ? "" : "s"}${outbox ? ` · ${outbox}` : ""} · ${last}`;
 }
 
 export class Sync {
@@ -112,14 +126,32 @@ export class Sync {
     const all = [...this.c.store.getSyncStatus().values()];
     if (!all.length) return this.c.toast("info", "Nothing syncs: no [[instances]] in the config");
     const now = this.c.now();
-    const bad = all.some((s) => stateColor(s.state) === "red");
+    const bad = all.some((s) => stateColor(s.state) === "red" || s.failedOps > 0);
     this.c.toast(bad ? "error" : "info", all.map((s) => statusLine(s, now)).join(" · "));
   }
 
-  /** :sync [status | instance]. */
+  /** :sync outbox: what waits to reach Jira, and what it refused, in one line. */
+  async outbox(): Promise<void> {
+    let entries: OutboxEntry[];
+    try {
+      entries = (await this.c.pipeline.call(({ timeoutMs }) => this.client.listOutbox({}, timeoutMs !== undefined ? { timeoutMs } : {}))).entries;
+    } catch (err) {
+      return this.c.failed(`No outbox: ${errorText(err)}`);
+    }
+    // A status's two rows are one change.
+    const changes = entries.filter((e) => e.field !== ItemField.RESOLUTION_KIND || !entries.some((o) => o.itemId === e.itemId && o.field === ItemField.STATUS_CATEGORY && o.state === e.state));
+    if (!changes.length) return this.c.toast("info", "Nothing waits to reach Jira");
+    const refused = changes.filter((e) => e.state === OutboxState.FAILED);
+    const line = (e: OutboxEntry) => `${singleLine(e.remoteKey)} ${fieldWord(e.field)}${e.state === OutboxState.FAILED ? " refused" : e.state === OutboxState.IN_FLIGHT ? " sent" : ""}`;
+    const head = refused.length ? `${changes.length - refused.length} to push, ${refused.length} refused (S to review)` : `${changes.length} to push`;
+    this.c.toast(refused.length ? "error" : "info", `${head}: ${changes.map(line).join(", ")}`);
+  }
+
+  /** :sync [status | outbox | instance]. */
   run(args: string): Promise<void> | void {
     const word = args.trim();
     if (word === "status") return this.status();
+    if (word === "outbox") return this.outbox();
     return this.now(word);
   }
 }

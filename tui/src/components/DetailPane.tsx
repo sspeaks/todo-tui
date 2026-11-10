@@ -28,6 +28,25 @@ const ARCHIVE_WHY: Partial<Record<ArchiveReason, string>> = {
   [ArchiveReason.REMOTE_UNAVAILABLE]: "its Jira issue is unavailable",
 };
 
+/** "the title and the status wait to reach Jira": what waits to push, a status's two fields once. */
+export function pendingText(fields: readonly ItemField[]): string {
+  const word = (f: ItemField) =>
+    f === ItemField.TITLE
+      ? "the title"
+      : f === ItemField.PRIORITY
+        ? "the priority"
+        : f === ItemField.LABELS
+          ? "the labels"
+          : f === ItemField.DUE_DATE
+            ? "the due date"
+            : f === ItemField.STATUS_CATEGORY || f === ItemField.RESOLUTION_KIND
+              ? "the status"
+              : "a field";
+  const words = [...new Set(fields.map(word))];
+  const list = words.length > 1 ? `${words.slice(0, -1).join(", ")} and ${words.at(-1)}` : (words[0] ?? "");
+  return `${list} ${words.length > 1 ? "wait" : "waits"} to reach Jira`;
+}
+
 /** Direct children, whatever their status (Decision 4). */
 const subtasksOf = (id: string): ViewQuery => ({
   filter: {
@@ -150,6 +169,16 @@ export function DetailPane({ id, width, height, focused }: { id: string | undefi
             {singleLine(item.remoteLink.key)}
             {item.remoteLink.linkState === LinkState.BROKEN ? <Text color="red"> (unavailable: deleted, or no access)</Text> : null}
             <Text dimColor> · {singleLine(item.remoteLink.url)}</Text>
+          </Field>
+        ) : null}
+        {item.pendingFields.length ? (
+          <Field label="To Jira">
+            <Text color="yellow">↑ {pendingText(item.pendingFields)}</Text>
+          </Field>
+        ) : null}
+        {item.hasConflict || item.hasPushFailure ? (
+          <Field label="Jira">
+            <Text color="red">! {item.hasPushFailure ? "Jira refused a change" : "Jira changed what you changed"}: S to review</Text>
           </Field>
         ) : null}
         <Field label="Status">

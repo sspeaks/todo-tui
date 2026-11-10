@@ -27,6 +27,11 @@ import type {
 } from "./gen/todo/v1/item_service_pb.js";
 import type { FilterSchema, SortKeySchema } from "./gen/todo/v1/filter_pb.js";
 import type { RelationSchema } from "./gen/todo/v1/relation_pb.js";
+import type {
+  ApplySuggestionPatchesResponse,
+  RejectSuggestionResponse,
+  SuggestionService,
+} from "./gen/todo/v1/suggestion_service_pb.js";
 import type { ViewSchema } from "./gen/todo/v1/view_pb.js";
 import type {
   CreateViewResponse,
@@ -47,11 +52,23 @@ export interface MutationOptions extends CallOptions {
   expectedRevision?: bigint;
   /** Defaults to a new ULID. Reuse one to retry a call idempotently. */
   requestId?: string;
+  /**
+   * The person confirmed changing, in the tracker, an issue assigned to
+   * someone else (design 5.9): without it such an edit fails with
+   * FAILED_PRECONDITION (ErrorInfo NOT_MINE). Only the calls that push take it.
+   */
+  confirmNotMine?: boolean;
 }
 
-function split({ expectedRevision, requestId, ...call }: MutationOptions) {
+function split({ expectedRevision, requestId, confirmNotMine: _, ...call }: MutationOptions) {
   const fields = { requestId: requestId ?? ulid(), ...(expectedRevision !== undefined && { expectedRevision }) };
   return [fields, call] as const;
+}
+
+/** As split, keeping confirm_not_mine for the calls whose edits push. */
+function splitPushed(opts: MutationOptions) {
+  const [fields, call] = split(opts);
+  return [{ ...fields, ...(opts.confirmNotMine && { confirmNotMine: true }) }, call] as const;
 }
 
 export interface CaptureOptions extends CallOptions {
@@ -94,7 +111,7 @@ export function updateItem(
   paths: readonly string[],
   opts: MutationOptions = {},
 ): Promise<UpdateItemResponse> {
-  const [fields, call] = split(opts);
+  const [fields, call] = splitPushed(opts);
   return client.updateItem({ ...fields, item, updateMask: { paths: [...paths] } }, call);
 }
 
@@ -104,7 +121,7 @@ export function setStatus(
   status: Status,
   opts: MutationOptions = {},
 ): Promise<SetStatusResponse> {
-  const [fields, call] = split(opts);
+  const [fields, call] = splitPushed(opts);
   return client.setStatus({ ...fields, id, status }, call);
 }
 
@@ -119,7 +136,7 @@ export function setRecurrence(
   rule: MessageInitShape<typeof RecurrenceRuleSchema> | undefined,
   opts: MutationOptions = {},
 ): Promise<SetRecurrenceResponse> {
-  const [fields, call] = split(opts);
+  const [fields, call] = splitPushed(opts);
   return client.setRecurrence({ ...fields, id, ...(rule !== undefined && { rule }) }, call);
 }
 
@@ -153,7 +170,7 @@ export function batchMutate(
   mutations: readonly MessageInitShape<typeof MutationSchema>[],
   opts: Omit<MutationOptions, "expectedRevision"> = {},
 ): Promise<BatchMutateResponse> {
-  const [fields, call] = split(opts);
+  const [fields, call] = splitPushed(opts);
   return client.batchMutate({ ...fields, mutations: [...mutations] }, call);
 }
 
@@ -265,6 +282,35 @@ export function deleteView(client: ViewsClient, id: string, opts: MutationOption
 export function moveView(client: ViewsClient, id: string, position: number, opts: MutationOptions = {}): Promise<MoveViewResponse> {
   const [{ requestId }, call] = split(opts);
   return client.moveView({ requestId, id, position }, call);
+}
+
+// --- Suggestions (design 3.11) ---
+
+export type SuggestionsClient = Client<typeof SuggestionService>;
+
+/**
+ * ApplySuggestionPatches: the patches, in one undoable op; those whose
+ * field changed since are skipped (skipped_patch_ids). On a linked Item
+ * each value is an edit that pushes, refused as a direct edit is
+ * (LINKED_READ_ONLY, NOT_MINE without confirmNotMine).
+ */
+export function applySuggestionPatches(
+  client: SuggestionsClient,
+  patchIds: readonly string[],
+  opts: Omit<MutationOptions, "expectedRevision"> = {},
+): Promise<ApplySuggestionPatchesResponse> {
+  const [fields, call] = splitPushed(opts);
+  return client.applySuggestionPatches({ ...fields, patchIds: [...patchIds] }, call);
+}
+
+/** RejectSuggestion: what waits of it is let go; never an undo stack entry. */
+export function rejectSuggestion(
+  client: SuggestionsClient,
+  id: string,
+  opts: Omit<MutationOptions, "expectedRevision" | "confirmNotMine"> = {},
+): Promise<RejectSuggestionResponse> {
+  const [{ requestId }, call] = split(opts);
+  return client.rejectSuggestion({ requestId, id }, call);
 }
 
 export function errorReason(err: unknown): string | undefined {

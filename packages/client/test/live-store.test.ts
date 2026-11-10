@@ -12,6 +12,7 @@ import { FakeDaemon } from "../src/fake-daemon.js";
 import { MAX_PAGE_SIZE } from "../src/limits.js";
 import { LiveStore, type LiveStoreOptions } from "../src/live-store.js";
 import { RelationKind } from "../src/gen/todo/v1/relation_pb.js";
+import { SuggestionKind, SuggestionSource } from "../src/gen/todo/v1/suggestion_pb.js";
 import { addRelation, deleteItem, removeRelation, setStatus, undeleteItem, undo } from "../src/mutations.js";
 
 async function waitFor(cond: () => boolean, timeoutMs = 2000): Promise<void> {
@@ -904,5 +905,53 @@ describe("LiveStore Items on demand and the undo state", () => {
     daemon.down = false;
     await store.undoState.reload();
     expect(store.undoState.getSnapshot()).toMatchObject({ status: "ready" });
+  });
+});
+
+describe("LiveStore Suggestions", () => {
+  const conflict = (daemon: FakeDaemon, itemId: string) =>
+    daemon.putSuggestion({
+      itemId,
+      kind: SuggestionKind.SYNC_CONFLICT,
+      source: SuggestionSource.SYNC,
+      patches: [{ field: ItemField.TITLE, expectedOld: { kind: { case: "stringValue", value: "a" } }, new: { kind: { case: "stringValue", value: "b" } } }],
+    });
+  const ids = (store: LiveStore) => store.suggestions.getSnapshot().suggestions.map((s) => s.id);
+
+  it("brings a deleted Item's Suggestions back with an undelete", async () => {
+    const { daemon, store } = setup(1);
+    const [one] = [...daemon.items.values()];
+    const s = conflict(daemon, one!.id);
+    const stop = store.suggestions.subscribe(() => {});
+    store.view().subscribe(() => {});
+    store.start();
+    await waitFor(() => ids(store).includes(s.id));
+    const items = createClient(ItemService, daemon.transport);
+    await deleteItem(items, one!.id);
+    await store.suggestions.reload();
+    expect(ids(store)).toEqual([]);
+    await undeleteItem(items, one!.id);
+    await waitFor(() => ids(store).includes(s.id));
+    stop();
+  });
+
+  it("forgets what it saw on ResyncRequired: a restored database's Suggestions stand whole", async () => {
+    const { daemon, store } = setup(1);
+    const [one] = [...daemon.items.values()];
+    // Seen at a high revision on the old timeline.
+    for (let i = 0; i < 8; i++) daemon.update(one!.id, { priority: i % 2 ? Priority.HIGH : Priority.LOW });
+    const s = conflict(daemon, one!.id);
+    const stop = store.suggestions.subscribe(() => {});
+    store.start();
+    await waitFor(() => ids(store).includes(s.id));
+    daemon.down = true;
+    daemon.dropStreams();
+    await waitFor(() => store.getConnection().state === "reconnecting");
+    // A backup from before the Suggestion, at a lower revision.
+    daemon.restore(3n, [create(ItemSchema, { ...one!, revision: 3n })]);
+    daemon.down = false;
+    await waitFor(() => store.getConnection().state === "live" && store.getConnection().revision === 3n);
+    await waitFor(() => !ids(store).includes(s.id));
+    stop();
   });
 });

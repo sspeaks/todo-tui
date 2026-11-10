@@ -1,7 +1,8 @@
 // Used by scripts/smoke.sh: connects (auto-spawning the daemon), subscribes
 // from the ListItems revision, prints READY, then prints the first changed
-// item as protobuf JSON and exits. With --list it prints every item instead,
-// and with --view <seed> the items the seeded view lists, in its order.
+// item as protobuf JSON and exits. With --list it prints every open item
+// instead (--all: done, archived and deferred too), and with --view <seed>
+// the items the seeded view lists, in its order.
 // TODO_TUI_HOME / TODO_BIN come from the env.
 import { toJsonString } from "@bufbuild/protobuf";
 import { ConnectError, createClient } from "@connectrpc/connect";
@@ -14,7 +15,10 @@ const timeoutMs = Number(process.env.SMOKE_TIMEOUT_MS ?? 15_000);
 async function list(): Promise<number> {
   const conn = await connect();
   try {
-    const { items } = await conn.items.listItems({ pageSize: 1000 });
+    // --all: done, archived and deferred too.
+    const all = process.argv.includes("--all");
+    const filter = all ? { includeDone: true, includeArchived: true, includeDeferred: true } : {};
+    const { items } = await conn.items.listItems({ pageSize: 1000, filter });
     for (const item of items) process.stdout.write(`${toJsonString(ItemSchema, item)}\n`);
     return 0;
   } finally {

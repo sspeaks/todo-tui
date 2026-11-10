@@ -1,4 +1,4 @@
-import { type ConnectionSnapshot, type SyncStatus, useConnection, useSyncStatus, useUndoState } from "@todo-tui/client";
+import { type ConnectionSnapshot, type SyncStatus, useConnection, useSuggestions, useSyncStatus, useUndoState } from "@todo-tui/client";
 import { Box, Text } from "ink";
 import { useEffect, useState } from "react";
 import { stateColor, stateWord } from "../controller/sync.js";
@@ -31,6 +31,8 @@ function modeLabel(s: UiState): string {
       return "HELP";
     case "report":
       return "L48";
+    case "suggestions":
+      return "SUGGESTIONS";
     case "command":
       return "COMMAND";
     case "quickAdd":
@@ -67,6 +69,8 @@ function hints(s: UiState): string {
       return joined(pair(s, "help_down", "help_up", "scroll"), hint(s, "help_close", "close"));
     case "report":
       return joined(hint(s, "report_copy", "copy"), pair(s, "report_down", "report_up", "scroll"), hint(s, "report_close", "close"));
+    case "suggestions":
+      return joined(hint(s, "suggestion_toggle", "tick"), hint(s, "suggestion_apply", "apply"), hint(s, "suggestion_reject", "reject"), hint(s, "suggestion_close", "close"));
     case "command":
       return "enter run · tab complete · esc cancel";
     case "quickAdd":
@@ -96,9 +100,17 @@ function marksLabel(marks: ReadonlySet<string>, listed: readonly { id: string }[
   return `${marks.size} marked${hidden ? ` (${hidden} hidden)` : ""}`;
 }
 
-/** "⇅ work-jira 2m" for each synced instance, with its colour. */
+/**
+ * "⇅ work-jira 2m" for each synced instance, with its colour; "↑3" while
+ * pushes wait, "!1" when Jira refused one (design 2.2, 5.11). A refusal
+ * is red: it waits for the person.
+ */
 function syncLabels(all: ReadonlyMap<string, SyncStatus>, now: Date): { id: string; text: string; color: "red" | "yellow" | undefined }[] {
-  return [...all.values()].map((s) => ({ id: s.instanceId, text: `⇅ ${truncate(singleLine(s.instanceId), 16)} ${stateWord(s, now)}`, color: stateColor(s.state) }));
+  return [...all.values()].map((s) => {
+    const outbox = [s.pendingOps ? `↑${s.pendingOps}` : "", s.failedOps ? `!${s.failedOps}` : ""].filter(Boolean).join(" ");
+    const text = `⇅ ${truncate(singleLine(s.instanceId), 16)} ${stateWord(s, now)}${outbox ? ` ${outbox}` : ""}`;
+    return { id: s.instanceId, text, color: s.failedOps ? "red" : stateColor(s.state) };
+  });
 }
 
 /** The controller's clock, re-read every 30 s so that "2m" ages. */
@@ -113,7 +125,7 @@ function useClock(now: () => Date): Date {
 }
 
 /**
- * Mode · connection · ⇅ sync · saving… · marks · pending prefix · the narrowing ·
+ * Mode · connection · ⇅ sync (↑ waiting, ! refused) · ✦ Suggestions · saving… · marks · pending prefix · the narrowing ·
  * the undo hint, and the keys for this mode on the right. The undo hint
  * and the error detail are cut first; the key hints give way when the
  * essentials would not fit beside them.
@@ -125,6 +137,8 @@ export function StatusBar({ width }: { width: number }) {
   const undo = useUndoState().undo;
   const clock = useClock(controller.now);
   const syncs = syncLabels(useSyncStatus(), clock);
+  const waiting = useSuggestions().suggestions.length;
+  const suggestions = waiting ? `✦ ${waiting}` : "";
   const undoKey = keyFor(state.keymap.bindings, "undo", sequenceLabel);
   const listed = useOptionalView(state.tab === undefined ? undefined : tabQuery(state.tab, state.narrow?.shown));
   const mode = modeLabel(state);
@@ -136,7 +150,7 @@ export function StatusBar({ width }: { width: number }) {
   const marks = marksLabel(state.marks, rows, narrowed !== undefined);
   const narrow = narrowed === undefined ? "" : `/${truncate(singleLine(narrowed), 24)} · ${rows.length}`;
   const keys = ` ${hints(state)}`;
-  const essential = [mode, conn, ...syncs.map((s) => s.text), busy, marks, pending, narrow].filter(Boolean).join(" · ");
+  const essential = [mode, conn, ...syncs.map((s) => s.text), suggestions, busy, marks, pending, narrow].filter(Boolean).join(" · ");
   const showKeys = displayWidth(essential) + displayWidth(keys) <= width;
   const live = connection.state === "live";
   const error = connectionError(connection);
@@ -153,6 +167,7 @@ export function StatusBar({ width }: { width: number }) {
               {s.text}
             </Text>
           ))}
+          {suggestions ? <Text color="magenta"> · {suggestions}</Text> : null}
           {busy ? <Text color="yellow"> · {busy}</Text> : null}
           {marks ? <Text color="magenta"> · {marks}</Text> : null}
           {pending ? <Text color="cyan"> · {pending}</Text> : null}

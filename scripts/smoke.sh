@@ -444,20 +444,22 @@ else
   rsee 'Repeats +every day · this one ' "the instance's Repeats line"
   tmx send-keys -t tui:recur q
 
-  # 9. Jira sync, read-only (P2): a fake Data Center on 127.0.0.1 with two
-  #    issues; `todo sync now` imports them, `todo sync status` says ok,
-  #    and the TUI shows ⇅ in the status bar and the key in the detail.
+  # 9. Jira sync (P2): a fake Data Center on 127.0.0.1 with two issues;
+  #    `todo sync now` imports them, `todo sync status` says ok, and the
+  #    TUI shows ⇅ in the status bar and the key in the detail. Then a
+  #    push (ADR-0007): x on the to-do issue reaches the fake as a close
+  #    with resolution Done, and the next pull reads it back done.
   if command -v python3 >/dev/null; then
     jhome=$root/jira
     new_home "$jhome"
-    python3 -I "$repo/scripts/fake-jira.py" smoke-pat >"$root/jira.port" &
+    python3 -I "$repo/scripts/fake-jira.py" smoke-pat "$root/jira.writes" >"$root/jira.port" &
     jira_pid=$!
     for _ in $(seq 1 50); do [[ -s $root/jira.port ]] && break; sleep 0.1; done
     port=$(head -n1 "$root/jira.port")
     [[ -n $port ]] || fail "the fake Jira did not start"
     printf 'smoke-pat' >"$jhome/jira.token"
     chmod 600 "$jhome/jira.token"
-    printf '[[instances]]\nid = "work-jira"\nkind = "jira-dc"\nbase_url = "http://127.0.0.1:%s"\ncredential = "file:%s"\nscopes = [{ name = "mine", query = "assignee = currentUser()" }]\npush = false\n' \
+    printf '[[instances]]\nid = "work-jira"\nkind = "jira-dc"\nbase_url = "http://127.0.0.1:%s"\ncredential = "file:%s"\nscopes = [{ name = "mine", query = "assignee = currentUser()" }]\npush = true\n' \
       "$port" "$jhome/jira.token" >"$jhome/config.toml"
     out=$(TODO_TUI_HOME=$jhome "$TODO_BIN" sync check) || fail "sync check failed: $out"
     [[ $out == "work-jira: ok as Dana Example (JIRAUSER10100), time zone UTC" ]] || fail "unexpected sync check: $out"
@@ -485,9 +487,28 @@ else
     ksee '^[› ] ○ .*smoke jira login fix +PLAT-1 ' "the to-do issue in Next"
     ksee '^[› ] ◐ .*smoke jira report +PLAT-2 ' "the in-progress issue in Next"
     ksee 'Jira +PLAT-[12] ·' "the selected issue's key in the detail"
+    # x on the to-do issue (PLAT-1) closes it in Jira as Done.
+    kscreen | grep -Eq '^› ○ .*PLAT-1 ' || tmx send-keys -t tui:jira j
+    ksee '^› ○ .*smoke jira login fix +PLAT-1 ' "PLAT-1 selected"
     tmx send-keys -t tui:jira x
-    # push = false keeps it read-only (ADR-0007's switch).
-    ksee 'PLAT-[12] is a Jira issue: edits reach Jira when pushes arrive' "the read-only refusal"
+    for _ in $(seq 1 100); do
+      grep -q '"to": "Closed"' "$root/jira.writes" 2>/dev/null && break
+      sleep 0.1
+    done
+    grep -qF '{"method": "POST", "key": "PLAT-1", "to": "Closed", "resolution": "Done"}' "$root/jira.writes" ||
+      { cat "$root/jira.writes" >&2 2>/dev/null; fail "x on PLAT-1 did not reach the fake Jira as Closed with Done"; }
+    out=$(TODO_TUI_HOME=$jhome "$TODO_BIN" sync now) || fail "sync now after the push failed: $out"
+    (cd "$repo/packages/client" && TODO_TUI_HOME=$jhome corepack pnpm exec tsx scripts/smoke-watch.ts --list --all) >"$root/jira.after" ||
+      fail "listing items failed"
+    grep -F '"key":"PLAT-1"' "$root/jira.after" | grep -qF '"status":"STATUS_DONE"' ||
+      { cat "$root/jira.after" >&2; fail "PLAT-1 did not read back done"; }
+    grep -F '"key":"PLAT-1"' "$root/jira.after" | grep -qF '"remoteStatusName":"Closed"' ||
+      { cat "$root/jira.after" >&2; fail "PLAT-1 did not read back Closed"; }
+    out=$(TODO_TUI_HOME=$jhome "$TODO_BIN" sync outbox) || fail "sync outbox failed: $out"
+    [[ $out == "nothing waits to reach Jira" ]] || fail "unexpected sync outbox: $out"
+    tmx send-keys -t tui:jira S
+    ksee 'Nothing to review' "an empty Suggestions pane"
+    tmx send-keys -t tui:jira Escape
     tmx send-keys -t tui:jira q
     kill "$jira_pid" 2>/dev/null || true
     TODO_TUI_HOME=$jhome "$TODO_BIN" daemon stop >/dev/null

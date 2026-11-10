@@ -3,8 +3,10 @@
 // in list order and without expected_revision (they are absolute): one op,
 // so one undo entry, toasted with its OpSummary. An Item deleted elsewhere
 // meanwhile is dropped and the rest retried once. A linked Item whose
-// Core the edit would change (ADR-0006) is dropped too, one refusal at a
-// time: the same edit can be Overlay on another (next on a Jira to-do).
+// field that does not push the edit would change (ADR-0006, ADR-0007) is
+// dropped too, one refusal at a time: the same edit can be Overlay on
+// another (next on a Jira to-do), or push from another. Someone else's
+// issue asks first, for the whole batch (the pipeline's NOT_MINE).
 
 import {
   type BatchMutateResponse,
@@ -19,7 +21,8 @@ import {
 } from "@todo-tui/client";
 import type { Target } from "../state/types.js";
 import type { Controller } from "./controller.js";
-import { errorText, opText, readOnlyText } from "./messages.js";
+import type { Outcome } from "./pipeline.js";
+import { errorText, hints, opText, readOnlyText } from "./messages.js";
 
 export type MutationInit = MessageInitShape<typeof MutationSchema>;
 
@@ -37,6 +40,10 @@ export const TOO_MANY = `Bulk actions take at most ${MAX_BULK} items`;
 /** The Item an error names (ErrorInfo metadata item_id), e.g. the closed one ITEM_CLOSED refuses a rule on. */
 export const errorItemId = (err: unknown): string | undefined =>
   err instanceof ConnectError ? err.findDetails(ErrorInfoSchema)[0]?.metadata.item_id : undefined;
+
+/** The field an error names (ErrorInfo metadata field), e.g. LINKED_READ_ONLY's. */
+export const errorField = (err: unknown): string | undefined =>
+  err instanceof ConnectError ? err.findDetails(ErrorInfoSchema)[0]?.metadata.field : undefined;
 
 /** The Item an ITEM_DELETED or ITEM_NOT_FOUND error names. */
 export function deletedItemId(err: unknown): string | undefined {
@@ -91,19 +98,24 @@ export class Bulk {
     let todo = steps;
     let dropped = 0;
     let linked = 0;
+    // A yes to someone else's issue holds for the retries of this action.
+    let confirmed = false;
     for (;;) {
       const batch = todo;
-      const out = await this.c.pipeline.run<BatchMutateResponse>({
+      const out: Outcome<BatchMutateResponse> = await this.c.pipeline.run<BatchMutateResponse>({
         call: (opts) => batchMutate(this.c.items, batch.map((s) => s.mutation), opts),
+        targets: batch.map((s) => s.id),
+        confirmed,
         // The next instances of the series it completed go into the store too.
         items: (res) => ({ items: [...res.items, ...res.generated], revision: res.result?.revision ?? 0n }),
       });
+      confirmed = out.confirmed;
       if (out.ok) {
         this.c.clearMarks();
         if (first >= 0) this.c.selectIndex(first);
         const notes = [
           dropped ? ` · ${dropped} was deleted elsewhere` : "",
-          linked ? ` · ${linked} Jira item${linked === 1 ? "" : "s"} left as ${linked === 1 ? "it is" : "they are"}` : "",
+          linked ? ` · ${linked} Jira item${linked === 1 ? "" : "s"} left as ${linked === 1 ? "it is" : "they are"} (Jira's)` : "",
         ];
         this.c.toastOp(out.res.result?.opId, describe(batch), notes.join(""));
         return true;
@@ -115,7 +127,7 @@ export class Bulk {
         todo = batch.filter((s) => s !== refused);
         if (todo.length) continue;
         const key = this.c.store.getItem(refused.id)?.remoteLink?.key;
-        this.c.failed(linked === 1 ? readOnlyText(key) : `${linked} Jira items: edits reach Jira when pushes arrive`);
+        this.c.failed(linked === 1 ? readOnlyText(key, errorField(out.err), hints.openKey) : `${linked} Jira items: that is Jira's, change it there`);
         return false;
       }
       const gone = deletedItemId(out.err);

@@ -156,6 +156,8 @@ sql_enum!(OpKind, "op_kind", {
     OpKind::UpdateView => "update_view",
     OpKind::DeleteView => "delete_view",
     OpKind::MoveView => "move_view",
+    OpKind::ApplySuggestion => "apply_suggestion",
+    OpKind::RejectSuggestion => "reject_suggestion",
 });
 sql_enum!(RelationKind, "relation_kind", {
     RelationKind::Blocks => "blocks",

@@ -1,0 +1,76 @@
+syntax = "proto3";
+
+package todo.v1;
+
+import "todo/v1/common.proto";
+import "todo/v1/item.proto";
+import "todo/v1/suggestion.proto";
+
+// Suggestions (design 3.11, 2.6): proposed changes, never applied without a
+// person. P2 makes the sync kinds only (sync_conflict, push_failed), which
+// are never superseded. A Suggestion waits while it is PENDING or
+// PARTIALLY_APPLIED; each change of one is a TOPIC_SUGGESTION change. A
+// deleted Item's Suggestions are not listed, and its patches are skipped;
+// they come back with an undelete.
+service SuggestionService {
+  // The Suggestions that wait, oldest first.
+  rpc ListSuggestions(ListSuggestionsRequest) returns (ListSuggestionsResponse);
+  // Applies the patches named, in one op by the person: one undo stack entry
+  // for all of them, whatever Suggestions they belong to. A patch applies
+  // only while its field still holds expected_old; one that does not is
+  // marked STALE and skipped, as is one already applied or rejected. The
+  // status of a Suggestion (status_category, with resolution_kind when it
+  // has one) applies as one pair: naming either patch applies both. Each
+  // value is an edit like any other: on a linked Item it is queued for the
+  // tracker (ADR-0007), refused as UpdateItem refuses it (LINKED_READ_ONLY,
+  // NOT_MINE without confirm_not_mine). A Suggestion becomes APPLIED once no
+  // patch waits and one was applied, PARTIALLY_APPLIED while some wait, and
+  // EXPIRED when all are stale. NOT_FOUND / PATCH_NOT_FOUND (metadata
+  // patch_id) for an id no Suggestion has.
+  rpc ApplySuggestionPatches(ApplySuggestionPatchesRequest) returns (ApplySuggestionPatchesResponse);
+  // Rejects every patch that waits: the Suggestion becomes REJECTED, or
+  // APPLIED when some were applied before. Rejecting one that no longer
+  // waits changes nothing. Never an undo stack entry. NOT_FOUND /
+  // SUGGESTION_NOT_FOUND (metadata suggestion_id).
+  rpc RejectSuggestion(RejectSuggestionRequest) returns (RejectSuggestionResponse);
+}
+
+message ListSuggestionsRequest {
+  // Only this Item's.
+  optional string item_id = 1;
+}
+
+message ListSuggestionsResponse {
+  repeated Suggestion suggestions = 1;
+  // The revision this was read at.
+  uint64 revision = 2;
+}
+
+message ApplySuggestionPatchesRequest {
+  string request_id = 1;
+  // 1 to 1000 Patch ids; a repeat counts once.
+  repeated string patch_ids = 2;
+  // As UpdateItemRequest's (design 5.9).
+  bool confirm_not_mine = 3;
+}
+
+message ApplySuggestionPatchesResponse {
+  MutationResult result = 1;
+  // The Items it changed, after the op.
+  repeated Item items = 2;
+  // Each Suggestion a named patch belongs to, as the op left it.
+  repeated Suggestion suggestions = 3;
+  // The patches named but not applied: stale, or already applied or
+  // rejected.
+  repeated string skipped_patch_ids = 4;
+}
+
+message RejectSuggestionRequest {
+  string request_id = 1;
+  string id = 2;
+}
+
+message RejectSuggestionResponse {
+  Suggestion suggestion = 1;
+  MutationResult result = 2;
+}

@@ -169,6 +169,41 @@ pub(crate) fn store(e: StoreError) -> Status {
         StoreError::RelationEnd { item_id, problem } => {
             Shape::ItemOp.relation_end(item_id, problem)
         }
+        StoreError::PatchNotFound(ref id) => error_info(
+            Code::NotFound,
+            "PATCH_NOT_FOUND",
+            e.to_string(),
+            [("patch_id", id.clone())],
+        ),
+        StoreError::SuggestionNotFound(ref id) => error_info(
+            Code::NotFound,
+            "SUGGESTION_NOT_FOUND",
+            e.to_string(),
+            [("suggestion_id", id.clone())],
+        ),
+        // Refused as a direct edit of the Item would be: the same ErrorInfo
+        // (LINKED_READ_ONLY, NOT_MINE, ITEM_CLOSED, ITEM_DELETED), naming
+        // the Item. A value no longer valid on it is about the patches the
+        // request names.
+        StoreError::PatchRefused { item_id, error } => match error {
+            MutationError::LinkedReadOnly(_)
+            | MutationError::NotMine(_)
+            | MutationError::Closed
+            | MutationError::Deleted => Shape::Update.status(0, &error, Some(item_id)),
+            other => error_info(
+                Code::FailedPrecondition,
+                "PATCH_INVALID",
+                cap(format!(
+                    "item {item_id}: a patch no longer applies: {}",
+                    describe(&other)
+                )),
+                [("item_id", item_id.to_string())].into_iter().chain(
+                    other
+                        .field()
+                        .map(|f| ("field", item_field_path(f).to_owned())),
+                ),
+            ),
+        },
         StoreError::SchemaTooNew { .. } => error_info(
             Code::FailedPrecondition,
             "SCHEMA_TOO_NEW",

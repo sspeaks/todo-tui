@@ -168,6 +168,8 @@ enum SyncAction {
         /// Only this instance (its id in the config).
         instance: Option<String>,
     },
+    /// What waits to reach Jira, and what Jira refused.
+    Outbox,
 }
 
 #[derive(Subcommand)]
@@ -265,6 +267,7 @@ async fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
                 SyncAction::Check => sync::check(&paths).await,
                 SyncAction::Status => sync::status(&paths).await,
                 SyncAction::Now { instance } => sync::now(&paths, instance).await,
+                SyncAction::Outbox => sync::outbox(&paths).await,
             };
         }
         Command::Config { action } => {

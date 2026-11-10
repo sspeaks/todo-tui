@@ -105,6 +105,7 @@ pub(crate) fn undo_tx(tx: &mut WriteTx<'_>, input: UndoInput, redo: bool) -> Res
         restored,
         relations_changed,
         signals,
+        fields,
         ..
     } = pass;
     op.report = Some(report_to_sql(&skipped)?);
@@ -152,8 +153,22 @@ pub(crate) fn undo_tx(tx: &mut WriteTx<'_>, input: UndoInput, redo: bool) -> Res
         }
     }
 
-    let (revision, slots) = write_op(tx, &op, &mut batch, today)?;
+    // An apply's patches wait again where the undo restored their Item, and
+    // a redo applies them again (design 3.11).
+    let suggested = if entry.kind == OpKind::ApplySuggestion {
+        crate::suggestion::on_undo(tx.conn(), entry.op_id, redo, &fields, &mut batch, input.now)?
+    } else {
+        Vec::new()
+    };
+    let (mut revision, slots) = write_op(tx, &op, &mut batch, today)?;
+    for id in &suggested {
+        revision = crate::outbox::record_suggestion(tx, id)?;
+    }
     let conn = tx.conn();
+    if !suggested.is_empty() {
+        conn.prepare_cached("UPDATE ops SET revision = ?2 WHERE id = ?1")?
+            .execute(params![op.id.to_string(), codec::rev_to_sql(revision)?])?;
+    }
     set_state(conn, entry.op_id, if redo { "done" } else { "undone" })?;
     op.insert_request_id(conn, revision, None)?;
     Ok(UndoOutput {
@@ -179,6 +194,9 @@ struct Pass {
     skipped: Vec<UndoSkipRow>,
     /// The Items a content unit was restored on, and what it restored.
     restored: HashMap<ItemId, Restored>,
+    /// The fields each Item had restored: an apply's patches wait again
+    /// only for these (design 3.11).
+    fields: HashMap<ItemId, Vec<ItemField>>,
     relations_changed: bool,
     /// The staleness units, applied once the content is restored.
     signals: Vec<(ItemId, RestoreUnit)>,
@@ -250,6 +268,10 @@ impl Pass {
     /// Notes that step `at` restored `unit` on `item_id`.
     fn note_restore(&mut self, at: usize, item_id: ItemId, unit: &RestoreUnit) {
         *self.restored.entry(item_id).or_default() |= Restored::of(unit);
+        self.fields
+            .entry(item_id)
+            .or_default()
+            .extend(unit.restores.iter().map(|r| r.field));
         for r in &unit.restores {
             match r.field {
                 ItemField::DeletedAt if r.value != FieldValue::Cleared => {

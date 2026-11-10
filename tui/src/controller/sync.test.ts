@@ -56,10 +56,10 @@ describe("o, gs and :sync", () => {
 });
 
 describe("the read-only guard", () => {
-  it("toasts the refusal with the issue's key, and Overlay edits still save", async () => {
+  it("toasts the refusal with the issue's key and the field, and Overlay edits still save", async () => {
     const t = await setup(fakeDaemon([item("PLAT-7 work", link("PLAT-7"))]));
     await t.c.press("x");
-    await vi.waitFor(() => expect(t.toast()).toBe("PLAT-7 is a Jira issue: edits reach Jira when pushes arrive"));
+    await vi.waitFor(() => expect(t.toast()).toBe("PLAT-7: the status is Jira's: change it there (o opens it)"));
     await t.c.press("eh");
     await vi.waitFor(() => expect(t.userOps()).toHaveLength(1));
   });
@@ -68,7 +68,7 @@ describe("the read-only guard", () => {
     const t = await setup(fakeDaemon([item("PLAT-1 work", link("PLAT-1")), item("local a"), item("PLAT-2 work", link("PLAT-2")), item("local b")]));
     await t.c.press("mmmm");
     await t.c.press("p1");
-    await vi.waitFor(() => expect(t.toast()).toBe("edit 2 items · u undo · 2 Jira items left as they are"));
+    await vi.waitFor(() => expect(t.toast()).toBe("edit 2 items · u undo · 2 Jira items left as they are (Jira's)"));
     expect(t.byTitle("local a")?.priority).toBe(Priority.HIGHEST);
     expect(t.byTitle("PLAT-1 work")?.priority).not.toBe(Priority.HIGHEST);
   });
@@ -83,7 +83,7 @@ describe("the read-only guard", () => {
     await vi.waitFor(() => expect(t.titles()).toHaveLength(3));
     await t.c.press("mmm");
     await t.c.press("sn");
-    await vi.waitFor(() => expect(t.toast()).toBe("move to next (2 items) · u undo · 1 Jira item left as it is"));
+    await vi.waitFor(() => expect(t.toast()).toBe("move to next (2 items) · u undo · 1 Jira item left as it is (Jira's)"));
     expect(t.byTitle("PLAT-1 todo")?.status).toBe(Status.NEXT);
     expect(t.byTitle("PLAT-2 todo doing")?.status).toBe(Status.IN_PROGRESS);
     expect(t.byTitle("todo local")?.status).toBe(Status.NEXT);
@@ -93,7 +93,7 @@ describe("the read-only guard", () => {
     const t = await setup(fakeDaemon([item("PLAT-1 work", link("PLAT-1")), item("PLAT-2 work", link("PLAT-2"))]));
     await t.c.press("mm");
     await t.c.press("p1");
-    await vi.waitFor(() => expect(t.toast()).toBe("2 Jira items: edits reach Jira when pushes arrive"));
+    await vi.waitFor(() => expect(t.toast()).toBe("2 Jira items: that is Jira's, change it there"));
     expect(t.userOps()).toEqual([]);
   });
 });

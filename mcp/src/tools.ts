@@ -7,11 +7,14 @@ import {
   Code,
   ConnectError,
   CreatedVia,
+  ErrorInfoSchema,
   Energy,
   type FilterSchema,
   type Item,
   ItemField,
   type MessageInitShape,
+  PatchState,
+  SuggestionKind,
   MAX_MATCHES_BYTES,
   Operator,
   Priority,
@@ -38,7 +41,7 @@ import {
   updateItem,
 } from "@todo-tui/client/core";
 import { z } from "zod";
-import { ENERGY_LEVELS, PRIORITY_LEVELS, STATUS_NAMES, isoDate, project, shortId } from "./project.js";
+import { ENERGY_LEVELS, PRIORITY_LEVELS, STATUS_NAMES, isoDate, project, prune, shortId, valueOf } from "./project.js";
 
 export interface ToolOptions {
   /** Register only the tools that read (`todo mcp --read-only`). */
@@ -58,17 +61,31 @@ function describe(err: unknown): Error {
   if (err instanceof ToolError) return err;
   if (err instanceof ConnectError) {
     const reason = errorReason(err);
+    const field = err.findDetails(ErrorInfoSchema)[0]?.metadata.field;
     if (err.code === Code.Aborted) return new ToolError(`changed elsewhere since it was read; get it again and retry (${err.rawMessage})`);
     if (err.code === Code.Unavailable) return new ToolError(`the todo daemon is not answering: ${err.rawMessage}`);
     if (reason === "LINKED_READ_ONLY") {
       return new ToolError(
-        "this item is a Jira issue, synced read-only: its title, description, status category (to do, in progress, done, cancelled), priority, labels, due date and the other Jira fields are Jira's. Change them in Jira. Here only waiting, defer, notes, the local priority, energy, archive and delete apply, and inbox/next/someday while Jira has it in to do",
+        `${field ? `${field.replace(/_/g, " ")}: ` : ""}this item is a Jira issue and that field is Jira's: change it in Jira. ` +
+          "Only the title, priority, labels, due date and status push to Jira, and only while sync pushes (push = true) and the link is whole; " +
+          "the description, assignee, components, fix versions, parent, points and estimates never do. Waiting, defer, notes, the local priority, energy, archive and delete stay local",
+      );
+    }
+    if (reason === "NOT_MINE") {
+      return new ToolError(
+        "this Jira issue is assigned to someone else, and the change would reach their ticket in Jira. Ask Seth first; if he agrees, call again with confirm_not_mine: true",
       );
     }
     return new ToolError(`${Code[err.code]}${reason ? ` ${reason}` : ""}: ${err.rawMessage}`);
   }
   return err instanceof Error ? err : new Error(String(err));
 }
+
+/** confirm_not_mine, as the edit tools take it (design 5.9). */
+const CONFIRM_NOT_MINE = z
+  .boolean()
+  .optional()
+  .describe("The issue is assigned to someone else and Seth agreed to change it in Jira; without it such an edit is refused");
 
 const ID = z
   .string()
@@ -87,7 +104,7 @@ const textOf = (text: string): FilterInit["anyOf"] =>
   }));
 
 export function registerTools(server: McpServer, clients: TodoClients, opts: ToolOptions = {}): void {
-  const { items, views, sync } = clients;
+  const { items, views, sync, suggestions } = clients;
 
   /** Runs `fn`, rewording daemon errors for a model. */
   async function run(fn: () => Promise<unknown>): Promise<Result> {
@@ -210,7 +227,8 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
     {
       title: "Todo counts",
       description:
-        "The inbox, due and overdue counts, the count of each view that shows one, today's date as the daemon sees it, and each Jira instance's sync state (ok, syncing, offline, auth_error, degraded) with its last pull.",
+        "The inbox, due and overdue counts, the count of each view that shows one, today's date as the daemon sees it, and each Jira instance's sync state (ok, syncing, offline, auth_error, degraded) with its last pull, " +
+        "how many changes wait to reach Jira (to_push) and how many Jira refused (refused; todo_suggestions lists them).",
       annotations: { readOnlyHint: true },
     },
     () =>
@@ -232,6 +250,8 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
               instance: s.instanceId,
               state: SyncState[s.state]?.toLowerCase() ?? "unknown",
               items: s.items,
+              ...(s.pendingOps && { to_push: s.pendingOps }),
+              ...(s.failedOps && { refused: s.failedOps }),
               ...(s.lastSuccessfulPullAt && { last_pull: timestampDate(s.lastSuccessfulPullAt).toISOString() }),
               ...(s.lastError && s.state !== SyncState.OK && { error: s.lastError }),
             })),
@@ -303,6 +323,43 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
       }),
   );
 
+  server.registerTool(
+    "todo_suggestions",
+    {
+      title: "Jira sync fallout",
+      description:
+        "What sync left for Seth to review: sync_conflict (Jira changed a field while his edit of it waited to push; Jira's value stands, his is offered again) " +
+        "and push_failed (Jira refused his change, with its error; Jira's value stands). Re-applying or rejecting is his, in the TUI's Suggestions pane (S); " +
+        "these tools never apply one.",
+      inputSchema: { id: ID.optional().describe("Only this item's") },
+      annotations: { readOnlyHint: true },
+    },
+    ({ id }) =>
+      run(async () => {
+        const itemId = id === undefined ? undefined : (await resolve(id)).id;
+        const res = await suggestions.listSuggestions(itemId === undefined ? {} : { itemId });
+        const byId = new Map<string, Item>();
+        for (const s of res.suggestions) {
+          if (!byId.has(s.itemId)) {
+            const got = await items.getItem({ id: s.itemId }).catch(() => undefined);
+            if (got?.item) byId.set(s.itemId, got.item);
+          }
+        }
+        return res.suggestions.map((s) => {
+          const item = byId.get(s.itemId);
+          return prune({
+            item: item && { short_id: shortId(item.id), title: item.title, jira: item.remoteLink?.key },
+            kind: s.kind === SuggestionKind.SYNC_CONFLICT ? "sync_conflict" : s.kind === SuggestionKind.PUSH_FAILED ? "push_failed" : "unknown",
+            why: s.rationale,
+            jira_said: s.error || undefined,
+            changes: s.patches
+              .filter((p) => p.state === PatchState.PENDING)
+              .map((p) => ({ field: ItemField[p.field]?.toLowerCase() ?? String(p.field), jira: valueOf(p.expectedOld), yours: valueOf(p.new) })),
+          });
+        });
+      }),
+  );
+
   if (opts.readOnly) return;
 
   // Writes.
@@ -334,8 +391,10 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
       title: "Update a todo",
       description:
         "Change fields of an item; only the fields given change. Empty string (or null) clears a field. " +
-        "Status, repeat, archive and delete have their own tools. A Jira-linked item syncs read-only: only the local fields " +
-        "(defer_until, waiting, private_notes, local_priority, energy) change; the rest are Jira's, to change in Jira.",
+        "Status, repeat, archive and delete have their own tools. On a Jira-linked item the title, priority, labels and due date are " +
+        "pushed to Jira (pending_fields shows them queued until Jira has them; ask Seth before renaming his ticket as a side effect); " +
+        "the description and the other Jira fields are Jira's, and refused. defer_until, waiting, private_notes, local_priority and energy " +
+        "stay local. An issue assigned to someone else needs confirm_not_mine.",
       inputSchema: {
         id: ID,
         title: z.string().optional(),
@@ -350,6 +409,7 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
         waiting_reason: z.string().optional(),
         follow_up: DATE.optional().describe("When to chase the waiting-on"),
         private_notes: z.string().optional().describe("Markdown, local only"),
+        confirm_not_mine: CONFIRM_NOT_MINE,
       },
     },
     (args) =>
@@ -390,7 +450,7 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
           else paths.push("waiting");
         }
         if (paths.length === 0) throw new ToolError("give at least one field to change");
-        const res = await updateItem(items, patch as Parameters<typeof updateItem>[1], paths);
+        const res = await updateItem(items, patch as Parameters<typeof updateItem>[1], paths, args.confirm_not_mine ? { confirmNotMine: true } : {});
         return res.item && project(res.item);
       }),
   );
@@ -401,13 +461,15 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
       title: "Set a todo's status",
       description:
         "Move an item to inbox, next, someday or in_progress, or close it as done or cancelled. Completing (or cancelling) " +
-        "a repeating item creates its next instance, returned as `next`.",
-      inputSchema: { id: ID, status: STATUS },
+        "a repeating item creates its next instance, returned as `next`. On a Jira-linked item done, cancelled, in_progress and a move " +
+        "back to to-do are pushed to Jira as a transition: done closes the issue with resolution Done, cancelled with Won't Do " +
+        "(pending_fields shows it queued). inbox, next and someday between themselves stay local. An issue assigned to someone else needs confirm_not_mine.",
+      inputSchema: { id: ID, status: STATUS, confirm_not_mine: CONFIRM_NOT_MINE },
     },
-    ({ id, status }) =>
+    ({ id, status, confirm_not_mine }) =>
       run(async () => {
         const item = await resolve(id);
-        const res = await setStatus(items, item.id, STATUS_NAMES[status]!);
+        const res = await setStatus(items, item.id, STATUS_NAMES[status]!, confirm_not_mine ? { confirmNotMine: true } : {});
         return { item: res.item && project(res.item), next: res.generated && project(res.generated) };
       }),
   );
@@ -419,18 +481,19 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
       description:
         "Set, replace or clear (empty string) an open item's repeat rule: daily, weekdays, mon,thu, weekly, monthly, 15th, 3d or 2w " +
         "(an @ is optional). weekly and monthly take the weekday or day from the item's due date. Without a due date, the first scheduled date becomes it.",
-      inputSchema: { id: ID, rule: z.string() },
+      inputSchema: { id: ID, rule: z.string(), confirm_not_mine: CONFIRM_NOT_MINE },
     },
-    ({ id, rule }) =>
+    ({ id, rule, confirm_not_mine }) =>
       run(async () => {
         const item = await resolve(id);
+        const confirm = confirm_not_mine ? { confirmNotMine: true } : {};
         if (rule.trim() === "") {
-          const res = await setRecurrence(items, item.id, undefined);
+          const res = await setRecurrence(items, item.id, undefined, confirm);
           return res.item && project(res.item);
         }
         const parsed = await parseRecurrence(items, rule, item.dueDate ? { anchor: item.dueDate } : {});
         if (!parsed.rule) throw new ToolError(`${rule}: ${parsed.warning || "not a repeat rule"}`);
-        const res = await setRecurrence(items, item.id, parsed.rule);
+        const res = await setRecurrence(items, item.id, parsed.rule, confirm);
         return res.item && project(res.item);
       }),
   );

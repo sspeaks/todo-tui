@@ -46,7 +46,9 @@ import { type ExportFs, Exporter } from "./export.js";
 import { type Clipboard, systemClipboard } from "./clipboard.js";
 import { Meetings, type UrlOpener } from "./meeting.js";
 import { Sync, type SyncClient } from "./sync.js";
-import { errorText } from "./messages.js";
+import { Suggestions } from "./suggestions.js";
+import { errorItemId } from "./bulk.js";
+import { errorText, hints, notMineText } from "./messages.js";
 import { Views } from "./views.js";
 import { QuickAdd, typedLines } from "./quick-add.js";
 import { type Input, InputQueue } from "./queue.js";
@@ -102,6 +104,7 @@ const triesOf = (bindings: readonly Binding[]): Readonly<Record<KeymapMode, Trie
   normal: buildTrie(bindings, "normal"),
   help: buildTrie(bindings, "help"),
   report: buildTrie(bindings, "report"),
+  suggestions: buildTrie(bindings, "suggestions"),
 });
 
 /** Keys of a which-key group: "1–5" for a run of consecutive digits, else each ("1 2 4 5", "1 6"). */
@@ -137,6 +140,9 @@ export class Controller {
   private readonly clipboard: Clipboard;
   readonly meetings: Meetings;
   readonly syncing: Sync;
+  readonly suggestions: Suggestions;
+  /** The NOT_MINE question's answer, while it is asked. */
+  private notMine: ((yes: boolean) => void) | undefined;
   readonly now: () => Date;
   private readonly queue: InputQueue;
   private readonly defaults: readonly Binding[];
@@ -163,6 +169,7 @@ export class Controller {
     this.defaults = opts.bindings ?? BINDINGS;
     this.tries = triesOf(this.defaults);
     this.ui.setState((s) => ({ ...s, keymap: { bindings: this.defaults, warnings: [] } }));
+    hints.openKey = keyFor(this.defaults, "open_remote", sequenceLabel);
     this.queue = new InputQueue(
       (input) => this.handle(input),
       (err) => this.toast("error", describe(err)),
@@ -172,6 +179,7 @@ export class Controller {
       this.timing,
       () => this.currentViews(),
       (busy) => this.ui.setState((s) => (s.busy === busy ? s : { ...s, busy })),
+      (err, targets) => this.askNotMine(err, targets),
     );
     this.actions = new ItemActions(this);
     this.prompts = new Prompts(this);
@@ -189,6 +197,7 @@ export class Controller {
     this.clipboard = opts.clipboard ?? systemClipboard();
     this.meetings = new Meetings(this, opts.openUrl);
     this.syncing = new Sync(this, opts.openUrl, opts.sync);
+    this.suggestions = new Suggestions(this);
   }
 
   /** Observes the store: the tabs, the current view, the counts and the undo state; starts the midnight poll. */
@@ -224,7 +233,11 @@ export class Controller {
     this.push([{ paste: text }]);
   }
 
-  /** Feeds keys written as parseKeys reads them ("jj<esc>"), and resolves once they are handled. */
+  /**
+   * Feeds keys written as parseKeys reads them ("jj<esc>"), and resolves
+   * once they are handled. An action that asks the NOT_MINE question is
+   * not handled until it is answered: a test does not await that press.
+   */
   press(keys: string): Promise<void> {
     this.push(parseKeys(keys));
     return this.queue.idle();
@@ -243,10 +256,24 @@ export class Controller {
   /**
    * Queues input behind the action in flight, if any. Only q or ctrl-c in
    * normal mode, with nothing else waiting, goes past it: quitting waits
-   * for the action at most a second.
+   * for the action at most a second. So does the answer to a NOT_MINE
+   * question, which the action in flight asks.
    */
   private push(inputs: readonly Input[]): void {
     const { mode } = this.state;
+    // The NOT_MINE question is asked from inside the action in flight, so
+    // its answer cannot wait behind it: the first key answers, the rest
+    // queue behind the action as before.
+    if (mode.kind === "confirm" && mode.action === "not_mine" && this.notMine) {
+      const [key, ...rest] = inputs;
+      // No key (an event that names none), or a paste: no answer; a paste
+      // waits for the action as any input does.
+      if (key === undefined) return;
+      if (typeof key !== "string") return this.queue.push(inputs);
+      this.notMineKey(mode, key);
+      if (rest.length) this.queue.push(rest);
+      return;
+    }
     const [first] = inputs;
     const bound = typeof first === "string" ? step(this.tries.normal, [], first) : undefined;
     const quitKey = bound?.kind === "run" && bound.binding.action.type === "quit";
@@ -396,6 +423,9 @@ export class Controller {
 
   setMode(mode: Mode): void {
     this.ui.setState((s) => ({ ...s, mode }));
+    // o does nothing in the pane (or its command line): no "(o opens it)".
+    const pane = mode.kind === "suggestions" || (mode.kind === "command" && mode.back !== undefined);
+    hints.openKey = pane ? undefined : this.keyFor("open_remote");
   }
 
   /**
@@ -611,6 +641,34 @@ export class Controller {
 
   // --- keys ---
 
+  /**
+   * NOT_MINE (design 5.9): asks "PLAT-412 is assigned to Alex: change it in
+   * Jira? y", the mode the action ran from kept to return to. Resolves to
+   * the answer once a key answers it; the keys queued behind the action
+   * wait, as for any action.
+   */
+  askNotMine(err: unknown, targets: readonly string[] | undefined): Promise<boolean> {
+    // Quitting: no question, the action fails as refused.
+    if (this.state.quitting) return Promise.resolve(false);
+    const id = errorItemId(err);
+    const item = id === undefined ? undefined : this.store.getItem(id);
+    const others = targets?.filter((t) => {
+      const i = this.store.getItem(t);
+      return i?.remoteLink !== undefined && !i.isMine;
+    }).length;
+    const back = this.state.mode;
+    this.setMode({ kind: "confirm", action: "not_mine", text: notMineText(item, others), back });
+    return new Promise<boolean>((resolve) => (this.notMine = resolve));
+  }
+
+  /** The NOT_MINE question's key: y changes it; anything else does not. */
+  private notMineKey(mode: Extract<Mode, { kind: "confirm"; action: "not_mine" }>, key: KeyToken): void {
+    this.setMode(mode.back ?? normalMode);
+    const answer = this.notMine;
+    this.notMine = undefined;
+    answer?.(key === "y");
+  }
+
   private handle(input: Input): void | Promise<void> {
     if (this.state.quitting) return;
     if (this.state.toast?.level === "error") this.clearToast();
@@ -633,9 +691,10 @@ export class Controller {
         return this.normalKey(mode.pending, input);
       case "help":
       case "report":
+      case "suggestions":
         return this.overlayKey(mode, input);
       case "command":
-        return this.commandKey(mode.line, input);
+        return this.commandKey(mode, input);
       case "quickAdd":
         return this.quickAdd.key(mode, input);
       case "prompt":
@@ -643,6 +702,7 @@ export class Controller {
       case "picker":
         return this.actions.pickerKey(mode, input);
       case "confirm":
+        if (mode.action === "not_mine") return this.notMineKey(mode, input);
         return mode.action === "delete_view" ? this.viewEdits.confirmKey(mode, input) : this.actions.confirmKey(mode, input);
       case "query":
         return this.viewEdits.key(mode, input);
@@ -663,8 +723,8 @@ export class Controller {
     return this.runBinding(r.binding);
   }
 
-  /** Help's and the report's keys, through their own trie: a prefix (g) waits for the next key, and esc drops it. */
-  private overlayKey(mode: Extract<Mode, { kind: "help" | "report" }>, key: KeyToken): void | Promise<void> {
+  /** Help's, the report's and the Suggestions pane's keys, through their own trie: a prefix (g) waits for the next key, and esc drops it. */
+  private overlayKey(mode: Extract<Mode, { kind: "help" | "report" | "suggestions" }>, key: KeyToken): void | Promise<void> {
     const pending = mode.pending ?? [];
     const settled: Mode = { ...mode, pending: undefined };
     if (pending.length && (key === "esc" || key === "ctrl+c")) return this.setMode(settled);
@@ -674,28 +734,32 @@ export class Controller {
     if (r.kind === "run") return this.runBinding(r.binding);
   }
 
-  private commandKey(line: LineState, key: KeyToken): void | Promise<void> {
+  /** The command line's keys; leaving it goes back to the pane it was opened from, if any. */
+  private commandKey(mode: Extract<Mode, { kind: "command" }>, key: KeyToken): void | Promise<void> {
+    const { line } = mode;
+    const back = mode.back ?? normalMode;
+    const keep = (next: LineState) => this.setMode({ kind: "command", line: next, ...(mode.back && { back: mode.back }) });
     switch (key) {
       case "esc":
       case "ctrl+c":
-        return this.setMode(normalMode);
+        return this.setMode(back);
       case "enter":
-        this.setMode(normalMode);
+        this.setMode(back);
         return this.runCommand(line.text);
       case "tab":
-        return this.setMode({ kind: "command", line: lineOf(completeCommand(line.text, this.store.getViews().views.map((v) => v.name))) });
+        return keep(lineOf(completeCommand(line.text, this.store.getViews().views.map((v) => v.name))));
       case "backspace":
         // As in vim, backspace on an empty command line leaves it.
-        if (line.text === "") return this.setMode(normalMode);
+        if (line.text === "") return this.setMode(back);
     }
     const next = isChar(key) ? insert(line, this.charRun(key)) : editLine(line, key);
-    if (next) this.setMode({ kind: "command", line: next });
+    if (next) keep(next);
   }
 
   private onPaste(mode: Mode, text: string): void | Promise<void> {
     switch (mode.kind) {
       case "command":
-        return this.setMode({ kind: "command", line: insert(mode.line, singleLine(text)) });
+        return this.setMode({ ...mode, line: insert(mode.line, singleLine(text)) });
       case "quickAdd":
         return this.quickAdd.paste(mode, text);
       case "prompt":
@@ -733,6 +797,7 @@ export class Controller {
       ? { ...applied, bindings: applied.bindings.map((b) => (b.id === "schedule_meeting" ? { ...b, keys: [] } : b)) }
       : applied;
     this.tries = triesOf(effective.bindings);
+    hints.openKey = keyFor(effective.bindings, "open_remote", sequenceLabel);
     this.ui.setState((s) => ({
       ...s,
       keymap: effective,
@@ -786,6 +851,10 @@ export class Controller {
         return this.meetings.start();
       case "sync":
         return this.syncing.run(r.args);
+      case "suggestions":
+        return this.suggestions.open();
+      case "apply":
+        return this.suggestions.applyFromCommand();
     }
   }
 
@@ -862,6 +931,14 @@ export class Controller {
         return this.setMode({ kind: "help", scroll: 0 });
       case "help_close":
         return this.setMode(normalMode);
+      case "suggestions":
+        return this.suggestions.open();
+      case "suggestion_toggle":
+        return this.suggestions.toggle();
+      case "suggestion_apply":
+        return this.suggestions.apply();
+      case "suggestion_reject":
+        return this.suggestions.reject();
       case "copy_report":
         return this.copyReport();
       case "open_remote":
@@ -869,7 +946,7 @@ export class Controller {
       case "sync_now":
         return this.syncing.now();
       case "command":
-        return this.setMode({ kind: "command", line: emptyLine });
+        return this.setMode({ kind: "command", line: emptyLine, ...(this.state.mode.kind === "suggestions" && { back: this.state.mode }) });
       case "quit":
         return this.quit();
       case "suspend":
@@ -922,6 +999,7 @@ export class Controller {
       const max = Math.max(0, mode.text.trimEnd().split("\n").length - this.height);
       return this.setMode({ ...mode, scroll: clamp(scroll(mode.scroll, max), 0, max) });
     }
+    if (mode.kind === "suggestions") return this.suggestions.move(scroll(0, 1) > 0 ? 1 : -1);
     if (this.state.focus === "detail") {
       const id = this.selectedId();
       return this.ui.setState((s) => {

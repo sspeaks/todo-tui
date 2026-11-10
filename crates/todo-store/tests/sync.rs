@@ -1435,3 +1435,795 @@ async fn a_retry_due_is_when_the_loop_wakes() {
         Some(ts(5_010))
     );
 }
+
+/// PLAT-1 with a sync_conflict on its title: "mine" waited, Jira made it
+/// "theirs". Returns the Item's id and the Suggestion.
+async fn title_conflict(store: &Store) -> (todo_core::ItemId, todo_core::suggestion::Suggestion) {
+    store
+        .apply_pull(page(vec![issue(1, "PLAT one")], None))
+        .await
+        .unwrap();
+    let item = by_key(store, "PLAT-1").await;
+    store.set_pushes(Some("work-jira"));
+    store
+        .mutate(user_edit(
+            item.id,
+            ItemField::Title,
+            FieldValue::String("mine".into()),
+        ))
+        .await
+        .unwrap();
+    store
+        .apply_pull(page(vec![titled(1, "theirs", 500)], None))
+        .await
+        .unwrap();
+    let (mut all, _) = store.list_suggestions(Some(item.id)).await.unwrap();
+    assert_eq!(all.len(), 1);
+    (item.id, all.remove(0))
+}
+
+fn apply_input(patches: &[&str]) -> todo_store::ApplyInput {
+    todo_store::ApplyInput {
+        request_id: new_ulid().to_string(),
+        patch_ids: patches.iter().map(|p| (*p).to_owned()).collect(),
+        confirm_not_mine: false,
+        now: ts(6_000),
+        today: TODAY,
+    }
+}
+
+fn undo_input() -> UndoInput {
+    UndoInput {
+        request_id: new_ulid().to_string(),
+        expected_op_id: None,
+        now: ts(7_000),
+        today: TODAY,
+    }
+}
+
+#[tokio::test]
+async fn applying_a_conflict_sets_yours_again_and_pushes_it_and_undo_offers_it_again() {
+    use todo_core::suggestion::{PatchState, SuggestionState};
+    let (_dir, store) = open();
+    let (item, s) = title_conflict(&store).await;
+    let patch = s.patches[0].id.clone();
+    assert_eq!(
+        s.patches[0].expected_old,
+        FieldValue::String("theirs".into())
+    );
+    let out = store
+        .apply_suggestion_patches(apply_input(&[&patch]))
+        .await
+        .unwrap();
+    assert!(out.skipped.is_empty());
+    assert_eq!(out.suggestions[0].state, SuggestionState::Applied);
+    assert_eq!(out.suggestions[0].patches[0].state, PatchState::Applied);
+    let got = store.get_item(item, TODAY).await.unwrap().item;
+    assert_eq!(got.core.title, "mine");
+    assert!(!got.derived.has_conflict);
+    // An edit like any other: it is queued for Jira, from Jira's value.
+    assert_eq!(got.derived.pending_fields, [ItemField::Title]);
+    let waiting: Vec<_> = outbox(&store, item)
+        .await
+        .into_iter()
+        .filter(|r| r.1 == "pending")
+        .collect();
+    assert!(waiting[0].2.contains("theirs") && waiting[0].3.contains("mine"));
+    assert!(store.list_suggestions(None).await.unwrap().0.is_empty());
+    // One undo entry, named for the Suggestion.
+    let undo = store.undo_state().await.unwrap().undo.unwrap();
+    assert_eq!(undo.kind, OpKind::ApplySuggestion);
+    assert_eq!(undo.description, "apply suggestion \"mine\"");
+
+    // Undo: Jira's title again, nothing to push, and the Suggestion waits.
+    store.undo(undo_input()).await.unwrap();
+    let got = store.get_item(item, TODAY).await.unwrap().item;
+    assert_eq!(got.core.title, "theirs");
+    assert!(got.derived.pending_fields.is_empty());
+    assert!(got.derived.has_conflict);
+    let (all, _) = store.list_suggestions(None).await.unwrap();
+    assert_eq!(all[0].state, SuggestionState::Pending);
+    // Redo applies it again.
+    store.redo(undo_input()).await.unwrap();
+    let got = store.get_item(item, TODAY).await.unwrap().item;
+    assert_eq!(
+        (got.core.title.as_str(), got.derived.has_conflict),
+        ("mine", false)
+    );
+    assert!(store.list_suggestions(None).await.unwrap().0.is_empty());
+}
+
+#[tokio::test]
+async fn a_stale_patch_is_skipped_and_its_suggestion_expires() {
+    use todo_core::suggestion::{PatchState, SuggestionState};
+    let (_dir, store) = open();
+    let (item, s) = title_conflict(&store).await;
+    // Jira changed it again since the Suggestion was made.
+    store
+        .apply_pull(page(vec![titled(1, "theirs 2", 600)], None))
+        .await
+        .unwrap();
+    let patch = s.patches[0].id.clone();
+    let out = store
+        .apply_suggestion_patches(apply_input(&[&patch]))
+        .await
+        .unwrap();
+    assert_eq!(out.skipped, std::slice::from_ref(&patch));
+    assert_eq!(out.suggestions[0].state, SuggestionState::Expired);
+    assert_eq!(out.suggestions[0].patches[0].state, PatchState::Stale);
+    let got = store.get_item(item, TODAY).await.unwrap().item;
+    assert_eq!(got.core.title, "theirs 2");
+    assert!(!got.derived.has_conflict, "nothing waits for it any more");
+    // Not an undo entry: it changed no field.
+    assert_ne!(
+        store.undo_state().await.unwrap().undo.map(|u| u.kind),
+        Some(OpKind::ApplySuggestion)
+    );
+    // Again: already stale, skipped, nothing changes.
+    let out = store
+        .apply_suggestion_patches(apply_input(&[&patch]))
+        .await
+        .unwrap();
+    assert_eq!(out.skipped, [patch]);
+    // An unknown patch is an error, and nothing is applied.
+    let err = store
+        .apply_suggestion_patches(apply_input(&["nope"]))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::PatchNotFound(ref p) if p == "nope"),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_status_conflict_applies_as_one_pair_and_queues_one_transition() {
+    use todo_core::suggestion::SuggestionState;
+    let (_dir, store) = open();
+    store
+        .apply_pull(page(vec![issue(1, "one")], None))
+        .await
+        .unwrap();
+    let item = by_key(&store, "PLAT-1").await;
+    store.set_pushes(Some("work-jira"));
+    store
+        .mutate(status_edit(item.id, Status::Done))
+        .await
+        .unwrap();
+    let mut doing = issue(1, "one");
+    doing.status_category = StatusCategory::InProgress;
+    doing.updated_at = ts(500);
+    store.apply_pull(page(vec![doing], None)).await.unwrap();
+    let (all, _) = store.list_suggestions(Some(item.id)).await.unwrap();
+    assert_eq!(all[0].patches.len(), 2);
+    // Naming the category alone applies the resolution kind with it.
+    let category = all[0]
+        .patches
+        .iter()
+        .find(|p| p.field == ItemField::StatusCategory)
+        .unwrap()
+        .id
+        .clone();
+    let out = store
+        .apply_suggestion_patches(apply_input(&[&category]))
+        .await
+        .unwrap();
+    assert!(out.skipped.is_empty());
+    assert_eq!(out.suggestions[0].state, SuggestionState::Applied);
+    let got = store.get_item(item.id, TODAY).await.unwrap().item;
+    assert_eq!(got.status(), Status::Done);
+    assert_eq!(
+        got.derived.pending_fields,
+        [ItemField::StatusCategory, ItemField::ResolutionKind]
+    );
+    // One change waiting: the transition.
+    assert_eq!(
+        store.outbox_counts("work-jira".into()).await.unwrap(),
+        (1, 0)
+    );
+    let entries = store.outbox(None).await.unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(
+        entries
+            .iter()
+            .all(|e| e.state == "pending" && e.key == "PLAT-1")
+    );
+}
+
+#[tokio::test]
+async fn rejecting_drops_the_marker_and_lets_a_refusal_go() {
+    use todo_core::suggestion::SuggestionState;
+    let (_dir, store) = open();
+    let (item, s) = title_conflict(&store).await;
+    let before = store.get_item(item, TODAY).await.unwrap().item;
+    let out = store
+        .reject_suggestion(new_ulid().to_string(), s.id.clone(), ts(6_000), TODAY)
+        .await
+        .unwrap();
+    assert_eq!(out.suggestion.state, SuggestionState::Rejected);
+    let got = store.get_item(item, TODAY).await.unwrap().item;
+    assert!(!got.derived.has_conflict);
+    assert!(
+        got.revision > before.revision,
+        "the marker's change is streamed"
+    );
+    assert_eq!(got.core.title, "theirs", "Jira's value stands");
+    assert!(store.list_suggestions(None).await.unwrap().0.is_empty());
+    // Never an undo entry.
+    assert_ne!(
+        store.undo_state().await.unwrap().undo.map(|u| u.kind),
+        Some(OpKind::RejectSuggestion)
+    );
+    // Rejecting again changes nothing; an unknown one is an error.
+    let again = store
+        .reject_suggestion(new_ulid().to_string(), s.id.clone(), ts(6_001), TODAY)
+        .await
+        .unwrap();
+    assert_eq!(again.suggestion.state, SuggestionState::Rejected);
+    assert!(matches!(
+        store
+            .reject_suggestion(new_ulid().to_string(), "nope".into(), ts(6_002), TODAY)
+            .await,
+        Err(StoreError::SuggestionNotFound(_))
+    ));
+
+    // A refusal counts as failed while its push_failed Suggestion waits.
+    store
+        .mutate(user_edit(
+            item,
+            ItemField::Title,
+            FieldValue::String("bad".into()),
+        ))
+        .await
+        .unwrap();
+    let rows = send(&store, item).await;
+    store
+        .record_push(
+            item,
+            "PLAT-1".into(),
+            rows,
+            todo_store::outbox::PushResult::Refused {
+                error: "refused (400)".into(),
+                jira: vec![(ItemField::Title, FieldValue::String("theirs".into()))],
+            },
+            ts(6_100),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.outbox_counts("work-jira".into()).await.unwrap(),
+        (0, 1)
+    );
+    let failed = store.outbox(None).await.unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].state, "failed");
+    assert_eq!(failed[0].last_error.as_deref(), Some("refused (400)"));
+    let (all, _) = store.list_suggestions(None).await.unwrap();
+    store
+        .reject_suggestion(new_ulid().to_string(), all[0].id.clone(), ts(6_200), TODAY)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.outbox_counts("work-jira".into()).await.unwrap(),
+        (0, 0)
+    );
+    assert!(store.outbox(None).await.unwrap().is_empty());
+    assert!(
+        !store
+            .get_item(item, TODAY)
+            .await
+            .unwrap()
+            .item
+            .derived
+            .has_push_failure
+    );
+}
+
+#[tokio::test]
+async fn reapplying_a_refused_value_queues_it_again() {
+    let (_dir, store) = open();
+    store
+        .apply_pull(page(vec![issue(1, "one")], None))
+        .await
+        .unwrap();
+    let item = by_key(&store, "PLAT-1").await;
+    store.set_pushes(Some("work-jira"));
+    store
+        .mutate(user_edit(
+            item.id,
+            ItemField::Title,
+            FieldValue::String("two".into()),
+        ))
+        .await
+        .unwrap();
+    let rows = send(&store, item.id).await;
+    store
+        .record_push(
+            item.id,
+            "PLAT-1".into(),
+            rows,
+            todo_store::outbox::PushResult::Refused {
+                error: "refused (400)".into(),
+                jira: vec![(ItemField::Title, FieldValue::String("one".into()))],
+            },
+            ts(5_001),
+        )
+        .await
+        .unwrap();
+    // The read-back puts Jira's value back.
+    store
+        .apply_pull(page(vec![titled(1, "one", 300)], None))
+        .await
+        .unwrap();
+    let (all, _) = store.list_suggestions(None).await.unwrap();
+    assert_eq!(
+        all[0].kind,
+        todo_core::suggestion::SuggestionKind::PushFailed
+    );
+    assert_eq!(all[0].error.as_deref(), Some("refused (400)"));
+    let patch = all[0].patches[0].id.clone();
+    store
+        .apply_suggestion_patches(apply_input(&[&patch]))
+        .await
+        .unwrap();
+    let got = store.get_item(item.id, TODAY).await.unwrap().item;
+    assert_eq!(got.core.title, "two");
+    assert!(!got.derived.has_push_failure);
+    // A try of its own: waiting, and the old refusal no longer counts.
+    assert_eq!(
+        store.outbox_counts("work-jira".into()).await.unwrap(),
+        (1, 0)
+    );
+}
+
+#[tokio::test]
+async fn applying_is_guarded_as_a_direct_edit_and_skips_a_deleted_item() {
+    let (_dir, store) = open();
+    let (item, s) = title_conflict(&store).await;
+    let patch = s.patches[0].id.clone();
+    // The kill switch: the title no longer pushes, so it is Jira's.
+    store.set_pushes(None);
+    let err = store
+        .apply_suggestion_patches(apply_input(&[&patch]))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StoreError::PatchRefused {
+                error: MutationError::LinkedReadOnly(ItemField::Title),
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    store.set_pushes(Some("work-jira"));
+    // Deleted: its Suggestions are not listed, and its patches wait.
+    let mut del = user_edit(item, ItemField::Title, FieldValue::Cleared);
+    del.kind = OpKind::Delete;
+    del.mutations[0].op = MutationOp::Delete;
+    store.mutate(del).await.unwrap();
+    assert!(store.list_suggestions(None).await.unwrap().0.is_empty());
+    let out = store
+        .apply_suggestion_patches(apply_input(&[&patch]))
+        .await
+        .unwrap();
+    assert_eq!(out.skipped, [patch]);
+    assert_eq!(
+        out.suggestions[0].state,
+        todo_core::suggestion::SuggestionState::Pending
+    );
+}
+
+#[tokio::test]
+async fn someone_elses_issue_needs_the_say_so_and_a_replay_answers_the_same() {
+    let (_dir, store) = open();
+    let mut theirs = issue(1, "PLAT one");
+    theirs.is_mine = false;
+    store
+        .apply_pull(page(vec![theirs.clone()], None))
+        .await
+        .unwrap();
+    let item = by_key(&store, "PLAT-1").await;
+    store.set_pushes(Some("work-jira"));
+    let mut edit = user_edit(item.id, ItemField::Title, FieldValue::String("mine".into()));
+    edit.confirm_not_mine = true;
+    store.mutate(edit).await.unwrap();
+    store
+        .apply_pull(page(
+            vec![RemoteIssue {
+                title: "theirs".into(),
+                updated_at: ts(500),
+                ..theirs
+            }],
+            None,
+        ))
+        .await
+        .unwrap();
+    let (all, _) = store.list_suggestions(None).await.unwrap();
+    let patch = all[0].patches[0].id.clone();
+    let err = store
+        .apply_suggestion_patches(apply_input(&[&patch]))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StoreError::PatchRefused {
+                error: MutationError::NotMine(ItemField::Title),
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    let mut confirmed = apply_input(&[&patch]);
+    confirmed.confirm_not_mine = true;
+    let first = store
+        .apply_suggestion_patches(confirmed.clone())
+        .await
+        .unwrap();
+    let replay = store.apply_suggestion_patches(confirmed).await.unwrap();
+    assert_eq!(replay.result, first.result);
+    assert!(replay.skipped.is_empty());
+    assert_eq!(replay.items[0].core.title, "mine");
+}
+
+/// Refuses what `send` begins for `item`, Jira staying at `jira`.
+async fn refuse(
+    store: &Store,
+    item: todo_core::ItemId,
+    field: ItemField,
+    jira: FieldValue,
+    at: i64,
+) {
+    let rows = send(store, item).await;
+    store
+        .record_push(
+            item,
+            "PLAT-1".into(),
+            rows,
+            todo_store::outbox::PushResult::Refused {
+                error: "refused (400)".into(),
+                jira: vec![(field, jira)],
+            },
+            ts(at),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_refusal_counts_once_and_not_after_it_is_dealt_with() {
+    let (_dir, store) = open();
+    store
+        .apply_pull(page(vec![issue(1, "one")], None))
+        .await
+        .unwrap();
+    let item = by_key(&store, "PLAT-1").await;
+    store.set_pushes(Some("work-jira"));
+    let title = |t: &str| user_edit(item.id, ItemField::Title, FieldValue::String(t.into()));
+    let jira_title = || FieldValue::String("one".into());
+    store.mutate(title("bad")).await.unwrap();
+    refuse(&store, item.id, ItemField::Title, jira_title(), 5_001).await;
+    store
+        .apply_pull(page(vec![titled(1, "one", 300)], None))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.outbox_counts("work-jira".into()).await.unwrap(),
+        (0, 1)
+    );
+    // Re-applied and refused again: one refusal of the title, not two.
+    let (all, _) = store.list_suggestions(None).await.unwrap();
+    store
+        .apply_suggestion_patches(apply_input(&[&all[0].patches[0].id]))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.outbox_counts("work-jira".into()).await.unwrap(),
+        (1, 0)
+    );
+    refuse(&store, item.id, ItemField::Title, jira_title(), 5_002).await;
+    assert_eq!(
+        store.outbox_counts("work-jira".into()).await.unwrap(),
+        (0, 1)
+    );
+    assert_eq!(store.outbox(None).await.unwrap().len(), 1);
+    // Rejected: dealt with. A later refusal of another field counts alone.
+    let (all, _) = store.list_suggestions(None).await.unwrap();
+    store
+        .reject_suggestion(new_ulid().to_string(), all[0].id.clone(), ts(5_003), TODAY)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.outbox_counts("work-jira".into()).await.unwrap(),
+        (0, 0)
+    );
+    store
+        .mutate(user_edit(
+            item.id,
+            ItemField::Priority,
+            FieldValue::Priority(Priority::High),
+        ))
+        .await
+        .unwrap();
+    refuse(
+        &store,
+        item.id,
+        ItemField::Priority,
+        FieldValue::Priority(Priority::Medium),
+        5_004,
+    )
+    .await;
+    assert_eq!(
+        store.outbox_counts("work-jira".into()).await.unwrap(),
+        (0, 1)
+    );
+    let listed = store.outbox(None).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].field, ItemField::Priority);
+}
+
+#[tokio::test]
+async fn a_deleted_items_outbox_does_not_count() {
+    let (_dir, store) = open();
+    store
+        .apply_pull(page(vec![issue(1, "one"), issue(2, "two")], None))
+        .await
+        .unwrap();
+    let one = by_key(&store, "PLAT-1").await;
+    let two = by_key(&store, "PLAT-2").await;
+    store.set_pushes(Some("work-jira"));
+    // One refused, one in flight.
+    store
+        .mutate(user_edit(
+            one.id,
+            ItemField::Title,
+            FieldValue::String("bad".into()),
+        ))
+        .await
+        .unwrap();
+    refuse(
+        &store,
+        one.id,
+        ItemField::Title,
+        FieldValue::String("one".into()),
+        5_001,
+    )
+    .await;
+    store
+        .mutate(user_edit(
+            two.id,
+            ItemField::Title,
+            FieldValue::String("flying".into()),
+        ))
+        .await
+        .unwrap();
+    send(&store, two.id).await;
+    assert_eq!(
+        store.outbox_counts("work-jira".into()).await.unwrap(),
+        (1, 1)
+    );
+    for id in [one.id, two.id] {
+        let mut del = user_edit(id, ItemField::Title, FieldValue::Cleared);
+        del.kind = OpKind::Delete;
+        del.mutations[0].op = MutationOp::Delete;
+        store.mutate(del).await.unwrap();
+    }
+    assert_eq!(
+        store.outbox_counts("work-jira".into()).await.unwrap(),
+        (0, 0)
+    );
+    assert!(store.outbox(None).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_status_half_in_flight_counts_once_and_a_reopen_meanwhile_is_not_a_conflict() {
+    let (_dir, store) = open();
+    let mut done = issue(1, "one");
+    done.status_category = StatusCategory::Done;
+    done.resolution_kind = Some(todo_core::ResolutionKind::Done);
+    store
+        .apply_pull(page(vec![done.clone()], None))
+        .await
+        .unwrap();
+    let item = by_key(&store, "PLAT-1").await;
+    store.set_pushes(Some("work-jira"));
+    // Done to cancelled: only the kind queues, and goes in flight.
+    store
+        .mutate(status_edit(item.id, Status::Cancelled))
+        .await
+        .unwrap();
+    let rows = send(&store, item.id).await;
+    // Reopened while the cancel is on its way: the category queues.
+    store
+        .mutate(status_edit(item.id, Status::Next))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.outbox_counts("work-jira".into()).await.unwrap(),
+        (1, 0)
+    );
+    store
+        .record_push(
+            item.id,
+            "PLAT-1".into(),
+            rows,
+            todo_store::outbox::PushResult::Sent,
+            ts(5_001),
+        )
+        .await
+        .unwrap();
+    // Jira took the cancel: the reopen goes next, no conflict.
+    let cancelled = RemoteIssue {
+        resolution_kind: Some(todo_core::ResolutionKind::Cancelled),
+        updated_at: ts(400),
+        ..done
+    };
+    store.apply_pull(page(vec![cancelled], None)).await.unwrap();
+    let got = store.get_item(item.id, TODAY).await.unwrap().item;
+    assert!(!got.derived.has_conflict);
+    assert_eq!(got.status(), Status::Next);
+    assert!(
+        !got.derived.pending_fields.is_empty(),
+        "the reopen still waits"
+    );
+    assert!(store.list_suggestions(None).await.unwrap().0.is_empty());
+}
+
+#[tokio::test]
+async fn undo_of_an_apply_reopens_only_what_it_restored_and_reject_drops_its_redo() {
+    let (_dir, store) = open();
+    store
+        .apply_pull(page(vec![issue(1, "one")], None))
+        .await
+        .unwrap();
+    let item = by_key(&store, "PLAT-1").await;
+    store.set_pushes(Some("work-jira"));
+    store
+        .mutate(user_edit(
+            item.id,
+            ItemField::Title,
+            FieldValue::String("mine".into()),
+        ))
+        .await
+        .unwrap();
+    store
+        .mutate(user_edit(
+            item.id,
+            ItemField::Priority,
+            FieldValue::Priority(Priority::High),
+        ))
+        .await
+        .unwrap();
+    // Jira changes both: two conflicts.
+    let mut theirs = titled(1, "theirs", 500);
+    theirs.priority = Priority::Low;
+    store.apply_pull(page(vec![theirs], None)).await.unwrap();
+    let (all, _) = store.list_suggestions(None).await.unwrap();
+    assert_eq!(all.len(), 2);
+    let ids: Vec<String> = all.iter().map(|s| s.patches[0].id.clone()).collect();
+    store
+        .apply_suggestion_patches(apply_input(&[&ids[0], &ids[1]]))
+        .await
+        .unwrap();
+    // A pull changes the priority under the apply (sync is never an undo
+    // entry, so the apply stays on top): its undo restores the title and
+    // skips the priority, changed since.
+    let mut later = titled(1, "theirs", 600);
+    later.priority = Priority::Lowest;
+    store.apply_pull(page(vec![later], None)).await.unwrap();
+    let out = store.undo(undo_input()).await.unwrap();
+    assert_eq!(out.entry.map(|e| e.kind), Some(OpKind::ApplySuggestion));
+    assert_eq!(out.skipped.len(), 1, "{:?}", out.skipped);
+    // The title's Suggestion waits again; the priority's stays applied (the
+    // pull's own conflict over the waiting priority is a new one).
+    let (waiting, _) = store.list_suggestions(None).await.unwrap();
+    let title = all
+        .iter()
+        .find(|s| s.patches[0].field == ItemField::Title)
+        .unwrap();
+    let priority = all
+        .iter()
+        .find(|s| s.patches[0].field == ItemField::Priority)
+        .unwrap();
+    assert!(waiting.iter().any(|s| s.id == title.id), "{waiting:?}");
+    assert!(!waiting.iter().any(|s| s.id == priority.id), "{waiting:?}");
+    // Rejected now: a redo of the apply would set it again, so it is gone.
+    store
+        .reject_suggestion(new_ulid().to_string(), title.id.clone(), ts(8_000), TODAY)
+        .await
+        .unwrap();
+    assert!(store.undo_state().await.unwrap().redo.is_none());
+    let (left, _) = store.list_suggestions(None).await.unwrap();
+    assert!(left.iter().all(|s| s.id != title.id));
+    let got = store.get_item(item.id, TODAY).await.unwrap().item;
+    assert_eq!(got.core.title, "theirs");
+}
+
+#[tokio::test]
+async fn a_stale_refusal_stops_counting_and_undo_of_an_apply_counts_it_again() {
+    let (_dir, store) = open();
+    store
+        .apply_pull(page(vec![issue(1, "one")], None))
+        .await
+        .unwrap();
+    let item = by_key(&store, "PLAT-1").await;
+    store.set_pushes(Some("work-jira"));
+    let refused = |s: &Store| {
+        let s = s.clone();
+        async move { s.outbox_counts("work-jira".into()).await.unwrap().1 }
+    };
+    // Refused, read back to Jira's value; then applied, and undone.
+    store
+        .mutate(user_edit(
+            item.id,
+            ItemField::Title,
+            FieldValue::String("bad".into()),
+        ))
+        .await
+        .unwrap();
+    refuse(
+        &store,
+        item.id,
+        ItemField::Title,
+        FieldValue::String("one".into()),
+        5_001,
+    )
+    .await;
+    store
+        .apply_pull(page(vec![titled(1, "one", 300)], None))
+        .await
+        .unwrap();
+    let (all, _) = store.list_suggestions(None).await.unwrap();
+    let patch = all[0].patches[0].id.clone();
+    store
+        .apply_suggestion_patches(apply_input(&[&patch]))
+        .await
+        .unwrap();
+    assert_eq!(refused(&store).await, 0, "applied: dealt with");
+    store.undo(undo_input()).await.unwrap();
+    assert_eq!(
+        refused(&store).await,
+        1,
+        "undone: it waits, and counts, again"
+    );
+    assert!(
+        store
+            .get_item(item.id, TODAY)
+            .await
+            .unwrap()
+            .item
+            .derived
+            .has_push_failure
+    );
+    store.redo(undo_input()).await.unwrap();
+    assert_eq!(refused(&store).await, 0, "redone: dealt with again");
+    store.undo(undo_input()).await.unwrap();
+    assert_eq!(refused(&store).await, 1);
+    // The field moves on (a person's edit): applying finds the patch stale,
+    // and the refusal, with nothing left to apply or reject, stops counting.
+    store
+        .mutate(user_edit(
+            item.id,
+            ItemField::Title,
+            FieldValue::String("other".into()),
+        ))
+        .await
+        .unwrap();
+    let out = store
+        .apply_suggestion_patches(apply_input(&[&patch]))
+        .await
+        .unwrap();
+    assert_eq!(out.skipped, std::slice::from_ref(&patch));
+    assert_eq!(refused(&store).await, 0);
+    assert!(
+        !store
+            .get_item(item.id, TODAY)
+            .await
+            .unwrap()
+            .item
+            .derived
+            .has_push_failure
+    );
+}

@@ -9,6 +9,8 @@ import { ArchiveReason, CreatedVia, LinkState, Priority, ResolutionKind, Status,
 import { ItemService } from "../src/gen/todo/v1/item_service_pb.js";
 import { OpKind, UndoSkipReason, UndoSkipSchema } from "../src/gen/todo/v1/op_pb.js";
 import { RelationKind } from "../src/gen/todo/v1/relation_pb.js";
+import { PatchState, SuggestionKind, SuggestionSource, SuggestionState } from "../src/gen/todo/v1/suggestion_pb.js";
+import { SuggestionService } from "../src/gen/todo/v1/suggestion_service_pb.js";
 import { FakeDaemon } from "../src/fake-daemon.js";
 import { MAX_CAPTURE_BYTES } from "../src/limits.js";
 import {
@@ -596,5 +598,162 @@ describe("FakeDaemon on a linked Item (read-only sync, ADR-0006)", () => {
     expect(rule?.reason).toBe("NOT_MINE");
     const repeated = await items.setRecurrence({ requestId: ulid(), id: theirs.id, rule: daily, confirmNotMine: true });
     expect(repeated.item?.recurrence).toBeDefined();
+  });
+});
+
+describe("FakeDaemon Suggestions (design 3.11)", () => {
+  const link = { trackerKind: "jira", instanceId: "work-jira", remoteId: "10001", key: "PLAT-1", url: "https://jira.example.com/browse/PLAT-1" };
+  const str = (value: string) => ({ kind: { case: "stringValue" as const, value } });
+
+  function conflicted() {
+    const daemon = new FakeDaemon([{ title: "theirs", remoteLink: link, isMine: true }]);
+    daemon.setConfig({ instances: [{ id: "work-jira", kind: "jira-dc", push: true }] });
+    const [item] = [...daemon.items.values()];
+    const s = daemon.putSuggestion({
+      itemId: item!.id,
+      kind: SuggestionKind.SYNC_CONFLICT,
+      source: SuggestionSource.SYNC,
+      rationale: "Jira changed the title on PLAT-1 while yours waited to push",
+      patches: [{ field: ItemField.TITLE, expectedOld: str("theirs"), new: str("mine") }],
+    });
+    return { daemon, item: item!, s, pane: createClient(SuggestionService, daemon.transport) };
+  }
+
+  it("lists what waits, flags the Item, and applies a patch as one undoable op", async () => {
+    const { daemon, item, s, pane } = conflicted();
+    expect(daemon.items.get(item.id)?.hasConflict).toBe(true);
+    const listed = await pane.listSuggestions({});
+    expect(listed.suggestions.map((x) => x.id)).toEqual([s.id]);
+    const out = await pane.applySuggestionPatches({ requestId: ulid(), patchIds: [s.patches[0]!.id] });
+    expect(out.skippedPatchIds).toEqual([]);
+    expect(out.items[0]?.title).toBe("mine");
+    expect(out.suggestions[0]?.state).toBe(SuggestionState.APPLIED);
+    expect(daemon.items.get(item.id)?.hasConflict).toBe(false);
+    expect((await pane.listSuggestions({})).suggestions).toEqual([]);
+    const items = createClient(ItemService, daemon.transport);
+    const top = (await getUndoState(items)).undo;
+    expect([top?.kind, top?.description]).toEqual([OpKind.APPLY_SUGGESTION, 'apply suggestion "mine"']);
+    // Undo: Jira's title, and the Suggestion waits again; redo applies it again.
+    await undo(items);
+    expect(daemon.items.get(item.id)?.title).toBe("theirs");
+    expect((await pane.listSuggestions({})).suggestions.map((x) => x.state)).toEqual([SuggestionState.PENDING]);
+    expect(daemon.items.get(item.id)?.hasConflict).toBe(true);
+    await redo(items);
+    expect(daemon.items.get(item.id)?.title).toBe("mine");
+    expect((await pane.listSuggestions({})).suggestions).toEqual([]);
+  });
+
+  it("skips a stale patch, expiring its Suggestion, and refuses an unknown one", async () => {
+    const { daemon, item, s, pane } = conflicted();
+    daemon.update(item.id, { title: "theirs 2" });
+    const out = await pane.applySuggestionPatches({ requestId: ulid(), patchIds: [s.patches[0]!.id] });
+    expect(out.skippedPatchIds).toEqual([s.patches[0]!.id]);
+    expect(out.suggestions[0]?.state).toBe(SuggestionState.EXPIRED);
+    expect(daemon.items.get(item.id)?.title).toBe("theirs 2");
+    expect((await failure(pane.applySuggestionPatches({ requestId: ulid(), patchIds: ["nope"] })))?.code).toBe(Code.InvalidArgument);
+    const err = await failure(pane.applySuggestionPatches({ requestId: ulid(), patchIds: [ulid()] }));
+    expect([err?.code, err?.findDetails(ErrorInfoSchema)[0]?.reason]).toEqual([Code.NotFound, "PATCH_NOT_FOUND"]);
+  });
+
+  it("goes through the guard: someone else's issue needs confirm_not_mine", async () => {
+    const { daemon, item, s, pane } = conflicted();
+    daemon.update(item.id, { isMine: false });
+    const err = await failure(pane.applySuggestionPatches({ requestId: ulid(), patchIds: [s.patches[0]!.id] }));
+    expect(err?.findDetails(ErrorInfoSchema)[0]?.reason).toBe("NOT_MINE");
+    const ok = await pane.applySuggestionPatches({ requestId: ulid(), patchIds: [s.patches[0]!.id], confirmNotMine: true });
+    expect(ok.items[0]?.title).toBe("mine");
+  });
+
+  it("applies a status pair as one, and rejects the rest", async () => {
+    const daemon = new FakeDaemon([{ title: "PLAT-1", remoteLink: link, isMine: true, statusCategory: StatusCategory.IN_PROGRESS, status: Status.IN_PROGRESS }]);
+    daemon.setConfig({ instances: [{ id: "work-jira", kind: "jira-dc", push: true }] });
+    const [item] = [...daemon.items.values()];
+    const s = daemon.putSuggestion({
+      itemId: item!.id,
+      kind: SuggestionKind.SYNC_CONFLICT,
+      source: SuggestionSource.SYNC,
+      patches: [
+        { field: ItemField.STATUS_CATEGORY, expectedOld: { kind: { case: "statusCategory", value: StatusCategory.IN_PROGRESS } }, new: { kind: { case: "statusCategory", value: StatusCategory.DONE } } },
+        { field: ItemField.RESOLUTION_KIND, expectedOld: { kind: { case: "cleared", value: {} } }, new: { kind: { case: "resolutionKind", value: ResolutionKind.CANCELLED } } },
+      ],
+    });
+    const pane = createClient(SuggestionService, daemon.transport);
+    const out = await pane.applySuggestionPatches({ requestId: ulid(), patchIds: [s.patches[0]!.id] });
+    expect(out.items[0]?.status).toBe(Status.CANCELLED);
+    expect(out.suggestions[0]?.patches.map((p) => p.state)).toEqual([PatchState.APPLIED, PatchState.APPLIED]);
+    const other = daemon.putSuggestion({ itemId: item!.id, kind: SuggestionKind.PUSH_FAILED, source: SuggestionSource.SYNC, error: "refused", patches: [{ field: ItemField.TITLE, expectedOld: str("PLAT-1"), new: str("x") }] });
+    expect(daemon.items.get(item!.id)?.hasPushFailure).toBe(true);
+    const rejected = await pane.rejectSuggestion({ requestId: ulid(), id: other.id });
+    expect(rejected.suggestion?.state).toBe(SuggestionState.REJECTED);
+    expect(daemon.items.get(item!.id)?.hasPushFailure).toBe(false);
+    const missing = await failure(pane.rejectSuggestion({ requestId: ulid(), id: ulid() }));
+    expect(missing?.findDetails(ErrorInfoSchema)[0]?.reason).toBe("SUGGESTION_NOT_FOUND");
+  });
+
+  it("undo reopens only what it restored, and a replay answers what that op applied", async () => {
+    const { daemon, item, s, pane } = conflicted();
+    const items = createClient(ItemService, daemon.transport);
+    const requestId = ulid();
+    const first = await pane.applySuggestionPatches({ requestId, patchIds: [s.patches[0]!.id] });
+    expect(first.skippedPatchIds).toEqual([]);
+    // Something else changes the title: the undo skips it, and the patch stays applied.
+    daemon.update(item.id, { title: "someone's" });
+    const undone = await undo(items);
+    expect(undone.skipped).toHaveLength(1);
+    expect(daemon.suggestions.get(s.id)?.patches[0]?.state).toBe(PatchState.APPLIED);
+    expect((await pane.listSuggestions({})).suggestions).toEqual([]);
+    // A retry of the first request answers as it did.
+    const again = await pane.applySuggestionPatches({ requestId, patchIds: [s.patches[0]!.id] });
+    expect([again.result?.opId, again.skippedPatchIds]).toEqual([first.result?.opId, []]);
+  });
+
+  it("applies two status pairs of one Item each on its own, the second stale after the first", async () => {
+    const daemon = new FakeDaemon([{ title: "PLAT-1", remoteLink: link, isMine: true, statusCategory: StatusCategory.IN_PROGRESS, status: Status.IN_PROGRESS }]);
+    daemon.setConfig({ instances: [{ id: "work-jira", kind: "jira-dc", push: true }] });
+    const [item] = [...daemon.items.values()];
+    const cat = (c: StatusCategory) => ({ kind: { case: "statusCategory" as const, value: c } });
+    const pair = (to: StatusCategory) =>
+      daemon.putSuggestion({
+        itemId: item!.id,
+        kind: SuggestionKind.SYNC_CONFLICT,
+        source: SuggestionSource.SYNC,
+        patches: [{ field: ItemField.STATUS_CATEGORY, expectedOld: cat(StatusCategory.IN_PROGRESS), new: cat(to) }],
+      });
+    const [a, b] = [pair(StatusCategory.DONE), pair(StatusCategory.TODO)];
+    const pane = createClient(SuggestionService, daemon.transport);
+    const out = await pane.applySuggestionPatches({ requestId: ulid(), patchIds: [a.patches[0]!.id, b.patches[0]!.id] });
+    expect(out.items[0]?.status).toBe(Status.DONE);
+    expect(out.skippedPatchIds).toEqual([b.patches[0]!.id]);
+    expect(daemon.suggestions.get(b.id)?.state).toBe(SuggestionState.EXPIRED);
+  });
+
+  it("an apply that closes a repeating Item makes no next instance, as the daemon's does not", async () => {
+    const daemon = new FakeDaemon([
+      {
+        title: "PLAT-1",
+        remoteLink: link,
+        isMine: true,
+        dueDate: { year: 2026, month: 11, day: 2 },
+        recurrence: { seriesId: ulid(), rule: { kind: { case: "daily", value: {} } } },
+      },
+    ]);
+    daemon.setConfig({ instances: [{ id: "work-jira", kind: "jira-dc", push: true }] });
+    const [item] = [...daemon.items.values()];
+    const s = daemon.putSuggestion({
+      itemId: item!.id,
+      kind: SuggestionKind.SYNC_CONFLICT,
+      source: SuggestionSource.SYNC,
+      patches: [
+        {
+          field: ItemField.STATUS_CATEGORY,
+          expectedOld: { kind: { case: "statusCategory", value: StatusCategory.TODO } },
+          new: { kind: { case: "statusCategory", value: StatusCategory.DONE } },
+        },
+      ],
+    });
+    const before = daemon.items.size;
+    await createClient(SuggestionService, daemon.transport).applySuggestionPatches({ requestId: ulid(), patchIds: [s.patches[0]!.id] });
+    expect(daemon.items.get(item!.id)?.status).toBe(Status.DONE);
+    expect(daemon.items.size).toBe(before);
   });
 });

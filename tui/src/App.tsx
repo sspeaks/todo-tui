@@ -5,6 +5,7 @@ import { Calendar } from "./components/Calendar.js";
 import { DetailPane } from "./components/DetailPane.js";
 import { HelpOverlay } from "./components/HelpOverlay.js";
 import { ReportPanel } from "./components/ReportPanel.js";
+import { SuggestionsPane, paneMode } from "./components/SuggestionsPane.js";
 import { ControllerContext, useRows, useUi } from "./components/hooks.js";
 import { ListPane } from "./components/ListPane.js";
 import { MessageLine, PromptPreviewLine, QueryPreviewLine } from "./components/MessageLine.js";
@@ -77,6 +78,8 @@ function Body({ shape }: { shape: Layout }) {
   const key = `${tab}\0${narrow ?? ""}`;
   const help = useUi((s) => s.mode.kind === "help");
   const report = useUi((s) => s.mode.kind === "report");
+  // The pane stays up while its command line or a NOT_MINE question it asked is open.
+  const suggestions = useUi((s) => paneMode(s.mode) !== undefined);
   const overlay = useUi((s) => s.overlay.kind === "detail");
   const focused = useUi((s) => s.focus === "detail");
   const height = shape.bodyHeight;
@@ -84,6 +87,7 @@ function Body({ shape }: { shape: Layout }) {
   const noViews = views.status === "ready" && !views.views.length;
   if (help) return <HelpOverlay width={shape.columns} height={height} />;
   if (report) return <ReportPanel width={shape.columns} height={height} />;
+  if (suggestions) return <SuggestionsPane width={shape.columns} height={height} />;
   if (tab === undefined) {
     return (
       <Box height={height}>

@@ -3,8 +3,11 @@ syntax = "proto3";
 package todo.v1;
 
 import "google/protobuf/timestamp.proto";
+import "todo/v1/field.proto";
+import "todo/v1/field_value.proto";
 
-// Jira sync (design 5, ADR-0006): read-only in its first milestone.
+// Jira sync (design 5, ADR-0006, ADR-0007): pulls, and the pushes of the
+// fields that push.
 service SyncService {
   // Each configured instance's sync state (design 5.11). The same state is
   // pushed to subscribers as Notice.sync_status whenever it changes.
@@ -13,6 +16,51 @@ service SyncService {
   // all of them, and returns at once; its progress is the sync status.
   // FAILED_PRECONDITION / NO_INSTANCE when none is configured.
   rpc SyncNow(SyncNowRequest) returns (SyncNowResponse);
+  // What waits to reach the tracker, and what it refused while the Item's
+  // push_failed Suggestion waits (design 5.6, 5.11): one entry per Item and
+  // field, oldest first (`todo sync outbox`).
+  rpc ListOutbox(ListOutboxRequest) returns (ListOutboxResponse);
+}
+
+message ListOutboxRequest {
+  // Empty for every instance.
+  string instance_id = 1;
+}
+
+message ListOutboxResponse {
+  repeated OutboxEntry entries = 1;
+}
+
+// One Item's change of one field on its way to the tracker. A status is
+// STATUS_CATEGORY and/or RESOLUTION_KIND, whichever changed (one entry or
+// two), pushed as one transition. A refusal is listed until the next one
+// of its field, or until its push_failed Suggestion is applied or
+// rejected; a deleted Item's entries are not listed.
+message OutboxEntry {
+  string instance_id = 1;
+  string item_id = 2;
+  // The issue's key, e.g. "PLAT-12".
+  string remote_key = 3;
+  string title = 4;
+  ItemField field = 5;
+  // The value it pushes; in flight, the value sent.
+  FieldValue new = 6;
+  OutboxState state = 7;
+  uint32 attempts = 8;
+  // Set while a retry waits (a transient failure, a 429's wait).
+  google.protobuf.Timestamp next_attempt_at = 9;
+  // The last failure, transient or the tracker's refusal.
+  string last_error = 10;
+  google.protobuf.Timestamp updated_at = 11;
+}
+
+enum OutboxState {
+  OUTBOX_STATE_UNSPECIFIED = 0;
+  OUTBOX_STATE_PENDING = 1;
+  // Sent, its answer not read back yet.
+  OUTBOX_STATE_IN_FLIGHT = 2;
+  // The tracker refused it; its value is in a push_failed Suggestion.
+  OUTBOX_STATE_FAILED = 3;
 }
 
 message GetSyncStatusRequest {}
@@ -49,8 +97,10 @@ message SyncStatus {
   // what changed before it, so once served_request reaches a caller's
   // request and the state is no longer SYNCING, its pull is done.
   uint64 served_request = 7;
-  // Changes waiting to reach the tracker, and those it refused (design
-  // 5.11): the outbox, by Item and field.
+  // Changes waiting to reach the tracker, and those it refused while their
+  // push_failed Suggestion waits (design 5.11): the outbox, by Item and
+  // field, a status (its category and resolution kind) counting once.
+  // Current whatever the state: an edit made offline counts at once.
   uint32 pending_ops = 8;
   uint32 failed_ops = 9;
 }

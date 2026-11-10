@@ -51,5 +51,9 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
 /// 21 added pushes (ADR-0007): Suggestion and Change.suggestion, SyncStatus's
 /// pending_ops and failed_ops; a linked Item takes edits of its pushed
 /// fields. 22 added the push worker's confirm_not_mine (UpdateItem,
-/// SetStatus, SetRecurrence, BatchMutate) and NOT_MINE.
-pub const API_MINOR: u32 = 22;
+/// SetStatus, SetRecurrence, BatchMutate) and NOT_MINE. 23 added the
+/// SuggestionService (ListSuggestions, ApplySuggestionPatches,
+/// RejectSuggestion), SyncService.ListOutbox, OP_KIND_APPLY_SUGGESTION and
+/// OP_KIND_REJECT_SUGGESTION; pending_ops counts a status once and
+/// failed_ops only while its push_failed Suggestion waits.
+pub const API_MINOR: u32 = 23;

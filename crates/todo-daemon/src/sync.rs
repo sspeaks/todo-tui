@@ -78,6 +78,47 @@ pub(crate) fn status_channel() -> (watch::Sender<BTreeMap<String, v1::SyncStatus
     watch::channel(BTreeMap::new())
 }
 
+/// Keeps each instance's outbox counts current (design 5.11), the only
+/// writer of them: after every committed change of an Item or a
+/// Suggestion, so an edit made offline shows as waiting at once and a
+/// reject takes a failure off, whatever the pull is doing; and when the
+/// loop adds an instance's status (`recount`). Counts that did not change
+/// send nothing.
+pub(crate) async fn count_outbox(
+    store: Store,
+    status: watch::Sender<BTreeMap<String, v1::SyncStatus>>,
+    recount: Arc<Notify>,
+    mut stop: ShutdownSignal,
+) {
+    let mut changes = store.subscribe();
+    loop {
+        tokio::select! {
+            got = changes.recv() => match got {
+                Ok(row) if !matches!(row.topic, todo_core::Topic::Item | todo_core::Topic::Suggestion) => continue,
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            },
+            () = recount.notified() => {}
+            () = stop.wait() => return,
+        }
+        // One count for a burst: a pull's page is many changes.
+        while changes.try_recv().is_ok() {}
+        let ids: Vec<String> = status.borrow().keys().cloned().collect();
+        for id in ids {
+            let Ok((pending, failed)) = store.outbox_counts(id.clone()).await else {
+                continue;
+            };
+            status.send_if_modified(|all| match all.get_mut(&id) {
+                Some(st) if (st.pending_ops, st.failed_ops) != (pending, failed) => {
+                    (st.pending_ops, st.failed_ops) = (pending, failed);
+                    true
+                }
+                _ => false,
+            });
+        }
+    }
+}
+
 /// The loop. It runs while the daemon does; a config change re-reads the
 /// instance (and starts over with it).
 pub(crate) async fn run(
@@ -86,6 +127,7 @@ pub(crate) async fn run(
     clients: Clients,
     now: SyncNow,
     status: watch::Sender<BTreeMap<String, v1::SyncStatus>>,
+    recount: Arc<Notify>,
     mut stop: ShutdownSignal,
 ) {
     let state = State {
@@ -113,8 +155,10 @@ pub(crate) async fn run(
             None => None,
             Some(i) => {
                 // A status from the start, before the credential is read
-                // (a keychain prompt can take a while).
+                // (a keychain prompt can take a while); count_outbox fills
+                // in what waits.
                 state.set(&i.id, |_| {});
+                recount.notify_one();
                 let served = now.requested();
                 let reconcile = last_reconcile.is_none_or(|at| {
                     Timestamp::now().duration_since(at).unsigned_abs() >= RECONCILE_EVERY
@@ -314,10 +358,7 @@ async fn pass(store: &Store, i: &Instance, state: &State, reconcile: bool) -> Ou
         .await
         .map(|t| t.len())
         .unwrap_or(0);
-    let (pending, failed) = store.outbox_counts(i.id.clone()).await.unwrap_or((0, 0));
     state.set(&i.id, |st| {
-        st.pending_ops = pending;
-        st.failed_ops = failed;
         st.state = v1::SyncState::Ok as i32;
         st.last_error.clear();
         st.last_successful_pull_at = Some(timestamp_to_proto(Timestamp::now()));

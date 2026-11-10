@@ -6,9 +6,11 @@
 //   3. a reload of the current view and of the undo state, awaited;
 // and the caller then toasts and the next key runs. There is no client-side
 // optimism: the next key sees the list as the daemon left it, so `xx`
-// completes two Items, never one twice.
+// completes two Items, never one twice. An edit of someone else's issue
+// (NOT_MINE, design 5.9) asks first, within step 1: y sends it again with
+// confirm_not_mine, and the action goes on as if it had not asked.
 
-import { type CallOptions, type Item, type LiveStore, type LiveView, isConnectionFailure, ulid } from "@todo-tui/client";
+import { type CallOptions, type Item, type LiveStore, type LiveView, errorReason, isConnectionFailure, ulid } from "@todo-tui/client";
 import { DaemonUnavailable } from "./messages.js";
 
 export interface Timing {
@@ -29,8 +31,11 @@ const RETRY_BEAT_MS = 100;
 /** How many times an action's settle reads the view before it goes on with what it has. */
 const SETTLE_TRIES = 3;
 
-/** What a mutation helper takes: the request id to reuse, and the deadline. */
-export type CallOpts = CallOptions & { requestId: string };
+/** What a mutation helper takes: the request id to reuse, the deadline, and the say-so for someone else's issue. */
+export type CallOpts = CallOptions & { requestId: string; confirmNotMine?: boolean };
+
+/** Asks whether to change someone else's issue (`err` names it) in the tracker; resolves to the answer. */
+export type AskNotMine = (err: unknown, targets: readonly string[] | undefined) => Promise<boolean>;
 
 export interface Effect<R> {
   /** The RPC; called again with the same options after a connection failure. */
@@ -39,9 +44,16 @@ export interface Effect<R> {
   readonly requestId?: string;
   /** The Items the response carries, and the revision they were read at. */
   readonly items: (res: R) => { readonly items: readonly Item[]; readonly revision: bigint };
+  /** The Items it acts on, when several (a batch): the NOT_MINE question counts those not the person's. */
+  readonly targets?: readonly string[];
+  /** The person already said yes to changing someone else's issue (a retry of an action they confirmed). */
+  readonly confirmed?: boolean;
 }
 
-export type Outcome<R> = { readonly ok: true; readonly res: R } | { readonly ok: false; readonly err: unknown };
+export type Outcome<R> =
+  /** `confirmed`: it was sent with the person's say-so for someone else's issue, which a retry keeps. */
+  | { readonly ok: true; readonly res: R; readonly confirmed: boolean }
+  | { readonly ok: false; readonly err: unknown; readonly confirmed: boolean };
 
 /** The Items and revision of a single-Item mutation's response, with the next instance of a series it completed (SetStatus). */
 export const single = <R extends { item?: Item; generated?: Item; result?: { revision: bigint } }>(res: R) => ({
@@ -59,19 +71,36 @@ export class Pipeline {
     private readonly views: () => readonly LiveView[],
     /** Sets (or, with undefined, clears) the status bar's "saving…". */
     private readonly busy: (label: string | undefined) => void,
+    /** Asks the NOT_MINE question; without it a NOT_MINE refusal is the action's error. */
+    private readonly askNotMine?: AskNotMine,
   ) {}
 
   /** Runs one action through steps 1–3; never throws. */
   async run<R>(effect: Effect<R>): Promise<Outcome<R>> {
-    const saving = setTimeout(() => this.busy("saving…"), this.timing.savingMs);
+    let saving = setTimeout(() => this.busy("saving…"), this.timing.savingMs);
+    let confirmed = effect.confirmed ?? false;
+    const send = (opts: CallOpts) => effect.call(confirmed ? { ...opts, confirmNotMine: true } : opts);
     try {
-      const res = await this.call(effect.call, effect.requestId);
+      const requestId = effect.requestId ?? ulid();
+      let res: R;
+      try {
+        res = await this.call(send, requestId);
+      } catch (err) {
+        if (confirmed || errorReason(err) !== "NOT_MINE" || !this.askNotMine) throw err;
+        clearTimeout(saving);
+        this.busy(undefined);
+        if (!(await this.askNotMine(err, effect.targets))) throw err;
+        confirmed = true;
+        saving = setTimeout(() => this.busy("saving…"), this.timing.savingMs);
+        // Refused, so nothing was recorded for the request id: the same one.
+        res = await this.call(send, requestId);
+      }
       const { items, revision } = effect.items(res);
       this.store.applyItems(items, revision);
       await this.settle(revision);
-      return { ok: true, res };
+      return { ok: true, res, confirmed };
     } catch (err) {
-      return { ok: false, err };
+      return { ok: false, err, confirmed };
     } finally {
       clearTimeout(saving);
       this.busy(undefined);

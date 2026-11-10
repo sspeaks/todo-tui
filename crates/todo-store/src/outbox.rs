@@ -127,11 +127,13 @@ pub(crate) fn same_value(a: &FieldValue, b: &FieldValue) -> bool {
 }
 
 /// Cancels what `item` has waiting: it was deleted (design 3.7), so its
-/// edits never reach the tracker; an undelete does not revive them.
+/// edits never reach the tracker; an undelete does not revive them. One in
+/// flight too: the pull skips a deleted Item, so it would never be read
+/// back (a send that landed shows in Jira's value after an undelete).
 pub(crate) fn cancel_item(conn: &Connection, item: todo_core::ItemId, at: Timestamp) -> Result<()> {
     conn.prepare_cached(
         "UPDATE outbox SET state = 'cancelled', updated_at = ?2
-         WHERE item_id = ?1 AND state = 'pending'",
+         WHERE item_id = ?1 AND state IN ('pending', 'in_flight')",
     )?
     .execute(params![item.to_string(), ts_to_sql(at)?])?;
     Ok(())
@@ -294,12 +296,13 @@ pub(crate) fn conflict(
     Ok(id)
 }
 
-/// Whether `item` has a pending Suggestion of `kind`: `has_conflict` and
-/// `has_push_failure` (design 3.2).
+/// Whether a Suggestion of `kind` waits for `item` (pending, or partly
+/// applied): `has_conflict` and `has_push_failure` (design 3.2).
 pub(crate) fn has_pending(conn: &Connection, item: todo_core::ItemId, kind: &str) -> Result<bool> {
     Ok(conn
         .prepare_cached(
-            "SELECT EXISTS (SELECT 1 FROM suggestions WHERE item_id = ?1 AND kind = ?2 AND state = 'pending')",
+            "SELECT EXISTS (SELECT 1 FROM suggestions WHERE item_id = ?1 AND kind = ?2
+                            AND state IN ('pending', 'partially_applied'))",
         )?
         .query_row(params![item.to_string(), kind], |r| r.get(0))?)
 }
@@ -375,14 +378,142 @@ pub(crate) fn load_suggestion(conn: &Connection, id: &str) -> Result<Option<Sugg
     }))
 }
 
+/// The rows that count (design 5.11): what waits, and the latest refusal
+/// of each field (an older one is cancelled by the next, and an apply or a
+/// reject of its push_failed Suggestion cancels it: [`clear_refused`]). A
+/// deleted Item's rows do not count: its Suggestions are hidden too, and
+/// an undelete brings both back.
+const LISTED: &str = "o.state IN ('pending', 'in_flight', 'failed')
+     AND NOT EXISTS (SELECT 1 FROM items d WHERE d.id = o.item_id AND d.deleted_at IS NOT NULL)";
+
+/// A status is one change, its category and resolution kind (fields 13 and
+/// 14) two rows: the kind's row is not counted beside its category's, both
+/// waiting (pending or in flight, a mix while one is on its way) or both
+/// refused.
+const ONE_PER_STATUS: &str = "NOT (o.field = 14 AND EXISTS (
+           SELECT 1 FROM outbox c WHERE c.item_id = o.item_id AND c.field = 13
+           AND (c.state = o.state
+                OR (c.state IN ('pending', 'in_flight') AND o.state IN ('pending', 'in_flight')))))";
+
+/// The refusals `fields` of `item` dealt with: a push_failed Suggestion
+/// applied (which queues the values afresh) or rejected. They no longer
+/// count as failed.
+/// Returns the rows it cancelled, which an undo of the apply puts back
+/// ([`restore_refused`]).
+pub(crate) fn clear_refused(
+    conn: &Connection,
+    item: todo_core::ItemId,
+    fields: &[ItemField],
+    at: Timestamp,
+) -> Result<Vec<String>> {
+    let mut cleared = Vec::new();
+    for f in fields {
+        let mut stmt = conn.prepare_cached(
+            "UPDATE outbox SET state = 'cancelled', updated_at = ?3
+             WHERE item_id = ?1 AND field = ?2 AND state = 'failed' RETURNING id",
+        )?;
+        let rows = stmt.query_map(params![item.to_string(), f.number(), ts_to_sql(at)?], |r| {
+            r.get::<_, String>(0)
+        })?;
+        for id in rows {
+            cleared.push(id?);
+        }
+    }
+    Ok(cleared)
+}
+
+/// Puts back the refusals `rows` an apply cleared: its undo offers the
+/// push_failed Suggestion again, and the refusal counts again with it. A
+/// row a later refusal of its field replaced stays as it is.
+pub(crate) fn restore_refused(conn: &Connection, rows: &[String], at: Timestamp) -> Result<()> {
+    for id in rows {
+        conn.prepare_cached(
+            "UPDATE outbox SET state = 'failed', updated_at = ?2
+             WHERE id = ?1 AND state = 'cancelled'
+               AND NOT EXISTS (SELECT 1 FROM outbox n WHERE n.item_id = outbox.item_id
+                               AND n.field = outbox.field AND n.state = 'failed')",
+        )?
+        .execute(params![id, ts_to_sql(at)?])?;
+    }
+    Ok(())
+}
+
 /// The outbox's counts for `instance`: waiting, and refused (design 5.11).
 pub(crate) fn counts(conn: &Connection, instance: &str) -> Result<(u32, u32)> {
     Ok(conn
-        .prepare_cached(
-            "SELECT COALESCE(SUM(state IN ('pending', 'in_flight')), 0), COALESCE(SUM(state = 'failed'), 0)
-             FROM outbox WHERE instance_id = ?1",
-        )?
+        .prepare_cached(&format!(
+            "SELECT COALESCE(SUM(o.state IN ('pending', 'in_flight')), 0), COALESCE(SUM(o.state = 'failed'), 0)
+             FROM outbox o WHERE o.instance_id = ?1 AND {LISTED} AND {ONE_PER_STATUS}"
+        ))?
         .query_row([instance], |r| Ok((r.get(0)?, r.get(1)?)))?)
+}
+
+/// One row of the outbox as `todo sync outbox` lists it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Entry {
+    pub instance_id: String,
+    pub item_id: todo_core::ItemId,
+    pub key: String,
+    pub title: String,
+    pub field: ItemField,
+    /// What it pushes; in flight, what was sent.
+    pub new: FieldValue,
+    /// `pending`, `in_flight` or `failed`.
+    pub state: String,
+    pub attempts: u32,
+    pub next_attempt_at: Option<Timestamp>,
+    pub last_error: Option<String>,
+    pub updated_at: Timestamp,
+}
+
+/// What waits, and what was refused while its Suggestion waits, oldest
+/// first: the rows [`counts`] counts, with both of a status.
+pub(crate) fn entries(conn: &Connection, instance: Option<&str>) -> Result<Vec<Entry>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT o.instance_id, o.item_id, i.remote_key, i.title, o.field,
+                COALESCE(o.sent_json, o.new_json), o.state, o.attempts, o.next_attempt_at,
+                o.last_error, o.updated_at
+         FROM outbox o JOIN items i ON i.id = o.item_id
+         WHERE (?1 IS NULL OR o.instance_id = ?1) AND {LISTED}
+         ORDER BY o.created_at, o.item_id, o.field"
+    ))?;
+    let rows = stmt.query_map([instance], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<String>>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, u32>(4)?,
+            r.get::<_, String>(5)?,
+            r.get::<_, String>(6)?,
+            r.get::<_, u32>(7)?,
+            r.get::<_, Option<i64>>(8)?,
+            r.get::<_, Option<String>>(9)?,
+            r.get::<_, i64>(10)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (instance_id, item, key, title, field, new, state, attempts, next, error, updated) =
+            row?;
+        let Some(field) = ItemField::from_number(field) else {
+            continue;
+        };
+        out.push(Entry {
+            instance_id,
+            item_id: codec::item_id_from_str(&item)?,
+            key: key.unwrap_or_default(),
+            title,
+            field,
+            new: codec::value_from_sql(&new)?,
+            state,
+            attempts,
+            next_attempt_at: next.map(codec::ts_from_sql).transpose()?,
+            last_error: error,
+            updated_at: codec::ts_from_sql(updated)?,
+        });
+    }
+    Ok(out)
 }
 
 /// Streams the Suggestion `id` as it is now, on `TOPIC_SUGGESTION`.
@@ -489,14 +620,22 @@ pub(crate) fn settle_pull(
             .iter()
             .map(|&f| value(find(f), f, |w| &w.new))
             .collect();
-        // What Jira has once the push lands: what was sent, while in flight.
-        let landed: Vec<FieldValue> = fields
-            .iter()
-            .map(|&f| value(find(f), f, |w| w.sent.as_ref().unwrap_or(&w.new)))
-            .collect();
-        let moved_on = unit
-            .iter()
-            .any(|w| w.sent.as_ref().is_some_and(|s| !same(s, &w.new)));
+        // What Jira has once the push lands: what was sent, while in
+        // flight. In a pair one row may be in flight and the other queued
+        // since (a reopen during a close): the queued one is not part of
+        // the send, so Jira still has its base.
+        let flying = unit.iter().any(|w| w.sent.is_some());
+        let lands: fn(&Waiting) -> &FieldValue = if flying {
+            |w| w.sent.as_ref().unwrap_or(&w.base)
+        } else {
+            |w| w.sent.as_ref().unwrap_or(&w.new)
+        };
+        let landed: Vec<FieldValue> = fields.iter().map(|&f| value(find(f), f, lands)).collect();
+        let moved_on = unit.iter().any(|w| match &w.sent {
+            Some(s) => !same(s, &w.new),
+            // Queued beside a row in flight: it goes next.
+            None => flying,
+        });
         let jira: Vec<FieldValue> = fields
             .iter()
             .map(|&f| jira_of(issue, f).unwrap_or(FieldValue::Cleared))
@@ -712,6 +851,13 @@ pub(crate) fn record_result(
                 if n == 1 {
                     continue;
                 }
+                // An older refusal of the field is this one's: only the
+                // latest counts as failed (design 5.11).
+                conn.prepare_cached(
+                    "UPDATE outbox SET state = 'cancelled', updated_at = ?3
+                     WHERE item_id = ?1 AND field = ?2 AND state = 'failed'",
+                )?
+                .execute(params![item.to_string(), w.field.number(), now])?;
                 let n = conn
                     .prepare_cached(
                         "UPDATE outbox SET state = 'failed', attempts = attempts + 1, last_error = ?2,

@@ -5,11 +5,13 @@ use std::io::{self, Write as _};
 use std::net::SocketAddr;
 use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
 use jiff::SignedDuration;
 use todo_proto::v1::item_service_server::ItemServiceServer;
+use todo_proto::v1::suggestion_service_server::SuggestionServiceServer;
 use todo_proto::v1::sync_service_server::SyncServiceServer;
 use todo_proto::v1::system_service_server::SystemServiceServer;
 use todo_proto::v1::view_service_server::ViewServiceServer;
@@ -27,7 +29,10 @@ use crate::conn::Clients;
 use crate::paths::Paths;
 use crate::remote::{self, Auth};
 use crate::scheduler::{self, Wake};
-use crate::service::{Ctx, item::Items, sync::Sync, system::System, view::Views, watch::Watch};
+use crate::service::{
+    Ctx, item::Items, suggestion::Suggestions, sync::Sync, system::System, view::Views,
+    watch::Watch,
+};
 use crate::spool;
 use crate::supervise::{Backoff, spawn_supervised};
 
@@ -269,13 +274,28 @@ impl Daemon {
         };
         let (status_tx, sync_status) = crate::sync::status_channel();
         let sync_now = crate::sync::SyncNow::default();
+        // The loop pokes the counter when it adds an instance's status.
+        let recount = Arc::new(tokio::sync::Notify::new());
+        let counter = {
+            let (store, status, stop) = (store.clone(), status_tx.clone(), shutdown.signal());
+            let recount = recount.clone();
+            spawn_supervised("outbox counts", shutdown.signal(), backoff, move || {
+                crate::sync::count_outbox(
+                    store.clone(),
+                    status.clone(),
+                    recount.clone(),
+                    stop.clone(),
+                )
+            })
+        };
         let sync = {
-            let (store, config, clients, now, stop) = (
+            let (store, config, clients, now, stop, recount) = (
                 store.clone(),
                 config.subscribe(),
                 clients.clone(),
                 sync_now.clone(),
                 shutdown.signal(),
+                recount.clone(),
             );
             spawn_supervised("sync", shutdown.signal(), backoff, move || {
                 crate::sync::run(
@@ -284,6 +304,7 @@ impl Daemon {
                     clients.clone(),
                     now.clone(),
                     status_tx.clone(),
+                    recount.clone(),
                     stop.clone(),
                 )
             })
@@ -326,6 +347,7 @@ impl Daemon {
             .add_service(ItemServiceServer::new(Items(ctx.clone())))
             .add_service(ViewServiceServer::new(Views(ctx.clone())))
             .add_service(SyncServiceServer::new(Sync(ctx.clone())))
+            .add_service(SuggestionServiceServer::new(Suggestions(ctx.clone())))
             .add_service(WatchServiceServer::new(Watch(ctx.clone())))
             .serve_with_incoming_shutdown(incoming, async move { stop.wait().await });
 
@@ -365,6 +387,10 @@ impl Daemon {
                     Sync(ctx.clone()),
                     auth.clone(),
                 ))
+                .add_service(SuggestionServiceServer::with_interceptor(
+                    Suggestions(ctx.clone()),
+                    auth.clone(),
+                ))
                 .add_service(WatchServiceServer::with_interceptor(Watch(ctx), auth))
                 .serve_with_incoming_shutdown(incoming, async move { stop.wait().await })
         });
@@ -397,7 +423,7 @@ impl Daemon {
         // has been dropped, so the last clone (dropped here) joins the
         // writer thread before the lock is released: a daemon that takes
         // the lock next sees every commit.
-        for task in [spool, scheduler, backups, sync] {
+        for task in [spool, scheduler, backups, sync, counter] {
             task.abort().await;
         }
         let _ = fs::remove_file(&paths.socket);

@@ -56,6 +56,7 @@
       "redo",
       "command",
       "sync_now",
+      "suggestions",
       "help",
       "quit",
       "suspend"
@@ -74,6 +75,15 @@
       "report_up",
       "report_copy",
       "report_close"
+    ],
+    "suggestions": [
+      "suggestion_down",
+      "suggestion_up",
+      "suggestion_toggle",
+      "suggestion_apply",
+      "suggestion_reject",
+      "suggestion_command",
+      "suggestion_close"
     ]
   },
   "named_tokens": [

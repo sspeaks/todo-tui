@@ -5,12 +5,15 @@
 import {
   ArchiveReason,
   Energy,
+  type FieldValue,
   type Item,
   ItemField,
   LinkState,
   Priority,
   type ProtoDate,
+  ResolutionKind,
   Status,
+  StatusCategory,
   ruleFromProto,
   ruleToken,
 } from "@todo-tui/client/core";
@@ -122,7 +125,32 @@ export function project(item: Item, opts: ProjectOptions = {}): Record<string, u
   return prune(out);
 }
 
-function prune(o: Record<string, unknown>): Record<string, unknown> {
+/** A Suggestion patch's value as plain JSON: a string, number, list, date, or null for none. */
+export function valueOf(v: FieldValue | undefined): unknown {
+  const k = v?.kind;
+  if (!k) return null;
+  switch (k.case) {
+    case undefined:
+    case "cleared":
+      return null;
+    case "stringSet":
+      return [...k.value.values];
+    case "dateValue":
+      return isoDate(k.value) ?? null;
+    case "priority":
+      return LEVEL_OF.get(k.value) ?? 0;
+    case "statusCategory":
+      return StatusCategory[k.value]?.toLowerCase() ?? null;
+    case "resolutionKind":
+      return ResolutionKind[k.value]?.toLowerCase() ?? null;
+    case "stringValue":
+      return k.value;
+    default:
+      return String(k.value);
+  }
+}
+
+export function prune(o: Record<string, unknown>): Record<string, unknown> {
   for (const [k, v] of Object.entries(o)) {
     if (v === undefined || v === "") delete o[k];
     else if (v !== null && typeof v === "object" && !Array.isArray(v)) {

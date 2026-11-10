@@ -59,7 +59,7 @@ fn day(date: Date, today: Date) -> String {
 }
 
 /// `"<title>"`, cut to [`MAX_TITLE_CHARS`] with `…`.
-fn quoted(title: &str) -> String {
+pub(crate) fn quoted(title: &str) -> String {
     if title.chars().count() <= MAX_TITLE_CHARS {
         return format!("\"{title}\"");
     }

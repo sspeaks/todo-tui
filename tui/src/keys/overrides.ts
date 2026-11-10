@@ -27,7 +27,7 @@ export interface EffectiveKeymap {
   readonly warnings: readonly KeymapWarning[];
 }
 
-const MODES: readonly KeymapMode[] = ["normal", "help", "report"];
+const MODES: readonly KeymapMode[] = ["normal", "help", "report", "suggestions"];
 
 const isToken = (t: string): boolean => (isChar(t) && t !== " ") || NAMED_TOKENS.includes(t) || (/^ctrl\+[a-z]$/.test(t) && !(t in CTRL_ALIASES));
 

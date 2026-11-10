@@ -821,9 +821,10 @@ async fn a_refused_close_leaves_a_title_jira_took() {
     assert_eq!(issues.lock().unwrap()[0]["fields"]["summary"], "new");
     assert_eq!(items[0].title, "new");
     assert_eq!(items[0].status, before.status, "Jira's status stands");
-    // Only the close failed (its category and kind), not the title.
+    // Only the close failed (one change: its category and kind), not the
+    // title.
     let st = status(&r).await;
-    assert_eq!((st.failed_ops, st.pending_ops), (2, 0));
+    assert_eq!((st.failed_ops, st.pending_ops), (1, 0));
     r.stop().await;
 }
 
@@ -940,5 +941,196 @@ async fn a_priority_jira_has_no_name_for_settles_as_the_one_it_reads_back_as() {
     assert!(!items[0].has_conflict, "no conflict with its own push");
     let st = status(&r).await;
     assert_eq!((st.pending_ops, st.failed_ops), (0, 0));
+    r.stop().await;
+}
+
+/// Waits until the instance's outbox counts are `want` (pending, failed).
+async fn counts(r: &Running, want: (u32, u32)) {
+    for _ in 0..200 {
+        let s = status(r).await;
+        if (s.pending_ops, s.failed_ops) == want {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let s = status(r).await;
+    panic!("counts never {want:?}: {:?}", (s.pending_ops, s.failed_ops));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_conflict_reapplied_through_the_suggestions_pushes_yours() {
+    use todo_proto::v1::suggestion_service_client::SuggestionServiceClient;
+    use todo_proto::v1::{ApplySuggestionPatchesRequest, ListSuggestionsRequest, SuggestionKind};
+    let fake = FakeJira::start("pat").await;
+    let issues = Arc::new(Mutex::new(vec![issue_json(1, "theirs", "new", &at(1))]));
+    serve_writable(&fake, issues.clone());
+    // Writes refused at first: the edit waits, as offline.
+    let refuse = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    {
+        let (issues, refuse) = (issues.clone(), refuse.clone());
+        let n = Arc::new(std::sync::atomic::AtomicU32::new(10));
+        fake.route("/rest/api/2/issue/1", move |seen| {
+            let mut all = issues.lock().unwrap();
+            match seen.method.as_str() {
+                "PUT" if refuse.load(std::sync::atomic::Ordering::SeqCst) => {
+                    (503, json!({"errorMessages": ["down"]}), vec![])
+                }
+                "PUT" => {
+                    let body: Value = serde_json::from_str(&seen.body).unwrap();
+                    for (k, v) in body["fields"].as_object().unwrap() {
+                        all[0]["fields"][k] = v.clone();
+                    }
+                    let h = n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    all[0]["fields"]["updated"] =
+                        json!(format!("2026-11-04T{h:02}:00:00.000+0000"));
+                    (204, Value::Null, vec![])
+                }
+                _ => (200, all[0].clone(), vec![]),
+            }
+        });
+    }
+    let r = start(&fake, "pat").await;
+    settled(&r, SyncState::Ok).await;
+    let id = linked(&r).await[0].id.clone();
+    let mut client = ItemServiceClient::new(r.channel().await);
+    client.update_item(edit_title(&id, "mine")).await.unwrap();
+    // Counted at once, before any pass.
+    counts(&r, (1, 0)).await;
+    // Someone renames it in Jira; the next pull lets Jira win, yours kept.
+    issues.lock().unwrap()[0]["fields"]["summary"] = json!("theirs, renamed");
+    issues.lock().unwrap()[0]["fields"]["updated"] = json!(at(5));
+    let items = until(&r, "a conflict", |items| items[0].has_conflict).await;
+    assert_eq!(items[0].title, "theirs, renamed");
+    counts(&r, (0, 0)).await;
+    let mut pane = SuggestionServiceClient::new(r.channel().await);
+    let all = pane
+        .list_suggestions(ListSuggestionsRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .suggestions;
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].kind, SuggestionKind::SyncConflict as i32);
+    assert!(
+        all[0].rationale.contains("the title on PLAT-1"),
+        "{:?}",
+        all[0]
+    );
+    // Re-applied (Jira writable now): it pushes, and the pane empties.
+    refuse.store(false, std::sync::atomic::Ordering::SeqCst);
+    let out = pane
+        .apply_suggestion_patches(ApplySuggestionPatchesRequest {
+            request_id: todo_core::new_ulid().to_string(),
+            patch_ids: vec![all[0].patches[0].id.clone()],
+            confirm_not_mine: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(out.skipped_patch_ids.is_empty());
+    assert_eq!(out.items[0].title, "mine");
+    let items = until(&r, "pushed", |items| items[0].pending_fields.is_empty()).await;
+    assert_eq!(items[0].title, "mine");
+    assert!(!items[0].has_conflict);
+    assert_eq!(issues.lock().unwrap()[0]["fields"]["summary"], "mine");
+    assert!(
+        pane.list_suggestions(ListSuggestionsRequest::default())
+            .await
+            .unwrap()
+            .into_inner()
+            .suggestions
+            .is_empty()
+    );
+    // An unknown patch: NOT_FOUND, PATCH_NOT_FOUND.
+    // Not a ULID: refused as an argument, not echoed back as a lookup.
+    let err = pane
+        .apply_suggestion_patches(ApplySuggestionPatchesRequest {
+            request_id: todo_core::new_ulid().to_string(),
+            patch_ids: vec!["nope".into()],
+            confirm_not_mine: false,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument);
+    let err = pane
+        .apply_suggestion_patches(ApplySuggestionPatchesRequest {
+            request_id: todo_core::new_ulid().to_string(),
+            patch_ids: vec![todo_core::new_ulid().to_string()],
+            confirm_not_mine: false,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::NotFound);
+    assert_eq!(
+        err.get_details_error_info().map(|i| i.reason),
+        Some("PATCH_NOT_FOUND".into())
+    );
+    r.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_outbox_lists_a_refusal_until_its_suggestion_is_rejected() {
+    use todo_proto::v1::suggestion_service_client::SuggestionServiceClient;
+    use todo_proto::v1::{
+        ListOutboxRequest, ListSuggestionsRequest, OutboxState, RejectSuggestionRequest,
+    };
+    let fake = FakeJira::start("pat").await;
+    let issues = Arc::new(Mutex::new(vec![issue_json(1, "kept", "new", &at(1))]));
+    serve_writable(&fake, issues.clone());
+    // No way to close.
+    fake.route("/rest/api/2/issue/1/transitions", |_| {
+        (200, json!({"transitions": []}), vec![])
+    });
+    let r = start(&fake, "pat").await;
+    settled(&r, SyncState::Ok).await;
+    let id = linked(&r).await[0].id.clone();
+    let mut client = ItemServiceClient::new(r.channel().await);
+    client.set_status(close(&id)).await.unwrap();
+    until(&r, "refused", |items| items[0].has_push_failure).await;
+    counts(&r, (0, 1)).await;
+    let mut sync = SyncServiceClient::new(r.channel().await);
+    let entries = sync
+        .list_outbox(ListOutboxRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .entries;
+    assert_eq!(entries.len(), 2, "the category and the resolution kind");
+    assert!(entries.iter().all(|e| e.state == OutboxState::Failed as i32
+        && e.remote_key == "PLAT-1"
+        && e.title == "kept"
+        && !e.last_error.is_empty()));
+    let mut pane = SuggestionServiceClient::new(r.channel().await);
+    let all = pane
+        .list_suggestions(ListSuggestionsRequest {
+            item_id: Some(id.clone()),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .suggestions;
+    assert!(!all[0].error.is_empty());
+    let out = pane
+        .reject_suggestion(RejectSuggestionRequest {
+            request_id: todo_core::new_ulid().to_string(),
+            id: all[0].id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        out.suggestion.unwrap().state,
+        todo_proto::v1::SuggestionState::Rejected as i32
+    );
+    counts(&r, (0, 0)).await;
+    assert!(
+        sync.list_outbox(ListOutboxRequest::default())
+            .await
+            .unwrap()
+            .into_inner()
+            .entries
+            .is_empty()
+    );
+    assert!(!linked(&r).await[0].has_push_failure);
     r.stop().await;
 }
