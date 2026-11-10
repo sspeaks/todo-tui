@@ -474,6 +474,7 @@ mod tests {
             actor: core::Actor::Sync,
             pushes: core::Pushes::None,
             confirm_not_mine: false,
+            local: core::Local::default(),
         };
         core::apply(item, &MutationOp::Update(updates), &ctx)
     }

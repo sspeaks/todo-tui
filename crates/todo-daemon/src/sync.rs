@@ -147,6 +147,11 @@ pub(crate) async fn run(
                 .filter(|i| i.push.enabled)
                 .map(|i| i.id.as_str()),
         );
+        // Pushes or not: a local field is the person's either way.
+        match &instance {
+            Some(i) => store.set_local(&i.id, &i.local_fields),
+            None => store.set_local("", &[]),
+        }
         // Only the configured instances have a status.
         state
             .tx
@@ -623,6 +628,9 @@ async fn push(
             .begin_push(sends.clone(), Timestamp::now())
             .await
             .map_err(sfail)?;
+        // A row left out (edited since, or kept local and so cancelled)
+        // changes the Item's pending fields: the read-back shows that too.
+        let left_out = begun.len() < sends.len();
         let rows: Vec<Waiting> = sends
             .into_iter()
             .filter(|(w, _)| begun.contains(&w.id))
@@ -673,7 +681,7 @@ async fn push(
             units.push((edits, None));
             units.push((moves, target));
         }
-        let mut read_back = false;
+        let mut read_back = left_out;
         for (unit, target) in units {
             if unit.is_empty() {
                 continue;

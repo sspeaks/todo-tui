@@ -76,6 +76,11 @@ month), Overcome by Events 287 (190 of them in one two-week clean-up), Incomplet
 - **`push = false`** on an instance keeps M9's read-only behaviour, a switch for a
   Jira one should not write to. What waits stays queued, and pulls show Jira's values
   meanwhile; it goes once pushes are on again (or an undo or delete cancels it).
+- **`local_fields = ["due_date"]`** on an instance makes its due date the person's:
+  an edit is taken with pushes on or off, queues nothing and asks nothing for someone
+  else's issue, and pulls neither import nor overwrite it. It is for a Jira whose
+  screens refuse the due date (BRME tracks a custom "Need Date" instead). Only the
+  due date can be local for now.
 
 ## Alternatives considered
 

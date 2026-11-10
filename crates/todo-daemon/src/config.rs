@@ -270,6 +270,11 @@ impl From<&Config> for v1::ConfigSnapshot {
                     poll_seconds: u32::try_from(i.poll_interactive.as_secs()).unwrap_or(u32::MAX),
                     idle_poll_seconds: u32::try_from(i.poll_idle.as_secs()).unwrap_or(u32::MAX),
                     push: i.push.enabled,
+                    local_fields: i
+                        .local_fields
+                        .iter()
+                        .map(|&f| todo_proto::convert::item_field_path(f).to_owned())
+                        .collect(),
                 })
                 .collect(),
             meetings: Some(v1::MeetingsConfig {
@@ -522,6 +527,7 @@ impl<'a> Reader<'a> {
         let mut poll = POLL_INTERACTIVE;
         let mut cancelled = default_cancelled_resolutions();
         let mut push = Push::default();
+        let mut local_fields = Vec::new();
         for (key, value) in table {
             let path = format!("{at}.{}", quote_key(&key));
             let text = value.as_str().map(str::trim);
@@ -606,6 +612,7 @@ impl<'a> Reader<'a> {
                     Some(name) => push.cancel_resolution = name.to_owned(),
                     None => self.warn(path, "must be a resolution's name, e.g. \"Done\""),
                 },
+                "local_fields" => local_fields = self.local_fields(&path, value),
                 "transitions" => self.transitions(&path, value, &mut push.transitions),
                 "priority_map" => self.priority_map(&path, value, &mut push.priority_map),
                 "email" | "promote_default" | "subtask_issue_type" | "assistant_enabled" => {
@@ -665,7 +672,40 @@ impl<'a> Reader<'a> {
             poll_idle: POLL_IDLE.max(poll),
             cancelled_resolutions: cancelled,
             push,
+            local_fields,
         })
+    }
+
+    /// `local_fields = ["due_date"]`: the Core fields kept local on the
+    /// instance's linked Items. Only the due date can be: no other field is
+    /// tied to it. A name it does not know is skipped with a warning.
+    fn local_fields(&mut self, path: &str, value: toml::Value) -> Vec<todo_core::ItemField> {
+        let Some(list) = value.as_array() else {
+            self.warn(
+                path.to_owned(),
+                "must be a list of field names, e.g. [\"due_date\"]",
+            );
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for v in list {
+            match v.as_str().map(str::trim) {
+                Some("due_date") => {
+                    if !out.contains(&todo_core::ItemField::DueDate) {
+                        out.push(todo_core::ItemField::DueDate);
+                    }
+                }
+                Some(other) => self.warn(
+                    path.to_owned(),
+                    format!("{other:?} cannot be kept local; only \"due_date\" can"),
+                ),
+                None => self.warn(
+                    path.to_owned(),
+                    "must be a list of field names, e.g. [\"due_date\"]",
+                ),
+            }
+        }
+        out
     }
 
     /// `transitions = { todo = "Open", in_progress = "In Progress" }`: the
@@ -1155,6 +1195,35 @@ mod tests {
         );
         assert_eq!(plain.instances[0].scopes, default_scopes());
         assert_eq!(plain.instances[0].push, Push::default());
+    }
+
+    #[test]
+    fn an_instance_reads_its_local_fields() {
+        let base = "[[instances]]\nid = \"j\"\nkind = \"jira-dc\"\nbase_url = \"https://j.example.com\"\ncredential = \"env:X\"\n";
+        let config = parse(&format!(
+            "{base}local_fields = [\"due_date\", \"due_date\"]\n"
+        ));
+        assert_eq!(config.warnings, vec![]);
+        assert_eq!(
+            config.instances[0].local_fields,
+            [todo_core::ItemField::DueDate]
+        );
+        assert!(parse(base).instances[0].local_fields.is_empty());
+        let bad = parse(&format!("{base}local_fields = [\"title\", \"due_date\"]\n"));
+        assert_eq!(
+            bad.instances[0].local_fields,
+            [todo_core::ItemField::DueDate]
+        );
+        assert_eq!(
+            bad.warnings
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["instances[0].local_fields: \"title\" cannot be kept local; only \"due_date\" can"]
+        );
+        let wrong = parse(&format!("{base}local_fields = \"due_date\"\n"));
+        assert!(wrong.instances[0].local_fields.is_empty());
+        assert_eq!(wrong.warnings.len(), 1);
     }
 
     #[test]

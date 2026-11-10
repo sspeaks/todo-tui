@@ -1593,10 +1593,10 @@ export class FakeDaemon {
         // A fixture's link without a state is whole, as the daemon writes it.
         [LinkState.OK, LinkState.UNSPECIFIED].includes(item.remoteLink?.linkState ?? LinkState.OK) &&
         this.config.instances.some((i) => i.id === item.remoteLink?.instanceId && i.push);
-      const core =
-        item.remoteLink !== undefined
-          ? changes.find((c) => CORE_FIELDS.has(c.field) && !(pushes && PUSHED_FIELDS.has(c.field)))
-          : undefined;
+      // The fields the instance keeps local (local_fields): the person's, never pushed.
+      const local = this.config.instances.find((i) => i.id === item.remoteLink?.instanceId)?.localFields ?? [];
+      const tracker = changes.filter((c) => CORE_FIELDS.has(c.field) && !local.includes(CORE_PATHS[c.field]!));
+      const core = item.remoteLink !== undefined ? tracker.find((c) => !(pushes && PUSHED_FIELDS.has(c.field))) : undefined;
       if (core) {
         const path = CORE_PATHS[core.field]!;
         throw errorInfo(
@@ -1607,7 +1607,7 @@ export class FakeDaemon {
         );
       }
       // Someone else's issue (design 5.9): a pushed edit needs the say-so.
-      const theirs = item.remoteLink !== undefined && !item.isMine && !p.confirmNotMine ? changes.find((c) => CORE_FIELDS.has(c.field)) : undefined;
+      const theirs = item.remoteLink !== undefined && !item.isMine && !p.confirmNotMine ? tracker[0] : undefined;
       if (theirs) {
         const path = CORE_PATHS[theirs.field]!;
         throw errorInfo(

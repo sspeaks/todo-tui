@@ -623,6 +623,7 @@ mod tests {
             actor: Actor::User,
             pushes: crate::mutation::Pushes::None,
             confirm_not_mine: false,
+            local: crate::mutation::Local::default(),
         };
         let mut skipped = Vec::new();
         let mut applied = Vec::new();
@@ -663,6 +664,7 @@ mod tests {
             actor: Actor::User,
             pushes: crate::mutation::Pushes::None,
             confirm_not_mine: false,
+            local: crate::mutation::Local::default(),
         }
     }
 
@@ -813,6 +815,7 @@ mod tests {
             actor: Actor::System,
             pushes: crate::mutation::Pushes::None,
             confirm_not_mine: false,
+            local: crate::mutation::Local::default(),
         };
         let (deleted, _) = run(&edited, &[MutationOp::Delete], system);
 
@@ -890,6 +893,7 @@ mod tests {
             actor: Actor::System,
             pushes: crate::mutation::Pushes::None,
             confirm_not_mine: false,
+            local: crate::mutation::Local::default(),
         };
         let moved = MutationOp::Update(vec![FieldUpdate {
             field: F::DueDate,
@@ -963,6 +967,7 @@ mod tests {
             actor: Actor::System,
             pushes: crate::mutation::Pushes::None,
             confirm_not_mine: false,
+            local: crate::mutation::Local::default(),
         };
         let (changed, _) = run(
             &edited,

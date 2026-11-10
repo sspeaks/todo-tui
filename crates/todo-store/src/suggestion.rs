@@ -278,6 +278,7 @@ pub(crate) fn apply_tx(tx: &mut WriteTx<'_>, input: ApplyInput) -> Result<ApplyO
         actor,
         pushes: tx.pushes(),
         confirm_not_mine: input.confirm_not_mine,
+        local: tx.local(),
     };
     let conn = tx.conn();
     let mut batch = Batch::default();

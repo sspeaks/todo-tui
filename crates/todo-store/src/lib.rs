@@ -517,6 +517,8 @@ pub struct WriteTx<'conn> {
     next_revision: Revision,
     /// Whether pushed fields are editable on linked Items (ADR-0007).
     pushes: todo_core::Pushes,
+    /// The fields kept local on an instance's linked Items.
+    local: todo_core::Local,
     /// This write queued a push: the sync loop is woken after the commit.
     queued: bool,
 }
@@ -525,6 +527,11 @@ impl WriteTx<'_> {
     /// Whether pushed fields are editable on linked Items (ADR-0007).
     pub fn pushes(&self) -> todo_core::Pushes {
         self.pushes
+    }
+
+    /// The fields kept local on an instance's linked Items (`local_fields`).
+    pub fn local(&self) -> todo_core::Local {
+        self.local
     }
 
     /// The open transaction, for SQL the helpers don't cover.
@@ -607,6 +614,9 @@ struct Shared {
     /// The instance whose linked Items take a person's edit of their pushed
     /// fields, queued for it (ADR-0007), as the config says; none, read-only.
     pushes: Mutex<todo_core::Pushes>,
+    /// The fields an instance keeps local on its linked Items, as the
+    /// config's `local_fields` says.
+    local: Mutex<todo_core::Local>,
     /// Notified when an op queued a push, after its commit.
     queued: Arc<tokio::sync::Notify>,
 }
@@ -653,6 +663,18 @@ impl Drop for Pooled {
 }
 
 impl Store {
+    /// The fields `instance` keeps local on its linked Items (config
+    /// `local_fields`): a person's edit of them is taken, pushes or not,
+    /// never queued, and a pull leaves them alone.
+    pub fn set_local(&self, instance: &str, fields: &[ItemField]) {
+        *self
+            .inner
+            .shared
+            .local
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = todo_core::Local::instance(instance, fields);
+    }
+
     /// The instance whose linked Items take a person's edit of their pushed
     /// fields, to be queued for it (ADR-0007): the daemon sets it from the
     /// config's `push`. None (read-only, ADR-0006) until set.
@@ -688,6 +710,7 @@ impl Store {
             revision: AtomicU64::new(revision),
             changes: broadcast::channel(BROADCAST_CAPACITY).0,
             pushes: Mutex::new(todo_core::Pushes::None),
+            local: Mutex::new(todo_core::Local::default()),
             queued: Arc::new(tokio::sync::Notify::new()),
         });
         run_write(&mut writer_conn, &shared, view::seed_tx)?;
@@ -1014,7 +1037,7 @@ impl Store {
         rows: Vec<(outbox::Waiting, todo_core::FieldValue)>,
         now: Timestamp,
     ) -> Result<Vec<String>> {
-        self.write(move |tx| outbox::begin(tx.conn(), &rows, now))
+        self.write(move |tx| outbox::begin(tx.conn(), &rows, tx.local(), now))
             .await
     }
 
@@ -1147,6 +1170,7 @@ where
         changes: Vec::new(),
         next_revision: shared.revision.load(Ordering::Acquire) + 1,
         pushes: *shared.pushes.lock().unwrap_or_else(|e| e.into_inner()),
+        local: *shared.local.lock().unwrap_or_else(|e| e.into_inner()),
         queued: false,
     };
     let value = f(&mut wtx)?;
@@ -2012,9 +2036,17 @@ fn write_op(
         let at = Timestamp::now();
         let conn = tx.conn();
         let create = tx.pushes();
+        let local = tx.local();
         let by_id = |id: ItemId| batch.slots.get(&id).map(|&s| batch.items[s].clone());
-        let mut queued =
-            outbox::enqueue(conn, &op.id.to_string(), &batch.events, by_id, create, at)?;
+        let mut queued = outbox::enqueue(
+            conn,
+            &op.id.to_string(),
+            &batch.events,
+            by_id,
+            create,
+            local,
+            at,
+        )?;
         let woke = !queued.is_empty();
         for &slot in &touched {
             let item = &batch.items[slot];
@@ -2181,6 +2213,7 @@ fn mutate_tx(tx: &mut WriteTx<'_>, input: MutateInput) -> Result<MutateOutput> {
         actor: input.actor,
         pushes: tx.pushes(),
         confirm_not_mine: input.confirm_not_mine,
+        local: tx.local(),
     };
     let conn = tx.conn();
     let mut batch = Batch::default();

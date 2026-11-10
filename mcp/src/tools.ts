@@ -392,7 +392,8 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
       description:
         "Change fields of an item; only the fields given change. Empty string (or null) clears a field. " +
         "Status, repeat, archive and delete have their own tools. On a Jira-linked item the title, priority, labels and due date are " +
-        "pushed to Jira (pending_fields shows them queued until Jira has them; ask Seth before renaming his ticket as a side effect); " +
+        "pushed to Jira (pending_fields shows them queued until Jira has them; ask Seth before renaming his ticket as a side effect), " +
+        "except a due date the instance keeps local (local_fields), which is his alone; " +
         "the description and the other Jira fields are Jira's, and refused. defer_until, waiting, private_notes, local_priority and energy " +
         "stay local. An issue assigned to someone else needs confirm_not_mine.",
       inputSchema: {

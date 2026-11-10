@@ -599,6 +599,20 @@ describe("FakeDaemon on a linked Item (read-only sync, ADR-0006)", () => {
     const repeated = await items.setRecurrence({ requestId: ulid(), id: theirs.id, rule: daily, confirmNotMine: true });
     expect(repeated.item?.recurrence).toBeDefined();
   });
+
+  it("takes a due date the instance keeps local, pushing or not, without asking (local_fields)", async () => {
+    const link = { trackerKind: "jira", instanceId: "work-jira", remoteId: "10001", key: "PLAT-1", url: "https://jira.example.com/browse/PLAT-1" };
+    const daemon = new FakeDaemon([{ title: "PLAT-1", remoteLink: link }]);
+    const [theirs] = [...daemon.items.values()];
+    const items = createClient(ItemService, daemon.transport);
+    const due = (day: number) => updateItem(items, { id: theirs!.id, dueDate: { year: 2026, month: 11, day } }, ["due_date"]);
+    daemon.setConfig({ instances: [{ id: "work-jira", kind: "jira-dc", localFields: ["due_date"] }] });
+    expect((await due(20)).item?.dueDate?.day).toBe(20);
+    expect((await failure(updateItem(items, { id: theirs!.id, title: "x" }, ["title"])))?.findDetails(ErrorInfoSchema)[0]?.reason).toBe("LINKED_READ_ONLY");
+    daemon.setConfig({ instances: [{ id: "work-jira", kind: "jira-dc", push: true, localFields: ["due_date"] }] });
+    expect((await due(21)).item?.dueDate?.day).toBe(21);
+    expect((await failure(updateItem(items, { id: theirs!.id, title: "x" }, ["title"])))?.findDetails(ErrorInfoSchema)[0]?.reason).toBe("NOT_MINE");
+  });
 });
 
 describe("FakeDaemon Suggestions (design 3.11)", () => {

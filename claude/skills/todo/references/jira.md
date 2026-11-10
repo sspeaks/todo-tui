@@ -8,12 +8,14 @@ Sync pulls the issues in (every minute while the TUI is open, every ten otherwis
 
 **Pushed to Jira**, through `todo_update` and `todo_set_status`:
 
-- title, priority, labels, due date;
+- title, priority, labels, due date (unless the instance keeps it local, below);
 - the status: `done` closes the issue with resolution **Done**, `cancelled` with **Won't Do**, `in_progress` starts it, and `inbox`/`next`/`someday` from in progress or done moves it back to To Do. Between inbox, next and someday the move is local, while Jira has the issue in To Do.
 
 **Jira's alone**, refused by the tools ("that field is Jira's: change it in Jira"): the description, assignee, components, fix versions, parent, story points and estimates. Sprint, reporter and Jira's status name are read-only too. Don't retry; tell Seth it changes in Jira, with the key and link.
 
 If Seth's config has `push = false` (the kill switch), nothing pushes and every Jira field is refused as above.
+
+An instance with `local_fields = ["due_date"]` keeps the due date local: setting it never touches Jira (his BRME screens have no due date), never asks about someone else's issue, and sync never overwrites it. It's his date for his list; the ticket's own dates are untouched. This holds with `push = false` too.
 
 **Local only**, never pushed. Prefer these for Seth's personal organization of a ticket:
 
@@ -32,7 +34,7 @@ A pushed edit changes a shared ticket, so:
 - **"Drop it", "not doing it"** on a Jira item is ambiguous: cancel (closes it in Jira as Won't Do) or delete locally (Jira untouched). Ask which.
 - **Someone else's issue**: an edit of an issue assigned to someone else fails ("assigned to someone else … confirm_not_mine"). Ask Seth whether to change their ticket; only with his yes, call again with `confirm_not_mine: true`.
 
-Repeat rules don't fit linked items: a fixed rule (`mon`, `daily`) sets the due date, which pushes, and each completion would close the issue. Suggest a local todo that refers to the key instead.
+Repeat rules don't fit linked items: a fixed rule (`mon`, `daily`) sets the due date, which pushes unless kept local, and each completion would close the issue. Suggest a local todo that refers to the key instead.
 
 ## After a change: pending, conflicts, refusals
 

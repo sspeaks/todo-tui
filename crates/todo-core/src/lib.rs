@@ -32,8 +32,9 @@ pub use item::{
     LinkState, OverlayFields, PersonRef, Priority, RemoteLink, StalenessSignals, Waiting,
 };
 pub use mutation::{
-    Actor, Applied, ApplyCtx, FieldChange, FieldRestore, FieldUpdate, Mutation, MutationError,
-    MutationOp, Pushes, RestoreSkip, RestoreUnit, SkipReason, apply, is_core, pushed, write_field,
+    Actor, Applied, ApplyCtx, FieldChange, FieldRestore, FieldUpdate, Local, Mutation,
+    MutationError, MutationOp, Pushes, RestoreSkip, RestoreUnit, SkipReason, apply, is_core,
+    pushed, write_field,
 };
 pub use query::{MAX_QUERY_BYTES, ParsedQuery, Query, QueryError, parse_query, print_query};
 pub use recurrence::{

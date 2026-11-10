@@ -47,6 +47,10 @@ message InstanceConfig {
   // Edits of the pushed fields reach the tracker (ADR-0007); false keeps
   // the instance read-only.
   bool push = 7;
+  // Core fields kept local on this instance's linked Items, by path
+  // ("due_date"): the person sets them, they never reach the tracker, and a
+  // pull leaves them alone.
+  repeated string local_fields = 8;
 }
 
 message ScopeConfig {

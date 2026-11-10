@@ -1136,6 +1136,7 @@ credential = "keychain:todo-tui/work-jira"   # or env:NAME, file:PATH (0600)
 promote_default = { project = "PLAT", issue_type = "Task" }
 subtask_issue_type = "Sub-task"
 # push = true                # false: read-only (ADR-0007)
+# local_fields = ["due_date"]  # kept local: never pushed, never overwritten by a pull
 # done_resolution = "Done"   # what x closes with; cancel_resolution = "Won't Do" for X
 # transitions = { todo = "Open", in_progress = "In Progress" }   # by target status; else the first Jira offers
 # priority_map = { highest = "Blocker", high = "Critical" }   # overrides only

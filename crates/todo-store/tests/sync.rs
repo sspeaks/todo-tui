@@ -2227,3 +2227,116 @@ async fn a_stale_refusal_stops_counting_and_undo_of_an_apply_counts_it_again() {
             .has_push_failure
     );
 }
+
+#[tokio::test]
+async fn a_local_due_date_is_the_persons_never_pushed_and_kept_over_pulls() {
+    let (_dir, store) = open();
+    store.set_local("work-jira", &[ItemField::DueDate]);
+    // Jira has a due date: an import does not take it.
+    let mut dated = issue(1, "one");
+    dated.due_date = Some(date(2026, 1, 1));
+    let mut theirs = issue(2, "two");
+    theirs.is_mine = false;
+    store
+        .apply_pull(page(vec![dated.clone(), theirs], None))
+        .await
+        .unwrap();
+    let item = by_key(&store, "PLAT-1").await;
+    assert_eq!(item.core.due_date, None);
+    let due = |d| user_edit(item.id, ItemField::DueDate, FieldValue::Date(d));
+    // Pushes off (the kill switch): still the person's to set.
+    store.mutate(due(date(2026, 11, 20))).await.unwrap();
+    // Pushes on: taken, and nothing queued for Jira.
+    store.set_pushes(Some("work-jira"));
+    store.mutate(due(date(2026, 11, 21))).await.unwrap();
+    let got = store.get_item(item.id, TODAY).await.unwrap().item;
+    assert_eq!(got.core.due_date, Some(date(2026, 11, 21)));
+    assert!(got.derived.pending_fields.is_empty());
+    assert!(outbox(&store, item.id).await.is_empty());
+    // A pull, Jira's due date changed or not, leaves it alone.
+    let mut later = titled(1, "one", 300);
+    later.due_date = Some(date(2026, 2, 2));
+    store.apply_pull(page(vec![later], None)).await.unwrap();
+    let got = store.get_item(item.id, TODAY).await.unwrap().item;
+    assert_eq!(got.core.due_date, Some(date(2026, 11, 21)));
+    assert!(!got.derived.has_conflict);
+    // Undo restores the earlier one, still nothing queued.
+    store.undo(undo_input()).await.unwrap();
+    let got = store.get_item(item.id, TODAY).await.unwrap().item;
+    assert_eq!(got.core.due_date, Some(date(2026, 11, 20)));
+    assert!(outbox(&store, item.id).await.is_empty());
+    // Someone else's issue: no question, Jira is not touched.
+    let two = by_key(&store, "PLAT-2").await;
+    store
+        .mutate(user_edit(
+            two.id,
+            ItemField::DueDate,
+            FieldValue::Date(date(2026, 12, 1)),
+        ))
+        .await
+        .unwrap();
+    // The title still pushes, and still asks for someone else's issue.
+    store
+        .mutate(user_edit(
+            item.id,
+            ItemField::Title,
+            FieldValue::String("renamed".into()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(outbox(&store, item.id).await.len(), 1);
+    let err = store
+        .mutate(user_edit(
+            two.id,
+            ItemField::Title,
+            FieldValue::String("x".into()),
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StoreError::Mutation {
+                error: MutationError::NotMine(ItemField::Title),
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    // Another instance's Items: Jira's, as before.
+    store.set_local("other-jira", &[ItemField::DueDate]);
+    let err = store.mutate(due(date(2026, 11, 22))).await;
+    assert!(
+        err.is_ok(),
+        "pushes still on for work-jira: the due date pushes"
+    );
+    let dated = |rows: Vec<(u32, String, String, String)>| {
+        rows.into_iter()
+            .filter(|r| r.0 == ItemField::DueDate.number())
+            .map(|r| r.1)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(dated(outbox(&store, item.id).await), ["pending"]);
+    // Kept local once more: the row queued meanwhile is not sent, the title is.
+    store.set_local("work-jira", &[ItemField::DueDate]);
+    let sent = send(&store, item.id).await;
+    assert_eq!(
+        sent.iter().map(|w| w.field).collect::<Vec<_>>(),
+        [ItemField::Title]
+    );
+    assert_eq!(dated(outbox(&store, item.id).await), ["cancelled"]);
+}
+
+#[tokio::test]
+async fn a_local_due_date_left_empty_stays_empty_over_pulls() {
+    let (_dir, store) = open();
+    store.set_local("work-jira", &[ItemField::DueDate]);
+    store
+        .apply_pull(page(vec![issue(1, "one")], None))
+        .await
+        .unwrap();
+    let mut dated = titled(1, "one", 300);
+    dated.due_date = Some(date(2026, 2, 2));
+    store.apply_pull(page(vec![dated], None)).await.unwrap();
+    assert_eq!(by_key(&store, "PLAT-1").await.core.due_date, None);
+}

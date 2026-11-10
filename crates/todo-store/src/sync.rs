@@ -55,12 +55,14 @@ pub(crate) fn linked(conn: &Connection, instance: &str, remote_id: &str) -> Resu
 
 pub(crate) fn apply_page_tx(tx: &mut WriteTx<'_>, page: PullPage) -> Result<PullOutcome> {
     let pushes = tx.pushes();
+    let local = tx.local();
     let conn = tx.conn();
     let ctx = ApplyCtx {
         now: page.now,
         actor: Actor::Sync,
         pushes: todo_core::Pushes::None,
         confirm_not_mine: false,
+        local: todo_core::Local::default(),
     };
     let mut batch = Batch::default();
     let mut out = PullOutcome::default();
@@ -91,7 +93,12 @@ pub(crate) fn apply_page_tx(tx: &mut WriteTx<'_>, page: PullPage) -> Result<Pull
         match linked(conn, &page.instance_id, &issue.remote_id)? {
             None if created.contains(&id) => {}
             None => {
-                let item = import(id, issue, parent, scopes, page.now);
+                let mut item = import(id, issue, parent, scopes, page.now);
+                // A field the instance keeps local starts empty: Jira's is
+                // not the person's.
+                for f in local.fields_of(&page.instance_id) {
+                    let _ = todo_core::write_field(&mut item, f, &todo_core::FieldValue::Cleared);
+                }
                 created.push(id);
                 out.imported.push(item.id);
                 batch.create(item, page.now);
@@ -121,7 +128,8 @@ pub(crate) fn apply_page_tx(tx: &mut WriteTx<'_>, page: PullPage) -> Result<Pull
                 };
                 // Waiting pushes first (design 5.6): the issue as the Item
                 // takes it, Jira's or, where a push still waits, the local.
-                let settled = crate::outbox::settle_pull(conn, &current, issue, pushes, page.now)?;
+                let settled =
+                    crate::outbox::settle_pull(conn, &current, issue, pushes, local, page.now)?;
                 suggested.extend(settled.suggested);
                 let (mut next, changes) =
                     update(&current, &settled.issue, parent, &scopes, page.now);
@@ -217,12 +225,14 @@ pub struct ReconcileOutcome {
 
 pub(crate) fn reconcile_tx(tx: &mut WriteTx<'_>, input: Reconcile) -> Result<ReconcileOutcome> {
     let pushes = tx.pushes();
+    let local = tx.local();
     let conn = tx.conn();
     let ctx = ApplyCtx {
         now: input.now,
         actor: Actor::Sync,
         pushes: todo_core::Pushes::None,
         confirm_not_mine: false,
+        local: todo_core::Local::default(),
     };
     let mut batch = Batch::default();
     let mut out = ReconcileOutcome::default();
@@ -239,7 +249,8 @@ pub(crate) fn reconcile_tx(tx: &mut WriteTx<'_>, input: Reconcile) -> Result<Rec
             // out of every scope.
             Some(issue) => {
                 let parent = live_parent(conn, &input.instance_id, issue, &HashMap::new())?;
-                let settled = crate::outbox::settle_pull(conn, &current, issue, pushes, input.now)?;
+                let settled =
+                    crate::outbox::settle_pull(conn, &current, issue, pushes, local, input.now)?;
                 suggested.extend(settled.suggested);
                 let (mut next, changes) = update(&current, &settled.issue, parent, &[], input.now);
                 next.derived.pending_fields = crate::outbox::pending_fields(conn, *id)?;

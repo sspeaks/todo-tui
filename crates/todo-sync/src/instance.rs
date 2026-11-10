@@ -71,6 +71,11 @@ pub struct Instance {
     pub cancelled_resolutions: Vec<String>,
     /// How edits reach the tracker (ADR-0007).
     pub push: Push,
+    /// Core fields kept local on this instance's linked Items
+    /// (`local_fields`): the person sets them, they never push, and a pull
+    /// leaves them alone. For a field the tracker's screens lack (BRME has
+    /// no due date, so every due date push is refused).
+    pub local_fields: Vec<todo_core::ItemField>,
 }
 
 /// An instance's push settings (ADR-0007).

@@ -31,6 +31,7 @@ pub(crate) fn enqueue(
     events: &[NewEvent],
     item: impl Fn(todo_core::ItemId) -> Option<Item>,
     create: todo_core::Pushes,
+    local: todo_core::Local,
     at: Timestamp,
 ) -> Result<Vec<todo_core::ItemId>> {
     let now = ts_to_sql(at)?;
@@ -46,6 +47,10 @@ pub(crate) fn enqueue(
         let Some(link) = &item.remote_link else {
             continue;
         };
+        // Kept local (`local_fields`): never sent.
+        if local.has(&item, change.field) {
+            continue;
+        }
         let id = item_id.to_string();
         let field = change.field.number();
         let waiting: Option<(String, String, Option<String>)> = conn
@@ -205,15 +210,22 @@ pub(crate) fn waiting(conn: &Connection, item: todo_core::ItemId) -> Result<Vec<
 /// The rows the worker is about to send, each with the value it sends
 /// (`new`, or what Jira will read it back as: a priority Jira has no name
 /// of its own for). A row edited since it was read is left out: its new
-/// value goes on the next try. Returns the ids now in flight.
+/// value goes on the next try, and one of a field the instance has kept
+/// local since it was queued (`local_fields`) is cancelled. Returns the ids
+/// now in flight.
 pub(crate) fn begin(
     conn: &Connection,
     rows: &[(Waiting, FieldValue)],
+    local: todo_core::Local,
     at: Timestamp,
 ) -> Result<Vec<String>> {
     let now = ts_to_sql(at)?;
     let mut begun = Vec::new();
     for (w, send) in rows {
+        if local.on(&w.instance_id, w.field) {
+            settle(conn, &w.id, "cancelled", at)?;
+            continue;
+        }
         let send = codec::value_to_sql(send)?;
         let n = conn
             .prepare_cached(
@@ -553,6 +565,7 @@ pub(crate) fn settle_pull(
     item: &Item,
     issue: &todo_core::remote::RemoteIssue,
     pushes: todo_core::Pushes,
+    local: todo_core::Local,
     at: Timestamp,
 ) -> Result<Settled> {
     use todo_core::remote::RemoteIssue;
@@ -560,9 +573,19 @@ pub(crate) fn settle_pull(
         issue: issue.clone(),
         suggested: Vec::new(),
     };
+    // A field the instance keeps local is the Item's, whatever Jira has; a
+    // row of one queued before it was kept local is the worker's to cancel.
+    for f in todo_core::mutation::LOCALIZABLE {
+        if local.has(item, f)
+            && let Some(v) = FieldValue::of(item, f)
+        {
+            put(&mut out.issue, f, &v);
+        }
+    }
     let rows: Vec<Waiting> = waiting(conn, item.id)?
         .into_iter()
         .filter(|w| pushes == todo_core::Pushes::instance(&w.instance_id))
+        .filter(|w| !local.on(&w.instance_id, w.field))
         .collect();
     if rows.is_empty() {
         return Ok(out);

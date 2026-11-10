@@ -157,6 +157,60 @@ pub struct ApplyCtx {
     /// The person confirmed changing, in the tracker, an Item assigned to
     /// someone else (design 5.9); without it such an edit is refused.
     pub confirm_not_mine: bool,
+    /// The fields an instance keeps local on its linked Items
+    /// (`local_fields`): a person edits them, pushes or not, and they never
+    /// reach the tracker.
+    pub local: Local,
+}
+
+/// The Core fields an instance keeps local (config `local_fields`): a
+/// tracker without them on its screens (BRME has no due date) would refuse
+/// every push. Copy, as [`Pushes`] is: the instance id's hash and a set of
+/// top-level field numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Local {
+    instance: u64,
+    fields: u64,
+}
+
+/// The fields `local_fields` may name: one with no other field tied to it,
+/// so a push of the rest never needs it.
+pub const LOCALIZABLE: [ItemField; 1] = [ItemField::DueDate];
+
+impl Local {
+    /// `fields` of the instance `id` are local.
+    pub fn instance(id: &str, fields: &[ItemField]) -> Self {
+        Local {
+            instance: instance_hash(id),
+            fields: fields
+                .iter()
+                .filter(|f| LOCALIZABLE.contains(f))
+                .fold(0, |set, f| set | 1 << f.number()),
+        }
+    }
+
+    /// Whether `field` is local on `item`: it is linked to the instance,
+    /// and the instance keeps `field` local.
+    pub fn has(&self, item: &Item, field: ItemField) -> bool {
+        item.remote_link
+            .as_ref()
+            .is_some_and(|l| self.on(&l.instance_id, field))
+    }
+
+    /// Whether `field` is local on the instance `id`'s Items.
+    pub fn on(&self, id: &str, field: ItemField) -> bool {
+        field.number() < 64
+            && self.fields & (1 << field.number()) != 0
+            && instance_hash(id) == self.instance
+    }
+
+    /// The local fields, if the instance `id` is this one's.
+    pub fn fields_of(&self, id: &str) -> Vec<ItemField> {
+        LOCALIZABLE
+            .into_iter()
+            .filter(|&f| self.on(id, f))
+            .collect()
+    }
 }
 
 /// Which instance pushes (ADR-0007), as the store knows it: one syncs
@@ -358,21 +412,24 @@ pub fn apply(item: &Item, op: &MutationOp, ctx: &ApplyCtx) -> Result<Applied, Mu
     // On a linked Item a person changes Overlay fields, and the pushed
     // ones while its instance pushes and its link is whole (ADR-0006,
     // ADR-0007). Sync writes Core; undo restores what it recorded.
+    // A field the instance keeps local is the person's alone.
+    let local = |f: ItemField| ctx.local.has(item, f);
     if item.is_linked()
         && matches!(ctx.actor, Actor::User | Actor::Suggestion(_))
-        && let Some(c) = changes
-            .iter()
-            .find(|c| is_core(c.field) && !(pushed(c.field) && pushes(item, ctx)))
+        && let Some(c) = changes.iter().find(|c| {
+            is_core(c.field) && !local(c.field) && !(pushed(c.field) && pushes(item, ctx))
+        })
     {
         return Err(MutationError::LinkedReadOnly(c.field));
     }
     // Not theirs (design 5.9): a pushed edit of someone else's issue needs
-    // the person's say-so, as it changes the ticket the assignee sees.
+    // the person's say-so, as it changes the ticket the assignee sees. A
+    // local field does not change it.
     if item.is_linked()
         && !item.derived.is_mine
         && !ctx.confirm_not_mine
         && matches!(ctx.actor, Actor::User | Actor::Suggestion(_))
-        && let Some(c) = changes.iter().find(|c| is_core(c.field))
+        && let Some(c) = changes.iter().find(|c| is_core(c.field) && !local(c.field))
     {
         return Err(MutationError::NotMine(c.field));
     }
@@ -952,6 +1009,7 @@ mod tests {
             actor,
             pushes: Pushes::None,
             confirm_not_mine: false,
+            local: Local::default(),
         }
     }
 
@@ -1406,6 +1464,7 @@ mod tests {
                     actor: Actor::Sync,
                     pushes: Pushes::None,
                     confirm_not_mine: false,
+                    local: Local::default(),
                 };
                 apply(
                     item,
@@ -2222,6 +2281,7 @@ mod tests {
                 actor: Actor::User,
                 pushes: Pushes::None,
                 confirm_not_mine: false,
+                local: Local::default(),
             },
         )
         .unwrap();
@@ -2886,6 +2946,7 @@ mod linked_tests {
             actor: Actor::User,
             pushes: Pushes::None,
             confirm_not_mine: false,
+            local: Local::default(),
         }
     }
 
