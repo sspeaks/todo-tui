@@ -896,6 +896,162 @@ async fn a_rate_limit_stops_the_batch_and_the_retry_comes_when_due() {
         assert!(tokio::time::Instant::now() < deadline, "never retried");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    settled(&r, SyncState::Ok).await;
+    // And the hold is over: the loop waits for its poll (a minute), not a
+    // pass a second.
+    let passes = || {
+        fake.seen()
+            .iter()
+            .filter(|s| s.target.starts_with("/rest/api/2/myself"))
+            .count()
+    };
+    let before = passes();
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(
+        passes() - before <= 1,
+        "{} passes in 4 s",
+        passes() - before
+    );
+    r.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reload_to_push_false_takes_effect_at_once() {
+    let fake = FakeJira::start("pat").await;
+    let issues = Arc::new(Mutex::new(vec![issue_json(1, "one", "new", &at(1))]));
+    serve_writable(&fake, issues.clone());
+    let r = start(&fake, "pat").await;
+    settled(&r, SyncState::Ok).await;
+    let id = linked(&r).await[0].id.clone();
+    let mut client = ItemServiceClient::new(r.channel().await);
+    // Hold the next pass in its pull (at most 5 s), so the reload lands
+    // mid-pass.
+    let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let held = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let (gate, held) = (gate.clone(), held.clone());
+        fake.route("/rest/api/2/myself", move |_| {
+            held.store(true, std::sync::atomic::Ordering::SeqCst);
+            let until = std::time::Instant::now() + Duration::from_secs(5);
+            while !gate.load(std::sync::atomic::Ordering::SeqCst) && std::time::Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            (200, json!({"key": "JIRAUSER10100", "name": "dana", "displayName": "Dana Example", "timeZone": "UTC"}), vec![])
+        });
+    }
+    client
+        .update_item(edit_title(&id, "pushed?"))
+        .await
+        .unwrap();
+    // The edit wakes a pass, which is held at /myself.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !held.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(tokio::time::Instant::now() < deadline, "no pass began");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The pass is under way; push = false, and reload.
+    let config = std::fs::read_to_string(&r.paths.config).unwrap();
+    std::fs::write(&r.paths.config, format!("{config}push = false\n")).unwrap();
+    todo_proto::v1::system_service_client::SystemServiceClient::new(r.channel().await)
+        .reload_config(todo_proto::v1::ReloadConfigRequest {})
+        .await
+        .unwrap();
+    // At once: a new edit of a pushed field is refused as read-only…
+    let err = client
+        .update_item(edit_title(&id, "again"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.get_details_error_info().unwrap().reason,
+        "LINKED_READ_ONLY"
+    );
+    // …and the pass under way sends nothing once it gets there: its
+    // read-back of the issue would follow a push, so wait for the pass to
+    // end (a search after the gate), then a little.
+    gate.store(true, std::sync::atomic::Ordering::SeqCst);
+    let before = fake.seen().len();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !fake.seen()[before..]
+        .iter()
+        .any(|s| s.target.contains("/search"))
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the pass never pulled"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    settled(&r, SyncState::Ok).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !fake.seen().iter().any(|s| s.method == "PUT"),
+        "a PUT after push = false"
+    );
+    r.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn offline_backs_off_even_with_a_push_waiting() {
+    let fake = FakeJira::start("pat").await;
+    let issues = Arc::new(Mutex::new(vec![issue_json(1, "one", "new", &at(1))]));
+    serve_writable(&fake, issues.clone());
+    let r = start(&fake, "pat").await;
+    settled(&r, SyncState::Ok).await;
+    // The push meets a 429 (wait 1 s), and from then on Jira is down (a 503
+    // at the first call of a pass): the retry falls due while every pass
+    // fails before it pushes.
+    let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let (issues, down) = (issues.clone(), down.clone());
+        fake.route("/rest/api/2/issue/*", move |seen| {
+            if seen.method == "PUT" {
+                down.store(true, std::sync::atomic::Ordering::SeqCst);
+                return (
+                    429,
+                    json!({"errorMessages": ["slow down"]}),
+                    vec![("Retry-After".into(), "1".into())],
+                );
+            }
+            (200, issues.lock().unwrap()[0].clone(), vec![])
+        });
+    }
+    {
+        let down = down.clone();
+        fake.route("/rest/api/2/myself", move |_| {
+            if down.load(std::sync::atomic::Ordering::SeqCst) {
+                return (503, json!({"errorMessages": ["down"]}), vec![]);
+            }
+            (200, json!({"key": "JIRAUSER10100", "name": "dana", "displayName": "Dana Example", "timeZone": "UTC"}), vec![])
+        });
+    }
+    let mut client = ItemServiceClient::new(r.channel().await);
+    let item = linked(&r).await.remove(0);
+    client
+        .update_item(edit_title(&item.id, "later"))
+        .await
+        .unwrap();
+    // The 429's second over, a pass meets the 503.
+    let myself_503 = || {
+        fake.seen()
+            .iter()
+            .filter(|s| s.target.starts_with("/rest/api/2/myself"))
+            .count()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !down.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(tokio::time::Instant::now() < deadline, "never pushed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let first = myself_503();
+    while myself_503() == first {
+        assert!(tokio::time::Instant::now() < deadline, "never retried");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Offline now waits 30 s: in 5 s no further pass, not one a second.
+    let before = myself_503();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let passes = myself_503() - before;
+    assert!(passes <= 1, "{passes} passes in 5 s");
     r.stop().await;
 }
 

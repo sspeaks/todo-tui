@@ -214,6 +214,9 @@ impl Daemon {
         if let Err(e) = store.record_config_change().await {
             tracing::warn!(error = %e, "recording the config read at start failed");
         }
+        // Before any call is served, so the first edit meets the guard the
+        // config asks for, not the read-only default.
+        crate::config::apply_to_store(&config.current(), &store);
         spool::import_logged(&paths, &store).await;
         let backoff = Backoff {
             first: options.restart_after,

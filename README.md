@@ -25,8 +25,10 @@ on items (`%low`, `e`), `h` / `l` between views, the L48 / N48 scrum report
 (`todo l48`, `:l48`), and Teams meeting links (`M`); see
 [Your scrum report: L48 / N48](#your-scrum-report-l48--n48) and
 [Meetings](#meetings). The first P2 milestone is done: read-only sync from
-Jira Data Center (`todo sync check|now|status`, `⇅` in the status bar, `o`);
-see [Jira sync (read-only)](#jira-sync-read-only). A phone app (Expo) can
+Jira Data Center (`todo sync check|now|status`, `⇅` in the status bar, `o`).
+The second (M10) pushes edits back: the title, priority, labels, due date
+and status, with what Jira refuses or overwrites kept in a Suggestions pane
+(`S`); see [Jira sync](#jira-sync). A phone app (Expo) can
 capture, browse the views and complete items over Tailscale; see
 [Phone app](#phone-app). The CLI captures, undoes and counts;
 listing, editing and completing items happen in the TUI or through Claude Code.
@@ -345,7 +347,8 @@ key hints) and a message line for prompts and results.
 | `z` | Archive / unarchive |
 | `dd` | Delete, with its subtasks (asks first: `y` deletes) |
 | `M` | Schedule a Teams meeting about it ([Meetings](#meetings)) |
-| `o` | Open its Jira issue in the browser ([Jira sync](#jira-sync-read-only)) |
+| `o` | Open its Jira issue in the browser ([Jira sync](#jira-sync)) |
+| `S`, `:suggestions` | The Suggestions pane: Jira's fallout to review ([Jira sync](#jira-sync)) |
 | **Marks and bulk** | |
 | `m` | Mark or unmark the item, and move down |
 | `V` | Mark the rows you move over; `V` or `esc` ends it |
@@ -356,7 +359,7 @@ key hints) and a message line for prompts and results.
 | **Undo** | |
 | `u`, `ctrl-r` | Undo, redo: the same history as `todo undo` |
 | **Commands** | |
-| `:` | Command line: `:q`, `:help`, `:search <words>`, `:refresh`, `:view …` ([Views](#views-of-your-own)), `:config`, `:export [path]`, `:l48 [since]`, `:meet`, `:sync [status]`; `tab` completes |
+| `:` | Command line: `:q`, `:help`, `:search <words>`, `:refresh`, `:view …` ([Views](#views-of-your-own)), `:config`, `:export [path]`, `:l48 [since]`, `:meet`, `:sync [status\|outbox]`, `:suggestions`; `tab` completes |
 | `gs` | Sync with Jira now |
 | `?`, F1, `:help` | Help: every key, the capture syntax and the dates |
 | `ctrl-z` | Suspend to the shell; `fg` comes back |
@@ -563,15 +566,17 @@ that is an email address (`~dana@example.com`). With marks it is one meeting abo
 all of them. On macOS it opens the Teams app (`msteams:`), else the browser. You
 pick the time and send it in Teams; todo-tui creates nothing and needs no login. `[meetings] provider = "none"` turns it off.
 
-### Jira sync (read-only)
+### Jira sync
 
 Your assigned Jira Data Center issues can live next to your todos: they are
 imported as items, with their key, status and link, and kept fresh (every
-minute while the TUI is open, every ten otherwise). This first version only
-**reads** Jira; nothing you do here changes an issue.
+minute while the TUI is open, every ten otherwise). Some edits go back to
+Jira: the title, priority, labels, due date and status. Everything else
+about the issue stays Jira's, and what is yours stays here.
 
 1. Make a Personal Access Token in Jira: your avatar → Profile → Personal
-   Access Tokens → Create token (read is all it needs).
+   Access Tokens → Create token. It acts as you, so what it pushes is your
+   edit in Jira's history.
 2. Keep it in the macOS keychain (it prompts for the token):
 
    ```sh
@@ -588,9 +593,14 @@ minute while the TUI is open, every ten otherwise). This first version only
    credential = "keychain:todo-tui/work-jira"   # service/account; or env:NAME, or file:PATH (mode 0600)
    # The default scope: your open issues.
    scopes = [{ name = "mine", query = "assignee = currentUser() AND resolution = Unresolved" }]
+   # push = false                 # read-only: nothing here changes Jira
+   # local_fields = ["due_date"]  # due dates stay here: for a Jira that refuses them
+   # done_resolution = "Done"     # what x closes with; cancel_resolution = "Won't Do" for X
+   # transitions = { todo = "Open", in_progress = "In Progress" }   # else the first Jira offers
    ```
 
-   `todo config reload` (or a SIGHUP) picks it up.
+   `todo config reload` (or a SIGHUP) picks it up. Pushes are on by default;
+   set `push = false` first if you want to try it read-only.
 4. `todo sync check` asks Jira who the token is, without the daemon:
    `work-jira: ok as Dana Example (JIRAUSER10100), time zone America/Los_Angeles`.
 5. `todo sync now` pulls and waits for it; `todo sync status` says how it
@@ -603,15 +613,44 @@ how it stands. To Do and In Progress issues land in Next; a resolution of
 Won't Do, Duplicate and the like (`cancelled_resolutions`) makes one
 cancelled, any other done.
 
-Read-only means Jira owns the title, description, status, priority,
-labels, due date and the other Jira fields: the TUI refuses to change them
-("PLAT-1 is a Jira issue: edits reach Jira when pushes arrive"), and a
-bulk edit leaves those items out. What is yours still works on them:
-waiting, defer, notes, the local priority override, energy, archive,
-delete, and inbox / next / someday while Jira has the issue in To Do. An
-issue that leaves your scopes is archived on its own, one deleted in Jira
-(or that you lost access to) is marked unavailable, and deleting an item
-here only hides it. Pushing edits to Jira comes in a later milestone.
+**What reaches Jira.** On a Jira item, `i` (title), `p` (priority), `t`
+(labels), `^` (due date) and the status keys change the issue too, within
+seconds while Jira answers:
+
+- `x` closes it with resolution Done, `X` with Won't Do, `s p` starts it,
+  and `s i` / `s n` / `s s` from in progress or done move it back to To Do.
+  Between inbox, next and someday the move is only here.
+- Undo pushes the old value back.
+- An issue assigned to someone else asks first ("PLAT-4 is assigned to
+  Alex: change it in Jira? y/N").
+- Offline, or before Jira answers, the change waits: the row shows `↑`, the
+  status bar `⇅ work-jira ↑2`, and it goes once Jira is back.
+
+**Jira's alone**: the description, assignee, components, fix versions,
+parent, story points and estimates. The TUI refuses them ("PLAT-1: the
+description is Jira's: change it there (o opens it)"), and a bulk edit
+leaves those items out. **Yours alone**, never sent: waiting, defer, notes,
+the local priority override, energy, archive and delete. Deleting an item
+here only hides it, and drops its changes still waiting; the issue stays
+open in Jira. An issue that leaves your scopes is archived on its own, and
+one deleted in Jira (or that you lost access to) is marked unavailable.
+
+**When Jira wins.** If someone changes a field in Jira while your edit of it
+waits, Jira's value stands and yours is kept as a Suggestion. If Jira
+refuses a change (a workflow that cannot close from there, a field it will
+not take), Jira's value stands too, the row shows `!` and the status bar
+`!1`. `S` (or `:suggestions`) opens the Suggestions pane: `j`/`k`, `enter`
+ticks a change (a heading: all of it), `ctrl-s` applies what is ticked,
+which pushes it again, and `r` lets it go. The status bar shows `✦ 1` while
+one waits. `:sync outbox` and `todo sync outbox` list what waits and what
+was refused; `todo sync status` adds `2 to push, 1 refused` and exits
+non-zero while something is refused.
+
+**Turning it off.** `push = false` on the instance makes it read-only again:
+nothing more is sent, the title and the rest are refused as Jira's, and
+what was waiting goes once pushes are back on. `local_fields = ["due_date"]`
+keeps due dates here, for a Jira whose screens have no due date: setting
+one never touches Jira and sync never overwrites it.
 
 ### Backups and export
 
@@ -641,8 +680,9 @@ claude mcp add --scope user todo -- todo mcp
 | `todo_get`, `todo_status`, `todo_views` | One item in full; the counts; the views |
 | `todo_l48` | The L48 / N48 report, as `todo l48` prints it |
 | `todo_meeting_link` | A Teams new-meeting link for items, prefilled as `M` fills it |
+| `todo_suggestions` | What Jira sync left to review (conflicts, refusals); applying one is yours, in the TUI's `S` |
 | `todo_capture` | A capture, as `todo add` takes it (tokens and all) |
-| `todo_update` | Title, description, priority, local priority, energy, due, defer, labels, waiting, private notes |
+| `todo_update` | Title, description, priority, local priority, energy, due, defer, labels, waiting, private notes; on a Jira item the title, priority, labels and due date reach Jira |
 | `todo_set_status` | `inbox`, `next`, `someday`, `in_progress`, `done`, `cancelled`; completing a repeating item returns the next one |
 | `todo_set_repeat` | Sets or clears the repeat rule |
 | `todo_archive`, `todo_unarchive`, `todo_delete`, `todo_undelete` | As named |
@@ -651,13 +691,13 @@ claude mcp add --scope user todo -- todo mcp
 Tools take the full id or the 8-character short id `todo add` prints. Their captures
 are `created_via = mcp`, and every change is yours, so `todo undo` or `u` undoes it.
 `todo mcp --read-only` offers only the tools that change nothing: `todo_list`,
-`todo_get`, `todo_status`, `todo_views`, `todo_l48` and `todo_meeting_link`. Like the TUI, it runs a bundle with Node (`share/todo-tui/mcp.js`, or
+`todo_get`, `todo_status`, `todo_views`, `todo_l48`, `todo_meeting_link` and `todo_suggestions`. Like the TUI, it runs a bundle with Node (`share/todo-tui/mcp.js`, or
 `mcp/dist/mcp.js` in a checkout; `TODO_MCP_ENTRY` overrides it) and starts the daemon
 if needed.
 
 [`claude/skills/todo/`](claude/skills/todo/SKILL.md) is a Claude Code skill that
-teaches Claude the capture syntax, the views, recurrence and, for later, Jira-linked
-items. To use it everywhere: `ln -s ~/todo-tui/claude/skills/todo ~/.claude/skills/todo`.
+teaches Claude the capture syntax, the views, recurrence and Jira-linked items: what
+an edit pushes, and to ask before closing or renaming a ticket as a side effect. To use it everywhere: `ln -s ~/todo-tui/claude/skills/todo ~/.claude/skills/todo`.
 
 ### Phone app
 

@@ -477,8 +477,10 @@ pub(crate) fn import_tx(
     let _ = conn;
     tx.skip_to(revision);
     // The config change: harmless to every client, which reads the config
-    // again, and the one row a replay finds.
+    // again, and the one row a replay finds. The daemon recounts the outbox
+    // on it too, and an imported queue wakes the worker.
     tx.record_change(Topic::Config, crate::CONFIG_ID, false, None)?;
+    tx.queued = true;
     Ok(ImportOutput {
         items,
         records,

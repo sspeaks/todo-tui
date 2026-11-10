@@ -75,7 +75,9 @@ month), Overcome by Events 287 (190 of them in one two-week clean-up), Incomplet
   a retry after a lost answer reads first, and finds it done.
 - **`push = false`** on an instance keeps M9's read-only behaviour, a switch for a
   Jira one should not write to. What waits stays queued, and pulls show Jira's values
-  meanwhile; it goes once pushes are on again (or an undo or delete cancels it).
+  meanwhile; it goes once pushes are on again (or an undo or delete cancels it). An
+  undo or redo made meanwhile queues its value too, rather than drift from Jira
+  silently. A reload applies the switch at once, mid-pass.
 - **`local_fields = ["due_date"]`** on an instance makes its due date the person's:
   an edit is taken with pushes on or off, queues nothing and asks nothing for someone
   else's issue, and pulls neither import nor overwrite it. It is for a Jira whose

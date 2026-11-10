@@ -137,18 +137,29 @@ fn outbox_lines(entries: &[v1::OutboxEntry], now: Timestamp) -> Vec<(String, boo
             .as_ref()
             .and_then(|v| todo_proto::convert::field_value_from_proto("new", v).ok())
     };
+    // Waiting, sent or not: one group, as the store counts a status (its two
+    // rows can be apart while one is on its way). A refusal is its own.
+    let waits = |s: i32| {
+        matches!(
+            v1::OutboxState::try_from(s),
+            Ok(v1::OutboxState::Pending | v1::OutboxState::InFlight)
+        )
+    };
+    let together = |a: &v1::OutboxEntry, b: &v1::OutboxEntry| {
+        a.item_id == b.item_id && (a.state == b.state || (waits(a.state) && waits(b.state)))
+    };
     // The resolution kind waiting beside `e`'s category, if any.
     let kind_beside = |e: &v1::OutboxEntry| {
-        entries.iter().find(|o| {
-            o.item_id == e.item_id && o.state == e.state && field(o) == Some(F::ResolutionKind)
-        })
+        entries
+            .iter()
+            .find(|o| together(o, e) && field(o) == Some(F::ResolutionKind))
     };
     let mut out = Vec::new();
     for e in entries {
         // A status is one change: the category's line, its kind joined in.
-        let category = entries.iter().any(|o| {
-            o.item_id == e.item_id && o.state == e.state && field(o) == Some(F::StatusCategory)
-        });
+        let category = entries
+            .iter()
+            .any(|o| together(o, e) && field(o) == Some(F::StatusCategory));
         if field(e) == Some(F::ResolutionKind) && category {
             continue;
         }
@@ -182,7 +193,15 @@ fn outbox_lines(entries: &[v1::OutboxEntry], now: Timestamp) -> Vec<(String, boo
             .as_ref()
             .and_then(|t| timestamp_from_proto("next_attempt_at", t).ok())
             .filter(|at| *at > now);
-        let (word, refused) = match v1::OutboxState::try_from(e.state) {
+        // In flight with an error or a retry: the send failed (or never
+        // went, behind one that did), and it waits as a pending row does;
+        // the next try reads Jira first in case it landed.
+        let failed = !e.last_error.is_empty() || e.next_attempt_at.is_some();
+        let state = match v1::OutboxState::try_from(e.state) {
+            Ok(v1::OutboxState::InFlight) if failed => Ok(v1::OutboxState::Pending),
+            s => s,
+        };
+        let (word, refused) = match state {
             Ok(v1::OutboxState::Pending) => match retry {
                 Some(at) => (format!("waiting, retry in {}", until(at, now)), false),
                 None => ("waiting".to_owned(), false),
@@ -475,6 +494,49 @@ mod tests {
             lines,
             [
                 ("PLAT-1  status → cancelled  refused  · Fix the login".to_owned(), true),
+                (
+                    "PLAT-1  title → \"Fix it\"  waiting, retry in 1m (rate limited)  · Fix the login"
+                        .to_owned(),
+                    false
+                ),
+            ]
+        );
+        // A status half in flight and half pending is one change, as the
+        // count has it; and an in-flight row with an error (a 429, or not
+        // sent behind one) waits, it is not "sent".
+        let lines = outbox_lines(
+            &[
+                entry(
+                    ItemField::StatusCategory,
+                    FieldValue::StatusCategory(StatusCategory::Done),
+                    v1::OutboxState::InFlight,
+                ),
+                entry(
+                    ItemField::ResolutionKind,
+                    FieldValue::ResolutionKind(ResolutionKind::Cancelled),
+                    v1::OutboxState::Pending,
+                ),
+                v1::OutboxEntry {
+                    next_attempt_at: Some(todo_proto::convert::timestamp_to_proto(
+                        Timestamp::from_second(10_090).unwrap(),
+                    )),
+                    last_error: "rate limited".into(),
+                    ..entry(
+                        ItemField::Title,
+                        FieldValue::String("Fix it".into()),
+                        v1::OutboxState::InFlight,
+                    )
+                },
+            ],
+            now,
+        );
+        assert_eq!(
+            lines,
+            [
+                (
+                    "PLAT-1  status → cancelled  sent, not read back yet  · Fix the login".to_owned(),
+                    false
+                ),
                 (
                     "PLAT-1  title → \"Fix it\"  waiting, retry in 1m (rate limited)  · Fix the login"
                         .to_owned(),

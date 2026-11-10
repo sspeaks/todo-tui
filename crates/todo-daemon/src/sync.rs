@@ -81,9 +81,10 @@ pub(crate) fn status_channel() -> (watch::Sender<BTreeMap<String, v1::SyncStatus
 /// Keeps each instance's outbox counts current (design 5.11), the only
 /// writer of them: after every committed change of an Item or a
 /// Suggestion, so an edit made offline shows as waiting at once and a
-/// reject takes a failure off, whatever the pull is doing; and when the
-/// loop adds an instance's status (`recount`). Counts that did not change
-/// send nothing.
+/// reject takes a failure off, whatever the pull is doing; after a config
+/// change, which is what an import records when it replaces the outbox;
+/// and when the loop adds an instance's status (`recount`). Counts that
+/// did not change send nothing.
 pub(crate) async fn count_outbox(
     store: Store,
     status: watch::Sender<BTreeMap<String, v1::SyncStatus>>,
@@ -94,7 +95,10 @@ pub(crate) async fn count_outbox(
     loop {
         tokio::select! {
             got = changes.recv() => match got {
-                Ok(row) if !matches!(row.topic, todo_core::Topic::Item | todo_core::Topic::Suggestion) => continue,
+                Ok(row) if !matches!(
+                    row.topic,
+                    todo_core::Topic::Item | todo_core::Topic::Suggestion | todo_core::Topic::Config
+                ) => continue,
                 Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             },
@@ -137,21 +141,14 @@ pub(crate) async fn run(
     let queued = store.pushes_queued();
     let mut last_reconcile: Option<Timestamp> = None;
     let mut offline_wait = Duration::from_secs(15);
+    let mut retry_wakes = true;
     loop {
-        let instance = config.borrow_and_update().instances.first().cloned();
+        let current = Arc::clone(&config.borrow_and_update());
+        let instance = current.instances.first().cloned();
         // A person may edit a linked Item's pushed fields only while its
-        // instance pushes (ADR-0007).
-        store.set_pushes(
-            instance
-                .as_ref()
-                .filter(|i| i.push.enabled)
-                .map(|i| i.id.as_str()),
-        );
-        // Pushes or not: a local field is the person's either way.
-        match &instance {
-            Some(i) => store.set_local(&i.id, &i.local_fields),
-            None => store.set_local("", &[]),
-        }
+        // instance pushes; a local field is theirs either way (ADR-0007).
+        // A reload sets these at once too, mid-pass.
+        crate::config::apply_to_store(&current, &store);
         // Only the configured instances have a status.
         state
             .tx
@@ -176,8 +173,16 @@ pub(crate) async fn run(
                 let outcome = match held {
                     // Jira asked to wait: this wake-up waits too.
                     Some(_) => Outcome::Held,
-                    None => pass(&store, i, &state, reconcile).await,
+                    None => {
+                        // Over: the next wait is the poll's again.
+                        *state.hold.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                        pass(&store, i, &state, reconcile).await
+                    }
                 };
+                // A push's retry may wake the loop sooner than the poll only
+                // after a pass that got as far as pushing: an offline, a
+                // refused token or a failing pull waits its own time.
+                retry_wakes = matches!(outcome, Outcome::Ok | Outcome::Held);
                 // Only once the pass is over: a caller waiting on its request
                 // reads served_request with the state the pass ended in.
                 state.set(&i.id, |st| st.served_request = served);
@@ -209,7 +214,9 @@ pub(crate) async fn run(
         // A push waiting on a retry wakes the loop when it is due, sooner
         // than the poll (a 429's few seconds); never sooner than a second.
         let retry = match &instance {
-            Some(i) if i.push.enabled => store.next_push_at(i.id.clone()).await.ok().flatten(),
+            Some(i) if retry_wakes && store.pushes_now(&i.id) => {
+                store.next_push_at(i.id.clone()).await.ok().flatten()
+            }
             _ => None,
         }
         .map(|at| {
@@ -222,6 +229,7 @@ pub(crate) async fn run(
             .hold
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .filter(|at| *at > Timestamp::now())
             .map(|at| {
                 Duration::try_from(at.duration_since(Timestamp::now()))
                     .unwrap_or_default()
@@ -577,7 +585,9 @@ async fn push(
     use todo_core::{FieldValue as V, ItemField as F};
     use todo_jira::{FieldPatch, PushError, Target};
     use todo_store::outbox::{PushResult, Waiting};
-    if !i.push.enabled {
+    // The store's flag, not this pass's config: a reload's push = false
+    // stops the pass between Items.
+    if !store.pushes_now(&i.id) {
         return Ok(());
     }
     let sfail = |e: todo_store::StoreError| store_fail(state, &i.id, &e);
@@ -586,6 +596,9 @@ async fn push(
         .await
         .map_err(sfail)?;
     for d in due {
+        if !store.pushes_now(&i.id) {
+            return Ok(());
+        }
         // Fresh first: the rule on what Jira has now (5.6).
         let issue = match adapter.fetch(&d.remote_id).await {
             Ok(Fetched::Found(issue)) => *issue,
@@ -598,6 +611,21 @@ async fn push(
             }
             Err(e) => return Err(fail(state, &i.id, &e)),
         };
+        // Not the issue the pull just linked (moved since, or another Jira
+        // answering under this id): nothing is sent to it this pass. A move
+        // is picked up by the next pull, and the rows go then. (A base_url
+        // changed under the same instance id is not caught here once a
+        // pull has read the other Jira's issue: that wants the links'
+        // origin recorded.)
+        if issue.key != d.key {
+            tracing::warn!(
+                instance = %i.id,
+                linked = %d.key,
+                found = %issue.key,
+                "the issue read back is not the one linked; its pushes wait"
+            );
+            continue;
+        }
         store
             .apply_pull(page(i, vec![(issue, Vec::new())], None, false))
             .await
@@ -682,7 +710,8 @@ async fn push(
             units.push((moves, target));
         }
         let mut read_back = left_out;
-        for (unit, target) in units {
+        let mut units = units.into_iter();
+        while let Some((unit, target)) = units.next() {
             if unit.is_empty() {
                 continue;
             }
@@ -695,8 +724,11 @@ async fn push(
                 Err(PushError::Jira(JiraError::Auth)) => {
                     return Err(fail(state, &i.id, &JiraError::Auth));
                 }
+                // This unit and the ones not sent behind it wait for the
+                // retry, so none reads as sent.
                 Err(PushError::Jira(e)) if e.is_transient() => {
-                    return later(store, i, state, unit, &d, e).await;
+                    let rest = unit.into_iter().chain(units.flat_map(|(u, _)| u)).collect();
+                    return later(store, i, state, rest, &d, e).await;
                 }
                 Err(e) => PushResult::Refused {
                     error: e.to_string(),

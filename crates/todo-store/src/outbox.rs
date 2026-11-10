@@ -24,13 +24,18 @@ fn kind_of(field: ItemField) -> &'static str {
 
 /// Queues the pushed changes of `events` on the linked Items in `items`
 /// (by id). Called for an op by a person: an edit, a suggestion applied,
-/// an undo or a redo (which restore Core without the guard).
+/// an undo or a redo (which restore Core without the guard). `restore`
+/// (an undo or a redo) queues a new row for any instance, pushing or not:
+/// with pushes off its value waits, and goes once they are on again, rather
+/// than leave the Item apart from Jira with nothing to say so.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn enqueue(
     conn: &Connection,
     op_id: &str,
     events: &[NewEvent],
     item: impl Fn(todo_core::ItemId) -> Option<Item>,
     create: todo_core::Pushes,
+    restore: bool,
     local: todo_core::Local,
     at: Timestamp,
 ) -> Result<Vec<todo_core::ItemId>> {
@@ -47,12 +52,23 @@ pub(crate) fn enqueue(
         let Some(link) = &item.remote_link else {
             continue;
         };
-        // Kept local (`local_fields`): never sent.
-        if local.has(&item, change.field) {
-            continue;
-        }
         let id = item_id.to_string();
         let field = change.field.number();
+        // Kept local (`local_fields`): never sent. A row queued before it
+        // was local holds a value the person has moved on from: cancelled,
+        // so it cannot come back if the field is pushed again.
+        if local.has(&item, change.field) {
+            let n = conn
+                .prepare_cached(
+                    "UPDATE outbox SET state = 'cancelled', updated_at = ?3
+                     WHERE item_id = ?1 AND field = ?2 AND state = 'pending'",
+                )?
+                .execute(params![id, field, now])?;
+            if n > 0 && !touched.contains(item_id) {
+                touched.push(*item_id);
+            }
+            continue;
+        }
         let waiting: Option<(String, String, Option<String>)> = conn
             .prepare_cached(
                 "SELECT id, base_json, sent_json FROM outbox
@@ -86,8 +102,9 @@ pub(crate) fn enqueue(
                 )?
                 .execute(params![row, new, op_id, now])?;
             }
-            // A new row only for the instance that pushes, a whole link.
-            None if create != todo_core::Pushes::instance(&link.instance_id)
+            // A new row only for the instance that pushes (or a restore),
+            // a whole link.
+            None if (!restore && create != todo_core::Pushes::instance(&link.instance_id))
                 || link.link_state != todo_core::LinkState::Ok =>
             {
                 continue;
@@ -135,13 +152,22 @@ pub(crate) fn same_value(a: &FieldValue, b: &FieldValue) -> bool {
 /// edits never reach the tracker; an undelete does not revive them. One in
 /// flight too: the pull skips a deleted Item, so it would never be read
 /// back (a send that landed shows in Jira's value after an undelete).
-pub(crate) fn cancel_item(conn: &Connection, item: todo_core::ItemId, at: Timestamp) -> Result<()> {
-    conn.prepare_cached(
-        "UPDATE outbox SET state = 'cancelled', updated_at = ?2
-         WHERE item_id = ?1 AND state IN ('pending', 'in_flight')",
-    )?
-    .execute(params![item.to_string(), ts_to_sql(at)?])?;
-    Ok(())
+/// Returns whether any row was cancelled: the caller then clears the Item's
+/// pulled version, so once undeleted (an undo at once too, before any pull)
+/// it is read again by id and shows Jira's values, not the edits that no
+/// longer go.
+pub(crate) fn cancel_item(
+    conn: &Connection,
+    item: todo_core::ItemId,
+    at: Timestamp,
+) -> Result<bool> {
+    let n = conn
+        .prepare_cached(
+            "UPDATE outbox SET state = 'cancelled', updated_at = ?2
+             WHERE item_id = ?1 AND state IN ('pending', 'in_flight')",
+        )?
+        .execute(params![item.to_string(), ts_to_sql(at)?])?;
+    Ok(n > 0)
 }
 
 /// The pushed fields `item` has waiting, in field order: its
@@ -432,6 +458,24 @@ pub(crate) fn clear_refused(
         }
     }
     Ok(cleared)
+}
+
+/// The Item and field of the outbox row `id`, if it exists.
+pub(crate) fn row_field(
+    conn: &Connection,
+    id: &str,
+) -> Result<Option<(todo_core::ItemId, ItemField)>> {
+    let row: Option<(String, u32)> = conn
+        .prepare_cached("SELECT item_id, field FROM outbox WHERE id = ?1")?
+        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    let Some((item, field)) = row else {
+        return Ok(None);
+    };
+    let Some(field) = ItemField::from_number(field) else {
+        return Ok(None);
+    };
+    Ok(Some((codec::item_id_from_str(&item)?, field)))
 }
 
 /// Puts back the refusals `rows` an apply cleared: its undo offers the

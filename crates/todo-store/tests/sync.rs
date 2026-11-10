@@ -730,6 +730,32 @@ async fn undo_of_a_pushed_edit_queues_the_old_value_and_delete_cancels() {
             .iter()
             .all(|r| r.1 == "cancelled")
     );
+    // Undone at once, before any pull: the edit it dropped is not shown as
+    // if it stood. The Item is read again by id, and Jira's value comes back.
+    store.undo(undo_input()).await.unwrap();
+    let back = store.get_item(item.id, TODAY).await.unwrap().item;
+    assert!(!back.is_deleted());
+    assert!(back.derived.pending_fields.is_empty());
+    let tracked = store.tracked("work-jira".into()).await.unwrap();
+    assert!(
+        tracked.iter().any(|t| t.id == item.id && t.stale),
+        "{tracked:?}"
+    );
+    store
+        .apply_pull(page(
+            vec![RemoteIssue {
+                updated_at: ts(400),
+                ..issue(1, "PLAT one")
+            }],
+            None,
+        ))
+        .await
+        .unwrap();
+    let back = store.get_item(item.id, TODAY).await.unwrap().item;
+    assert_eq!(
+        back.core.priority, item.core.priority,
+        "Jira's, not the dropped High"
+    );
 }
 
 #[tokio::test]
@@ -1089,6 +1115,45 @@ async fn with_pushes_turned_off_undo_and_delete_still_settle_what_waits() {
 }
 
 #[tokio::test]
+async fn with_pushes_off_an_undo_of_a_pushed_edit_waits_for_pushes() {
+    let (_dir, store) = open();
+    store
+        .apply_pull(page(vec![issue(1, "one")], None))
+        .await
+        .unwrap();
+    let item = by_key(&store, "PLAT-1").await;
+    store.set_pushes(Some("work-jira"));
+    store
+        .mutate(user_edit(
+            item.id,
+            ItemField::Title,
+            FieldValue::String("mine".into()),
+        ))
+        .await
+        .unwrap();
+    // Jira took it: the row is done.
+    send(&store, item.id).await;
+    store
+        .apply_pull(page(vec![titled(1, "mine", 300)], None))
+        .await
+        .unwrap();
+    assert_eq!(outbox(&store, item.id).await[0].1, "done");
+    // Pushes off, then undo: "one" is shown, and waits to push, rather than
+    // leave the Item apart from Jira with nothing to say so.
+    store.set_pushes(None);
+    store.undo(undo_input()).await.unwrap();
+    let got = store.get_item(item.id, TODAY).await.unwrap().item;
+    assert_eq!(got.core.title, "one");
+    assert_eq!(got.derived.pending_fields, [ItemField::Title]);
+    let rows = outbox(&store, item.id).await;
+    assert_eq!(rows.last().unwrap().1, "pending", "{rows:?}");
+    // Pushes on again: it goes.
+    store.set_pushes(Some("work-jira"));
+    let sent = send(&store, item.id).await;
+    assert_eq!(sent[0].new, FieldValue::String("one".into()));
+}
+
+#[tokio::test]
 async fn reconciliation_keeps_a_waiting_edit_as_a_pull_does() {
     let (_dir, store) = open();
     store
@@ -1160,12 +1225,17 @@ async fn an_import_over_one_that_brought_waiting_pushes_replaces_it() {
         .await
         .unwrap();
     let (_b, target) = open();
+    let woken = target.pushes_queued();
     for _ in 0..2 {
         // Without the history: only sync's rows and the outbox remain.
         let export = source.export(false).await.unwrap();
         target.import(export.revision, export.rows).await.unwrap();
     }
     assert_eq!(outbox(&target, item.id).await.len(), 1);
+    // What it brought to push wakes the worker, not the next poll.
+    tokio::time::timeout(std::time::Duration::from_secs(1), woken.notified())
+        .await
+        .expect("an import wakes the push worker");
 }
 
 #[tokio::test]
@@ -1893,6 +1963,76 @@ async fn refuse(
 }
 
 #[tokio::test]
+async fn a_redo_clears_only_the_refusals_of_what_it_restored() {
+    let (_dir, store) = open();
+    store
+        .apply_pull(page(vec![issue(1, "one")], None))
+        .await
+        .unwrap();
+    let item = by_key(&store, "PLAT-1").await;
+    store.set_pushes(Some("work-jira"));
+    // The title and labels go in one PUT, and Jira refuses both.
+    store
+        .mutate(user_edit(
+            item.id,
+            ItemField::Title,
+            FieldValue::String("bad".into()),
+        ))
+        .await
+        .unwrap();
+    store
+        .mutate(user_edit(
+            item.id,
+            ItemField::Labels,
+            FieldValue::StringSet(vec!["x".into()]),
+        ))
+        .await
+        .unwrap();
+    let rows = send(&store, item.id).await;
+    store
+        .record_push(
+            item.id,
+            "PLAT-1".into(),
+            rows,
+            todo_store::outbox::PushResult::Refused {
+                error: "refused (400)".into(),
+                jira: vec![
+                    (ItemField::Title, FieldValue::String("one".into())),
+                    (ItemField::Labels, FieldValue::StringSet(vec![])),
+                ],
+            },
+            ts(5_001),
+        )
+        .await
+        .unwrap();
+    store
+        .apply_pull(page(vec![titled(1, "one", 300)], None))
+        .await
+        .unwrap();
+    let refused = || async { store.outbox_counts("work-jira".into()).await.unwrap().1 };
+    assert_eq!(refused().await, 2);
+    // Both re-applied, then undone: both count again.
+    let (all, _) = store.list_suggestions(None).await.unwrap();
+    let ids: Vec<String> = all[0].patches.iter().map(|p| p.id.clone()).collect();
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    store
+        .apply_suggestion_patches(apply_input(&refs))
+        .await
+        .unwrap();
+    assert_eq!(refused().await, 0);
+    store.undo(undo_input()).await.unwrap();
+    assert_eq!(refused().await, 2);
+    // Jira moves the title; the redo restores the labels only, so the
+    // title's patch still waits, and its refusal still counts.
+    store
+        .apply_pull(page(vec![titled(1, "jira's", 400)], None))
+        .await
+        .unwrap();
+    store.redo(undo_input()).await.unwrap();
+    assert_eq!(refused().await, 1, "the title's refusal stands");
+}
+
+#[tokio::test]
 async fn a_refusal_counts_once_and_not_after_it_is_dealt_with() {
     let (_dir, store) = open();
     store
@@ -2201,6 +2341,18 @@ async fn a_stale_refusal_stops_counting_and_undo_of_an_apply_counts_it_again() {
     assert_eq!(refused(&store).await, 0, "redone: dealt with again");
     store.undo(undo_input()).await.unwrap();
     assert_eq!(refused(&store).await, 1);
+    // Jira moves the title (a pull keeps the redo stack): a redo restores
+    // nothing, so the Suggestion still waits, and its refusal still counts.
+    store
+        .apply_pull(page(vec![titled(1, "jira's", 400)], None))
+        .await
+        .unwrap();
+    let _ = store.redo(undo_input()).await;
+    assert_eq!(refused(&store).await, 1, "a redo that restored nothing");
+    store
+        .apply_pull(page(vec![titled(1, "one", 500)], None))
+        .await
+        .unwrap();
     // The field moves on (a person's edit): applying finds the patch stale,
     // and the refusal, with nothing left to apply or reject, stops counting.
     store
@@ -2325,6 +2477,41 @@ async fn a_local_due_date_is_the_persons_never_pushed_and_kept_over_pulls() {
         [ItemField::Title]
     );
     assert_eq!(dated(outbox(&store, item.id).await), ["cancelled"]);
+}
+
+#[tokio::test]
+async fn a_due_date_kept_local_cancels_what_it_queued_before() {
+    let (_dir, store) = open();
+    store
+        .apply_pull(page(vec![issue(1, "one")], None))
+        .await
+        .unwrap();
+    let item = by_key(&store, "PLAT-1").await;
+    store.set_pushes(Some("work-jira"));
+    let due = |d| user_edit(item.id, ItemField::DueDate, FieldValue::Date(d));
+    store.mutate(due(date(2026, 11, 5))).await.unwrap();
+    // Pushes off and the due date local, then edited again: the old row,
+    // which no worker will reach, does not keep the old value.
+    store.set_pushes(None);
+    store.set_local("work-jira", &[ItemField::DueDate]);
+    store.mutate(due(date(2026, 11, 20))).await.unwrap();
+    let got = store.get_item(item.id, TODAY).await.unwrap().item;
+    assert!(got.derived.pending_fields.is_empty());
+    assert_eq!(outbox(&store, item.id).await[0].1, "cancelled");
+    // Pushed again later: nothing old comes back, the person's date stands.
+    store.set_local("work-jira", &[]);
+    store.set_pushes(Some("work-jira"));
+    store
+        .apply_pull(page(vec![titled(1, "one", 300)], None))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .due_pushes("work-jira".into(), ts(5_000), 50)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]

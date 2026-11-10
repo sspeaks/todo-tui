@@ -612,7 +612,10 @@ impl<'a> Reader<'a> {
                     Some(name) => push.cancel_resolution = name.to_owned(),
                     None => self.warn(path, "must be a resolution's name, e.g. \"Done\""),
                 },
-                "local_fields" => local_fields = self.local_fields(&path, value),
+                "local_fields" => match self.local_fields(&path, value) {
+                    Some(fields) => local_fields = fields,
+                    None => ok = false,
+                },
                 "transitions" => self.transitions(&path, value, &mut push.transitions),
                 "priority_map" => self.priority_map(&path, value, &mut push.priority_map),
                 "email" | "promote_default" | "subtask_issue_type" | "assistant_enabled" => {
@@ -678,14 +681,20 @@ impl<'a> Reader<'a> {
 
     /// `local_fields = ["due_date"]`: the Core fields kept local on the
     /// instance's linked Items. Only the due date can be: no other field is
-    /// tied to it. A name it does not know is skipped with a warning.
-    fn local_fields(&mut self, path: &str, value: toml::Value) -> Vec<todo_core::ItemField> {
+    /// tied to it. A name it does not know is skipped with a warning. None
+    /// when it is not a list: the instance is skipped, since syncing with
+    /// none local would hand every kept due date back to the tracker's.
+    fn local_fields(
+        &mut self,
+        path: &str,
+        value: toml::Value,
+    ) -> Option<Vec<todo_core::ItemField>> {
         let Some(list) = value.as_array() else {
             self.warn(
                 path.to_owned(),
                 "must be a list of field names, e.g. [\"due_date\"]",
             );
-            return Vec::new();
+            return None;
         };
         let mut out = Vec::new();
         for v in list {
@@ -705,7 +714,7 @@ impl<'a> Reader<'a> {
                 ),
             }
         }
-        out
+        Some(out)
     }
 
     /// `transitions = { todo = "Open", in_progress = "In Progress" }`: the
@@ -1050,6 +1059,17 @@ pub(crate) enum ReloadError {
     Store(#[from] todo_store::StoreError),
 }
 
+/// What the store takes from the config (ADR-0007): the instance that
+/// pushes, and the fields it keeps local, pushing or not.
+pub(crate) fn apply_to_store(config: &Config, store: &todo_store::Store) {
+    let instance = config.instances.first();
+    store.set_pushes(instance.filter(|i| i.push.enabled).map(|i| i.id.as_str()));
+    match instance {
+        Some(i) => store.set_local(&i.id, &i.local_fields),
+        None => store.set_local("", &[]),
+    }
+}
+
 /// Reloads the config and, when it changed, records a config change, so
 /// every subscriber gets the new one. Shared by `ReloadConfig` and SIGHUP.
 /// A change whose record failed is recorded by the next reload, changed or
@@ -1060,6 +1080,9 @@ pub(crate) async fn reload(
 ) -> Result<(Arc<Config>, bool), ReloadError> {
     let _one = handle.reloading.lock().await;
     let (config, changed) = handle.reload_locked().await?;
+    // At once, not when the sync loop next comes round: a pass running
+    // stops pushing (the kill switch) or keeps a field local from here on.
+    apply_to_store(&config, store);
     if changed || handle.unrecorded.load(Ordering::Acquire) {
         handle.unrecorded.store(true, Ordering::Release);
         store.record_config_change().await?;
@@ -1221,9 +1244,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["instances[0].local_fields: \"title\" cannot be kept local; only \"due_date\" can"]
         );
+        // Not a list: skipped, not synced with nothing local (which would
+        // hand every kept due date back to Jira's).
         let wrong = parse(&format!("{base}local_fields = \"due_date\"\n"));
-        assert!(wrong.instances[0].local_fields.is_empty());
-        assert_eq!(wrong.warnings.len(), 1);
+        assert!(wrong.instances.is_empty());
+        assert_eq!(
+            wrong
+                .warnings
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            [
+                "instances[0].local_fields: must be a list of field names, e.g. [\"due_date\"]",
+                "instances[0]: skipped: it does not sync until the errors above are fixed"
+            ]
+        );
     }
 
     #[test]

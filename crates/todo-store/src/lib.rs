@@ -675,6 +675,18 @@ impl Store {
             .unwrap_or_else(|e| e.into_inner()) = todo_core::Local::instance(instance, fields);
     }
 
+    /// Whether `instance` pushes now: the worker asks before each Item, so a
+    /// reload's `push = false` stops a pass already running.
+    pub fn pushes_now(&self, instance: &str) -> bool {
+        *self
+            .inner
+            .shared
+            .pushes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            == todo_core::Pushes::instance(instance)
+    }
+
     /// The instance whose linked Items take a person's edit of their pushed
     /// fields, to be queued for it (ADR-0007): the daemon sets it from the
     /// config's `push`. None (read-only, ADR-0006) until set.
@@ -2029,9 +2041,9 @@ fn write_op(
     let revision = first + touched.len() as Revision - 1;
     op.insert(tx.conn(), revision, batch.events.len() + derived.len())?;
     // Pushes (ADR-0007): a person's changes of pushed fields queue (only
-    // with pushes on: a waiting row is updated or cancelled either way, as
-    // undo restores without the guard), a delete cancels what waits; each
-    // Item whose outbox changed has its pending fields again.
+    // with pushes on, but for an undo or redo, which restores without the
+    // guard: its value waits for pushes to come back), a delete cancels what
+    // waits; each Item whose outbox changed has its pending fields again.
     if op.by_person {
         let at = Timestamp::now();
         let conn = tx.conn();
@@ -2044,14 +2056,20 @@ fn write_op(
             &batch.events,
             by_id,
             create,
+            matches!(op.kind, OpKind::Undo | OpKind::Redo),
             local,
             at,
         )?;
         let woke = !queued.is_empty();
         for &slot in &touched {
-            let item = &batch.items[slot];
+            let item = &mut batch.items[slot];
             if item.remote_link.is_some() && item.is_deleted() && !batch.loaded[slot].is_deleted() {
-                outbox::cancel_item(conn, item.id, at)?;
+                // What it dropped is read again from Jira after an undelete.
+                if outbox::cancel_item(conn, item.id, at)?
+                    && let Some(link) = &mut item.remote_link
+                {
+                    link.last_pulled_version = None;
+                }
                 queued.push(item.id);
             }
         }

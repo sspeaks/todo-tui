@@ -543,6 +543,8 @@ pub(crate) fn on_undo(
         ("applied", "pending")
     };
     let mut changed: Vec<String> = Vec::new();
+    // The (Item, field) of each patch it moved: only their refusals follow.
+    let mut moved: Vec<(ItemId, ItemField)> = Vec::new();
     for id in applied_by(conn, &entry.to_string())? {
         let Some(p) = load_patch(conn, &id)? else {
             continue;
@@ -561,16 +563,33 @@ pub(crate) fn on_undo(
                 "UPDATE suggestion_patches SET state = ?3 WHERE id = ?1 AND state = ?2",
             )?
             .execute(params![id, from, to])?;
-        if n == 1 && !changed.contains(&p.suggestion) {
-            changed.push(p.suggestion);
+        if n == 1 {
+            moved.push((p.item, p.field));
+            if !changed.contains(&p.suggestion) {
+                changed.push(p.suggestion);
+            }
         }
     }
     for id in &changed {
         settle(conn, id, at)?;
     }
-    // The refusals the apply cleared count again while their Suggestion
-    // waits again; a redo clears them again.
-    let cleared = report_of(conn, &entry.to_string())?.cleared;
+    // The refusals the apply cleared count again while their patch waits
+    // again; a redo clears them again. Only those of a patch it moved: one
+    // whose field a pull moved since keeps its state, and its refusal.
+    let cleared: Vec<String> = report_of(conn, &entry.to_string())?
+        .cleared
+        .into_iter()
+        .filter(|row| {
+            crate::outbox::row_field(conn, row)
+                .ok()
+                .flatten()
+                .is_some_and(|(item, field)| {
+                    moved.iter().any(|&(i, f)| {
+                        i == item && (f == field || (is_status(f) && is_status(field)))
+                    })
+                })
+        })
+        .collect();
     if redo {
         for id in &cleared {
             conn.prepare_cached(
@@ -578,7 +597,7 @@ pub(crate) fn on_undo(
             )?
             .execute(params![id, ts_to_sql(at)?])?;
         }
-    } else if !changed.is_empty() {
+    } else {
         crate::outbox::restore_refused(conn, &cleared, at)?;
     }
     for item in restored.keys() {
