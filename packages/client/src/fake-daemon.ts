@@ -485,6 +485,9 @@ export class FakeDaemon {
   readonly syncNows: string[] = [];
   /** The Suggestions, by id: putSuggestion's, as the RPCs leave them. */
   readonly suggestions = new Map<string, Suggestion>();
+  /** The issues attach can link to (setIssue), and the last made number. */
+  private readonly issues = new Map<string, { title: string }>();
+  private issueSeq = 100;
   /** The assistant's jobs (Refine), oldest first. */
   private readonly jobs = new Map<string, AssistantJob>();
   private refineAnswer: (item: Item) => { rationale: string; patches: MessageInitShape<typeof PatchSchema>[] } | { error: string } = () => ({ rationale: "", patches: [] });
@@ -655,6 +658,8 @@ export class FakeDaemon {
           this.check();
           return { entries: this.outbox.filter((e) => !req.instanceId || e.instanceId === req.instanceId) };
         },
+        promote: (req) => this.link(req.itemId, undefined, req.project),
+        attach: (req) => this.link(req.itemId, req.key.trim().toUpperCase(), undefined),
       });
       service(SuggestionService, {
         listSuggestions: (req) => {
@@ -982,6 +987,54 @@ export class FakeDaemon {
       job.state = AssistantJobState.DONE;
     }, 0);
     return { job };
+  }
+
+  /**
+   * Promote (`key` undefined: a new issue in `project`, else promote_default's)
+   * or attach (to `key`, which must be one setIssue made): the Item takes the
+   * issue's title and key, pinned, as the daemon links it (design 5.7, 3.3).
+   */
+  private link(itemId: string, key: string | undefined, project: string | undefined) {
+    this.check();
+    const instance = this.config.instances[0];
+    if (!instance) throw errorInfo(Code.FailedPrecondition, "NO_INSTANCE", "no [[instances]] are configured to sync", {});
+    if (!instance.push) throw errorInfo(Code.FailedPrecondition, "PUSH_OFF", `${instance.id} is read-only (push = false)`, {});
+    const id = idOf("item_id", itemId);
+    const item = this.items.get(id);
+    if (!item || item.deletedAt !== undefined) throw errorInfo(Code.NotFound, "ITEM_NOT_FOUND", `item ${id} not found`, { item_id: id });
+    if (item.remoteLink) throw errorInfo(Code.FailedPrecondition, "ALREADY_LINKED", `already linked to ${item.remoteLink.key}`, { key: item.remoteLink.key });
+    let title = item.title;
+    let made: string;
+    if (key === undefined) {
+      const p = project?.trim() || instance.promoteProject;
+      if (!p) throw errorInfo(Code.FailedPrecondition, "NO_PROMOTE_TARGET", "no project given, and no promote_default", {});
+      made = `${p.toUpperCase()}-${++this.issueSeq}`;
+    } else {
+      const issue = this.issues.get(key);
+      if (!issue) throw errorInfo(Code.NotFound, "ISSUE_NOT_FOUND", "Jira has no such issue you can read", {});
+      made = key;
+      title = issue.title;
+    }
+    const remoteLink = { trackerKind: "jira", instanceId: instance.id, remoteId: String(this.issueSeq), key: made, url: `https://jira.example.com/browse/${made}`, pinned: true, linkState: LinkState.OK };
+    const lost = title !== item.title;
+    const next = this.put({ id, title, remoteLink, isMine: true });
+    let suggestionId = "";
+    if (lost) {
+      const s = this.putSuggestion({
+        itemId: id,
+        kind: SuggestionKind.LINK_CONFLICT,
+        source: SuggestionSource.SYNC,
+        rationale: `${made}'s values replaced this todo's when it was linked`,
+        patches: [{ field: ItemField.TITLE, expectedOld: { kind: { case: "stringValue", value: title } }, new: { kind: { case: "stringValue", value: item.title } } }],
+      });
+      suggestionId = s.id;
+    }
+    return { item: next, result: { opId: ulid(), revision: this.revision }, suggestionId };
+  }
+
+  /** An issue attach can link to, by key, with its title. */
+  setIssue(key: string, title: string): void {
+    this.issues.set(key, { title });
   }
 
   /** What ListOutbox answers from now on. */

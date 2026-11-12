@@ -61,6 +61,10 @@ message InstanceConfig {
   // ("due_date"): the person sets them, they never reach the tracker, and a
   // pull leaves them alone.
   repeated string local_fields = 8;
+  // promote_default's project and issue type (design 5.7): what P creates
+  // in unless told; "" when unset.
+  string promote_project = 9;
+  string promote_issue_type = 10;
 }
 
 message ScopeConfig {

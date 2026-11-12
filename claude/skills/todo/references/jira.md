@@ -51,4 +51,6 @@ Repeat rules don't fit linked items: a fixed rule (`mon`, `daily`) sets the due 
 
 - **Find a ticket**: `todo_list` with `text: "PLAT-530"` matches the key. Always show the key and link when listing Jira items.
 - **Delete is local only**: it hides the item in todo-tui and stops it being imported again, and cancels its edits still waiting to push, but never deletes or closes the issue in Jira, which stays open and assigned. Use it when Seth wants the ticket out of his todo list without touching it.
-- **Comments, other transitions, reassigning and creating issues** aren't covered by the todo tools. Use a Jira tool if one is available, and say that's what you're doing.
+- **Make a todo a Jira issue**: `todo_promote` creates it (title, description, priority, labels, due date) in the project given, else his `promote_default`, and links the todo. The issue is real and his team sees it; it can't be undone from here. Always ask Seth first, naming the project.
+- **Link a todo to an existing issue**: `todo_link` with the key. Jira's fields replace the todo's; what differed waits as a `link_conflict` in `todo_suggestions` for him to apply back in S. Nothing changes in Jira.
+- **Comments, other transitions and reassigning** aren't covered by the todo tools. Use a Jira tool if one is available, and say that's what you're doing.

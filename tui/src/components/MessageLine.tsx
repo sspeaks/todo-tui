@@ -115,6 +115,8 @@ const PROMPT_HINTS: Readonly<Record<Extract<Mode, { kind: "prompt" }>["prompt"],
   waiting: "<person> [^date] · tab completes the person · empty clears",
   repeat: "a rule: daily, weekdays, mon,thu, 15th, 3d, 2w · empty stops it",
   meeting: "the subject · enter opens Teams, prefilled · esc cancels",
+  promote: "the Jira project · enter creates the issue (your team sees it) · esc cancels",
+  link: "an issue key, e.g. PLAT-12 · enter links it, Jira's fields win · esc cancels",
 };
 
 /** The hints of a prompt acting on marks, where they differ. */

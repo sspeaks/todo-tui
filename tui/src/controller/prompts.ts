@@ -63,6 +63,8 @@ export const PROMPT_LABELS: Readonly<Record<PromptKind, string>> = {
   waiting: "Waiting on",
   repeat: "Repeats",
   meeting: "Meeting",
+  promote: "Create in Jira project",
+  link: "Link to Jira issue",
 };
 
 /** How many times a derived edit rebases silently before it shows the conflict. */
@@ -178,6 +180,8 @@ export class Prompts {
    */
   open(kind: PromptKind): void | Promise<void> {
     if (kind === "meeting") return this.c.meetings.start();
+    if (kind === "promote") return this.c.link.promote();
+    if (kind === "link") return this.c.link.attach();
     // The title is the selected Item's own; the rest act on the marks when there are some.
     const target = this.c.target(kind !== "title");
     const item = target && this.c.store.getItem(target.ids[0] ?? "");
@@ -256,7 +260,7 @@ export class Prompts {
   /** Asks for the preview of the current text: at once when no request is in flight, else after it. */
   private preview(): void {
     const { mode } = this.c.state;
-    if (mode.kind !== "prompt" || mode.prompt === "title" || mode.prompt === "labels" || mode.prompt === "meeting") return;
+    if (mode.kind !== "prompt" || ["title", "labels", "meeting", "promote", "link"].includes(mode.prompt)) return;
     if (mode.prompt === "repeat") {
       const query = this.repeatQuery(mode);
       this.repeatAsked = query.key;
@@ -390,6 +394,7 @@ export class Prompts {
 
   private submit(mode: Prompt): void | Promise<void> {
     if (mode.prompt === "meeting") return this.c.meetings.submit(mode);
+    if (mode.prompt === "promote" || mode.prompt === "link") return this.c.link.submit(mode);
     if (mode.target.bulk) return this.saveBulk(mode);
     const id = mode.target.ids[0] ?? "";
     const item = this.c.store.getItem(id);
@@ -591,6 +596,8 @@ export class Prompts {
     switch (mode.prompt) {
       case "title":
       case "meeting":
+      case "promote":
+      case "link":
         return;
       case "labels": {
         const edits = parseLabelEdits(mode.line.text);

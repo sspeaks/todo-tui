@@ -261,6 +261,22 @@ describe("todo mcp tools", () => {
 describe("todo mcp tools with pushes (ADR-0007)", () => {
   const link = { trackerKind: "jira", instanceId: "work-jira", remoteId: "1", key: "PLAT-1", url: "https://jira.example.com/browse/PLAT-1" };
 
+  it("todo_promote creates the issue and links the todo; todo_link links one to a key", async () => {
+    const { call, daemon } = await harness({
+      items: [
+        { id: "01JBQ00000000000000000PR01", title: "Ship the report", status: Status.NEXT },
+        { id: "01JBQ00000000000000000PR02", title: "look at login", status: Status.NEXT },
+      ],
+    });
+    daemon.setConfig({ instances: [{ id: "work-jira", kind: "jira-dc", push: true, promoteProject: "PLAT", promoteIssueType: "Task" }] });
+    const made = await call("todo_promote", { id: "0000PR01" });
+    expect(made.jira?.key).toMatch(/^PLAT-\d+$/);
+    daemon.setIssue("PLAT-7", "Fix the login test");
+    const linked = await call("todo_link", { id: "0000PR02", key: "PLAT-7" });
+    expect([linked.title, linked.jira?.key, linked.replaced]).toEqual(["Fix the login test", "PLAT-7", expect.stringContaining("todo_suggestions")]);
+    await expect(call("todo_link", { id: "0000PR02", key: "PLAT-7" })).rejects.toThrow(/already linked/);
+  });
+
   it("pushes the title, the description and a close, and asks for someone else's issue", async () => {
     const { call, daemon } = await harness({
       items: [

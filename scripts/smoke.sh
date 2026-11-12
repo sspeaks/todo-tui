@@ -480,7 +480,7 @@ else
     [[ -n $port ]] || fail "the fake Jira did not start"
     printf 'smoke-pat' >"$jhome/jira.token"
     chmod 600 "$jhome/jira.token"
-    printf '[[instances]]\nid = "work-jira"\nkind = "jira-dc"\nbase_url = "http://127.0.0.1:%s"\ncredential = "file:%s"\nscopes = [{ name = "mine", query = "assignee = currentUser()" }]\npush = true\n' \
+    printf '[[instances]]\nid = "work-jira"\nkind = "jira-dc"\nbase_url = "http://127.0.0.1:%s"\ncredential = "file:%s"\nscopes = [{ name = "mine", query = "assignee = currentUser()" }]\npush = true\npromote_default = { project = "PLAT", issue_type = "Task" }\n' \
       "$port" "$jhome/jira.token" >"$jhome/config.toml"
     out=$(TODO_TUI_HOME=$jhome "$TODO_BIN" sync check) || fail "sync check failed: $out"
     [[ $out == "work-jira: ok as Dana Example (JIRAUSER10100), time zone UTC" ]] || fail "unexpected sync check: $out"
@@ -549,6 +549,18 @@ else
     ksee 'Nothing to review' "an empty Suggestions pane"
     tmx send-keys -t tui:jira Escape
     tmx send-keys -t tui:jira q
+    # Promote and attach (design 5.7, 3.3): a local todo becomes PLAT-3 in
+    # the fake, and another is linked to a teammate's OPS-9, outside the
+    # scope, taking its title.
+    pid=$(TODO_TUI_HOME=$jhome "$TODO_BIN" add "smoke promote me" | awk '{print $1}')
+    out=$(TODO_TUI_HOME=$jhome "$TODO_BIN" promote "$pid") || fail "promote failed: $out"
+    [[ $out == "created PLAT-3  http://127.0.0.1:$port/browse/PLAT-3" ]] || fail "unexpected promote: $out"
+    grep -qF '{"method": "POST", "key": "PLAT-3", "created": "smoke promote me"}' "$root/jira.writes" ||
+      { cat "$root/jira.writes" >&2; fail "promote did not reach the fake Jira"; }
+    lid=$(TODO_TUI_HOME=$jhome "$TODO_BIN" add "smoke link me" | awk '{print $1}')
+    out=$(TODO_TUI_HOME=$jhome "$TODO_BIN" link "$lid" ops-9) || fail "link failed: $out"
+    grep -qF "linked to OPS-9" <<<"$out" || fail "unexpected link: $out"
+    grep -qF "wait in the TUI (S)" <<<"$out" || fail "link did not offer the todo's title back: $out"
     kill "$jira_pid" 2>/dev/null || true
     TODO_TUI_HOME=$jhome "$TODO_BIN" daemon stop >/dev/null
   else

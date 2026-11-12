@@ -81,6 +81,55 @@ pub(crate) async fn check(paths: &Paths) -> anyhow::Result<ExitCode> {
     })
 }
 
+/// `todo promote <id> [--project P] [--type T]` (design 5.7): creates the
+/// Jira issue from the todo, while it waits, and links it.
+pub(crate) async fn promote(
+    paths: &Paths,
+    id: String,
+    project: Option<String>,
+    kind: Option<String>,
+) -> anyhow::Result<ExitCode> {
+    let channel = ready(paths).await.map_err(|why| anyhow::anyhow!("{why}"))?;
+    let Some(item) = crate::assistant::resolve(channel.clone(), &id).await? else {
+        return Ok(ExitCode::FAILURE);
+    };
+    let mut sync = SyncServiceClient::new(channel);
+    let out = call(sync.promote(v1::PromoteRequest {
+        item_id: item.id,
+        project: project.unwrap_or_default(),
+        issue_type: kind.unwrap_or_default(),
+    }))
+    .await
+    .map_err(failed)?;
+    let linked = out.item.and_then(|i| i.remote_link).unwrap_or_default();
+    print_out(format!("created {}  {}", linked.key, linked.url));
+    if !out.suggestion_id.is_empty() {
+        print_out("Jira changed what it was created with: review it in the TUI (S)");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `todo link <id> <KEY>` (design 3.3): links the todo to an existing issue.
+pub(crate) async fn link(paths: &Paths, id: String, key: String) -> anyhow::Result<ExitCode> {
+    let channel = ready(paths).await.map_err(|why| anyhow::anyhow!("{why}"))?;
+    let Some(item) = crate::assistant::resolve(channel.clone(), &id).await? else {
+        return Ok(ExitCode::FAILURE);
+    };
+    let mut sync = SyncServiceClient::new(channel);
+    let out = call(sync.attach(v1::AttachRequest {
+        item_id: item.id,
+        key,
+    }))
+    .await
+    .map_err(failed)?;
+    let linked = out.item.and_then(|i| i.remote_link).unwrap_or_default();
+    print_out(format!("linked to {}  {}", linked.key, linked.url));
+    if !out.suggestion_id.is_empty() {
+        print_out("Jira's values replaced some of the todo's: they wait in the TUI (S)");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 /// `todo sync status`: each instance's line, from the daemon. Fails when
 /// one needs attention (a refused token, a failed pull).
 pub(crate) async fn status(paths: &Paths) -> anyhow::Result<ExitCode> {

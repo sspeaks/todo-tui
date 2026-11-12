@@ -6,7 +6,7 @@
 import { Energy, Priority, Status } from "@todo-tui/client";
 import type { KeyToken } from "./tokenize.js";
 
-export type PromptKind = "title" | "labels" | "due" | "defer" | "waiting" | "repeat" | "meeting";
+export type PromptKind = "title" | "labels" | "due" | "defer" | "waiting" | "repeat" | "meeting" | "promote" | "link";
 
 export type Action =
   | { type: "move"; by: 1 | -1 }
@@ -145,6 +145,8 @@ export const BINDINGS: readonly Binding[] = [
   { id: "edit_labels", keys: ["t"], action: { type: "prompt", prompt: "labels" }, markAware: true, section: "Items", help: "Edit the labels" },
   { id: "toggle_archive", keys: ["z"], action: { type: "archive_toggle" }, markAware: true, section: "Items", help: "Archive / unarchive" },
   { id: "open_remote", keys: ["o"], action: { type: "open_remote" }, section: "Items", help: "Open its Jira issue in the browser" },
+  { id: "promote", keys: ["P"], action: { type: "prompt", prompt: "promote" }, section: "Items", help: "Make it a Jira issue (the project to create in)" },
+  { id: "link_issue", keys: ["L"], action: { type: "prompt", prompt: "link" }, section: "Items", help: "Link it to a Jira issue by key" },
   { id: "schedule_meeting", keys: ["M"], action: { type: "prompt", prompt: "meeting" }, markAware: true, section: "Items", help: "Schedule a Teams meeting about it (Teams opens, prefilled)" },
   { id: "delete", keys: ["d d"], action: { type: "delete" }, markAware: true, section: "Items", help: "Delete (confirm)" },
 

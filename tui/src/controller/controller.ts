@@ -46,6 +46,7 @@ import { type ExportFs, Exporter } from "./export.js";
 import { type Clipboard, systemClipboard } from "./clipboard.js";
 import { Meetings, type UrlOpener } from "./meeting.js";
 import { Sync, type SyncClient } from "./sync.js";
+import { Link } from "./link.js";
 import { Refine } from "./refine.js";
 import { Suggestions } from "./suggestions.js";
 import { errorItemId } from "./bulk.js";
@@ -143,6 +144,7 @@ export class Controller {
   readonly syncing: Sync;
   readonly suggestions: Suggestions;
   readonly refine: Refine;
+  readonly link: Link;
   /** The Suggestions the last sync saw, to tell one that arrives. */
   private knownSuggestions: ReadonlySet<string> = new Set();
   /** The NOT_MINE question's answer, while it is asked. */
@@ -203,6 +205,7 @@ export class Controller {
     this.syncing = new Sync(this, opts.openUrl, opts.sync);
     this.suggestions = new Suggestions(this);
     this.refine = new Refine(this);
+    this.link = new Link(this);
   }
 
   /** Observes the store: the tabs, the current view, the counts and the undo state; starts the midnight poll. */
@@ -867,6 +870,10 @@ export class Controller {
         return this.suggestions.open();
       case "refine":
         return this.refine.start();
+      case "promote":
+        return this.link.promote(r.args);
+      case "link":
+        return this.link.attach(r.args);
       case "apply":
         return this.suggestions.applyFromCommand();
     }

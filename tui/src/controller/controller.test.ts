@@ -131,8 +131,8 @@ describe("keys", () => {
     const t = await setup();
     await t.c.press(":zz<enter>");
     expect(t.state().toast).toMatchObject({ level: "error", text: "Not a command: zz" });
-    await t.c.press(":promote<enter>");
-    expect(t.state().toast).toMatchObject({ level: "info", text: ":promote arrives with Jira sync in P2" });
+    await t.c.press(":standup<enter>");
+    expect(t.state().toast).toMatchObject({ level: "info", text: ":standup arrives with the standup in P4" });
     await t.c.press(":search  <enter>");
     expect(t.state().toast?.text).toBe("Search for what? :search <words>");
     await t.c.press(":refr<tab>");

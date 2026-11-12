@@ -21,7 +21,7 @@ BASE = ""
 CLOCK = [10]
 
 
-def issue(n, title, category, status):
+def make_issue(n, title, category, status):
     return {
         "id": str(n),
         "key": f"PLAT-{n}",
@@ -42,9 +42,14 @@ def issue(n, title, category, status):
 
 
 ISSUES = [
-    issue(1, "smoke jira login fix", "new", "Open"),
-    issue(2, "smoke jira report", "indeterminate", "In Review"),
+    make_issue(1, "smoke jira login fix", "new", "Open"),
+    make_issue(2, "smoke jira report", "indeterminate", "In Review"),
 ]
+# A teammate's issue, outside the person's scope: searches never list it, it
+# reads by key (attach, design 3.3).
+ELSEWHERE = [make_issue(9, "smoke jira teammate's task", "new", "Open")]
+ELSEWHERE[0]["key"] = "OPS-9"
+ELSEWHERE[0]["fields"]["assignee"] = {"key": "JIRAUSER2", "name": "alex", "displayName": "Alex Example"}
 # Wiki markup, read as Markdown (ADR-0009); the colour has no Markdown form.
 ISSUES[1]["fields"]["description"] = "h2. Report\r\n* weekly {{totals}}\r\n{color:#888}footer{color}"
 
@@ -102,7 +107,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(200, GET[path])
         m = re.fullmatch(r"/rest/api/2/issue/([A-Z0-9-]+)(/transitions)?", path)
         # By id or by key, as Jira takes either (attach reads by key).
-        found = [i for i in ISSUES if m and m.group(1) in (i["id"], i["key"])]
+        found = [i for i in ISSUES + ELSEWHERE if m and m.group(1) in (i["id"], i["key"])]
         if found and m.group(2):
             transitions = []
             for tid, name, to, key in WORKFLOW:
@@ -144,8 +149,8 @@ class Handler(BaseHTTPRequestHandler):
             f = body.get("fields", {})
             if f.get("project", {}).get("key") != "PLAT":
                 return self.reply(400, {"errorMessages": [], "errors": {"issuetype": "valid issue type is required"}})
-            n = max(int(i["id"]) for i in ISSUES) + 1
-            new = issue(n, f.get("summary", ""), "new", "Open")
+            n = max(int(i["id"]) for i in ISSUES if int(i["id"]) < 9) + 1
+            new = make_issue(n, f.get("summary", ""), "new", "Open")
             for k in ("description", "labels", "duedate"):
                 if f.get(k) is not None:
                     new["fields"][k] = f[k]

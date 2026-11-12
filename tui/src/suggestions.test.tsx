@@ -409,3 +409,47 @@ describe("space r: Claude refines (ADR-0010)", () => {
     await t.waitFrame((f) => expect(f).toContain("Claude is off"));
   });
 });
+
+describe("P and L: promote and attach (design 5.7, 3.3)", () => {
+  const jira = { instances: [{ id: "work-jira", kind: "jira-dc", push: true, promoteProject: "PLAT", promoteIssueType: "Task" }] };
+
+  it("P creates the issue in promote_default's project and says so", async () => {
+    const fd = fakeDaemon([item("Ship the report")]);
+    fd.daemon.setConfig(jira);
+    const id = [...fd.daemon.items.values()][0]!.id;
+    const t = renderTui({ daemon: fd, columns: 120, rows: 20 });
+    await t.live();
+    await t.press("P");
+    await t.waitFrame((f) => expect(f).toContain("Create in Jira project: PLAT"));
+    await t.press("<enter>");
+    await t.waitFrame((f) => expect(f).toMatch(/Created PLAT-\d+/));
+    expect(fd.daemon.items.get(id)?.remoteLink?.pinned).toBe(true);
+  });
+
+  it("L links to a key, Jira's title wins, and yours waits in S", async () => {
+    const fd = fakeDaemon([item("look at login")]);
+    fd.daemon.setConfig(jira);
+    fd.daemon.setIssue("PLAT-7", "Fix the login test");
+    const id = [...fd.daemon.items.values()][0]!.id;
+    const t = renderTui({ daemon: fd, columns: 120, rows: 20 });
+    await t.live();
+    await t.press("L");
+    await t.press("nope<enter>");
+    await t.waitFrame((f) => expect(f).toContain("An issue key, e.g. PLAT-12"));
+    await t.press("<ctrl+u>plat-7<enter>");
+    await t.waitFrame((f) => expect(f).toContain("Linked to PLAT-7 · what Jira changed of yours is in S"));
+    expect(fd.daemon.items.get(id)?.title).toBe("Fix the login test");
+    await t.press("S");
+    await t.waitFrame((f) => expect(f).toMatch(/\[ \] title +Fix the login test \(Jira\) → look at login \(yours\)/));
+  });
+
+  it("says why when it cannot", async () => {
+    const fd = fakeDaemon([item("x")]);
+    fd.daemon.setConfig({ instances: [{ id: "work-jira", kind: "jira-dc", push: false }] });
+    const t = renderTui({ daemon: fd, columns: 120, rows: 20 });
+    await t.live();
+    await t.press("P");
+    await t.press("PLAT<enter>");
+    await t.waitFrame((f) => expect(f).toContain("Not created: Jira is read-only here (push = false)"));
+  });
+});

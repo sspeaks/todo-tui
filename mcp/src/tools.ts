@@ -356,7 +356,9 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
                   ? "push_failed"
                   : s.kind === SuggestionKind.REFINE
                     ? "refine"
-                    : "unknown",
+                    : s.kind === SuggestionKind.LINK_CONFLICT
+                      ? "link_conflict"
+                      : "unknown",
             why: s.rationale,
             jira_said: s.error || undefined,
             changes: s.patches
@@ -534,6 +536,46 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
     true,
   );
   simple("todo_undelete", "Undelete a todo", "Bring a deleted item back.", (id) => undeleteItem(items, id));
+
+  server.registerTool(
+    "todo_promote",
+    {
+      title: "Create a Jira issue from a todo",
+      description:
+        "Creates a Jira issue from a local todo (its title, description, priority, labels and due date) and links the todo to it: the issue is real, " +
+        "visible to Seth's team, and cannot be undone here. Ask Seth first, with the project. The project defaults to promote_default's.",
+      inputSchema: {
+        id: ID,
+        project: z.string().optional().describe("The Jira project key, e.g. PLAT; else promote_default's"),
+        issue_type: z.string().optional().describe("The issue type's name; else promote_default's"),
+      },
+      annotations: { destructiveHint: false, openWorldHint: true },
+    },
+    (args) =>
+      run(async () => {
+        const item = await resolve(args.id);
+        const res = await sync.promote({ itemId: item.id, project: args.project ?? "", issueType: args.issue_type ?? "" });
+        return { ...(res.item && project(res.item)), ...(res.suggestionId && { jira_changed: "Jira changed what it was created with; it waits in todo_suggestions" }) };
+      }),
+  );
+
+  server.registerTool(
+    "todo_link",
+    {
+      title: "Link a todo to a Jira issue",
+      description:
+        "Links a local todo to an existing Jira issue by key (anyone's Seth can read). Jira's fields replace the todo's; what differed is offered back " +
+        "as a link_conflict in todo_suggestions. Jira itself is not changed.",
+      inputSchema: { id: ID, key: z.string().describe("The issue key, e.g. PLAT-12") },
+      annotations: { destructiveHint: false },
+    },
+    (args) =>
+      run(async () => {
+        const item = await resolve(args.id);
+        const res = await sync.attach({ itemId: item.id, key: args.key });
+        return { ...(res.item && project(res.item)), ...(res.suggestionId && { replaced: "Jira's values replaced some of the todo's; see todo_suggestions" }) };
+      }),
+  );
 
   server.registerTool(
     "todo_undo",

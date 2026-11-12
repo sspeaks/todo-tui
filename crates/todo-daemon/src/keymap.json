@@ -48,6 +48,8 @@
       "edit_labels",
       "toggle_archive",
       "open_remote",
+      "promote",
+      "link_issue",
       "schedule_meeting",
       "delete",
       "mark",

@@ -2,7 +2,7 @@
 // completion over them, and a pointer to the milestone that brings each
 // planned one.
 
-export type CommandName = "quit" | "help" | "refresh" | "search" | "config" | "view" | "export" | "l48" | "meet" | "sync" | "suggestions" | "apply" | "refine";
+export type CommandName = "quit" | "help" | "refresh" | "search" | "config" | "view" | "export" | "l48" | "meet" | "sync" | "suggestions" | "apply" | "refine" | "promote" | "link";
 
 interface CommandSpec {
   readonly name: string;
@@ -26,14 +26,14 @@ export const COMMANDS: readonly CommandSpec[] = [
   { name: "sync", help: "Sync with Jira now; :sync status says how it stands, :sync outbox what waits", runs: "sync", args: "[status | outbox | instance]" },
   { name: "suggestions", help: "The Suggestions pane: what Jira won over, and what it refused", runs: "suggestions" },
   { name: "refine", help: "Ask Claude to refine the Item, or the marked ones (proposals land in S)", runs: "refine" },
+  { name: "promote", help: "Make the Item a Jira issue, in the project given or promote_default's", runs: "promote", args: "[PROJECT]" },
+  { name: "link", help: "Link the Item to a Jira issue by key", runs: "link", args: "KEY" },
   { name: "w", help: "In the Suggestions pane: apply what is ticked", runs: "apply" },
   { name: "export", help: "Write every record to a file (~/todo-export-….jsonl)", runs: "export", args: "[path]" },
 ];
 
 /** Commands from the design that a later milestone brings, and where they arrive. */
 const PLANNED: Readonly<Record<string, string>> = {
-  promote: "with Jira sync in P2",
-  link: "with Jira sync in P2",
   review: "with the weekly review in P4",
   standup: "with the standup in P4",
 };

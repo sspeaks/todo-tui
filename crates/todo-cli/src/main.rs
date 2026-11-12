@@ -67,6 +67,26 @@ enum Command {
         #[arg(long)]
         copy: bool,
     },
+    /// Make a todo a Jira issue (design 5.7): created now, in promote_default's
+    /// project unless given, and linked. Your team sees it.
+    Promote {
+        /// The todo: its short id or full id.
+        id: String,
+        /// The Jira project key; else promote_default's.
+        #[arg(long)]
+        project: Option<String>,
+        /// The issue type's name; else promote_default's.
+        #[arg(long = "type")]
+        kind: Option<String>,
+    },
+    /// Link a todo to an existing Jira issue by key (design 3.3): Jira's
+    /// fields win, and the todo's that differed wait in the TUI (S).
+    Link {
+        /// The todo: its short id or full id.
+        id: String,
+        /// The issue's key, e.g. PLAT-12.
+        key: String,
+    },
     /// Ask Claude to refine an Item (ADR-0010): it proposes a clearer title,
     /// due date, priority, labels and waiting-on, for review in the TUI (S).
     Refine {
@@ -270,6 +290,10 @@ async fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
         Command::Status { .. } => return status::status(&paths).await,
         Command::L48 { since, copy } => return report::l48(&paths, since, copy).await,
         Command::Refine { id } => return assistant::refine(&paths, id).await,
+        Command::Promote { id, project, kind } => {
+            return sync::promote(&paths, id, project, kind).await;
+        }
+        Command::Link { id, key } => return sync::link(&paths, id, key).await,
         Command::Assistant { action } => {
             return match action {
                 AssistantAction::Usage => assistant::usage(&paths).await,

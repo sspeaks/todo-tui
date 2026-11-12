@@ -144,7 +144,10 @@ pub(crate) async fn usage(paths: &Paths) -> anyhow::Result<ExitCode> {
 
 /// The Item a full or short (last 8 characters) id names; `None` after
 /// saying why there is none, or more than one.
-async fn resolve(channel: crate::conn::Conn, id: &str) -> anyhow::Result<Option<v1::Item>> {
+pub(crate) async fn resolve(
+    channel: crate::conn::Conn,
+    id: &str,
+) -> anyhow::Result<Option<v1::Item>> {
     let wanted = id.trim().to_ascii_uppercase();
     let mut items = ItemServiceClient::new(channel);
     if wanted.len() == 26 {

@@ -278,6 +278,16 @@ impl From<&Config> for v1::ConfigSnapshot {
                         .iter()
                         .map(|&f| todo_proto::convert::item_field_path(f).to_owned())
                         .collect(),
+                    promote_project: i
+                        .promote
+                        .as_ref()
+                        .map(|p| p.project.clone())
+                        .unwrap_or_default(),
+                    promote_issue_type: i
+                        .promote
+                        .as_ref()
+                        .map(|p| p.issue_type.clone())
+                        .unwrap_or_default(),
                 })
                 .collect(),
             meetings: Some(v1::MeetingsConfig {
