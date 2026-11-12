@@ -47,6 +47,8 @@ pub struct Config {
     pub l48: ReportConfig,
     /// `[meetings] provider`: false for "none" (design 2.9).
     pub meetings: bool,
+    /// `[assistant]` (design 6, ADR-0010): `None` while no provider is set.
+    pub assistant: Option<Assistant>,
     /// `[[instances]]` (design 8.2, ADR-0006): at most one is used in M9.
     pub instances: Vec<Instance>,
     /// `[client] remote`: the clients on this machine use a daemon elsewhere
@@ -172,6 +174,7 @@ impl Config {
             },
             l48: ReportConfig::default(),
             meetings: true,
+            assistant: None,
             instances: Vec::new(),
             client: None,
             client_error: None,
@@ -280,6 +283,18 @@ impl From<&Config> for v1::ConfigSnapshot {
             meetings: Some(v1::MeetingsConfig {
                 provider: if c.meetings { "teams" } else { "none" }.to_owned(),
             }),
+            assistant: Some(v1::AssistantConfig {
+                provider: c
+                    .assistant
+                    .as_ref()
+                    .map_or("", |_| "claude_code")
+                    .to_owned(),
+                model: c
+                    .assistant
+                    .as_ref()
+                    .map(|a| a.model.clone())
+                    .unwrap_or_default(),
+            }),
             l48: Some(v1::L48Config {
                 window_days: c.l48.window_days,
                 working_days: c.l48.working_days.iter().map(|d| d.to_i32()).collect(),
@@ -358,7 +373,7 @@ impl<'a> Reader<'a> {
                         });
                     }
                 }
-                "assistant" => self.warn(key, "not used until the Claude assistant (P3)"),
+                "assistant" => self.section("assistant", value, Reader::assistant),
                 "stale" => self.warn(key, "not used until stale reviews (P4)"),
                 _ => self.warn(quote_key(&key), "unknown key; ignored"),
             }
@@ -819,6 +834,66 @@ impl<'a> Reader<'a> {
         Some(out)
     }
 
+    /// `[assistant]` (ADR-0010): `provider = "claude_code"` turns it on.
+    fn assistant(&mut self, table: toml::Table) {
+        let mut on = false;
+        let mut a = Assistant::default();
+        for (key, value) in table {
+            let path = format!("assistant.{}", quote_key(&key));
+            let text = value.as_str().map(str::trim);
+            match key.as_str() {
+                "provider" => match text {
+                    Some("claude_code") => on = true,
+                    Some("api") => self.warn(
+                        path,
+                        "\"api\" is not built yet; use \"claude_code\" (Claude Code's CLI)",
+                    ),
+                    _ => self.warn(path, "must be \"claude_code\"; the assistant stays off"),
+                },
+                "model" => match text {
+                    Some(m) => a.model = m.to_owned(),
+                    None => self.warn(path, "must be a model name, e.g. \"claude-haiku-5-5\""),
+                },
+                "claude_bin" => match text.filter(|s| !s.is_empty()) {
+                    Some(b) => {
+                        let home = std::env::var_os("HOME")
+                            .map(PathBuf::from)
+                            .filter(|h| h.is_absolute());
+                        a.claude_bin = match (b.strip_prefix("~/"), home) {
+                            (Some(rest), Some(home)) => home.join(rest),
+                            _ => PathBuf::from(b),
+                        };
+                    }
+                    None => self.warn(path, "must be the path of the claude CLI"),
+                },
+                "style_notes" => match text {
+                    Some(n) => a.style_notes = n.to_owned(),
+                    None => self.warn(path, "must be text"),
+                },
+                "include_private_notes" => match value.as_bool() {
+                    Some(b) => a.include_private_notes = b,
+                    None => self.warn(path, "must be true or false; using false"),
+                },
+                "timeout_seconds" => match value
+                    .as_integer()
+                    .and_then(|v| u64::try_from(v).ok())
+                    .filter(|&v| (5..=600).contains(&v))
+                {
+                    Some(t) => a.timeout = std::time::Duration::from_secs(t),
+                    None => self.warn(
+                        path,
+                        "must be a whole number of seconds from 5 to 600; using 120",
+                    ),
+                },
+                "auto_refine" | "models" => {
+                    self.warn(path, "not used yet: refine runs on request (space r)")
+                }
+                _ => self.warn(path, "unknown key; ignored"),
+            }
+        }
+        self.config.assistant = on.then_some(a);
+    }
+
     fn meetings(&mut self, table: toml::Table) {
         for (key, value) in table {
             let path = format!("meetings.{}", quote_key(&key));
@@ -1057,6 +1132,33 @@ pub(crate) enum ReloadError {
     /// have not seen it; the next reload records it.
     #[error("recording the config change failed: {0}")]
     Store(#[from] todo_store::StoreError),
+}
+
+/// `[assistant]` (ADR-0010): the Claude Code CLI and how it is asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Assistant {
+    /// The `claude` binary; `claude` on PATH by default.
+    pub claude_bin: PathBuf,
+    /// `""`: the CLI's own default.
+    pub model: String,
+    /// Added to every prompt ("titles imperative, under 60 chars").
+    pub style_notes: String,
+    /// Private notes are left out of what Claude sees unless this is set
+    /// (design 6.10).
+    pub include_private_notes: bool,
+    pub timeout: std::time::Duration,
+}
+
+impl Default for Assistant {
+    fn default() -> Self {
+        Assistant {
+            claude_bin: PathBuf::from("claude"),
+            model: String::new(),
+            style_notes: String::new(),
+            include_private_notes: false,
+            timeout: std::time::Duration::from_secs(120),
+        }
+    }
 }
 
 /// What the store takes from the config (ADR-0007): the instance that
@@ -1522,12 +1624,63 @@ mod tests {
     #[test]
     fn unknown_and_future_keys_warn() {
         assert_eq!(
-            warnings("colour = 1\n[ui]\ntheme = \"dark\"\n[assistant]\n[stale]\n"),
+            warnings("colour = 1\n[ui]\ntheme = \"dark\"\n[stale]\n"),
             [
                 "colour: unknown key; ignored",
                 "ui.theme: unknown key; ignored",
-                "assistant: not used until the Claude assistant (P3)",
                 "stale: not used until stale reviews (P4)",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_assistant_is_on_with_a_provider_only() {
+        // No section, or one without a provider: off.
+        assert_eq!(parse("").assistant, None);
+        assert_eq!(
+            parse(
+                "[assistant]
+model = \"m\""
+            )
+            .assistant,
+            None
+        );
+        let on = parse(
+            "[assistant]\nprovider = \"claude_code\"\nmodel = \"claude-haiku-5-5\"\n\
+             claude_bin = \"/opt/claude\"\nstyle_notes = \"short titles\"\n\
+             include_private_notes = true\ntimeout_seconds = 30\n",
+        );
+        let a = on.assistant.as_ref().unwrap();
+        assert_eq!(
+            (
+                a.claude_bin.to_str(),
+                a.model.as_str(),
+                a.style_notes.as_str(),
+                a.include_private_notes,
+                a.timeout.as_secs()
+            ),
+            (
+                Some("/opt/claude"),
+                "claude-haiku-5-5",
+                "short titles",
+                true,
+                30
+            )
+        );
+        assert_eq!(on.warnings, vec![]);
+        let served = v1::ConfigSnapshot::from(&on).assistant.unwrap();
+        assert_eq!(
+            (served.provider.as_str(), served.model.as_str()),
+            ("claude_code", "claude-haiku-5-5")
+        );
+        assert_eq!(
+            warnings(
+                "[assistant]\nprovider = \"api\"\ntimeout_seconds = 1\nauto_refine = \"auto\""
+            ),
+            [
+                "assistant.provider: \"api\" is not built yet; use \"claude_code\" (Claude Code's CLI)",
+                "assistant.timeout_seconds: must be a whole number of seconds from 5 to 600; using 120",
+                "assistant.auto_refine: not used yet: refine runs on request (space r)",
             ]
         );
     }

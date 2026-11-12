@@ -32,6 +32,16 @@ message ConfigSnapshot {
   // [[instances]] (design 8.2): the tracker connections that sync, without
   // their credentials.
   repeated InstanceConfig instances = 11;
+  // [assistant] (design 6, ADR-0010): Claude, when a provider is set.
+  AssistantConfig assistant = 12;
+}
+
+// [assistant]: the provider Claude is run on, if any.
+message AssistantConfig {
+  // "claude_code", or "" when the assistant is off (no provider).
+  string provider = 1;
+  // The model asked for; "" is the provider's own default.
+  string model = 2;
 }
 
 // One [[instances]] entry (ADR-0006).
