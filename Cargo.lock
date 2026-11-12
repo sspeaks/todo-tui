@@ -2024,8 +2024,10 @@ name = "todo-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "futures-util",
+ "http-body",
  "hyper-rustls",
  "hyper-util",
  "jiff",

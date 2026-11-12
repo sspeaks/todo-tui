@@ -20,6 +20,8 @@ todo-proto = { path = "crates/todo-proto" }
 todo-daemon = { path = "crates/todo-daemon" }
 
 anyhow = "1.0.104"
+bytes = "1.12.1"
+http-body = "1.1.0"
 async-stream = "0.3.6"
 clap = { version = "4.6.7", features = ["derive"] }
 futures-util = "0.3.34"

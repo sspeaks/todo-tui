@@ -81,7 +81,8 @@ impl Conn {
             })
             .map_response(|res: Response<_>| res.map(Body::new))
             .layer(tonic_web::GrpcWebClientLayer::new())
-            .service(client)
+            // One gRPC-Web frame per chunk, however a proxy merged them.
+            .service(client.map_response(|res| res.map(crate::frames::SplitFrames::new)))
             .map_err(BoxError::from);
         Ok(Conn {
             svc: BoxCloneSyncService::new(svc),

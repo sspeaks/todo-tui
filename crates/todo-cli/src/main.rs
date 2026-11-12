@@ -5,6 +5,7 @@ mod backup;
 mod config;
 mod conn;
 mod export;
+mod frames;
 mod launch;
 mod remote;
 mod report;
