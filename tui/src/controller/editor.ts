@@ -12,11 +12,11 @@ import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { type Item, errorReason, updateItem } from "@todo-tui/client";
+import { type Item, type UpdateItemResponse, errorReason, updateItem } from "@todo-tui/client";
 import type { Controller } from "./controller.js";
 import { withoutInterrupts } from "./job.js";
 import { errorText, opText, quoted } from "./messages.js";
-import { single } from "./pipeline.js";
+import { type Outcome, single } from "./pipeline.js";
 
 /** What the editor left: the file's text, or why there is none. */
 export type EditorOutcome = { readonly ok: true; readonly text: string } | { readonly ok: false; readonly reason: string };
@@ -107,12 +107,16 @@ export class DescriptionEditor {
 
   private async save(item: Item, text: string, base: { value: string; revision: bigint }): Promise<void> {
     let expectedRevision = base.revision;
+    // A yes to someone else's issue holds for the rebases of this save.
+    let confirmed = false;
     for (let rebases = 0; ; rebases++) {
       const revision = expectedRevision;
-      const out = await this.c.pipeline.run({
+      const out: Outcome<UpdateItemResponse> = await this.c.pipeline.run({
         call: (opts) => updateItem(this.c.items, { id: item.id, description: text }, ["description"], { ...opts, expectedRevision: revision }),
         items: single,
+        confirmed,
       });
+      confirmed = out.confirmed;
       if (out.ok) return this.c.toastOp(out.res.result?.opId, opText("edit", item.title));
       if (errorReason(out.err) !== "REVISION_MISMATCH") return this.keep(item, text, errorText(out.err, item));
       let fresh: Item | undefined;

@@ -73,8 +73,9 @@ Every tool returns `short_id` (8 characters, the same id `todo add` prints) and 
 
 An item with a `jira` field (key, url, remote_status) mirrors a Jira issue. Some edits of it are **pushed to Jira**: they change the real ticket that Seth's team sees. Read `references/jira.md` before changing one. In short:
 
-- The title, priority, labels, due date and status push. `todo_set_status` done closes the issue with resolution Done, cancelled with Won't Do. Do these only when Seth asks for that change, and ask before renaming or closing a ticket as a side effect of something else.
-- The description, assignee and the other Jira fields never push: the tools refuse them. Say it changes in Jira, and give the link.
+- The title, description, priority, labels, due date and status push. `todo_set_status` done closes the issue with resolution Done, cancelled with Won't Do. Do these only when Seth asks for that change, and ask before renaming or closing a ticket as a side effect of something else.
+- A description is Markdown; keep its `wiki:` code spans and ```` ```wiki ```` blocks as they are (Jira formatting with no Markdown form).
+- The assignee and the other Jira fields never push: the tools refuse them. Say it changes in Jira, and give the link.
 - For Seth's own ordering and scheduling, prefer the local fields: `local_priority`, `defer_until`, waiting, energy and `private_notes`.
 - An issue assigned to someone else is refused unless Seth agrees (`confirm_not_mine`). Ask him first.
 - To take a ticket off his list without touching it in Jira (reassigned, not his any more), delete it locally.

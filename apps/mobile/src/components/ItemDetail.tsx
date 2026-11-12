@@ -21,6 +21,7 @@ import { type ReactNode, useState } from "react";
 import { ActivityIndicator, Alert, KeyboardAvoidingView, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { protoDate } from "../dates";
 import { useKnown } from "../known";
+import { withNotMine } from "../not-mine";
 import { useSnack } from "../snack";
 import { type Theme, useTheme } from "../theme";
 import { useToday } from "../today";
@@ -84,10 +85,13 @@ function Loaded({ item }: { item: Item }) {
 
   const update = async (patch: Patch, paths: string[], text: string, opts: { expectRevision?: boolean } = {}) => {
     try {
-      const res = await updateItem(clients.items, { id: item.id, ...patch }, paths, {
-        timeoutMs: 15_000,
-        ...(opts.expectRevision && { expectedRevision: item.revision }),
-      });
+      const res = await withNotMine((once) =>
+        updateItem(clients.items, { id: item.id, ...patch }, paths, {
+          timeoutMs: 15_000,
+          ...once,
+          ...(opts.expectRevision && { expectedRevision: item.revision }),
+        }),
+      );
       snack.done(text, { ...(res.result && { result: res.result }), items: [res.item] });
       return true;
     } catch (err) {
@@ -109,7 +113,7 @@ function Loaded({ item }: { item: Item }) {
   const changeStatus = async (status: Status) => {
     if (status === item.status) return;
     try {
-      const res = await setStatus(clients.items, item.id, status, { timeoutMs: 15_000 });
+      const res = await withNotMine((once) => setStatus(clients.items, item.id, status, { timeoutMs: 15_000, ...once }));
       const label = ALL_STATUSES.find((x) => x.value === status)?.label ?? "";
       const next = res.generated?.dueDate ? ` · next ${dayLabel(dayOf(res.generated.dueDate), today)}` : "";
       snack.done(`${label}${next}`, { ...(res.result && { result: res.result }), items: [res.item, res.generated] });

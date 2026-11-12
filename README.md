@@ -613,22 +613,26 @@ how it stands. To Do and In Progress issues land in Next; a resolution of
 Won't Do, Duplicate and the like (`cancelled_resolutions`) makes one
 cancelled, any other done.
 
-**What reaches Jira.** On a Jira item, `i` (title), `p` (priority), `t`
-(labels), `^` (due date) and the status keys change the issue too, within
-seconds while Jira answers:
+**What reaches Jira.** On a Jira item, `i` (title), `E` (description), `p`
+(priority), `t` (labels), `^` (due date) and the status keys change the issue
+too, within seconds while Jira answers:
 
 - `x` closes it with resolution Done, `X` with Won't Do, `s p` starts it,
   and `s i` / `s n` / `s s` from in progress or done move it back to To Do.
   Between inbox, next and someday the move is only here.
+- The description is Markdown here and wiki markup in Jira, converted both
+  ways. Formatting Markdown has no form for (a colour, a panel, an odd
+  table) is kept as it was, as a `` `wiki:…` `` code span or a
+  ```` ```wiki ```` block: leave those be, and they go back unchanged.
 - Undo pushes the old value back.
 - An issue assigned to someone else asks first ("PLAT-4 is assigned to
   Alex: change it in Jira? y/N").
 - Offline, or before Jira answers, the change waits: the row shows `↑`, the
   status bar `⇅ work-jira ↑2`, and it goes once Jira is back.
 
-**Jira's alone**: the description, assignee, components, fix versions,
-parent, story points and estimates. The TUI refuses them ("PLAT-1: the
-description is Jira's: change it there (o opens it)"), and a bulk edit
+**Jira's alone**: the assignee, components, fix versions, parent, story
+points and estimates. The TUI refuses them ("PLAT-1: the assignee is
+Jira's: change it there (o opens it)"), and a bulk edit
 leaves those items out. **Yours alone**, never sent: waiting, defer, notes,
 the local priority override, energy, archive and delete. Deleting an item
 here only hides it, and drops its changes still waiting; the issue stays

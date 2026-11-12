@@ -6,6 +6,7 @@ import { dayLabel, dayOf } from "@todo-tui/present";
 import { router } from "expo-router";
 import { useCallback, useMemo } from "react";
 import { tap } from "./haptics";
+import { withNotMine } from "./not-mine";
 import { useSnack } from "./snack";
 
 export const isClosed = (s: Status) => s === Status.DONE || s === Status.CANCELLED;
@@ -25,7 +26,8 @@ export function useItemActions(today: number): ItemActions {
       const reopen = isClosed(item.status);
       tap();
       try {
-        const res = await setStatus(clients.items, item.id, reopen ? Status.NEXT : Status.DONE, { timeoutMs: 15_000 });
+        const status = reopen ? Status.NEXT : Status.DONE;
+        const res = await withNotMine((once) => setStatus(clients.items, item.id, status, { timeoutMs: 15_000, ...once }));
         const next = res.generated?.dueDate ? ` · next ${dayLabel(dayOf(res.generated.dueDate), today)}` : "";
         snack.done(`${reopen ? "Reopened" : "Done"}: ${item.title}${next}`, { ...(res.result && { result: res.result }), items: [res.item, res.generated] });
       } catch (err) {

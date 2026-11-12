@@ -299,3 +299,49 @@ describe("the NOT_MINE question's input", () => {
     expect(fd.daemon.items.get(id)?.status).not.toBe(Status.DONE);
   });
 });
+
+describe("E on a Jira item (ADR-0009)", () => {
+  it("pushes the description, asks once for someone else's issue, and the yes holds across a rebase", async () => {
+    const fd = fakeDaemon([item("theirs", { ...link("PLAT-11"), isMine: false, description: "## Steps", assignee: { ref: { case: "freeText", value: "Alex" } } })]);
+    fd.daemon.setConfig(pushing);
+    const id = [...fd.daemon.items.values()][0]!.id;
+    const editor = async () => ({ ok: true as const, text: "## Mine\n" });
+    const t = renderTui({ daemon: fd, columns: 120, rows: 20, controller: { editor } });
+    await t.live();
+    // Count the questions; while the first is asked, another field changes,
+    // so the yes's resend is a revision mismatch and the save rebases.
+    let asked = 0;
+    const ask = t.controller.askNotMine.bind(t.controller);
+    t.controller.askNotMine = (err, targets) => {
+      asked += 1;
+      if (asked === 1) fd.daemon.items.get(id)!.revision += 1n;
+      return ask(err, targets);
+    };
+    void t.press("E");
+    await t.waitFrame((f) => expect(f).toContain("PLAT-11 is assigned to Alex: change it in Jira? y/N"));
+    await t.press("y");
+    await vi.waitFor(() => expect(fd.daemon.items.get(id)?.description).toBe("## Mine"));
+    expect(t.frame()).not.toContain("y/N");
+    expect(asked).toBe(1);
+  });
+
+  it("dims the Jira formatting kept in a description, line by line", async () => {
+    const { rawLines } = await import("./components/DetailPane.js");
+    expect(rawLines("## Steps\n`wiki:{panel}`\n```wiki\n||a|b|\n```\nafter `wiki:+u+` text")).toEqual([
+      { line: "## Steps", raw: false },
+      { line: "`wiki:{panel}`", raw: true },
+      { line: "```wiki", raw: true },
+      { line: "||a|b|", raw: true },
+      { line: "```", raw: true },
+      { line: "after `wiki:+u+` text", raw: false },
+    ]);
+  });
+
+  it("names the description among what waits to reach Jira", async () => {
+    const fd = fakeDaemon([item("waits", { ...link("PLAT-12"), isMine: true, pendingFields: [ItemField.DESCRIPTION] })]);
+    fd.daemon.setConfig(pushing);
+    const t = renderTui({ daemon: fd, columns: 120, rows: 20 });
+    await t.live();
+    await t.waitFrame((f) => expect(f).toMatch(/To Jira\s+↑ the description waits to reach/));
+  });
+});

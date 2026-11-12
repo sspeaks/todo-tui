@@ -8,10 +8,12 @@ Sync pulls the issues in (every minute while the TUI is open, every ten otherwis
 
 **Pushed to Jira**, through `todo_update` and `todo_set_status`:
 
-- title, priority, labels, due date (unless the instance keeps it local, below);
+- title, description, priority, labels, due date (unless the instance keeps it local, below);
 - the status: `done` closes the issue with resolution **Done**, `cancelled` with **Won't Do**, `in_progress` starts it, and `inbox`/`next`/`someday` from in progress or done moves it back to To Do. Between inbox, next and someday the move is local, while Jira has the issue in To Do.
 
-**Jira's alone**, refused by the tools ("that field is Jira's: change it in Jira"): the description, assignee, components, fix versions, parent, story points and estimates. Sprint, reporter and Jira's status name are read-only too. Don't retry; tell Seth it changes in Jira, with the key and link.
+**Jira's alone**, refused by the tools ("that field is Jira's: change it in Jira"): the assignee, components, fix versions, parent, story points and estimates. Sprint, reporter and Jira's status name are read-only too. Don't retry; tell Seth it changes in Jira, with the key and link.
+
+**The description** is Markdown, converted from Jira's wiki markup, and pushes back as wiki markup. Formatting Markdown has no form for (a colour, a panel, an odd table) is kept as it was: as a `` `wiki:…` `` code span or a ```` ```wiki ```` block. Leave those exactly as they are when editing a description; they go back to Jira unchanged. Change the text around them freely.
 
 If Seth's config has `push = false` (the kill switch), nothing pushes and every Jira field is refused as above.
 

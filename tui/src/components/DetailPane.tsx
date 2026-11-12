@@ -33,15 +33,17 @@ export function pendingText(fields: readonly ItemField[]): string {
   const word = (f: ItemField) =>
     f === ItemField.TITLE
       ? "the title"
-      : f === ItemField.PRIORITY
-        ? "the priority"
-        : f === ItemField.LABELS
-          ? "the labels"
-          : f === ItemField.DUE_DATE
-            ? "the due date"
-            : f === ItemField.STATUS_CATEGORY || f === ItemField.RESOLUTION_KIND
-              ? "the status"
-              : "a field";
+      : f === ItemField.DESCRIPTION
+        ? "the description"
+        : f === ItemField.PRIORITY
+          ? "the priority"
+          : f === ItemField.LABELS
+            ? "the labels"
+            : f === ItemField.DUE_DATE
+              ? "the due date"
+              : f === ItemField.STATUS_CATEGORY || f === ItemField.RESOLUTION_KIND
+                ? "the status"
+                : "a field";
   const words = [...new Set(fields.map(word))];
   const list = words.length > 1 ? `${words.slice(0, -1).join(", ")} and ${words.at(-1)}` : (words[0] ?? "");
   return `${list} ${words.length > 1 ? "wait" : "waits"} to reach Jira`;
@@ -75,6 +77,39 @@ function Field({ label, children, dim }: { label: string; children: ReactNode; d
           {children}
         </Text>
       </Box>
+    </Box>
+  );
+}
+
+/**
+ * A description, Jira formatting with no Markdown form dimmed: the lines of
+ * a ```wiki block and a line that is one `wiki:` span (ADR-0009). They are
+ * kept for Jira, not meant to be read.
+ */
+export function rawLines(text: string): { line: string; raw: boolean }[] {
+  let fence: string | undefined;
+  return text.split("\n").map((line) => {
+    const open = /^(`{3,})wiki\s*$/.exec(line);
+    if (fence === undefined && open) {
+      fence = open[1];
+      return { line, raw: true };
+    }
+    if (fence !== undefined) {
+      if (line.trimEnd() === fence) fence = undefined;
+      return { line, raw: true };
+    }
+    return { line, raw: /^`wiki:[^`]*`$/.test(line) };
+  });
+}
+
+function Description({ text }: { text: string }) {
+  return (
+    <Box flexDirection="column">
+      {rawLines(text).map(({ line, raw }, i) => (
+        <Text key={i} wrap="wrap" dimColor={raw}>
+          {line || " "}
+        </Text>
+      ))}
     </Box>
   );
 }
@@ -267,9 +302,11 @@ export function DetailPane({ id, width, height, focused }: { id: string | undefi
           </>
         ) : null}
         <Heading>Description</Heading>
-        <Text wrap="wrap" dimColor={!item.description}>
-          {item.description ? sanitize(item.description, { multiline: true }) : "—"}
-        </Text>
+        {item.description ? (
+          <Description text={sanitize(item.description, { multiline: true })} />
+        ) : (
+          <Text dimColor>—</Text>
+        )}
         {item.privateNotes ? (
           <>
             <Heading>Private notes</Heading>
