@@ -139,14 +139,18 @@ fn priority_of(s: &str) -> Option<Priority> {
 }
 
 /// The patches Claude's `answer` makes for `item`, as `(field, the value
-/// Claude saw, the value proposed)`: only what is valid, and only what would
-/// change. `editable` says which fields the person may change on this Item
-/// (a linked Item's tracker-only fields are not), so none is proposed that
-/// applying would refuse.
+/// Claude saw, the value proposed)`: only what is valid, only what would
+/// change, and only what the prompt allows, whatever the item's text told
+/// Claude: a description only where there is none, labels only those in use
+/// (the item's own kept), a due date within a year of today. `editable` says
+/// which fields the person may change on this Item (a linked Item's
+/// tracker-only fields are not), so none is proposed that applying would
+/// refuse.
 pub fn patches(
     item: &Item,
     answer: &Value,
     today: Date,
+    labels_in_use: &[String],
     editable: impl Fn(ItemField) -> bool,
 ) -> (String, Vec<(ItemField, FieldValue, FieldValue)>) {
     let rationale = answer["rationale"].as_str().unwrap_or_default().trim();
@@ -164,63 +168,77 @@ pub fn patches(
         }
     };
     let text = |k: &str| answer[k].as_str().map(str::trim).filter(|s| !s.is_empty());
+    // One line of text, as the core takes a title: no line break or control.
+    let one_line = |s: &str| {
+        s.chars().count() <= 200
+            && !s.chars().any(char::is_control)
+            && !s.contains(['\u{85}', '\u{2028}', '\u{2029}'])
+    };
     if let Some(t) = text("title")
-        && !t.contains(['\n', '\r'])
-        && t.len() <= 500
+        && one_line(t)
     {
         add(ItemField::Title, FieldValue::String(t.to_owned()));
     }
-    if let Some(d) = answer["description"].as_str()
-        && d.trim() != item.core.description.trim()
+    // Only where there is none: details moved out of a long title.
+    if item.core.description.trim().is_empty()
+        && let Some(d) = text("description")
+        && d.len() <= 20_000
     {
-        add(
-            ItemField::Description,
-            FieldValue::Markdown(d.trim_end().to_owned()),
-        );
+        add(ItemField::Description, FieldValue::Markdown(d.to_owned()));
     }
     if let Some(p) = text("priority").and_then(priority_of) {
         add(ItemField::Priority, FieldValue::Priority(p));
     }
-    if let Some(d) = text("due_date").and_then(|d| d.parse::<Date>().ok()) {
+    // Within a year either way: the text names a day, not a decade.
+    let year = jiff::Span::new().years(1);
+    let near = |d: Date| d >= today.saturating_sub(year) && d <= today.saturating_add(year);
+    if let Some(d) = text("due_date").and_then(|d| d.parse::<Date>().ok())
+        && near(d)
+    {
         add(ItemField::DueDate, FieldValue::Date(d));
     }
     if let Some(labels) = answer["labels"].as_array() {
-        let mut set: Vec<String> = labels
-            .iter()
-            .filter_map(Value::as_str)
-            .map(|l| l.trim().trim_start_matches('#').to_owned())
-            .filter(|l| !l.is_empty() && !l.contains(|c: char| c.is_whitespace() || c.is_control()))
-            .collect();
-        set.sort();
-        set.dedup();
-        let mut now = item.core.labels.clone();
-        now.sort();
-        if set != now {
+        // The item's own labels stay; Claude adds only labels in use.
+        let mut set = item.core.labels.clone();
+        for l in labels.iter().filter_map(Value::as_str) {
+            let l = l.trim().trim_start_matches('#');
+            if labels_in_use.iter().any(|u| u == l) && !set.iter().any(|s| s == l) {
+                set.push(l.to_owned());
+            }
+        }
+        if set.len() > item.core.labels.len() {
             add(ItemField::Labels, FieldValue::StringSet(set));
         }
     }
-    if let Some(on) = text("waiting_on")
-        && !on.contains(['\n', '\r'])
+    // waiting_on and waiting_reason each null for "as it is".
+    let current = item.overlay.waiting.as_ref();
+    let on = text("waiting_on")
+        .map(str::to_owned)
+        .or_else(|| current.map(|w| person(&w.on)));
+    let reason = text("waiting_reason")
+        .map(str::to_owned)
+        .or_else(|| current.map(|w| w.reason.clone()))
+        .unwrap_or_default();
+    if (text("waiting_on").is_some() || text("waiting_reason").is_some())
+        && let Some(on) = on
+        && one_line(&on)
+        && one_line(&reason)
+        && !current.is_some_and(|w| person(&w.on) == on && w.reason == reason)
     {
-        let reason = text("waiting_reason").unwrap_or_default().to_owned();
-        let same = item
-            .overlay
-            .waiting
-            .as_ref()
-            .is_some_and(|w| person(&w.on) == on && w.reason == reason);
-        if !same {
-            let since = item.overlay.waiting.as_ref().map_or(today, |w| w.since);
-            let follow_up_on = item.overlay.waiting.as_ref().and_then(|w| w.follow_up_on);
-            add(
-                ItemField::Waiting,
-                FieldValue::Waiting(Waiting {
-                    on: PersonRef::FreeText(on.to_owned()),
-                    reason,
-                    since,
-                    follow_up_on,
-                }),
-            );
-        }
+        let on = match current {
+            // The same person keeps their ref (a Person, not text).
+            Some(w) if person(&w.on) == on => w.on.clone(),
+            _ => PersonRef::FreeText(on),
+        };
+        add(
+            ItemField::Waiting,
+            FieldValue::Waiting(Waiting {
+                on,
+                reason,
+                since: current.map_or(today, |w| w.since),
+                follow_up_on: current.and_then(|w| w.follow_up_on),
+            }),
+        );
     }
     (rationale, out)
 }
@@ -254,7 +272,8 @@ mod tests {
             "waiting_on": "Dana",
             "waiting_reason": "the login test fix"
         });
-        let (why, p) = patches(&it, &answer, TODAY, |_| true);
+        let in_use = ["work".to_owned(), "testing".to_owned()];
+        let (why, p) = patches(&it, &answer, TODAY, &in_use, |_| true);
         assert_eq!(why, "A follow-up with Dana, due Friday.");
         let fields: Vec<ItemField> = p.iter().map(|x| x.0).collect();
         assert_eq!(
@@ -274,7 +293,7 @@ mod tests {
         );
         assert_eq!(
             p[3].2,
-            FieldValue::StringSet(vec!["testing".into(), "work".into()])
+            FieldValue::StringSet(vec!["work".into(), "testing".into()])
         );
         let FieldValue::Waiting(w) = &p[4].2 else {
             panic!()
@@ -298,8 +317,70 @@ mod tests {
             "waiting_on": "a\nb",
             "description": "longer text"
         });
-        let (_, p) = patches(&it, &answer, TODAY, |f| f != ItemField::Description);
+        let (_, p) = patches(&it, &answer, TODAY, &[], |f| f != ItemField::Description);
         assert!(p.is_empty(), "{p:?}");
+    }
+
+    #[test]
+    fn what_the_item_text_could_steer_is_held_to_the_prompts_rules() {
+        // Review M12: an item's text cannot get Claude to drop labels,
+        // invent one, rewrite a description, set a date years off, or erase
+        // a waiting reason.
+        let mut it = item("Call the vendor\u{2028}now");
+        it.core.labels = vec!["work".into(), "home".into()];
+        it.core.description = "keep me".into();
+        it.overlay.waiting = Some(Waiting {
+            on: PersonRef::FreeText("Dana".into()),
+            reason: "the quote".into(),
+            since: date(2026, 11, 1),
+            follow_up_on: None,
+        });
+        let answer = json!({
+            "rationale": "r",
+            "title": "Call the vendor\u{2028}now",
+            "description": "replaced",
+            "due_date": "2031-01-01",
+            "labels": ["invented", "work"],
+            "waiting_on": "Dana Smith",
+            "waiting_reason": null
+        });
+        let (_, p) = patches(&it, &answer, TODAY, &["work".into(), "home".into()], |_| {
+            true
+        });
+        let fields: Vec<ItemField> = p.iter().map(|x| x.0).collect();
+        assert_eq!(fields, [ItemField::Waiting]);
+        let FieldValue::Waiting(w) = &p[0].2 else {
+            panic!()
+        };
+        assert_eq!(
+            (w.reason.as_str(), w.since),
+            ("the quote", date(2026, 11, 1))
+        );
+        // Only the reason: the person stays, the same ref.
+        let (_, p) = patches(
+            &it,
+            &json!({"rationale": "", "waiting_reason": "the signed quote"}),
+            TODAY,
+            &[],
+            |_| true,
+        );
+        let FieldValue::Waiting(w) = &p[0].2 else {
+            panic!()
+        };
+        assert_eq!(
+            (w.on.clone(), w.reason.as_str()),
+            (PersonRef::FreeText("Dana".into()), "the signed quote")
+        );
+        // A description where there is none is taken.
+        it.core.description.clear();
+        let (_, p) = patches(
+            &it,
+            &json!({"rationale": "", "description": "details"}),
+            TODAY,
+            &[],
+            |_| true,
+        );
+        assert_eq!(p[0].2, FieldValue::Markdown("details".into()));
     }
 
     #[test]

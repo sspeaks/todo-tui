@@ -213,7 +213,7 @@ All bindings live in one declarative keymap table (4.6), are listed in the `F1` 
 
 **In P1 (M4)**: `P`, `L`, `o`, `gs`, `S` and the `space` leader are unbound until their services exist (P2–P4). **Marks** belong to the current view: a view switch, a successful bulk action and `esc` clear them; an Item that leaves the view leaves the marks; `/` keeps them (`3 marked (1 hidden)`). When the view has marks, the mark-aware keys `x X s p ^ D w W t z dd @` (and `e`, M8) act on every marked Item through one `BatchMutate`, so one undo entry (`mark done (3 items) · u undo`); `z` on a mixed set archives if any is unarchived. `@` is prefilled with the rule the marked Items share, if they share one, and resolves its text against each Item's own due date (one `ParseRecurrence` per date), so `weekly` repeats each on its own weekday; each Item without recurrence gets its own series. `i`, `E`, `A` and `enter` act on the selected Item only, `u` and `ctrl-r` on the global stack. More than 1000 marks is refused, since splitting the batch would split the undo.
 
-**Claude actions** (`space` leader; hidden if no provider configured): `space r` refine · `space p` prioritize · `space s` split · `space c` draft comment · `space l` find related · `space m` draft a meeting agenda (2.9). All but the agenda produce Suggestions; the agenda is text for the meeting form, like the standup (6.6). `?` opens the **Ask bar** (6.7).
+**Claude actions** (`space` leader; hidden if no provider configured): `space r` refine · `space p` prioritize · `space s` split · `space c` draft comment · `space l` find related · `space m` draft a meeting agenda (2.9). All but the agenda produce Suggestions; the agenda is text for the meeting form, like the standup (6.6). `?` opens the **Ask bar** (6.7). **As built (P3 M12)**: `space r` and `:refine` only, mark-aware; without `[assistant] provider` `space r` is no key and `:refine` says how to turn it on. The status bar shows `✦ refining…` while a refine runs, and a toast says what came of it.
 
 **Command line** (`:`) with fuzzy completion, which doubles as the command palette: `:review`, `:standup`, `:sync`, `:promote`, `:link PLAT-123`, `:export`, `:view new …`, `:help`. P1 runs `:q`/`:quit`, `:help`/`:h`, `:search <q>`, `:refresh`, `:config` (the file and its warnings, the keymap's first), `:view …` (2.4) and `:export [path]` (7.4, to `~/todo-export-YYYYMMDD-HHMM.jsonl` by default), with `tab` prefix completion (the fuzzy palette comes later); a planned command says when it arrives (`:l48` and `:meet` in M8, `:sync`, `:promote`, `:link` and `:w` in P2, `:review` and `:standup` in P4), anything else "Not a command".
 
@@ -921,6 +921,8 @@ The assistant talks to Claude through a `ClaudeProvider` abstraction in `todo-as
 | `api` | `ANTHROPIC_API_KEY`, or an `ant auth login` OAuth profile | Claude API (Console) | Raw HTTP to `POST /v1/messages` (no official Rust SDK). Supports structured outputs, prompt caching, model per task. **Default.** |
 | `claude_code` | Whatever the user's installed Claude Code is logged into, including a Pro/Max subscription | User's Claude plan | Daemon shells out to the user's `claude` CLI in headless/print mode with JSON output. Read-only tools are provided by pointing it at `todo mcp --read-only` (4.6). Slower per call; batching (6.3) matters more. |
 
+**As built (P3 M12, ADR-0010)**: `claude_code` first, as `todo_assistant::ClaudeCode`: `claude -p --output-format json --json-schema <schema> --system-prompt <prompt> --tools "" --strict-mcp-config --setting-sources "" --no-session-persistence [--model m]`, the context on stdin, killed after `timeout_seconds` (120). No tools, MCP servers, settings or saved session: the CLI sees only the context the daemon builds (checked against Claude Code 2.1.308, which then offers only its own structured-output tool). The envelope's `structured_output` is the answer; `usage` and `total_cost_usd` are recorded. A missing binary, a hang, a login error and an API error each say what to do. `api` is not built (`provider = "api"` warns and leaves the assistant off). Tests and smoke use a stand-in (`DaemonOptions.assistant`) or a stub `claude` script, never a real call.
+
 Claims to verify at build time: `ant auth login` OAuth profiles work for direct HTTP calls; structured outputs via `output_config.format`; current Claude Code headless flags. Rules: the app never reads, copies or refreshes Claude Code's credentials itself. It only invokes the user's own `claude` binary. Before open-sourcing, confirm that this provider is consistent with Anthropic's current terms for third-party tools.
 
 ### 6.2 Tasks
@@ -944,6 +946,9 @@ Every Claude feature is a **task kind**, with its own prompt template, output sc
 Model IDs are config values (`claude-haiku-5-5`, `claude-sonnet-5-5`, `claude-opus-5-5` at time of writing). Defaults favor cheap models for high-frequency work.
 
 ### 6.3 Pipeline
+
+**As built (P3 M12)**: on request only, `refine` only. `AssistantService.Refine(item_ids)` (1 to 20) queues a job in `assistant_jobs` (migration `0010`) and returns at once; a request for an Item a waiting job holds joins it. One supervised task runs jobs one at a time, one Claude call per Item: the Item (private notes only with `include_private_notes`), today, the labels in use, `style_notes`, and up to 20 Items whose title or key shares a word of three letters or more (FTS5, OR, best first) as `(key or short id, title)`. The answer is validated as step 5 says, and patches applying would refuse (a linked Item's tracker-only fields, a field kept local) are dropped. Each Item with something to change gets one `refine` Suggestion (source `claude`), streamed on `TOPIC_SUGGESTION`; none when nothing would change. `GetJob` and `ListJobs` give the state, error, tokens, cost and time; a job a stopped daemon left behind is failed at start. No debounce, batching, cache breakpoints or skip-if-unchanged yet: a person asks for each refine.
+
 
 ```
 trigger ──► job queue ──► context builder ──► provider ──► validate ──► Suggestion(s) ──► watch stream ──► TUI
@@ -1036,6 +1041,8 @@ Two layers, both on the same capture path (`todo add`, TUI quick-add, MCP):
 ### 6.10 Data sent to Claude
 
 What is sent: Item Core and Overlay fields of the Items in context, minus `private_notes` (excluded by default; config can include them). A global switch (omit `assistant.provider` to disable) and a per-instance toggle (`assistant_enabled`, 8.2) exist even though v1 assumes sending is fine, so a future corporate policy needs no redesign.
+
+**As built (P3 M12)**: as above, with private notes left out unless `include_private_notes = true`; no remote extras are sent; the candidates are only titles and keys. `assistant_enabled` per instance is not read yet.
 
 ## 7. Storage, Offline & Export
 
@@ -1175,7 +1182,10 @@ scopes = [{ name = "mine", query = "assignee = currentUser() AND resolution = Un
 assistant_enabled = true
 
 [assistant]
-provider = "api"            # "api" | "claude_code" | omit to disable
+provider = "claude_code"    # "claude_code" (ADR-0010) | omit to disable; "api" later
+# claude_bin = "claude"     # the Claude Code CLI; on PATH by default
+# model = "claude-haiku-5-5"  # else the CLI's own default
+# timeout_seconds = 120
 auto_refine = "auto"        # "auto" | "on_request"
 style_notes = ""
 include_private_notes = false
@@ -1293,6 +1303,15 @@ M11 built Jira descriptions in four phases (`api_minor` 24–25, ADR-0009): the 
 M11 left these for later: other Jira constructs Markdown could hold (`_italic_` as `*italic*`, strikethrough, quotes) are kept as text; ADF for Jira Cloud.
 
 M10 left these for later: the description and its safety rules (next); `choose_transition` alternatives and missing-field prompts for a refused transition (3.4); value overrides (`e`), `R` and a per-Item filter in the pane (2.6); a `target_refinement` record (3.4; not needed while pulls leave the refinement alone); concurrent pushes per instance; comments, issue links, promote and attach; a second instance.
+
+**P3 progress.** Seth asked for the Claude work before P2's promote and attach (2026-11-12): P3 starts while P2's last milestones wait.
+
+| Milestone | Scope | Status |
+|---|---|---|
+| M12 | `refine` on request through the Claude Code CLI (ADR-0010): `AssistantService` (`Refine`, `GetJob`, `ListJobs`), the job runner, `refine` Suggestions (source `claude`, ticked in the pane), `space r` / `:refine`, `todo refine`, `todo assistant usage` | done (`api_minor` 26) |
+| next | Promote and attach (5.7, P2), or the `api` provider and auto refine (6.1–6.3) | planned |
+
+M12 built it in three phases: the provider and `[assistant]`; the service, runner and migration `0010` (`api_minor` 26); the clients. It left these for later: the `api` provider, auto refine on capture with debounce and batching, skip-if-unchanged, `merge_into` patches (a duplicate is named in the rationale), `relate`, `prioritize` and the other kinds, learning from decisions (6.8), `assistant_enabled` per instance, an MCP refine tool (Claude Code edits directly).
 
 ### 9.2 Open questions
 

@@ -28,7 +28,9 @@ on items (`%low`, `e`), `h` / `l` between views, the L48 / N48 scrum report
 Jira Data Center (`todo sync check|now|status`, `⇅` in the status bar, `o`).
 The second (M10) pushes edits back: the title, priority, labels, due date
 and status, with what Jira refuses or overwrites kept in a Suggestions pane
-(`S`); see [Jira sync](#jira-sync). A phone app (Expo) can
+(`S`); see [Jira sync](#jira-sync). The first Claude milestone (M12) refines
+an item on request through your own Claude Code: `space r` or `todo refine`;
+see [Claude refines an item](#claude-refines-an-item). A phone app (Expo) can
 capture, browse the views and complete items over Tailscale; see
 [Phone app](#phone-app). The CLI captures, undoes and counts;
 listing, editing and completing items happen in the TUI or through Claude Code.
@@ -348,7 +350,8 @@ key hints) and a message line for prompts and results.
 | `dd` | Delete, with its subtasks (asks first: `y` deletes) |
 | `M` | Schedule a Teams meeting about it ([Meetings](#meetings)) |
 | `o` | Open its Jira issue in the browser ([Jira sync](#jira-sync)) |
-| `S`, `:suggestions` | The Suggestions pane: Jira's fallout to review ([Jira sync](#jira-sync)) |
+| `S`, `:suggestions` | The Suggestions pane: what Jira or Claude left to review ([Jira sync](#jira-sync)) |
+| `space r`, `:refine` | Ask Claude to refine it, or the marked ones ([Claude refines an item](#claude-refines-an-item)) |
 | **Marks and bulk** | |
 | `m` | Mark or unmark the item, and move down |
 | `V` | Mark the rows you move over; `V` or `esc` ends it |
@@ -359,7 +362,7 @@ key hints) and a message line for prompts and results.
 | **Undo** | |
 | `u`, `ctrl-r` | Undo, redo: the same history as `todo undo` |
 | **Commands** | |
-| `:` | Command line: `:q`, `:help`, `:search <words>`, `:refresh`, `:view …` ([Views](#views-of-your-own)), `:config`, `:export [path]`, `:l48 [since]`, `:meet`, `:sync [status\|outbox]`, `:suggestions`; `tab` completes |
+| `:` | Command line: `:q`, `:help`, `:search <words>`, `:refresh`, `:view …` ([Views](#views-of-your-own)), `:config`, `:export [path]`, `:l48 [since]`, `:meet`, `:sync [status\|outbox]`, `:suggestions`, `:refine`; `tab` completes |
 | `gs` | Sync with Jira now |
 | `?`, F1, `:help` | Help: every key, the capture syntax and the dates |
 | `ctrl-z` | Suspend to the shell; `fg` comes back |
@@ -670,6 +673,37 @@ It also backs up before it migrates the database to a new schema.
 | `todo export [--out FILE] [--no-history]` | Every record as JSON Lines (`--no-history` leaves out the undo history); `:export [path]` in the TUI |
 | `todo import FILE` | Loads an export into an empty database, as on a new machine |
 
+### Claude refines an item
+
+With Claude Code installed and logged in, Claude can tidy an item for you:
+a clearer title, and the due date, priority, labels and who it waits on that
+its text gives. It only proposes; you tick what you want.
+
+1. Turn it on in `~/.config/todo-tui/config.toml`, then `todo config reload`:
+
+   ```toml
+   [assistant]
+   provider = "claude_code"
+   # model = "claude-haiku-5-5"     # else Claude Code's own default
+   # style_notes = "titles imperative, under 60 characters"
+   # include_private_notes = false  # private notes are never sent unless true
+   ```
+
+2. In the TUI, `space r` on an item (or the marked ones), or `:refine`. The
+   status bar shows `✦ refining…`, and a toast says when it is done.
+3. `S` opens the Suggestions pane: Claude's changes are already ticked;
+   `enter` unticks one, `ctrl-s` applies the rest as one change (`u` undoes
+   it), `r` rejects them all. An item that looks like a duplicate is named
+   there.
+
+From the shell, `todo refine <id>` (the short id `todo add` prints) waits
+and prints what Claude proposes; `todo assistant usage` lists the requests
+and what they cost. Nothing runs by itself: each refine is one you asked
+for. The daemon runs your `claude` CLI headless with no tools, so Claude
+sees only the item, the labels you use and the titles of similar items,
+billed to the plan Claude Code is logged into
+([ADR-0010](docs/adr/0010-claude-code-provider.md)).
+
 ### Claude Code
 
 `todo mcp` serves the todo tools to Claude Code over stdio. Register it once:
@@ -684,7 +718,7 @@ claude mcp add --scope user todo -- todo mcp
 | `todo_get`, `todo_status`, `todo_views` | One item in full; the counts; the views |
 | `todo_l48` | The L48 / N48 report, as `todo l48` prints it |
 | `todo_meeting_link` | A Teams new-meeting link for items, prefilled as `M` fills it |
-| `todo_suggestions` | What Jira sync left to review (conflicts, refusals); applying one is yours, in the TUI's `S` |
+| `todo_suggestions` | What waits to review (Jira conflicts and refusals, Claude's refines); applying one is yours, in the TUI's `S` |
 | `todo_capture` | A capture, as `todo add` takes it (tokens and all) |
 | `todo_update` | Title, description, priority, local priority, energy, due, defer, labels, waiting, private notes; on a Jira item the title, description, priority, labels and due date reach Jira |
 | `todo_set_status` | `inbox`, `next`, `someday`, `in_progress`, `done`, `cancelled`; completing a repeating item returns the next one |

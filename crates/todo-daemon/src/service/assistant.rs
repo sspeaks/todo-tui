@@ -33,7 +33,8 @@ impl Assistants {
     }
 
     async fn job_proto(&self, job: Job) -> Result<v1::AssistantJob, Status> {
-        let suggestion_ids = if job.state == JobState::Done {
+        // A failed job may have refined the Items before the one that failed.
+        let suggestion_ids = if matches!(job.state, JobState::Done | JobState::Failed) {
             self.0
                 .store
                 .job_suggestions(job.id.clone())

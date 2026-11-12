@@ -84,11 +84,12 @@ export class Suggestions {
 
   /**
    * Claude's changes that arrived while the pane is open (a refine just
-   * done) start ticked too; a sync one never does.
+   * done) start ticked too, unless the person has ticked something since it
+   * opened: ctrl-s then applies only what they chose. A sync one never does.
    */
   arrived(before: ReadonlySet<string>): void {
     const mode = this.c.state.mode;
-    if (mode.kind !== "suggestions") return;
+    if (mode.kind !== "suggestions" || mode.ticked.size) return;
     const fresh = this.rows().filter((r) => !before.has(r.suggestion.id));
     if (!fresh.length) return;
     const ticked = new Set(mode.ticked);

@@ -40,6 +40,8 @@ export class Refine {
     }
     const n = target.ids.length;
     this.c.toast("info", `Asking Claude to refine ${n === 1 ? "it" : `${n} items`}… (S shows what it proposes)`);
+    // A request that joined a job already followed: no second follower.
+    if (this.following.has(id)) return;
     this.following.add(id);
     this.show();
     void this.follow(id, n);
@@ -53,7 +55,11 @@ export class Refine {
         await new Promise((r) => setTimeout(r, timing.pollMs));
         const job = (await this.c.store.assistantClient.getJob({ id }, { timeoutMs: 10_000 })).job;
         if (!job) return;
-        if (job.state === AssistantJobState.FAILED) return this.c.toast("error", `Claude could not refine it: ${job.error}`);
+        if (job.state === AssistantJobState.FAILED) {
+          const made = job.suggestionIds.length;
+          const part = made ? ` (${made} ${made === 1 ? "item" : "items"} done first · S to review)` : "";
+          return this.c.toast("error", `Claude could not refine it: ${job.error}${part}`);
+        }
         if (job.state === AssistantJobState.DONE) {
           const made = job.suggestionIds.length;
           return this.c.toast(

@@ -29,6 +29,9 @@ export interface EffectiveKeymap {
 
 const MODES: readonly KeymapMode[] = ["normal", "help", "report", "suggestions"];
 
+/** Keys a later default made a prefix: a person's own binding of one wins. */
+const LATE_PREFIXES: readonly string[] = ["space"];
+
 const isToken = (t: string): boolean => (isChar(t) && t !== " ") || NAMED_TOKENS.includes(t) || (/^ctrl\+[a-z]$/.test(t) && !(t in CTRL_ALIASES));
 
 /** `defaults` with `keymap` applied. The result does not depend on the map's order. */
@@ -69,14 +72,21 @@ export function applyOverrides(defaults: readonly Binding[], keymap: Readonly<Re
     if (!defaults.some((b) => b.keys.includes(keys))) warnings.push({ keys, message: "is not bound, so there is nothing to unbind" });
   }
 
-  // Then bind each, against everything else already in place.
+  // Then bind each, against everything else already in place. `space` was
+  // a key of its own until the Claude actions made it a prefix (space r,
+  // M12): a person's binding of it, written before, takes it back, the
+  // space sequences giving way with a warning.
   for (const { keys, target, modes } of binds) {
-    const candidate = bindings.map((b) => (b.id === target.id ? { ...b, keys: [...b.keys, keys] } : b));
+    const shadowed = (k: string) => LATE_PREFIXES.includes(keys) && k.startsWith(`${keys} `);
+    const lost = bindings.filter((b) => b.id !== target.id && b.keys.some(shadowed) && bindingModes(b).some((m) => modes.includes(m)));
+    const freed = lost.length ? bindings.map((b) => (lost.includes(b) ? { ...b, keys: b.keys.filter((k) => !shadowed(k)) } : b)) : bindings;
+    const candidate = freed.map((b) => (b.id === target.id ? { ...b, keys: [...b.keys, keys] } : b));
     const error = conflict(candidate, modes);
     if (error) {
       warnings.push({ keys, message: error });
       continue;
     }
+    for (const l of lost) warnings.push({ keys, message: `takes ${l.keys.filter(shadowed).join(", ")} off ${l.id}` });
     bindings = candidate;
   }
   warnings.sort((a, b) => (a.keys < b.keys ? -1 : a.keys > b.keys ? 1 : 0));

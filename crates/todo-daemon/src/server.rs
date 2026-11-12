@@ -235,6 +235,11 @@ impl Daemon {
         // Before any call is served, so the first edit meets the guard the
         // config asks for, not the read-only default.
         crate::config::apply_to_store(&config.current(), &store);
+        // Jobs an earlier daemon left queued or running never ran: failed,
+        // before a Refine could join one.
+        if let Err(e) = store.abandon_jobs(jiff::Timestamp::now()).await {
+            tracing::warn!(error = %e, "failing the assistant's abandoned jobs failed");
+        }
         spool::import_logged(&paths, &store).await;
         let backoff = Backoff {
             first: options.restart_after,

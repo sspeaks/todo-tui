@@ -28,6 +28,14 @@ describe("[keymap] overrides", () => {
     expect(runs(bindings, ["k"])).toBe("move_up");
   });
 
+  it("a key bound before a default made it a prefix keeps working, with a warning", () => {
+    // space r (refine, M12) made space a prefix; an earlier "space" = … wins.
+    const { bindings, warnings } = applyOverrides(BINDINGS, { space: "mark" });
+    expect(runs(bindings, ["space"])).toBe("mark");
+    expect(keysOf(bindings, "refine")).toEqual([]);
+    expect(warnings).toEqual([{ keys: "space", message: "takes space r off refine" }]);
+  });
+
   it("moves a key from one action to another", () => {
     const { bindings } = applyOverrides(BINDINGS, { x: "mark_cancelled" });
     expect(runs(bindings, ["x"])).toBe("mark_cancelled");

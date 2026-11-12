@@ -59,9 +59,11 @@ pub trait Provider: Send + Sync {
 }
 
 /// The person's own `claude` CLI, headless (design 6.1 `claude_code`): no
-/// tools, no MCP servers, no settings, no saved session, so the context the
-/// daemon builds is all it sees. The daemon never reads Claude Code's
-/// credentials: the CLI uses whatever it is logged into.
+/// tools, no MCP servers, no saved session, and run in an empty directory,
+/// so the context the daemon builds is all it sees (no project CLAUDE.md or
+/// memory). Its user settings load, as they hold how it reaches Claude (a
+/// gateway, a token, model names); the daemon never reads them, nor Claude
+/// Code's credentials: the CLI uses whatever it is logged into.
 #[derive(Debug, Clone)]
 pub struct ClaudeCode {
     pub bin: PathBuf,
@@ -84,8 +86,10 @@ impl ClaudeCode {
             "--tools".to_owned(),
             String::new(),
             "--strict-mcp-config".to_owned(),
+            // User settings only: how the CLI reaches Claude, not a
+            // project's settings or hooks.
             "--setting-sources".to_owned(),
-            String::new(),
+            "user".to_owned(),
             "--no-session-persistence".to_owned(),
         ];
         if !self.model.is_empty() {
@@ -98,8 +102,13 @@ impl ClaudeCode {
 
 impl Provider for ClaudeCode {
     async fn run(&self, task: Task) -> Result<Answer, ProviderError> {
+        // An empty directory: no project's CLAUDE.md or memory joins the
+        // context.
+        let dir = std::env::temp_dir().join(format!("todo-claude-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
         let mut child = Command::new(&self.bin)
             .args(self.args(&task))
+            .current_dir(&dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -134,12 +143,20 @@ impl Provider for ClaudeCode {
 
 /// An error from a run that printed nothing: what stderr says.
 fn stderr_error(err: &str) -> ProviderError {
-    let lower = err.to_ascii_lowercase();
-    if lower.contains("login") || lower.contains("logged in") || lower.contains("authenticat") {
+    if login_error(err) {
         ProviderError::NotLoggedIn
     } else {
         ProviderError::BadAnswer(first_line(err, "no output"))
     }
+}
+
+/// Whether the CLI says it is not logged in: its own words, not any message
+/// that mentions a login.
+fn login_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    ["please run /login", "not logged in", "invalid api key"]
+        .iter()
+        .any(|w| lower.contains(w))
 }
 
 fn first_line(s: &str, empty: &str) -> String {
@@ -148,16 +165,23 @@ fn first_line(s: &str, empty: &str) -> String {
 }
 
 /// The CLI's `--output-format json` envelope: `structured_output` holds the
-/// answer; `is_error` with the message in `result` a failure.
+/// answer; `is_error` with the message in `result` a failure, or with only
+/// an `error_…` subtype (a turn limit, no valid structured answer) one that
+/// logging in would not fix.
 pub fn parse_envelope(stdout: &str) -> Result<Answer, ProviderError> {
     let v: Value = serde_json::from_str(stdout.trim())
         .map_err(|e| ProviderError::BadAnswer(format!("not JSON ({e})")))?;
     let text = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default();
     if v.get("is_error").and_then(Value::as_bool).unwrap_or(false) {
-        let msg = first_line(text("result"), "an error");
-        let lower = msg.to_ascii_lowercase();
-        if lower.contains("login") || lower.contains("authenticat") || lower.contains("401") {
+        let msg = first_line(text("result"), "");
+        if v.get("api_error_status").and_then(Value::as_u64) == Some(401) || login_error(&msg) {
             return Err(ProviderError::NotLoggedIn);
+        }
+        if msg.is_empty() {
+            return Err(ProviderError::BadAnswer(match text("subtype") {
+                "" | "success" => "an error with no message".to_owned(),
+                s => s.replace('_', " "),
+            }));
         }
         return Err(ProviderError::Refused(msg));
     }
@@ -237,6 +261,23 @@ mod tests {
         );
         let login = r#"{"is_error":true,"result":"Invalid API key · Please run /login"}"#;
         assert_eq!(parse_envelope(login), Err(ProviderError::NotLoggedIn));
+        let status = r#"{"is_error":true,"result":"API Error: denied","api_error_status":401}"#;
+        assert_eq!(parse_envelope(status), Err(ProviderError::NotLoggedIn));
+        // A message that only mentions a login page is not a login error.
+        let page =
+            r#"{"is_error":true,"result":"API Error: 403 see https://sso.example.com/login"}"#;
+        assert!(matches!(
+            parse_envelope(page),
+            Err(ProviderError::Refused(_))
+        ));
+        // No message: the subtype says what went wrong.
+        let turns = r#"{"is_error":true,"subtype":"error_max_structured_output_retries"}"#;
+        assert_eq!(
+            parse_envelope(turns),
+            Err(ProviderError::BadAnswer(
+                "error max structured output retries".into()
+            ))
+        );
         assert!(matches!(
             parse_envelope("not json"),
             Err(ProviderError::BadAnswer(_))
@@ -283,6 +324,7 @@ mod tests {
             "-p",
             "--output-format json",
             "--strict-mcp-config",
+            "--setting-sources user",
             "--no-session-persistence",
             "--model claude-haiku-5-5",
             "--system-prompt sys",

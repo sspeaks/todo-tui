@@ -672,7 +672,7 @@ export class FakeDaemon {
         refine: (req) => this.refine(req.itemIds),
         getJob: (req) => {
           this.check();
-          const job = this.jobs.get(req.id);
+          const job = this.jobs.get(idOf("id", req.id));
           if (!job) throw errorInfo(Code.NotFound, "JOB_NOT_FOUND", "no such job", {});
           return { job };
         },
@@ -959,13 +959,16 @@ export class FakeDaemon {
       const item = this.items.get(id);
       if (!item || item.deletedAt !== undefined) throw errorInfo(Code.NotFound, "ITEM_NOT_FOUND", `item ${id} not found`, { item_id: id });
     }
+    // One Item a waiting job holds: that job, as the daemon joins it.
+    const waiting = ids.length === 1 && [...this.jobs.values()].find((j) => (j.state === AssistantJobState.QUEUED || j.state === AssistantJobState.RUNNING) && j.itemIds.includes(ids[0]!));
+    if (waiting) return { job: waiting };
     const job = create(AssistantJobSchema, { id: ulid(), itemIds: ids, state: AssistantJobState.QUEUED, model: this.config.assistant.model, createdAt: this.stamp() });
     this.jobs.set(job.id, job);
     setTimeout(() => {
       job.state = AssistantJobState.RUNNING;
       for (const id of ids) {
         const item = this.items.get(id);
-        if (!item) continue;
+        if (!item || item.deletedAt !== undefined) continue;
         const out = this.refineAnswer(item);
         if ("error" in out) {
           job.state = AssistantJobState.FAILED;

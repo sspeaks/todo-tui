@@ -149,7 +149,8 @@ async fn a_refine_becomes_a_claude_suggestion_and_applies_as_one_op() {
         "rationale": "A follow-up with Dana, due Friday.",
         "title": "Follow up with Dana on the flaky login test",
         "priority": "medium",
-        "due_date": "2099-01-02",
+        // Within a year of today, as refine takes a due date.
+        "due_date": jiff::Zoned::now().date().saturating_add(jiff::Span::new().days(3)).to_string(),
         "waiting_on": "Dana",
         "waiting_reason": "the fix"
     });
@@ -353,4 +354,46 @@ async fn off_refuses_a_failing_claude_fails_the_job_and_nothing_to_change_makes_
         .unwrap_err();
     assert_eq!(err.code(), Code::InvalidArgument);
     quiet.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_refine_joins_the_first_and_a_restarted_daemon_fails_what_was_left() {
+    let d = start(ON, Ok(json!({"rationale": "r", "title": "Clean"}))).await;
+    let mut items = ItemServiceClient::new(d.channel().await);
+    let item = capture(&mut items, "messy").await;
+    let mut ai = AssistantServiceClient::new(d.channel().await);
+    let a = ai
+        .refine(RefineRequest {
+            item_ids: vec![item.id.clone()],
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .job
+        .unwrap();
+    let job = done(&mut ai, &a.id).await;
+    assert_eq!(job.state, AssistantJobState::Done as i32, "{}", job.error);
+    // Done: a new request is a new job, and ends too.
+    let b = ai
+        .refine(RefineRequest {
+            item_ids: vec![item.id.clone()],
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .job
+        .unwrap();
+    assert_ne!(a.id, b.id);
+    done(&mut ai, &b.id).await;
+    let jobs = ai
+        .list_jobs(ListJobsRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .jobs;
+    assert!(
+        jobs.iter()
+            .all(|j| j.state == AssistantJobState::Done as i32)
+    );
+    d.stop().await;
 }
