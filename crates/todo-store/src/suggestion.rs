@@ -222,7 +222,7 @@ fn settle(conn: &Connection, id: &str, at: Timestamp) -> Result<()> {
 
 /// `item`'s `has_conflict` and `has_push_failure`, from what waits.
 fn set_flags(conn: &Connection, item: &mut Item) -> Result<()> {
-    item.derived.has_conflict = has_pending(conn, item.id, "sync_conflict")?;
+    item.derived.has_conflict = crate::outbox::has_conflict(conn, item.id)?;
     item.derived.has_push_failure = has_pending(conn, item.id, "push_failed")?;
     Ok(())
 }

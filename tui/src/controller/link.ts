@@ -4,7 +4,7 @@
 // came of it. Neither is an undo entry (the issue it made or linked has no
 // inverse).
 
-import { type Item, type MutationResult, SyncService, createClient, errorReason } from "@todo-tui/client";
+import { ConnectError, type Item, type MutationResult, SyncService, createClient, errorReason } from "@todo-tui/client";
 import { lineOf } from "../keys/line-editor.js";
 import { type Mode, normalMode } from "../state/types.js";
 import type { Controller } from "./controller.js";
@@ -53,20 +53,22 @@ export class Link {
   async submit(mode: Prompt): Promise<void> {
     const id = mode.target.ids[0] ?? "";
     const text = mode.line.text.trim();
-    if (mode.prompt === "link" && !/^[A-Za-z][A-Za-z0-9]*-\d+$/.test(text)) {
+    if (mode.prompt === "link" && !/^[A-Za-z][A-Za-z0-9_]*-\d+$/.test(text)) {
       return this.c.setMode({ ...mode, error: "An issue key, e.g. PLAT-12" });
     }
     this.c.setMode(normalMode);
     const promote = mode.prompt === "promote";
-    this.c.toast("info", promote ? "Creating it in Jira…" : `Linking it to ${text.toUpperCase()}…`);
     try {
-      // Jira may take a while to create: longer than an edit's wait.
-      const opts = { timeoutMs: 60_000 };
       type Linked = { item?: Item; result?: MutationResult; suggestionId: string };
-      const res = await this.c.pipeline.call(
-        (): Promise<Linked> => (promote ? this.client.promote({ itemId: id, project: text }, opts) : this.client.attach({ itemId: id, key: text }, opts)),
+      // Sent once, never resent: a second promote is a second issue. Jira
+      // may take a while to create, longer than an edit's wait.
+      const res = await this.c.pipeline.once(
+        promote ? "creating in Jira…" : "linking…",
+        60_000,
+        ({ timeoutMs }): Promise<Linked> =>
+          promote ? this.client.promote({ itemId: id, project: text }, { timeoutMs }) : this.client.attach({ itemId: id, key: text }, { timeoutMs }),
+        (r) => ({ items: r.item ? [r.item] : [], revision: r.result?.revision ?? 0n }),
       );
-      if (res.item) this.c.store.applyItems([res.item], res.result?.revision ?? 0n);
       const key = res.item?.remoteLink?.key ?? text.toUpperCase();
       const differ = res.suggestionId ? " · what Jira changed of yours is in S" : "";
       this.c.toast("info", `${promote ? "Created" : "Linked to"} ${key}${differ}`);
@@ -84,13 +86,15 @@ function linkError(err: unknown, promote: boolean): string {
       return `${what}: give a project, or set promote_default = { project = "…", issue_type = "Task" } in [[instances]]`;
     case "PUSH_OFF":
       return `${what}: Jira is read-only here (push = false)`;
-    case "MISSING_FIELDS":
-    case "ALREADY_LINKED":
-    case "ISSUE_NOT_FOUND":
-    case "JIRA_UNAVAILABLE":
-    case "JIRA_REFUSED":
-      return `${what}: ${errorText(err)}`;
+    case "CREATE_UNKNOWN":
+    case "CREATED_UNREAD":
+      // Jira may have made it: the daemon's words say where to look.
+      return ConnectError.from(err).rawMessage;
+    case undefined:
+      // No answer: the daemon finishes it all the same, so look before P again.
+      return promote ? `${what} yet: ${errorText(err)} · it may still be linked, look before P again` : `${what}: ${errorText(err)}`;
     default:
-      return `${what}: ${errorText(err)}`;
+      // The daemon's answer (a Jira one may be UNAVAILABLE): its words.
+      return `${what}: ${ConnectError.from(err).rawMessage}`;
   }
 }

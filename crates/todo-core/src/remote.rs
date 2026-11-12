@@ -291,6 +291,8 @@ pub fn link_to(
         if old == new {
             continue;
         }
+        // Labels in another order are what was sent (Jira sorts them).
+        let lost_it = !old.matches(&new);
         // What the person had set and Jira did not take: worth offering back.
         // An empty local value lost nothing.
         let had = !matches!(&old, FieldValue::Cleared)
@@ -298,7 +300,7 @@ pub fn link_to(
             && old != FieldValue::Markdown(String::new())
             && old != FieldValue::StringSet(Vec::new())
             && old != FieldValue::Priority(Priority::None);
-        if had && crate::mutation::pushed(field) && field != ItemField::ResolutionKind {
+        if lost_it && had && crate::mutation::pushed(field) && field != ItemField::ResolutionKind {
             lost.push(FieldChange {
                 field,
                 old: old.clone(),

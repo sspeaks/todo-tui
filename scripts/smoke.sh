@@ -549,13 +549,13 @@ else
     ksee 'Nothing to review' "an empty Suggestions pane"
     tmx send-keys -t tui:jira Escape
     tmx send-keys -t tui:jira q
-    # Promote and attach (design 5.7, 3.3): a local todo becomes PLAT-3 in
+    # Promote and attach (design 5.7, 3.3): a local todo becomes PLAT-10 in
     # the fake, and another is linked to a teammate's OPS-9, outside the
     # scope, taking its title.
     pid=$(TODO_TUI_HOME=$jhome "$TODO_BIN" add "smoke promote me" | awk '{print $1}')
     out=$(TODO_TUI_HOME=$jhome "$TODO_BIN" promote "$pid") || fail "promote failed: $out"
-    [[ $out == "created PLAT-3  http://127.0.0.1:$port/browse/PLAT-3" ]] || fail "unexpected promote: $out"
-    grep -qF '{"method": "POST", "key": "PLAT-3", "created": "smoke promote me"}' "$root/jira.writes" ||
+    [[ $out == "created PLAT-10  http://127.0.0.1:$port/browse/PLAT-10" ]] || fail "unexpected promote: $out"
+    grep -qF '{"method": "POST", "key": "PLAT-10", "created": "smoke promote me"}' "$root/jira.writes" ||
       { cat "$root/jira.writes" >&2; fail "promote did not reach the fake Jira"; }
     lid=$(TODO_TUI_HOME=$jhome "$TODO_BIN" add "smoke link me" | awk '{print $1}')
     out=$(TODO_TUI_HOME=$jhome "$TODO_BIN" link "$lid" ops-9) || fail "link failed: $out"

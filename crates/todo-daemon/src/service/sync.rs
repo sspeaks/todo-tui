@@ -60,6 +60,141 @@ impl Sync {
         Ok((i, got.item))
     }
 
+    /// Promote (design 5.7), under the link lock from the check that the
+    /// Item is local to its link: a second promote of it, or a pass
+    /// importing the new issue meanwhile, waits and then sees it linked.
+    async fn promote_now(&self, req: PromoteRequest) -> Result<todo_store::LinkOutput, Status> {
+        let _held = self.0.links.lock().await;
+        let (i, item) = self.target(&req.item_id).await?;
+        let adapter = self.adapter(&i).await?;
+        let (project, default_type) = match (&*req.project, &i.promote) {
+            ("", Some(p)) => (p.project.clone(), p.issue_type.clone()),
+            ("", None) => {
+                return Err(error::error_info(
+                    Code::FailedPrecondition,
+                    "NO_PROMOTE_TARGET",
+                    "no project given, and no promote_default = { project = \"…\", issue_type = \"…\" } in [[instances]]",
+                    [],
+                ));
+            }
+            (p, target) => (
+                p.to_owned(),
+                target
+                    .as_ref()
+                    .map_or_else(|| "Task".to_owned(), |t| t.issue_type.clone()),
+            ),
+        };
+        // A subtask of a linked parent is created under it, as a sub-task.
+        let parent = match item.core.parent_id {
+            Some(p) => self
+                .0
+                .store
+                .get_item(p, jiff::Zoned::now().date())
+                .await
+                .ok()
+                .and_then(|g| g.item.remote_link.map(|l| l.key)),
+            None => None,
+        };
+        let issue_type = match (&*req.issue_type, &parent) {
+            ("", Some(_)) => i.subtask_issue_type.clone(),
+            ("", None) => default_type,
+            (t, _) => t.to_owned(),
+        };
+        let local_due = i.local_fields.contains(&todo_core::ItemField::DueDate);
+        let new = todo_jira::NewIssue {
+            project,
+            issue_type,
+            summary: item.core.title.clone(),
+            description: item.core.description.clone(),
+            priority: Some(item.core.priority).filter(|p| *p != todo_core::Priority::None),
+            labels: item.core.labels.clone(),
+            due_date: item.core.due_date.filter(|_| !local_due),
+            parent,
+        };
+        let sent = jiff::Timestamp::now();
+        let issue = match adapter.create(&new).await {
+            Ok(issue) => issue,
+            Err(todo_jira::CreateError::MissingFields(fields)) => {
+                let names = fields.keys().cloned().collect::<Vec<_>>().join(", ");
+                let said = fields
+                    .iter()
+                    .map(|(k, v)| format!("{k}: {v}"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(error::error_info(
+                    Code::FailedPrecondition,
+                    "MISSING_FIELDS",
+                    format!("Jira needs {names} to create it ({said})"),
+                    [("fields", names)],
+                ));
+            }
+            // The request may have made the issue before its answer was
+            // lost (design 5.7 step 4): look before saying it failed.
+            Err(todo_jira::CreateError::Unknown(e)) => {
+                match adapter.find_created(&new, sent).await {
+                    Ok(Some(found)) => found,
+                    Ok(None) => return Err(jira_status(e)),
+                    Err(_) => {
+                        return Err(error::error_info(
+                            Code::Unavailable,
+                            "CREATE_UNKNOWN",
+                            format!(
+                                "Jira did not answer ({e}), and may have made it: look in {} before trying again",
+                                new.project
+                            ),
+                            [],
+                        ));
+                    }
+                }
+            }
+            // Made, and not read back: once more, else the person links it.
+            Err(todo_jira::CreateError::Unread { key, error }) => match adapter.fetch(&key).await {
+                Ok(todo_jira::Fetched::Found(issue)) => *issue,
+                _ => {
+                    return Err(error::error_info(
+                        Code::FailedPrecondition,
+                        "CREATED_UNREAD",
+                        format!(
+                            "Jira made {key} but it could not be read back ({error}): link it with L"
+                        ),
+                        [("key", key)],
+                    ));
+                }
+            },
+            Err(todo_jira::CreateError::Jira(e)) => return Err(jira_status(e)),
+        };
+        // As Jira reads back what was sent: the same, not a change of Jira's.
+        let sent_description =
+            todo_jira::wiki::to_markdown(&todo_jira::wiki::to_wiki(&item.core.description));
+        self.link(&i, &item, issue, Some(sent_description)).await
+    }
+
+    /// Attach (design 3.3), under the link lock as promote is.
+    async fn attach_now(&self, req: AttachRequest) -> Result<todo_store::LinkOutput, Status> {
+        let key = req.key.trim().to_ascii_uppercase();
+        // A project key: a letter, then letters, digits or underscores.
+        let valid = key.split_once('-').is_some_and(|(p, n)| {
+            p.starts_with(|c: char| c.is_ascii_alphabetic())
+                && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !n.is_empty()
+                && n.chars().all(|c| c.is_ascii_digit())
+        });
+        if !valid {
+            return Err(error::bad_request(
+                "key",
+                "must be an issue key, e.g. PLAT-12",
+            ));
+        }
+        let _held = self.0.links.lock().await;
+        let (i, item) = self.target(&req.item_id).await?;
+        let adapter = self.adapter(&i).await?;
+        let issue = match adapter.fetch(&key).await.map_err(jira_status)? {
+            todo_jira::Fetched::Found(issue) => *issue,
+            _ => return Err(jira_status(todo_jira::JiraError::NotFound)),
+        };
+        self.link(&i, &item, issue, None).await
+    }
+
     async fn adapter(&self, i: &todo_sync::Instance) -> Result<todo_jira::Adapter, Status> {
         crate::sync::adapter_for(i).await.map_err(jira_status)
     }
@@ -69,7 +204,8 @@ impl Sync {
         i: &todo_sync::Instance,
         item: &todo_core::Item,
         issue: todo_core::remote::RemoteIssue,
-        promote: bool,
+        // Promote's: the description as Jira reads back what it was sent.
+        sent_description: Option<String>,
     ) -> Result<todo_store::LinkOutput, Status> {
         let out = self
             .0
@@ -78,7 +214,8 @@ impl Sync {
                 item: item.id,
                 instance_id: i.id.clone(),
                 issue,
-                promote,
+                promote: sent_description.is_some(),
+                sent_description,
                 now: jiff::Timestamp::now(),
                 today: jiff::Zoned::now().date(),
             })
@@ -184,80 +321,11 @@ impl SyncService for Sync {
         &self,
         request: Request<PromoteRequest>,
     ) -> Result<Response<PromoteResponse>, Status> {
-        let req = request.into_inner();
-        let (i, item) = self.target(&req.item_id).await?;
-        let adapter = self.adapter(&i).await?;
-        let (project, default_type) = match (&*req.project, &i.promote) {
-            ("", Some(p)) => (p.project.clone(), p.issue_type.clone()),
-            ("", None) => {
-                return Err(error::error_info(
-                    Code::FailedPrecondition,
-                    "NO_PROMOTE_TARGET",
-                    "no project given, and no promote_default = { project = \"…\", issue_type = \"…\" } in [[instances]]",
-                    [],
-                ));
-            }
-            (p, target) => (
-                p.to_owned(),
-                target
-                    .as_ref()
-                    .map_or_else(|| "Task".to_owned(), |t| t.issue_type.clone()),
-            ),
-        };
-        // A subtask of a linked parent is created under it, as a sub-task.
-        let parent = match item.core.parent_id {
-            Some(p) => self
-                .0
-                .store
-                .get_item(p, jiff::Zoned::now().date())
-                .await
-                .ok()
-                .and_then(|g| g.item.remote_link.map(|l| l.key)),
-            None => None,
-        };
-        let issue_type = match (&*req.issue_type, &parent) {
-            ("", Some(_)) => i.subtask_issue_type.clone(),
-            ("", None) => default_type,
-            (t, _) => t.to_owned(),
-        };
-        let local_due = i.local_fields.contains(&todo_core::ItemField::DueDate);
-        let new = todo_jira::NewIssue {
-            project,
-            issue_type,
-            summary: item.core.title.clone(),
-            description: item.core.description.clone(),
-            priority: Some(item.core.priority).filter(|p| *p != todo_core::Priority::None),
-            labels: item.core.labels.clone(),
-            due_date: item.core.due_date.filter(|_| !local_due),
-            parent,
-        };
-        let issue = match adapter.create(&new).await {
-            Ok(issue) => issue,
-            Err(todo_jira::CreateError::MissingFields(fields)) => {
-                let names = fields.keys().cloned().collect::<Vec<_>>().join(", ");
-                let said = fields
-                    .iter()
-                    .map(|(k, v)| format!("{k}: {v}"))
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                return Err(error::error_info(
-                    Code::FailedPrecondition,
-                    "MISSING_FIELDS",
-                    format!("Jira needs {names} to create it ({said})"),
-                    [("fields", names)],
-                ));
-            }
-            // The request may have made the issue before its answer was
-            // lost (design 5.7 step 4): look before saying it failed.
-            Err(todo_jira::CreateError::Jira(e)) if e.is_transient() => {
-                match adapter.find_created(&new.summary).await {
-                    Ok(Some(found)) => found,
-                    _ => return Err(jira_status(e)),
-                }
-            }
-            Err(todo_jira::CreateError::Jira(e)) => return Err(jira_status(e)),
-        };
-        let out = self.link(&i, &item, issue, true).await?;
+        // To the end even if the caller goes: an issue made is linked.
+        let me = Sync(self.0.clone());
+        let out = tokio::spawn(async move { me.promote_now(request.into_inner()).await })
+            .await
+            .map_err(|e| Status::internal(format!("promote: {e}")))??;
         Ok(Response::new(PromoteResponse {
             item: Some(v1::Item::from(out.item)),
             result: Some(out.result.into()),
@@ -269,27 +337,10 @@ impl SyncService for Sync {
         &self,
         request: Request<AttachRequest>,
     ) -> Result<Response<AttachResponse>, Status> {
-        let req = request.into_inner();
-        let key = req.key.trim().to_ascii_uppercase();
-        let valid = key.split_once('-').is_some_and(|(p, n)| {
-            !p.is_empty()
-                && p.chars().all(|c| c.is_ascii_alphanumeric())
-                && !n.is_empty()
-                && n.chars().all(|c| c.is_ascii_digit())
-        });
-        if !valid {
-            return Err(error::bad_request(
-                "key",
-                "must be an issue key, e.g. PLAT-12",
-            ));
-        }
-        let (i, item) = self.target(&req.item_id).await?;
-        let adapter = self.adapter(&i).await?;
-        let issue = match adapter.fetch(&key).await.map_err(jira_status)? {
-            todo_jira::Fetched::Found(issue) => *issue,
-            _ => return Err(jira_status(todo_jira::JiraError::NotFound)),
-        };
-        let out = self.link(&i, &item, issue, false).await?;
+        let me = Sync(self.0.clone());
+        let out = tokio::spawn(async move { me.attach_now(request.into_inner()).await })
+            .await
+            .map_err(|e| Status::internal(format!("attach: {e}")))??;
         Ok(Response::new(AttachResponse {
             item: Some(v1::Item::from(out.item)),
             result: Some(out.result.into()),

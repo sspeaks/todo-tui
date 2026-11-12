@@ -32,4 +32,6 @@ pub(crate) struct Ctx {
     pub(crate) heartbeat: std::time::Duration,
     /// Where Refine puts a job (design 6.3).
     pub(crate) assistant: crate::assistant::Queue,
+    /// Promote and attach hold it while they link; a pass while it imports.
+    pub(crate) links: crate::sync::Links,
 }

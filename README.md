@@ -28,7 +28,8 @@ on items (`%low`, `e`), `h` / `l` between views, the L48 / N48 scrum report
 Jira Data Center (`todo sync check|now|status`, `⇅` in the status bar, `o`).
 The second (M10) pushes edits back: the title, priority, labels, due date
 and status, with what Jira refuses or overwrites kept in a Suggestions pane
-(`S`); see [Jira sync](#jira-sync). The first Claude milestone (M12) refines
+(`S`); M11 the description too, and M13 makes a todo a Jira issue (`P`) or
+links it to one (`L`); see [Jira sync](#jira-sync). The first Claude milestone (M12) refines
 an item on request through your own Claude Code: `space r` or `todo refine`;
 see [Claude refines an item](#claude-refines-an-item). A phone app (Expo) can
 capture, browse the views and complete items over Tailscale; see
@@ -350,6 +351,7 @@ key hints) and a message line for prompts and results.
 | `dd` | Delete, with its subtasks (asks first: `y` deletes) |
 | `M` | Schedule a Teams meeting about it ([Meetings](#meetings)) |
 | `o` | Open its Jira issue in the browser ([Jira sync](#jira-sync)) |
+| `P`, `L` | Make it a Jira issue; link it to one by key ([Jira sync](#jira-sync)) |
 | `S`, `:suggestions` | The Suggestions pane: what Jira or Claude left to review ([Jira sync](#jira-sync)) |
 | `space r`, `:refine` | Ask Claude to refine it, or the marked ones ([Claude refines an item](#claude-refines-an-item)) |
 | **Marks and bulk** | |
@@ -362,7 +364,7 @@ key hints) and a message line for prompts and results.
 | **Undo** | |
 | `u`, `ctrl-r` | Undo, redo: the same history as `todo undo` |
 | **Commands** | |
-| `:` | Command line: `:q`, `:help`, `:search <words>`, `:refresh`, `:view …` ([Views](#views-of-your-own)), `:config`, `:export [path]`, `:l48 [since]`, `:meet`, `:sync [status\|outbox]`, `:suggestions`, `:refine`; `tab` completes |
+| `:` | Command line: `:q`, `:help`, `:search <words>`, `:refresh`, `:view …` ([Views](#views-of-your-own)), `:config`, `:export [path]`, `:l48 [since]`, `:meet`, `:sync [status\|outbox]`, `:suggestions`, `:refine`, `:promote [PROJECT]`, `:link KEY`; `tab` completes |
 | `gs` | Sync with Jira now |
 | `?`, F1, `:help` | Help: every key, the capture syntax and the dates |
 | `ctrl-z` | Suspend to the shell; `fg` comes back |
@@ -653,6 +655,26 @@ one waits. `:sync outbox` and `todo sync outbox` list what waits and what
 was refused; `todo sync status` adds `2 to push, 1 refused` and exits
 non-zero while something is refused.
 
+**Making a todo a Jira issue, or linking it to one.** On a local todo, `P`
+(or `:promote [PROJECT]`, or `todo promote <id>`) creates the issue in Jira
+from its title, description, priority, labels and due date, and links the
+todo to it; the prompt is prefilled with `promote_default`'s project:
+
+```toml
+[[instances]]
+# …
+promote_default = { project = "PLAT", issue_type = "Task" }
+# subtask_issue_type = "Sub-task"   # a subtask of a linked todo is created under it
+```
+
+The issue is real and your team sees it; it cannot be undone from here. If
+Jira needs more fields, it says which. If Jira does not answer, the daemon
+looks for the issue before saying it failed, so a retry never makes two.
+`L` (or `:link KEY`, or `todo link <id> KEY`) links a todo to an issue that
+exists, yours or a teammate's: Jira's fields replace the todo's, and what
+differed waits in `S` to put back. Either way the todo stays in your list,
+even outside your scopes.
+
 **Turning it off.** `push = false` on the instance makes it read-only again:
 nothing more is sent, the title and the rest are refused as Jira's, and
 what was waiting goes once pushes are back on. `local_fields = ["due_date"]`
@@ -719,6 +741,7 @@ claude mcp add --scope user todo -- todo mcp
 | `todo_l48` | The L48 / N48 report, as `todo l48` prints it |
 | `todo_meeting_link` | A Teams new-meeting link for items, prefilled as `M` fills it |
 | `todo_suggestions` | What waits to review (Jira conflicts and refusals, Claude's refines); applying one is yours, in the TUI's `S` |
+| `todo_promote`, `todo_link` | Make a todo a Jira issue (ask first: it is real); link one to an issue by key |
 | `todo_capture` | A capture, as `todo add` takes it (tokens and all) |
 | `todo_update` | Title, description, priority, local priority, energy, due, defer, labels, waiting, private notes; on a Jira item the title, description, priority, labels and due date reach Jira |
 | `todo_set_status` | `inbox`, `next`, `someday`, `in_progress`, `done`, `cancelled`; completing a repeating item returns the next one |

@@ -1,6 +1,9 @@
 // The Suggestions pane and the push state in the TUI (design 2.6, 2.2,
 // 5.9, ADR-0007), over FakeDaemon.
 import {
+  Code,
+  ConnectError,
+  ErrorInfoSchema,
   ItemField,
   PatchState,
   Priority,
@@ -441,6 +444,35 @@ describe("P and L: promote and attach (design 5.7, 3.3)", () => {
     expect(fd.daemon.items.get(id)?.title).toBe("Fix the login test");
     await t.press("S");
     await t.waitFrame((f) => expect(f).toMatch(/\[ \] title +Fix the login test \(Jira\) → look at login \(yours\)/));
+  });
+
+  it("sends a promote once: an unavailable Jira is not tried again", async () => {
+    const fd = fakeDaemon([item("Ship the report")]);
+    fd.daemon.setConfig(jira);
+    fd.daemon.promoteFails = new ConnectError("Jira is offline", Code.Unavailable, undefined, [
+      { desc: ErrorInfoSchema, value: { reason: "JIRA_UNAVAILABLE", domain: "todo-tui" } },
+    ]);
+    const t = renderTui({ daemon: fd, columns: 120, rows: 20 });
+    await t.live();
+    await t.press("P");
+    await t.press("<enter>");
+    await t.waitFrame((f) => expect(f).toContain("Not created: Jira is offline"));
+    expect(fd.daemon.promotes).toBe(1);
+  });
+
+  it("L refuses an issue another todo holds", async () => {
+    const fd = fakeDaemon([item("one"), item("two")]);
+    fd.daemon.setConfig(jira);
+    fd.daemon.setIssue("PLAT-7", "Fix the login test");
+    const t = renderTui({ daemon: fd, columns: 120, rows: 20 });
+    await t.live();
+    await t.press("L");
+    await t.press("PLAT-7<enter>");
+    await t.waitFrame((f) => expect(f).toContain("Linked to PLAT-7"));
+    await t.press("j");
+    await t.press("L");
+    await t.press("PLAT-7<enter>");
+    await t.waitFrame((f) => expect(f).toContain("Not linked: already linked to PLAT-7"));
   });
 
   it("says why when it cannot", async () => {

@@ -1482,6 +1482,15 @@ async fn attach_links_a_todo_to_an_issue_and_offers_back_what_jira_replaced() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::InvalidArgument);
+    // A project key may have an underscore: a key, just not one Jira has.
+    let err = sync
+        .attach(AttachRequest {
+            item_id: todo.id.clone(),
+            key: "MY_PROJ-12".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::NotFound);
     // Someone else's issue links, pinned; Jira's title wins, yours is offered back.
     let out = sync
         .attach(AttachRequest {
@@ -1530,5 +1539,104 @@ async fn attach_links_a_todo_to_an_issue_and_offers_back_what_jira_replaced() {
         .await
         .unwrap_err();
     assert_eq!(err.get_details_error_info().unwrap().reason, "PUSH_OFF");
+    r.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_promote_whose_answer_is_lost_finds_the_issue_rather_than_make_another() {
+    use todo_proto::v1::PromoteRequest;
+    let fake = FakeJira::start("pat").await;
+    let issues = Arc::new(Mutex::new(vec![issue_json(1, "existing", "new", &at(1))]));
+    serve_writable(&fake, issues.clone());
+    let r = start(&fake, "pat").await;
+    settled(&r, SyncState::Ok).await;
+    reconfigure(
+        &r,
+        "promote_default = { project = \"PLAT\", issue_type = \"Task\" }\n",
+    )
+    .await;
+    // Jira makes the issue, then its answer is a gateway's 502.
+    let made = issues.clone();
+    fake.route("/rest/api/2/issue", move |seen| {
+        let body: Value = serde_json::from_str(&seen.body).unwrap();
+        let mut issue = issue_json(
+            2,
+            body["fields"]["summary"].as_str().unwrap(),
+            "new",
+            &at(2),
+        );
+        issue["fields"]["created"] = json!(
+            jiff::Timestamp::now()
+                .strftime("%Y-%m-%dT%H:%M:%S%.3f+0000")
+                .to_string()
+        );
+        made.lock().unwrap().push(issue);
+        (502, json!({"errorMessages": ["Bad Gateway"]}), vec![])
+    });
+    let todo = local(&r, "Do NOT ship the report").await;
+    let out = SyncServiceClient::new(r.channel().await)
+        .promote(PromoteRequest {
+            item_id: todo.id.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let link = out.item.unwrap().remote_link.unwrap();
+    assert_eq!(link.key, "PLAT-2");
+    assert_eq!(issues.lock().unwrap().len(), 2, "one issue made, not two");
+    let posts = fake
+        .seen()
+        .into_iter()
+        .filter(|s| s.method == "POST" && s.target == "/rest/api/2/issue")
+        .count();
+    assert_eq!(posts, 1);
+    let search = fake
+        .seen()
+        .into_iter()
+        .rev()
+        .find(|s| s.target == "/rest/api/2/search" && s.body.contains("currentUser()"))
+        .unwrap();
+    assert!(
+        search.body.contains("do not ship the report"),
+        "{}",
+        search.body
+    );
+    r.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_promotes_of_one_todo_make_one_issue() {
+    use todo_proto::v1::PromoteRequest;
+    let fake = FakeJira::start("pat").await;
+    let issues = Arc::new(Mutex::new(vec![issue_json(1, "existing", "new", &at(1))]));
+    serve_writable(&fake, issues.clone());
+    let r = start(&fake, "pat").await;
+    settled(&r, SyncState::Ok).await;
+    reconfigure(
+        &r,
+        "promote_default = { project = \"PLAT\", issue_type = \"Task\" }\n",
+    )
+    .await;
+    let todo = local(&r, "Ship the report").await;
+    let promote = || {
+        let (channel, id) = (r.channel(), todo.id.clone());
+        async move {
+            SyncServiceClient::new(channel.await)
+                .promote(PromoteRequest {
+                    item_id: id,
+                    ..Default::default()
+                })
+                .await
+        }
+    };
+    let (a, b) = tokio::join!(promote(), promote());
+    let reasons: Vec<String> = [&a, &b]
+        .iter()
+        .filter_map(|r| r.as_ref().err())
+        .map(|e| e.get_details_error_info().unwrap().reason)
+        .collect();
+    assert_eq!(reasons, ["ALREADY_LINKED"], "{a:?} {b:?}");
+    assert_eq!(issues.lock().unwrap().len(), 2, "one issue made");
     r.stop().await;
 }

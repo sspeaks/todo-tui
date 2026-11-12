@@ -403,22 +403,29 @@ pub struct NewIssue {
     pub parent: Option<String>,
 }
 
-/// Why a create did not make an issue.
+/// Why a create did not return the issue it made.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum CreateError {
+    /// Jira refused it: no issue was made.
     #[error(transparent)]
     Jira(#[from] JiraError),
     /// Jira needs these fields set first (design 5.7 step 1): by id, what it
     /// said of each.
     #[error("Jira needs {}", .0.keys().cloned().collect::<Vec<_>>().join(", "))]
     MissingFields(std::collections::BTreeMap<String, String>),
+    /// The request may have made the issue, its answer lost or unreadable
+    /// (design 5.7 step 4): [`Adapter::find_created`] looks for it.
+    #[error("Jira may have made it: {0}")]
+    Unknown(JiraError),
+    /// Jira made `key` and it could not be read back.
+    #[error("Jira made {key} but it could not be read back: {error}")]
+    Unread { key: String, error: JiraError },
 }
 
 impl Adapter {
     /// Creates the issue (`POST /issue`, design 5.7) and reads it back whole.
-    /// A create is not idempotent: a transient failure after the request may
-    /// have made the issue, so the caller looks with [`Adapter::find_created`]
-    /// before trying again.
+    /// A create is not idempotent: once the request may have made the issue,
+    /// it never says it failed ([`CreateError::Unknown`], `Unread`).
     pub async fn create(&self, new: &NewIssue) -> Result<RemoteIssue, CreateError> {
         let mut fields = serde_json::Map::new();
         fields.insert("project".into(), json!({ "key": new.project }));
@@ -452,23 +459,43 @@ impl Adapter {
         {
             Ok(v) => v,
             Err(JiraError::Fields(f)) => return Err(CreateError::MissingFields(f)),
+            // A 2xx Jira's body does not explain made the issue all the same.
+            Err(e @ JiraError::Malformed(_)) => return Err(CreateError::Unknown(e)),
+            Err(e) if e.is_transient() => return Err(CreateError::Unknown(e)),
             Err(e) => return Err(e.into()),
         };
-        let id = made
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| JiraError::Malformed("the created issue has no id".into()))?;
-        match self.fetch(id).await? {
-            Fetched::Found(issue) => Ok(*issue),
-            _ => Err(JiraError::Malformed(format!("the created issue {id} cannot be read")).into()),
+        let Some(id) = ["key", "id"]
+            .into_iter()
+            .find_map(|k| made.get(k).and_then(Value::as_str))
+        else {
+            return Err(CreateError::Unknown(JiraError::Malformed(
+                "the created issue has no key".into(),
+            )));
+        };
+        let unread = |error| CreateError::Unread {
+            key: id.to_owned(),
+            error,
+        };
+        match self.fetch(id).await {
+            Ok(Fetched::Found(issue)) => Ok(*issue),
+            Ok(_) => Err(unread(JiraError::Malformed("Jira does not show it".into()))),
+            Err(e) => Err(unread(e)),
         }
     }
 
-    /// An issue the person created in the last ten minutes with exactly
-    /// `summary`, newest first (design 5.7 step 4, open question 2): what a
-    /// create whose answer was lost may have made.
-    pub async fn find_created(&self, summary: &str) -> Result<Option<RemoteIssue>, JiraError> {
+    /// An issue the person created as `new`, since `since` (within the last
+    /// ten minutes), with exactly its summary, in its project, of its type and
+    /// under its parent, newest first (design 5.7 step 4, open question 2):
+    /// what a create whose answer was lost may have made.
+    pub async fn find_created(
+        &self,
+        new: &NewIssue,
+        since: Timestamp,
+    ) -> Result<Option<RemoteIssue>, JiraError> {
+        let summary = &new.summary;
+        // Lower case: Jira's text search reads AND, OR and NOT as operators.
         let words: String = summary
+            .to_lowercase()
             .chars()
             .map(|c| {
                 if c.is_alphanumeric() || c == ' ' {
@@ -482,17 +509,30 @@ impl Adapter {
         if words.is_empty() {
             return Ok(None);
         }
-        let jql = format!(
-            "reporter = currentUser() AND created >= -10m AND summary ~ \"{words}\" ORDER BY created DESC"
+        let mut jql = format!(
+            "project = {} AND issuetype = {} AND reporter = currentUser() AND created >= -10m AND summary ~ \"{words}\"",
+            jql_string(&new.project),
+            jql_string(&new.issue_type),
         );
+        if let Some(parent) = &new.parent {
+            jql.push_str(&format!(" AND parent = {}", jql_string(parent)));
+        }
+        jql.push_str(" ORDER BY created DESC");
         let res = self
             .search(&jql, 0, search_fields(&self.discovery), false)
             .await?;
+        // A minute's grace: Jira's clock is not this one.
+        let since = since - SignedDuration::from_mins(1);
         Ok(self
             .issues_of(&res)
             .into_iter()
-            .find(|i| i.title == summary))
+            .find(|i| &i.title == summary && i.created_at >= since))
     }
+}
+
+/// `s` as a JQL string literal.
+fn jql_string(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 /// A field a push sets (ADR-0007): the few that reach Jira.
@@ -1226,8 +1266,10 @@ mod tests {
             panic!("{err:?}")
         };
         assert_eq!(f.keys().collect::<Vec<_>>(), ["issuetype"]);
-        // The lost-answer search finds an issue by its exact summary.
-        let found = a.find_created("Ship the report").await.unwrap();
+        // The lost-answer search finds an issue by its exact summary, in its
+        // project and of its type, made since the create was sent.
+        let sent = made.created_at;
+        let found = a.find_created(&new, sent).await.unwrap();
         assert_eq!(found.map(|i| i.key), Some("PLAT-2".to_owned()));
         let seen = fake.seen();
         let jql = seen
@@ -1236,10 +1278,27 @@ mod tests {
             .find(|s| s.target == "/rest/api/2/search")
             .unwrap();
         assert!(
-            jql.body
-                .contains("reporter = currentUser() AND created >= -10m"),
+            jql.body.contains(
+                r#"project = \"PLAT\" AND issuetype = \"Task\" AND reporter = currentUser() AND created >= -10m AND summary ~ \"ship the report\""#
+            ),
             "{}",
             jql.body
+        );
+        // One made before the create was sent is not the one it made.
+        let later = sent + SignedDuration::from_mins(5);
+        assert_eq!(a.find_created(&new, later).await.unwrap(), None);
+        // Upper-case operators are words to the search.
+        let not = NewIssue {
+            summary: "Do NOT merge (yet)".into(),
+            parent: Some("PLAT-1".into()),
+            ..new.clone()
+        };
+        let _ = a.find_created(&not, sent).await.unwrap();
+        let seen = fake.seen();
+        let jql = &seen.last().unwrap().body;
+        assert!(
+            jql.contains(r#"summary ~ \"do not merge yet\" AND parent = \"PLAT-1\""#),
+            "{jql}"
         );
         // A key reads as an id does (attach).
         let Fetched::Found(by_key) = a.fetch("PLAT-1").await.unwrap() else {

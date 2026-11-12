@@ -108,6 +108,25 @@ export class Pipeline {
   }
 
   /**
+   * An RPC that must not be sent twice (promote makes a Jira issue each
+   * time), shown as `label` while it runs: sent once with `timeoutMs`, its
+   * Items into the store and the views settled after. A failure is thrown,
+   * never resent.
+   */
+  async once<R>(label: string, timeoutMs: number, call: (opts: CallOpts) => Promise<R>, items: Effect<R>["items"]): Promise<R> {
+    this.busy(label);
+    try {
+      const res = await call({ requestId: ulid(), timeoutMs });
+      const { items: got, revision } = items(res);
+      this.store.applyItems(got, revision);
+      await this.settle(revision);
+      return res;
+    } finally {
+      this.busy(undefined);
+    }
+  }
+
+  /**
    * Re-reads the current views and the undo state: the next key sees the
    * list as the action left it (read at `revision` or later), and u names
    * the action.

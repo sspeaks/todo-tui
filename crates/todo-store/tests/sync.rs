@@ -2745,3 +2745,115 @@ async fn the_assistant_migration_keeps_sync_suggestions_and_takes_claudes() {
     assert_eq!(jobs.len(), 2);
     assert_eq!(jobs[0].state, todo_store::assistant::JobState::Failed);
 }
+
+/// A local todo with `labels`, a due date and a description, under `parent`.
+async fn local_todo(
+    store: &Store,
+    title: &str,
+    parent: Option<todo_core::ItemId>,
+) -> todo_core::Item {
+    let mut draft = todo_core::CaptureDraft::from_title(title);
+    draft.labels = vec!["zeta".into(), "alpha".into()];
+    draft.due_date = Some(date(2026, 11, 20));
+    let (item, _) = store
+        .capture(todo_store::CaptureInput {
+            request_id: new_ulid().to_string(),
+            draft,
+            created_via: todo_core::CreatedVia::Cli,
+            parent_id: parent,
+            spool_id: None,
+            now: ts(500),
+            today: TODAY,
+        })
+        .await
+        .unwrap();
+    let mut edit = user_edit(
+        item.id,
+        ItemField::Description,
+        FieldValue::Markdown("*soon*".into()),
+    );
+    edit.now = ts(600);
+    store.mutate(edit).await.unwrap();
+    store.get_item(item.id, TODAY).await.unwrap().item
+}
+
+fn link_input(
+    item: todo_core::ItemId,
+    issue: RemoteIssue,
+    sent: Option<&str>,
+) -> todo_store::LinkInput {
+    todo_store::LinkInput {
+        item,
+        instance_id: "work-jira".into(),
+        issue,
+        promote: sent.is_some(),
+        sent_description: sent.map(str::to_owned),
+        now: ts(1_000),
+        today: TODAY,
+    }
+}
+
+#[tokio::test]
+async fn a_promote_keeps_local_fields_and_what_jira_took_as_sent() {
+    let (_dir, store) = open();
+    store.set_local("work-jira", &[ItemField::DueDate]);
+    let parent = local_todo(&store, "the parent", None).await;
+    let todo = local_todo(&store, "Ship it", Some(parent.id)).await;
+    // Jira took it as sent: labels sorted, the description in its own form,
+    // and no due date (a local field is never sent).
+    let mut made = issue(5, "Ship it");
+    made.labels = vec!["alpha".into(), "zeta".into()];
+    made.description = "_soon_".into();
+    let out = store
+        .link(link_input(todo.id, made.clone(), Some("_soon_")))
+        .await
+        .unwrap();
+    assert_eq!(out.suggestion, None, "nothing was lost");
+    let item = out.item;
+    assert_eq!(item.core.due_date, Some(date(2026, 11, 20)));
+    assert_eq!(item.core.parent_id, Some(parent.id));
+    assert!(!item.derived.has_conflict);
+    // A pull of the issue, which has no parent, keeps the local one.
+    let mut later = made.clone();
+    later.updated_at = ts(300);
+    store.apply_pull(page(vec![later], None)).await.unwrap();
+    let pulled = store.get_item(todo.id, TODAY).await.unwrap().item;
+    assert_eq!(pulled.core.parent_id, Some(parent.id));
+    assert_eq!(pulled.core.due_date, Some(date(2026, 11, 20)));
+    // Another Item cannot take the same issue.
+    let other = local_todo(&store, "other", None).await;
+    assert!(matches!(
+        store.link(link_input(other.id, made, None)).await,
+        Err(StoreError::AlreadyLinked(k)) if k == "PLAT-5"
+    ));
+}
+
+#[tokio::test]
+async fn an_attach_offers_back_what_jira_replaced_and_a_pull_keeps_the_marker() {
+    let (_dir, store) = open();
+    let todo = local_todo(&store, "look at it", None).await;
+    let theirs = issue(7, "Fix the login test");
+    let out = store
+        .link(link_input(todo.id, theirs.clone(), None))
+        .await
+        .unwrap();
+    let sid = out.suggestion.expect("a link_conflict");
+    assert!(out.item.derived.has_conflict);
+    let s = suggestions(&store, todo.id).await;
+    assert_eq!(s.len(), 1, "{s:?}");
+    let fields = &s[0].1;
+    for f in [
+        ItemField::Title,
+        ItemField::Labels,
+        ItemField::DueDate,
+        ItemField::Description,
+    ] {
+        assert!(fields.contains(&f.number()), "{f:?} in {fields:?}");
+    }
+    // The pull after the link leaves the marker while the Suggestion waits.
+    let mut later = theirs;
+    later.updated_at = ts(300);
+    store.apply_pull(page(vec![later], None)).await.unwrap();
+    let pulled = store.get_item(todo.id, TODAY).await.unwrap().item;
+    assert!(pulled.derived.has_conflict, "{sid}");
+}

@@ -332,7 +332,9 @@ impl Daemon {
                 )
             })
         };
+        let links = crate::sync::Links::default();
         let sync = {
+            let links = links.clone();
             let (store, config, clients, now, stop, recount) = (
                 store.clone(),
                 config.subscribe(),
@@ -349,11 +351,13 @@ impl Daemon {
                     now.clone(),
                     status_tx.clone(),
                     recount.clone(),
+                    links.clone(),
                     stop.clone(),
                 )
             })
         };
         let ctx = Ctx {
+            links,
             sync_status,
             sync_now,
             backups: paths.backups(),

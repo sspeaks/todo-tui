@@ -254,6 +254,7 @@ mod tests {
             sync_now: crate::sync::SyncNow::default(),
             heartbeat,
             assistant: crate::assistant::Queue::new().0,
+            links: crate::sync::Links::default(),
         }
     }
 

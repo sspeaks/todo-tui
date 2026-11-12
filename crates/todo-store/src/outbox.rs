@@ -345,6 +345,12 @@ pub(crate) fn has_pending(conn: &Connection, item: todo_core::ItemId, kind: &str
         .query_row(params![item.to_string(), kind], |r| r.get(0))?)
 }
 
+/// `has_conflict` (design 3.2): a Jira value replaced the person's and is
+/// offered back, by a pull (`sync_conflict`) or a link (`link_conflict`).
+pub(crate) fn has_conflict(conn: &Connection, item: todo_core::ItemId) -> Result<bool> {
+    Ok(has_pending(conn, item, "sync_conflict")? || has_pending(conn, item, "link_conflict")?)
+}
+
 /// A pushed field in a person's words.
 pub(crate) fn field_word(field: ItemField) -> &'static str {
     match field {

@@ -149,7 +149,7 @@ class Handler(BaseHTTPRequestHandler):
             f = body.get("fields", {})
             if f.get("project", {}).get("key") != "PLAT":
                 return self.reply(400, {"errorMessages": [], "errors": {"issuetype": "valid issue type is required"}})
-            n = max(int(i["id"]) for i in ISSUES if int(i["id"]) < 9) + 1
+            n = max(int(i["id"]) for i in ISSUES + ELSEWHERE) + 1
             new = make_issue(n, f.get("summary", ""), "new", "Open")
             for k in ("description", "labels", "duedate"):
                 if f.get(k) is not None:

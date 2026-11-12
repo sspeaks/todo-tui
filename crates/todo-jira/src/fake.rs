@@ -356,6 +356,12 @@ impl FakeJira {
                 }
             }
             issue["fields"]["issuetype"] = f["issuetype"].clone();
+            // Made now, as the lost-answer search reads it.
+            issue["fields"]["created"] = json!(
+                jiff::Timestamp::now()
+                    .strftime("%Y-%m-%dT%H:%M:%S%.3f+0000")
+                    .to_string()
+            );
             issue["fields"]["reporter"] = json!({"key": "JIRAUSER10100", "name": "dana", "displayName": "Dana Example"});
             let key = issue["key"].clone();
             all.push(issue);

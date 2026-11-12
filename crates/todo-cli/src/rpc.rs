@@ -174,10 +174,18 @@ fn after_shutdown(result: Result<(), Status>) -> AfterShutdown {
 pub(crate) async fn call<T>(
     rpc: impl Future<Output = Result<Response<T>, Status>>,
 ) -> Result<T, Status> {
-    match tokio::time::timeout(RPC_TIMEOUT, rpc).await {
+    call_within(RPC_TIMEOUT, rpc).await
+}
+
+/// [`call`], for at most `wait`: for an RPC that waits on Jira.
+pub(crate) async fn call_within<T>(
+    wait: Duration,
+    rpc: impl Future<Output = Result<Response<T>, Status>>,
+) -> Result<T, Status> {
+    match tokio::time::timeout(wait, rpc).await {
         Ok(result) => result.map(Response::into_inner),
         Err(_) => Err(Status::deadline_exceeded(format!(
-            "no answer within {RPC_TIMEOUT:?}"
+            "no answer within {wait:?}"
         ))),
     }
 }

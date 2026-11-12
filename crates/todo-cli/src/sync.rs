@@ -13,7 +13,10 @@ use todo_proto::v1::sync_service_client::SyncServiceClient;
 use todo_proto::v1::{self, GetSyncStatusRequest, ListOutboxRequest, SyncNowRequest, SyncStatus};
 use todo_sync::credential::{SystemSecrets, resolve};
 
-use crate::rpc::{call, ready};
+use crate::rpc::{call, call_within, ready};
+
+/// How long promote and link wait on Jira, as the TUI does.
+const JIRA_WAIT: Duration = Duration::from_secs(60);
 use crate::status::failed;
 use crate::{print_err, print_out};
 
@@ -94,11 +97,16 @@ pub(crate) async fn promote(
         return Ok(ExitCode::FAILURE);
     };
     let mut sync = SyncServiceClient::new(channel);
-    let out = call(sync.promote(v1::PromoteRequest {
-        item_id: item.id,
-        project: project.unwrap_or_default(),
-        issue_type: kind.unwrap_or_default(),
-    }))
+    // Jira may take a while to create; the daemon links it even if this
+    // gives up first.
+    let out = call_within(
+        JIRA_WAIT,
+        sync.promote(v1::PromoteRequest {
+            item_id: item.id,
+            project: project.unwrap_or_default(),
+            issue_type: kind.unwrap_or_default(),
+        }),
+    )
     .await
     .map_err(failed)?;
     let linked = out.item.and_then(|i| i.remote_link).unwrap_or_default();
@@ -116,10 +124,13 @@ pub(crate) async fn link(paths: &Paths, id: String, key: String) -> anyhow::Resu
         return Ok(ExitCode::FAILURE);
     };
     let mut sync = SyncServiceClient::new(channel);
-    let out = call(sync.attach(v1::AttachRequest {
-        item_id: item.id,
-        key,
-    }))
+    let out = call_within(
+        JIRA_WAIT,
+        sync.attach(v1::AttachRequest {
+            item_id: item.id,
+            key,
+        }),
+    )
     .await
     .map_err(failed)?;
     let linked = out.item.and_then(|i| i.remote_link).unwrap_or_default();

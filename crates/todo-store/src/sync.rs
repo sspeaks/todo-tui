@@ -131,11 +131,12 @@ pub(crate) fn apply_page_tx(tx: &mut WriteTx<'_>, page: PullPage) -> Result<Pull
                 let settled =
                     crate::outbox::settle_pull(conn, &current, issue, pushes, local, page.now)?;
                 suggested.extend(settled.suggested);
+                let parent = kept_parent(conn, &current, issue, parent)?;
                 let (mut next, changes) =
                     update(&current, &settled.issue, parent, &scopes, page.now);
                 let mut changes = changes;
                 next.derived.pending_fields = crate::outbox::pending_fields(conn, id)?;
-                next.derived.has_conflict = crate::outbox::has_pending(conn, id, "sync_conflict")?;
+                next.derived.has_conflict = crate::outbox::has_conflict(conn, id)?;
                 next.derived.has_push_failure =
                     crate::outbox::has_pending(conn, id, "push_failed")?;
                 // Back in a scope, or readable again: a left_scope or
@@ -213,6 +214,10 @@ pub struct LinkInput {
     pub issue: RemoteIssue,
     /// Promote (the issue was made from the Item) or attach.
     pub promote: bool,
+    /// Promote's: the description as the tracker reads back what it was
+    /// sent (Markdown to wiki markup and back), so its new form is not taken
+    /// for a change of Jira's.
+    pub sent_description: Option<String>,
     pub now: Timestamp,
     pub today: Date,
 }
@@ -227,6 +232,7 @@ pub struct LinkOutput {
 }
 
 pub(crate) fn link_tx(tx: &mut WriteTx<'_>, input: LinkInput) -> Result<LinkOutput> {
+    let local = tx.local();
     let conn = tx.conn();
     if let Some(other) = linked(conn, &input.instance_id, &input.issue.remote_id)?
         && other != input.item
@@ -250,8 +256,25 @@ pub(crate) fn link_tx(tx: &mut WriteTx<'_>, input: LinkInput) -> Result<LinkOutp
         Some(p) => linked(conn, &input.instance_id, p)?,
         None => None,
     };
-    let (mut next, changes, lost) =
+    let (mut next, mut changes, mut lost) =
         todo_core::remote::link_to(&current, &input.issue, parent, input.now);
+    // A field the instance keeps local stays the person's (ADR-0007): Jira's
+    // is not theirs, and promote never sent it.
+    for field in local.fields_of(&input.instance_id) {
+        if let Some(old) = todo_core::FieldValue::of(&current, field) {
+            todo_core::write_field(&mut next, field, &old)
+                .map_err(|error| StoreError::Mutation { index: 0, error })?;
+        }
+        changes.retain(|c| c.field != field);
+        lost.retain(|c| c.field != field);
+    }
+    // What promote sent, as Jira keeps it: not lost.
+    if let Some(sent) = &input.sent_description {
+        lost.retain(|c| {
+            c.field != todo_core::ItemField::Description
+                || !matches!(&c.new, todo_core::FieldValue::Markdown(new) if new.trim() == sent.trim())
+        });
+    }
     next.derived.pending_fields = Vec::new();
     // The person's values Jira did not take: offered back, unticked (3.3).
     let suggestion = if lost.is_empty() {
@@ -284,9 +307,10 @@ pub(crate) fn link_tx(tx: &mut WriteTx<'_>, input: LinkInput) -> Result<LinkOutp
                 codec::value_to_sql(&c.old)?
             ])?;
         }
-        next.derived.has_conflict = true;
         Some(sid)
     };
+    next.derived.has_conflict =
+        crate::outbox::has_conflict(conn, input.item)? || suggestion.is_some();
     record(&mut batch, slot, next, changes);
     let kind = if input.promote {
         OpKind::Promote
@@ -363,12 +387,13 @@ pub(crate) fn reconcile_tx(tx: &mut WriteTx<'_>, input: Reconcile) -> Result<Rec
             // out of every scope.
             Some(issue) => {
                 let parent = live_parent(conn, &input.instance_id, issue, &HashMap::new())?;
+                let parent = kept_parent(conn, &current, issue, parent)?;
                 let settled =
                     crate::outbox::settle_pull(conn, &current, issue, pushes, local, input.now)?;
                 suggested.extend(settled.suggested);
                 let (mut next, changes) = update(&current, &settled.issue, parent, &[], input.now);
                 next.derived.pending_fields = crate::outbox::pending_fields(conn, *id)?;
-                next.derived.has_conflict = crate::outbox::has_pending(conn, *id, "sync_conflict")?;
+                next.derived.has_conflict = crate::outbox::has_conflict(conn, *id)?;
                 next.derived.has_push_failure =
                     crate::outbox::has_pending(conn, *id, "push_failed")?;
                 (next, changes)
@@ -493,6 +518,30 @@ fn live_parent(
         Some(id) if !is_deleted(conn, id)? => Ok(Some(id)),
         _ => Ok(None),
     }
+}
+
+/// The parent a pull gives `item`: `parent`, Jira's; or, when the issue has
+/// none, the local parent it has (one no tracker knows, which promote and
+/// attach keep, 3.3), so a pull never takes it out from under it.
+fn kept_parent(
+    conn: &Connection,
+    item: &todo_core::Item,
+    issue: &RemoteIssue,
+    parent: Option<ItemId>,
+) -> Result<Option<ItemId>> {
+    let Some(mine) = item
+        .core
+        .parent_id
+        .filter(|_| issue.parent_remote_id.is_none())
+    else {
+        return Ok(parent);
+    };
+    let local: bool = conn
+        .prepare_cached("SELECT remote_id IS NULL AND deleted_at IS NULL FROM items WHERE id = ?1")?
+        .query_row([mine.to_string()], |r| r.get(0))
+        .optional()?
+        .unwrap_or(false);
+    Ok(if local { Some(mine) } else { parent })
 }
 
 fn is_deleted(conn: &Connection, id: ItemId) -> Result<bool> {

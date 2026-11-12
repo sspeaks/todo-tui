@@ -486,8 +486,11 @@ export class FakeDaemon {
   /** The Suggestions, by id: putSuggestion's, as the RPCs leave them. */
   readonly suggestions = new Map<string, Suggestion>();
   /** The issues attach can link to (setIssue), and the last made number. */
-  private readonly issues = new Map<string, { title: string }>();
+  private readonly issues = new Map<string, { title: string; remoteId: string }>();
   private issueSeq = 100;
+  /** Promote calls; and, when set, the error the next one answers (once). */
+  promotes = 0;
+  promoteFails: ConnectError | undefined;
   /** The assistant's jobs (Refine), oldest first. */
   private readonly jobs = new Map<string, AssistantJob>();
   private refineAnswer: (item: Item) => { rationale: string; patches: MessageInitShape<typeof PatchSchema>[] } | { error: string } = () => ({ rationale: "", patches: [] });
@@ -658,7 +661,14 @@ export class FakeDaemon {
           this.check();
           return { entries: this.outbox.filter((e) => !req.instanceId || e.instanceId === req.instanceId) };
         },
-        promote: (req) => this.link(req.itemId, undefined, req.project),
+        promote: (req) => {
+          this.check();
+          this.promotes++;
+          const fail = this.promoteFails;
+          this.promoteFails = undefined;
+          if (fail) throw fail;
+          return this.link(req.itemId, undefined, req.project);
+        },
         attach: (req) => this.link(req.itemId, req.key.trim().toUpperCase(), undefined),
       });
       service(SuggestionService, {
@@ -1005,19 +1015,25 @@ export class FakeDaemon {
     if (item.remoteLink) throw errorInfo(Code.FailedPrecondition, "ALREADY_LINKED", `already linked to ${item.remoteLink.key}`, { key: item.remoteLink.key });
     let title = item.title;
     let made: string;
+    let remoteId: string;
     if (key === undefined) {
       const p = project?.trim() || instance.promoteProject;
       if (!p) throw errorInfo(Code.FailedPrecondition, "NO_PROMOTE_TARGET", "no project given, and no promote_default", {});
-      made = `${p.toUpperCase()}-${++this.issueSeq}`;
+      remoteId = String(++this.issueSeq);
+      made = `${p.toUpperCase()}-${remoteId}`;
     } else {
       const issue = this.issues.get(key);
       if (!issue) throw errorInfo(Code.NotFound, "ISSUE_NOT_FOUND", "Jira has no such issue you can read", {});
+      // One Item per issue, as the store has it.
+      const holder = [...this.items.values()].find((i) => i.remoteLink?.instanceId === instance.id && i.remoteLink.remoteId === issue.remoteId);
+      if (holder) throw errorInfo(Code.FailedPrecondition, "ALREADY_LINKED", `already linked to ${key}`, { key });
       made = key;
+      remoteId = issue.remoteId;
       title = issue.title;
     }
-    const remoteLink = { trackerKind: "jira", instanceId: instance.id, remoteId: String(this.issueSeq), key: made, url: `https://jira.example.com/browse/${made}`, pinned: true, linkState: LinkState.OK };
+    const remoteLink = { trackerKind: "jira", instanceId: instance.id, remoteId, key: made, url: `https://jira.example.com/browse/${made}`, pinned: true, linkState: LinkState.OK };
     const lost = title !== item.title;
-    const next = this.put({ id, title, remoteLink, isMine: true });
+    let next = this.put({ id, title, remoteLink, isMine: true });
     let suggestionId = "";
     if (lost) {
       const s = this.putSuggestion({
@@ -1028,13 +1044,15 @@ export class FakeDaemon {
         patches: [{ field: ItemField.TITLE, expectedOld: { kind: { case: "stringValue", value: title } }, new: { kind: { case: "stringValue", value: item.title } } }],
       });
       suggestionId = s.id;
+      // putSuggestion flagged it has_conflict.
+      next = this.items.get(id) ?? next;
     }
     return { item: next, result: { opId: ulid(), revision: this.revision }, suggestionId };
   }
 
   /** An issue attach can link to, by key, with its title. */
   setIssue(key: string, title: string): void {
-    this.issues.set(key, { title });
+    this.issues.set(key, { title, remoteId: String(++this.issueSeq) });
   }
 
   /** What ListOutbox answers from now on. */
@@ -1047,7 +1065,7 @@ export class FakeDaemon {
     const item = this.items.get(itemId);
     if (!item) return;
     const kinds = [...this.suggestions.values()].filter((s) => s.itemId === itemId && waits(s)).map((s) => s.kind);
-    const conflict = kinds.includes(SuggestionKind.SYNC_CONFLICT);
+    const conflict = kinds.includes(SuggestionKind.SYNC_CONFLICT) || kinds.includes(SuggestionKind.LINK_CONFLICT);
     const failure = kinds.includes(SuggestionKind.PUSH_FAILED);
     if (item.hasConflict === conflict && item.hasPushFailure === failure) return;
     this.put({ id: itemId, hasConflict: conflict, hasPushFailure: failure });

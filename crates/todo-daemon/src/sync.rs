@@ -53,14 +53,30 @@ impl SyncNow {
     }
 }
 
+/// Held by promote and attach from the check that an Item is local until
+/// it is linked, and by a pass while it writes a page: a pass never imports
+/// an issue promote made as a second Item.
+pub(crate) type Links = Arc<tokio::sync::Mutex<()>>;
+
 struct State {
     tx: watch::Sender<BTreeMap<String, v1::SyncStatus>>,
+    links: Links,
     /// Jira asked to wait (a 429's Retry-After, design 5.12): no pass
     /// before then, whatever wakes the loop.
     hold: std::sync::Mutex<Option<Timestamp>>,
 }
 
 impl State {
+    /// Writes `page`, under the link lock.
+    async fn apply(
+        &self,
+        store: &Store,
+        page: PullPage,
+    ) -> Result<todo_store::PullOutcome, todo_store::StoreError> {
+        let _held = self.links.lock().await;
+        store.apply_pull(page).await
+    }
+
     fn set(&self, id: &str, f: impl FnOnce(&mut v1::SyncStatus)) {
         self.tx.send_modify(|all| {
             let s = all.entry(id.to_owned()).or_insert_with(|| v1::SyncStatus {
@@ -125,6 +141,7 @@ pub(crate) async fn count_outbox(
 
 /// The loop. It runs while the daemon does; a config change re-reads the
 /// instance (and starts over with it).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     store: Store,
     mut config: watch::Receiver<Arc<Config>>,
@@ -132,10 +149,12 @@ pub(crate) async fn run(
     now: SyncNow,
     status: watch::Sender<BTreeMap<String, v1::SyncStatus>>,
     recount: Arc<Notify>,
+    links: Links,
     mut stop: ShutdownSignal,
 ) {
     let state = State {
         tx: status,
+        links,
         hold: std::sync::Mutex::new(None),
     };
     let queued = store.pushes_queued();
@@ -349,8 +368,11 @@ async fn pass(store: &Store, i: &Instance, state: &State, reconcile: bool) -> Ou
                     now: Timestamp::now(),
                     today: Zoned::now().date(),
                 };
-                let store = store.clone();
-                async move { store.apply_pull(page).await.map(|_| ()) }
+                let (store, links) = (store.clone(), state.links.clone());
+                async move {
+                    let _held = links.lock().await;
+                    store.apply_pull(page).await.map(|_| ())
+                }
             })
             .await;
         match result {
@@ -458,13 +480,11 @@ async fn tracked_and_reconcile(
         let issues = adapter.pull_ids(&outside, since).await.map_err(jfail)?;
         let newest = issues.iter().map(|is| is.updated_at).max();
         let issues = issues.into_iter().map(|is| (is, Vec::new())).collect();
-        store
-            .apply_pull(page(
-                i,
-                issues,
-                newest.map(|at| (OUTSIDE.to_owned(), at)),
-                false,
-            ))
+        state
+            .apply(
+                store,
+                page(i, issues, newest.map(|at| (OUTSIDE.to_owned(), at)), false),
+            )
             .await
             .map_err(sfail)?;
     }
@@ -491,8 +511,8 @@ async fn tracked_and_reconcile(
                 (is, scopes)
             })
             .collect();
-        store
-            .apply_pull(page(i, issues, None, true))
+        state
+            .apply(store, page(i, issues, None, true))
             .await
             .map_err(sfail)?;
     }
@@ -569,8 +589,8 @@ async fn tracked_and_reconcile(
                 (is, scopes)
             })
             .collect();
-        store
-            .apply_pull(page(i, issues, None, true))
+        state
+            .apply(store, page(i, issues, None, true))
             .await
             .map_err(sfail)?;
     }
@@ -642,8 +662,8 @@ async fn push(
             );
             continue;
         }
-        store
-            .apply_pull(page(i, vec![(issue, Vec::new())], None, false))
+        state
+            .apply(store, page(i, vec![(issue, Vec::new())], None, false))
             .await
             .map_err(sfail)?;
         // What still waits after the rule: Jira at the base.
@@ -771,8 +791,8 @@ async fn push(
         if read_back {
             match adapter.fetch(&d.remote_id).await {
                 Ok(Fetched::Found(issue)) => {
-                    store
-                        .apply_pull(page(i, vec![(*issue, Vec::new())], None, false))
+                    state
+                        .apply(store, page(i, vec![(*issue, Vec::new())], None, false))
                         .await
                         .map_err(sfail)?;
                 }
