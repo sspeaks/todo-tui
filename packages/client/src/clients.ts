@@ -1,5 +1,6 @@
 import { type Client, type Transport, createClient } from "@connectrpc/connect";
 import { ItemService } from "./gen/todo/v1/item_service_pb.js";
+import { AssistantService } from "./gen/todo/v1/assistant_service_pb.js";
 import { SuggestionService } from "./gen/todo/v1/suggestion_service_pb.js";
 import { SyncService } from "./gen/todo/v1/sync_service_pb.js";
 import { SystemService } from "./gen/todo/v1/system_service_pb.js";
@@ -13,6 +14,7 @@ export interface TodoClients {
   watch: Client<typeof WatchService>;
   sync: Client<typeof SyncService>;
   suggestions: Client<typeof SuggestionService>;
+  assistant: Client<typeof AssistantService>;
 }
 
 export function createClients(transport: Transport): TodoClients {
@@ -23,5 +25,6 @@ export function createClients(transport: Transport): TodoClients {
     watch: createClient(WatchService, transport),
     sync: createClient(SyncService, transport),
     suggestions: createClient(SuggestionService, transport),
+    assistant: createClient(AssistantService, transport),
   };
 }

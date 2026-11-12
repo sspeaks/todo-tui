@@ -253,6 +253,7 @@ mod tests {
             sync_status: crate::sync::status_channel().1,
             sync_now: crate::sync::SyncNow::default(),
             heartbeat,
+            assistant: crate::assistant::Queue::new().0,
         }
     }
 

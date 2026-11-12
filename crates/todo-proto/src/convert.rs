@@ -851,8 +851,13 @@ impl From<&core::suggestion::Suggestion> for v1::Suggestion {
             kind: match s.kind {
                 K::SyncConflict => v1::SuggestionKind::SyncConflict,
                 K::PushFailed => v1::SuggestionKind::PushFailed,
+                K::Refine => v1::SuggestionKind::Refine,
             } as i32,
-            source: v1::SuggestionSource::Sync as i32,
+            source: if s.kind.from_claude() {
+                v1::SuggestionSource::Claude
+            } else {
+                v1::SuggestionSource::Sync
+            } as i32,
             rationale: s.rationale.clone(),
             error: s.error.clone().unwrap_or_default(),
             state: match s.state {

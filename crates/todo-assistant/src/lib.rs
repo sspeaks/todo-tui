@@ -1,5 +1,6 @@
 //! Claude providers, job queue and suggestion parsing.
 
 pub mod provider;
+pub mod refine;
 
 pub use provider::{Answer, ClaudeCode, Fake, Provider, ProviderError, Task, Usage};

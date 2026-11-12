@@ -15,7 +15,7 @@ use todo_core::{
 
 use crate::{OpKind, Result, StoreError};
 
-fn corrupt(what: impl std::fmt::Display) -> StoreError {
+pub(crate) fn corrupt(what: impl std::fmt::Display) -> StoreError {
     StoreError::Corrupt(what.to_string())
 }
 
@@ -66,6 +66,7 @@ sql_enum!(CreatedVia, "created_via", {
 sql_enum!(SuggestionKind, "suggestion_kind", {
     SuggestionKind::SyncConflict => "sync_conflict",
     SuggestionKind::PushFailed => "push_failed",
+    SuggestionKind::Refine => "refine",
 });
 sql_enum!(SuggestionState, "suggestion_state", {
     SuggestionState::Pending => "pending",

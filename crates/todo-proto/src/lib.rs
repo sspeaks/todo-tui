@@ -59,4 +59,7 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
 /// Item's description is Markdown, converted from the tracker's wiki markup
 /// (ADR-0009), no longer the tracker's text. 25: the description is a
 /// pushed field: a person's edit of it is taken and queued, as the title's.
-pub const API_MINOR: u32 = 25;
+/// 26 added the AssistantService (Refine, GetJob, ListJobs, ADR-0010),
+/// ConfigSnapshot.assistant, SUGGESTION_KIND_REFINE and
+/// SUGGESTION_SOURCE_CLAUDE.
+pub const API_MINOR: u32 = 26;

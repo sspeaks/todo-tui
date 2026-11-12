@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package todo.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// The assistant (design 6, ADR-0010): Claude, on request, through the
+// person's own Claude Code CLI. It only proposes: what it makes is a
+// Suggestion (kind REFINE, source CLAUDE) in the Suggestions pane, never a
+// change to an Item. Without [assistant] provider every call fails
+// FAILED_PRECONDITION / ASSISTANT_OFF.
+service AssistantService {
+  // Asks Claude to refine the Items named (design 6.2 `refine`), in one
+  // request; returns at once with the job. A refine of one Item already
+  // waiting is joined, not asked again. The Suggestion arrives on the
+  // change stream (TOPIC_SUGGESTION) when the job is done; GetJob says how
+  // it went.
+  rpc Refine(RefineRequest) returns (RefineResponse);
+  rpc GetJob(GetJobRequest) returns (GetJobResponse);
+  // The latest jobs, newest first, with what each cost (design 6.3 step 7).
+  rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
+}
+
+message RefineRequest {
+  // 1 to 20 Item ids, live ones.
+  repeated string item_ids = 1;
+}
+
+message RefineResponse {
+  AssistantJob job = 1;
+}
+
+message GetJobRequest {
+  string id = 1;
+}
+
+message GetJobResponse {
+  AssistantJob job = 1;
+}
+
+message ListJobsRequest {
+  // At most this many; 0 is 50.
+  uint32 limit = 1;
+}
+
+message ListJobsResponse {
+  repeated AssistantJob jobs = 1;
+}
+
+message AssistantJob {
+  string id = 1;
+  repeated string item_ids = 2;
+  AssistantJobState state = 3;
+  // Why it failed, in words the person can act on.
+  string error = 4;
+  string model = 5;
+  uint64 input_tokens = 6;
+  uint64 output_tokens = 7;
+  // Input read from the prompt cache.
+  uint64 cached_tokens = 8;
+  double cost_usd = 9;
+  uint64 duration_ms = 10;
+  google.protobuf.Timestamp created_at = 11;
+  // The Suggestions it made, once done; none when nothing would change.
+  repeated string suggestion_ids = 12;
+}
+
+enum AssistantJobState {
+  ASSISTANT_JOB_STATE_UNSPECIFIED = 0;
+  ASSISTANT_JOB_STATE_QUEUED = 1;
+  ASSISTANT_JOB_STATE_RUNNING = 2;
+  ASSISTANT_JOB_STATE_DONE = 3;
+  ASSISTANT_JOB_STATE_FAILED = 4;
+}

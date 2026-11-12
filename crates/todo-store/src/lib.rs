@@ -5,6 +5,7 @@
 //! call; reads run on a small pool of read-only connections (WAL mode).
 
 mod archive;
+pub mod assistant;
 mod codec;
 mod export;
 mod hierarchy;
@@ -675,6 +676,16 @@ impl Store {
             .unwrap_or_else(|e| e.into_inner()) = todo_core::Local::instance(instance, fields);
     }
 
+    /// Whether `item`'s instance keeps `field` local (`local_fields`).
+    pub fn keeps_local(&self, item: &Item, field: ItemField) -> bool {
+        self.inner
+            .shared
+            .local
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .has(item, field)
+    }
+
     /// Whether `instance` pushes now: the worker asks before each Item, so a
     /// reload's `push = false` stops a pass already running.
     pub fn pushes_now(&self, instance: &str) -> bool {
@@ -1106,6 +1117,76 @@ impl Store {
         item: Option<ItemId>,
     ) -> Result<(Vec<todo_core::suggestion::Suggestion>, Revision)> {
         self.read(move |conn| suggestion::list_tx(conn, item)).await
+    }
+
+    /// Queues a refine of `items` (design 6.3); its job's id. A request for
+    /// Items a waiting job already holds joins that job.
+    pub async fn queue_refine(
+        &self,
+        items: Vec<ItemId>,
+        model: String,
+        now: Timestamp,
+    ) -> Result<String> {
+        self.write(move |tx| {
+            if let [one] = items.as_slice()
+                && let Some(id) = assistant::waiting_tx(tx.conn(), *one)?
+            {
+                return Ok(id);
+            }
+            assistant::queue_tx(tx.conn(), &items, &model, now)
+        })
+        .await
+    }
+
+    /// What a refine of `item` shows Claude besides the Item: the labels in
+    /// use and up to `limit` Items that may be the same thing.
+    pub async fn refine_context(
+        &self,
+        item: Item,
+        limit: usize,
+    ) -> Result<assistant::RefineContext> {
+        self.read(move |conn| assistant::context_tx(conn, &item, limit))
+            .await
+    }
+
+    /// The job `id` started running.
+    pub async fn start_job(&self, id: String, now: Timestamp) -> Result<()> {
+        self.write(move |tx| assistant::start_tx(tx.conn(), &id, now))
+            .await
+    }
+
+    /// The job `id` ended; its refines become Suggestions. Their ids.
+    pub async fn finish_job(
+        &self,
+        id: String,
+        end: assistant::JobEnd,
+        refined: Vec<assistant::Refined>,
+        now: Timestamp,
+    ) -> Result<Vec<String>> {
+        self.write(move |tx| assistant::finish_tx(tx, &id, end, refined, now))
+            .await
+    }
+
+    /// The job `id`, if there is one.
+    pub async fn job(&self, id: String) -> Result<Option<assistant::Job>> {
+        self.read(move |conn| assistant::job_tx(conn, &id)).await
+    }
+
+    /// The Suggestions the job `id` made.
+    pub async fn job_suggestions(&self, id: String) -> Result<Vec<String>> {
+        self.read(move |conn| assistant::suggestions_tx(conn, &id))
+            .await
+    }
+
+    /// The latest `limit` jobs, newest first (`todo assistant usage`).
+    pub async fn jobs(&self, limit: usize) -> Result<Vec<assistant::Job>> {
+        self.read(move |conn| assistant::jobs_tx(conn, limit)).await
+    }
+
+    /// Fails the jobs a daemon left queued or running when it stopped; how many.
+    pub async fn abandon_jobs(&self, now: Timestamp) -> Result<usize> {
+        self.write(move |tx| assistant::abandon_tx(tx.conn(), now))
+            .await
     }
 
     /// Applies the patches named as one op by the person (design 3.11):

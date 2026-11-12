@@ -2566,9 +2566,11 @@ async fn the_markdown_migration_reads_linked_items_again() {
         let stale = store.tracked("work-jira".into()).await.unwrap();
         assert!(stale.iter().all(|t| !t.stale));
     }
-    // As at version 8: the migration runs again on the next open.
+    // As at version 8: the migrations since run again on the next open
+    // (0010's table dropped, as it would not yet exist).
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.pragma_update(None, "user_version", 8).unwrap();
+    conn.execute_batch("DROP TABLE assistant_jobs;").unwrap();
     drop(conn);
     let store = Store::open(&path).unwrap();
     let tracked = store.tracked("work-jira".into()).await.unwrap();
@@ -2662,4 +2664,84 @@ async fn a_description_changed_in_jira_meanwhile_is_a_conflict_with_yours_kept()
         (p.field, &p.expected_old, &p.new),
         (ItemField::Description, &md("## Theirs"), &md("## Mine"))
     );
+}
+
+#[tokio::test]
+async fn the_assistant_migration_keeps_sync_suggestions_and_takes_claudes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("todo.db");
+    let item_id;
+    {
+        let store = Store::open(&path).unwrap();
+        let (id, _) = title_conflict(&store).await;
+        item_id = id;
+    }
+    // As at version 9: 0010 rebuilds suggestions with what it holds.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.pragma_update(None, "user_version", 9).unwrap();
+    conn.execute_batch("DROP TABLE assistant_jobs;").unwrap();
+    drop(conn);
+    let store = Store::open(&path).unwrap();
+    let (all, _) = store.list_suggestions(Some(item_id)).await.unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(
+        all[0].kind,
+        todo_core::suggestion::SuggestionKind::SyncConflict
+    );
+    // A refine job and its Suggestion.
+    let job = store
+        .queue_refine(vec![item_id], "m".into(), ts(9_000))
+        .await
+        .unwrap();
+    // A second request for the same Item joins the waiting job.
+    assert_eq!(
+        store
+            .queue_refine(vec![item_id], "m".into(), ts(9_001))
+            .await
+            .unwrap(),
+        job
+    );
+    store.start_job(job.clone(), ts(9_002)).await.unwrap();
+    let made = store
+        .finish_job(
+            job.clone(),
+            todo_store::assistant::JobEnd {
+                error: None,
+                input_tokens: 10,
+                output_tokens: 2,
+                cached_tokens: 0,
+                cost_usd: 0.0,
+                duration_ms: 5,
+            },
+            vec![todo_store::assistant::Refined {
+                item: item_id,
+                rationale: "clearer".into(),
+                patches: vec![(
+                    ItemField::Priority,
+                    FieldValue::Priority(Priority::None),
+                    FieldValue::Priority(Priority::High),
+                )],
+            }],
+            ts(9_003),
+        )
+        .await
+        .unwrap();
+    assert_eq!(made.len(), 1);
+    assert_eq!(store.job_suggestions(job.clone()).await.unwrap(), made);
+    let (all, _) = store.list_suggestions(Some(item_id)).await.unwrap();
+    assert_eq!(all.len(), 2);
+    assert!(
+        all.iter()
+            .any(|s| s.kind == todo_core::suggestion::SuggestionKind::Refine)
+    );
+    // Done, a new request queues a new job; one left running is failed at start.
+    let next = store
+        .queue_refine(vec![item_id], "m".into(), ts(9_004))
+        .await
+        .unwrap();
+    assert_ne!(next, job);
+    assert_eq!(store.abandon_jobs(ts(9_005)).await.unwrap(), 1);
+    let jobs = store.jobs(10).await.unwrap();
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0].state, todo_store::assistant::JobState::Failed);
 }

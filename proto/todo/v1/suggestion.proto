@@ -37,11 +37,14 @@ enum SuggestionKind {
   SUGGESTION_KIND_UNSPECIFIED = 0;
   SUGGESTION_KIND_SYNC_CONFLICT = 1;
   SUGGESTION_KIND_PUSH_FAILED = 2;
+  // Claude's cleaner fields for an Item, asked for (design 6.2, ADR-0010).
+  SUGGESTION_KIND_REFINE = 3;
 }
 
 enum SuggestionSource {
   SUGGESTION_SOURCE_UNSPECIFIED = 0;
   SUGGESTION_SOURCE_SYNC = 1;
+  SUGGESTION_SOURCE_CLAUDE = 2;
 }
 
 enum SuggestionState {

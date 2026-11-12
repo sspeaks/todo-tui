@@ -305,7 +305,7 @@ async fn handshake_reports_version_and_api_minor() {
         .into_inner();
     assert_eq!(info.daemon_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(info.api_minor, todo_proto::API_MINOR);
-    assert_eq!(info.api_minor, 25);
+    assert_eq!(info.api_minor, 26);
     d.stop().await;
 }
 
@@ -1020,7 +1020,7 @@ async fn the_scheduler_sweeps_when_it_starts() {
         archive_done_after: Some(SignedDuration::from_hours(1)),
         ..DaemonOptions::default()
     };
-    let d = start_with(hour).await;
+    let d = start_with(hour.clone()).await;
     let mut items = d.items().await;
     let a = capture(&mut items, "a").await;
     items

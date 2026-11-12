@@ -1,5 +1,6 @@
 //! tonic service implementations over a shared [`Ctx`].
 
+pub(crate) mod assistant;
 pub(crate) mod item;
 pub(crate) mod suggestion;
 pub(crate) mod sync;
@@ -29,4 +30,6 @@ pub(crate) struct Ctx {
     pub(crate) sync_now: crate::sync::SyncNow,
     /// How often a quiet Subscribe stream gets a Heartbeat.
     pub(crate) heartbeat: std::time::Duration,
+    /// Where Refine puts a job (design 6.3).
+    pub(crate) assistant: crate::assistant::Queue,
 }

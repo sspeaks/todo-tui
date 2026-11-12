@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use jiff::SignedDuration;
+use todo_proto::v1::assistant_service_server::AssistantServiceServer;
 use todo_proto::v1::item_service_server::ItemServiceServer;
 use todo_proto::v1::suggestion_service_server::SuggestionServiceServer;
 use todo_proto::v1::sync_service_server::SyncServiceServer;
@@ -30,8 +31,8 @@ use crate::paths::Paths;
 use crate::remote::{self, Auth};
 use crate::scheduler::{self, Wake};
 use crate::service::{
-    Ctx, item::Items, suggestion::Suggestions, sync::Sync, system::System, view::Views,
-    watch::Watch,
+    Ctx, assistant::Assistants, item::Items, suggestion::Suggestions, sync::Sync, system::System,
+    view::Views, watch::Watch,
 };
 use crate::spool;
 use crate::supervise::{Backoff, spawn_supervised};
@@ -46,7 +47,7 @@ pub enum Started {
 }
 
 /// How a [`Daemon`] runs its background tasks. Tests shorten them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct DaemonOptions {
     /// How often the scheduler sweeps when no user op wakes it (60 s).
     pub scheduler_interval: Duration,
@@ -68,6 +69,22 @@ pub struct DaemonOptions {
     /// Test hook: the scheduler's first this many runs panic at once.
     #[doc(hidden)]
     pub scheduler_panics: u32,
+    /// What runs the assistant's tasks: the person's Claude Code CLI, or a
+    /// stand-in for tests (never a real Claude call in a test).
+    pub assistant: crate::assistant::Run,
+}
+
+impl std::fmt::Debug for DaemonOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DaemonOptions")
+            .field("scheduler_interval", &self.scheduler_interval)
+            .field("archive_done_after", &self.archive_done_after)
+            .field("spool_interval", &self.spool_interval)
+            .field("restart_after", &self.restart_after)
+            .field("backup_check", &self.backup_check)
+            .field("heartbeat", &self.heartbeat)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for DaemonOptions {
@@ -80,6 +97,7 @@ impl Default for DaemonOptions {
             backup_check: crate::backup::CHECK,
             heartbeat: crate::service::watch::HEARTBEAT,
             scheduler_panics: 0,
+            assistant: crate::assistant::claude_code(),
         }
     }
 }
@@ -275,6 +293,24 @@ impl Daemon {
                 )
             })
         };
+        let (queue, jobs) = crate::assistant::Queue::new();
+        let assistant = {
+            let (store, config, run, stop) = (
+                store.clone(),
+                config.clone(),
+                options.assistant.clone(),
+                shutdown.signal(),
+            );
+            spawn_supervised("assistant", shutdown.signal(), backoff, move || {
+                crate::assistant::run(
+                    store.clone(),
+                    config.clone(),
+                    run.clone(),
+                    jobs.clone(),
+                    stop.clone(),
+                )
+            })
+        };
         let (status_tx, sync_status) = crate::sync::status_channel();
         let sync_now = crate::sync::SyncNow::default();
         // The loop pokes the counter when it adds an instance's status.
@@ -322,6 +358,7 @@ impl Daemon {
             wake,
             config,
             heartbeat: options.heartbeat,
+            assistant: queue,
         };
         let remote_clients = clients.clone();
 
@@ -351,6 +388,7 @@ impl Daemon {
             .add_service(ViewServiceServer::new(Views(ctx.clone())))
             .add_service(SyncServiceServer::new(Sync(ctx.clone())))
             .add_service(SuggestionServiceServer::new(Suggestions(ctx.clone())))
+            .add_service(AssistantServiceServer::new(Assistants(ctx.clone())))
             .add_service(WatchServiceServer::new(Watch(ctx.clone())))
             .serve_with_incoming_shutdown(incoming, async move { stop.wait().await });
 
@@ -394,6 +432,10 @@ impl Daemon {
                     Suggestions(ctx.clone()),
                     auth.clone(),
                 ))
+                .add_service(AssistantServiceServer::with_interceptor(
+                    Assistants(ctx.clone()),
+                    auth.clone(),
+                ))
                 .add_service(WatchServiceServer::with_interceptor(Watch(ctx), auth))
                 .serve_with_incoming_shutdown(incoming, async move { stop.wait().await })
         });
@@ -426,7 +468,7 @@ impl Daemon {
         // has been dropped, so the last clone (dropped here) joins the
         // writer thread before the lock is released: a daemon that takes
         // the lock next sees every commit.
-        for task in [spool, scheduler, backups, sync, counter] {
+        for task in [spool, scheduler, backups, assistant, sync, counter] {
             task.abort().await;
         }
         let _ = fs::remove_file(&paths.socket);

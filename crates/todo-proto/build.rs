@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 const PROTOS: &[&str] = &[
     "todo/export/v1/export.proto",
+    "todo/v1/assistant_service.proto",
     "todo/v1/common.proto",
     "todo/v1/config.proto",
     "todo/v1/field.proto",

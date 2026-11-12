@@ -1,5 +1,5 @@
 //! A Suggestion (design 3.11): a proposed change, never applied without a
-//! person. P2 makes the sync kinds (ADR-0007).
+//! person. P2 makes the sync kinds (ADR-0007), P3 Claude's (ADR-0010).
 
 use jiff::Timestamp;
 
@@ -13,6 +13,17 @@ pub enum SuggestionKind {
     SyncConflict,
     /// Jira refused a push.
     PushFailed,
+    /// Claude's cleaner fields for an Item, asked for by the person (design
+    /// 6.2 `refine`).
+    Refine,
+}
+
+impl SuggestionKind {
+    /// Who made it (design 3.11 `source`): sync for the sync kinds, Claude
+    /// for refine.
+    pub fn from_claude(self) -> bool {
+        matches!(self, SuggestionKind::Refine)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
