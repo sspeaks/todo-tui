@@ -449,13 +449,20 @@ fn pushes(item: &Item, ctx: &ApplyCtx) -> bool {
 }
 
 /// A Core field a push sends (ADR-0007): the status (category and
-/// resolution kind, through SetStatus) and the title, priority, labels and
-/// due date. The rest stay the tracker's alone.
+/// resolution kind, through SetStatus) and the title, description (as wiki
+/// markup, ADR-0009), priority, labels and due date. The rest stay the
+/// tracker's alone.
 pub fn pushed(field: ItemField) -> bool {
     use ItemField as F;
     matches!(
         field,
-        F::Title | F::Priority | F::Labels | F::DueDate | F::StatusCategory | F::ResolutionKind
+        F::Title
+            | F::Description
+            | F::Priority
+            | F::Labels
+            | F::DueDate
+            | F::StatusCategory
+            | F::ResolutionKind
     )
 }
 

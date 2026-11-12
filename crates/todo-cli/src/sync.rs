@@ -248,6 +248,18 @@ fn value_text(v: &todo_core::FieldValue) -> String {
             .join(" "),
         V::Date(d) => d.to_string(),
         V::Cleared => "none".to_owned(),
+        V::Markdown(md) if md.trim().is_empty() => "empty".to_owned(),
+        // A description: its first line, cut short, as one line holds it.
+        V::Markdown(md) => {
+            let first = md
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or_default()
+                .trim();
+            let cut: String = first.chars().take(40).collect();
+            let more = cut.len() < first.len() || md.trim().lines().count() > 1;
+            format!("{:?}", if more { format!("{cut}…") } else { cut })
+        }
         other => format!("{other:?}"),
     }
 }

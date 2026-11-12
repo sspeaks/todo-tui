@@ -582,8 +582,10 @@ describe("FakeDaemon on a linked Item (read-only sync, ADR-0006)", () => {
     const items = createClient(ItemService, daemon.transport);
     expect((await updateItem(items, { id: ok!.id, title: "mine" }, ["title"])).item?.title).toBe("mine");
     expect((await setStatus(items, ok!.id, Status.DONE)).item?.status).toBe(Status.DONE);
-    const [info] = (await failure(updateItem(items, { id: ok!.id, description: "d" }, ["description"])))?.findDetails(ErrorInfoSchema) ?? [];
-    expect([info?.reason, info?.metadata.field]).toEqual(["LINKED_READ_ONLY", "description"]);
+    // The description pushes too (ADR-0009); the item type does not.
+    expect((await updateItem(items, { id: ok!.id, description: "## d" }, ["description"])).item?.description).toBe("## d");
+    const [info] = (await failure(updateItem(items, { id: ok!.id, itemType: "Story" }, ["item_type"])))?.findDetails(ErrorInfoSchema) ?? [];
+    expect([info?.reason, info?.metadata.field]).toEqual(["LINKED_READ_ONLY", "item_type"]);
     // A broken link stays read-only.
     expect((await failure(updateItem(items, { id: broken!.id, title: "x" }, ["title"])))?.code).toBe(Code.FailedPrecondition);
     // Someone else's issue takes a pushed edit only when confirmed (design 5.9).

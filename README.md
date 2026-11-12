@@ -682,7 +682,7 @@ claude mcp add --scope user todo -- todo mcp
 | `todo_meeting_link` | A Teams new-meeting link for items, prefilled as `M` fills it |
 | `todo_suggestions` | What Jira sync left to review (conflicts, refusals); applying one is yours, in the TUI's `S` |
 | `todo_capture` | A capture, as `todo add` takes it (tokens and all) |
-| `todo_update` | Title, description, priority, local priority, energy, due, defer, labels, waiting, private notes; on a Jira item the title, priority, labels and due date reach Jira |
+| `todo_update` | Title, description, priority, local priority, energy, due, defer, labels, waiting, private notes; on a Jira item the title, description, priority, labels and due date reach Jira |
 | `todo_set_status` | `inbox`, `next`, `someday`, `in_progress`, `done`, `cancelled`; completing a repeating item returns the next one |
 | `todo_set_repeat` | Sets or clears the repeat rule |
 | `todo_archive`, `todo_unarchive`, `todo_delete`, `todo_undelete` | As named |

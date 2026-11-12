@@ -261,7 +261,7 @@ describe("todo mcp tools", () => {
 describe("todo mcp tools with pushes (ADR-0007)", () => {
   const link = { trackerKind: "jira", instanceId: "work-jira", remoteId: "1", key: "PLAT-1", url: "https://jira.example.com/browse/PLAT-1" };
 
-  it("pushes the title and a close, refuses the description by name, and asks for someone else's issue", async () => {
+  it("pushes the title, the description and a close, and asks for someone else's issue", async () => {
     const { call, daemon } = await harness({
       items: [
         { id: "01JBQ00000000000000000JRA2", title: "Linked", status: Status.NEXT, remoteLink: link, isMine: true },
@@ -271,7 +271,12 @@ describe("todo mcp tools with pushes (ADR-0007)", () => {
     daemon.setConfig({ instances: [{ id: "work-jira", kind: "jira-dc", push: true }] });
     expect((await call("todo_update", { id: "0000JRA2", title: "Renamed" })).title).toBe("Renamed");
     expect((await call("todo_set_status", { id: "0000JRA2", status: "done" })).item.status).toBe("done");
-    await expect(call("todo_update", { id: "0000JRA2", description: "d" })).rejects.toThrow(/^description: this item is a Jira issue and that field is Jira's/);
+    // The description pushes too (ADR-0009); with pushes off it is refused by name.
+    expect((await call("todo_update", { id: "0000JRA2", description: "## d" })).id).toBeDefined();
+    expect((await call("todo_get", { id: "0000JRA2" })).description).toBe("## d");
+    daemon.setConfig({ instances: [{ id: "work-jira", kind: "jira-dc", push: false }] });
+    await expect(call("todo_update", { id: "0000JRA2", description: "e" })).rejects.toThrow(/^description: this item is a Jira issue and that field is Jira's/);
+    daemon.setConfig({ instances: [{ id: "work-jira", kind: "jira-dc", push: true }] });
     await expect(call("todo_update", { id: "0000JRA4", title: "x" })).rejects.toThrow(/assigned to someone else.*confirm_not_mine: true/);
     expect((await call("todo_update", { id: "0000JRA4", title: "x", confirm_not_mine: true })).title).toBe("x");
     expect((await call("todo_set_status", { id: "0000JRA4", status: "cancelled", confirm_not_mine: true })).item.status).toBe("cancelled");

@@ -241,11 +241,11 @@ async fn the_first_pass_imports_the_scope_and_later_ones_follow_it() {
             request_id: todo_core::new_ulid().to_string(),
             item: Some(Item {
                 id: items[0].id.clone(),
-                description: "mine".into(),
+                item_type: "Story".into(),
                 ..Item::default()
             }),
             update_mask: Some(prost_types::FieldMask {
-                paths: vec!["description".into()],
+                paths: vec!["item_type".into()],
             }),
             ..UpdateItemRequest::default()
         })
@@ -640,6 +640,55 @@ async fn an_edit_and_a_close_reach_jira_and_read_back() {
         ("new title", Status::Done as i32)
     );
     assert_eq!(status(&r).await.pending_ops, 0);
+    r.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_description_reaches_jira_as_wiki_and_keeps_what_did_not_convert() {
+    use todo_proto::v1::ListSuggestionsRequest;
+    use todo_proto::v1::suggestion_service_client::SuggestionServiceClient;
+    let fake = FakeJira::start("pat").await;
+    let mut one = issue_json(1, "notes", "new", &at(1));
+    one["fields"]["description"] =
+        json!("h2. Steps\r\n* tag {{v2}}\r\n\r\n{color:#888}footer{color}\r\n{panel}box{panel}");
+    let issues = Arc::new(Mutex::new(vec![one]));
+    serve_writable(&fake, issues.clone());
+    let r = start(&fake, "pat").await;
+    settled(&r, SyncState::Ok).await;
+    let item = linked(&r).await.remove(0);
+    let edited = item.description.replace("tag `v2`", "tag `v3` **now**");
+    assert_ne!(edited, item.description);
+    let mut client = ItemServiceClient::new(r.channel().await);
+    client
+        .update_item(UpdateItemRequest {
+            request_id: todo_core::new_ulid().to_string(),
+            item: Some(Item {
+                id: item.id.clone(),
+                description: edited.clone(),
+                ..Item::default()
+            }),
+            update_mask: Some(prost_types::FieldMask {
+                paths: vec!["description".into()],
+            }),
+            ..UpdateItemRequest::default()
+        })
+        .await
+        .unwrap();
+    // Sent as wiki, the rest as it was; read back, it settles as it is.
+    let items = until(&r, "pushed", |items| items[0].pending_fields.is_empty()).await;
+    assert_eq!(
+        issues.lock().unwrap()[0]["fields"]["description"],
+        "h2. Steps\n* tag {{v3}} *now*\n\n{color:#888}footer{color}\n{panel}box{panel}"
+    );
+    assert_eq!(items[0].description, edited);
+    let mut pane = SuggestionServiceClient::new(r.channel().await);
+    let waiting = pane
+        .list_suggestions(ListSuggestionsRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .suggestions;
+    assert!(waiting.is_empty(), "{waiting:?}");
     r.stop().await;
 }
 

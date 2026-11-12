@@ -67,8 +67,8 @@ function describe(err: unknown): Error {
     if (reason === "LINKED_READ_ONLY") {
       return new ToolError(
         `${field ? `${field.replace(/_/g, " ")}: ` : ""}this item is a Jira issue and that field is Jira's: change it in Jira. ` +
-          "Only the title, priority, labels, due date and status push to Jira, and only while sync pushes (push = true) and the link is whole; " +
-          "the description, assignee, components, fix versions, parent, points and estimates never do. Waiting, defer, notes, the local priority, energy, archive and delete stay local",
+          "Only the title, description, priority, labels, due date and status push to Jira, and only while sync pushes (push = true) and the link is whole; " +
+          "the assignee, components, fix versions, parent, points and estimates never do. Waiting, defer, notes, the local priority, energy, archive and delete stay local",
       );
     }
     if (reason === "NOT_MINE") {
@@ -391,15 +391,16 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
       title: "Update a todo",
       description:
         "Change fields of an item; only the fields given change. Empty string (or null) clears a field. " +
-        "Status, repeat, archive and delete have their own tools. On a Jira-linked item the title, priority, labels and due date are " +
+        "Status, repeat, archive and delete have their own tools. On a Jira-linked item the title, description, priority, labels and due date are " +
         "pushed to Jira (pending_fields shows them queued until Jira has them; ask Seth before renaming his ticket as a side effect), " +
         "except a due date the instance keeps local (local_fields), which is his alone; " +
-        "the description and the other Jira fields are Jira's, and refused. defer_until, waiting, private_notes, local_priority and energy " +
+        "the other Jira fields are Jira's, and refused. A Jira description is Markdown converted from Jira's markup: keep its `wiki:` code spans and ```wiki blocks " +
+        "as they are (Jira formatting with no Markdown form; they go back unchanged). defer_until, waiting, private_notes, local_priority and energy " +
         "stay local. An issue assigned to someone else needs confirm_not_mine.",
       inputSchema: {
         id: ID,
         title: z.string().optional(),
-        description: z.string().optional().describe("Markdown"),
+        description: z.string().optional().describe("Markdown; on a Jira item it reaches Jira"),
         priority: z.number().int().min(0).max(5).optional().describe("1 (highest) to 5 (lowest); 0 for none"),
         local_priority: z.number().int().min(0).max(5).optional().describe("A local override of priority, never pushed to Jira; 0 clears it"),
         energy: z.enum(["low", "medium", "high", ""]).optional().describe("How much focus it takes, local only; empty clears it"),

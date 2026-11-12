@@ -349,6 +349,7 @@ pub(crate) fn has_pending(conn: &Connection, item: todo_core::ItemId, kind: &str
 pub(crate) fn field_word(field: ItemField) -> &'static str {
     match field {
         ItemField::Title => "the title",
+        ItemField::Description => "the description",
         ItemField::Priority => "the priority",
         ItemField::Labels => "the labels",
         ItemField::DueDate => "the due date",
@@ -642,6 +643,7 @@ pub(crate) fn settle_pull(
     let jira_of = |i: &RemoteIssue, field: ItemField| -> Option<FieldValue> {
         Some(match field {
             ItemField::Title => FieldValue::String(i.title.clone()),
+            ItemField::Description => FieldValue::Markdown(i.description.clone()),
             ItemField::Priority => FieldValue::Priority(i.priority),
             ItemField::Labels => FieldValue::StringSet(i.labels.clone()),
             ItemField::DueDate => i.due_date.map_or(FieldValue::Cleared, FieldValue::Date),
@@ -763,6 +765,7 @@ pub(crate) fn settle_pull(
 fn put(issue: &mut todo_core::remote::RemoteIssue, field: ItemField, value: &FieldValue) {
     match (field, value) {
         (ItemField::Title, FieldValue::String(s)) => issue.title = s.clone(),
+        (ItemField::Description, FieldValue::Markdown(s)) => issue.description = s.clone(),
         (ItemField::Priority, FieldValue::Priority(p)) => issue.priority = *p,
         (ItemField::Labels, FieldValue::StringSet(l)) => issue.labels = l.clone(),
         (ItemField::DueDate, FieldValue::Date(d)) => issue.due_date = Some(*d),

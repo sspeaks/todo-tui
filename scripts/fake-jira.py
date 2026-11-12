@@ -45,6 +45,8 @@ ISSUES = [
     issue(1, "smoke jira login fix", "new", "Open"),
     issue(2, "smoke jira report", "indeterminate", "In Review"),
 ]
+# Wiki markup, read as Markdown (ADR-0009); the colour has no Markdown form.
+ISSUES[1]["fields"]["description"] = "h2. Report\r\n* weekly {{totals}}\r\n{color:#888}footer{color}"
 
 # BRME's workflow: (id, name, target status, its category).
 WORKFLOW = [

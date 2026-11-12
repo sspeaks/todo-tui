@@ -391,6 +391,8 @@ impl Adapter {
 #[derive(Debug, Clone, PartialEq)]
 pub enum FieldPatch {
     Title(String),
+    /// Markdown: sent as wiki markup (ADR-0009).
+    Description(String),
     Priority(Priority),
     Labels(Vec<String>),
     DueDate(Option<Date>),
@@ -448,6 +450,7 @@ impl Adapter {
         for p in patches {
             let (k, v) = match p {
                 FieldPatch::Title(t) => ("summary", json!(t)),
+                FieldPatch::Description(md) => ("description", json!(crate::wiki::to_wiki(md))),
                 FieldPatch::Priority(level) => match self.discovery.priority_names.get(level) {
                     Some(name) => ("priority", json!({ "name": name })),
                     // None, or an instance without priorities: Jira's own

@@ -652,12 +652,30 @@ async fn with_pushes_on_a_pushed_edit_queues_and_the_rest_stays_jiras() {
             ItemField::ResolutionKind.number()
         ]
     );
+    // The description pushes too (ADR-0009), as Markdown.
+    store
+        .mutate(user_edit(
+            item.id,
+            ItemField::Description,
+            FieldValue::Markdown("## Steps".into()),
+        ))
+        .await
+        .unwrap();
+    let rows = outbox(&store, item.id).await;
+    let row = rows
+        .iter()
+        .find(|r| r.0 == ItemField::Description.number())
+        .unwrap();
+    assert_eq!(
+        (row.1.as_str(), row.3.as_str()),
+        ("pending", r###"{"markdown":"## Steps"}"###)
+    );
     // What does not push is still Jira's.
     let err = store
         .mutate(user_edit(
             item.id,
-            ItemField::Description,
-            FieldValue::Markdown("x".into()),
+            ItemField::ItemType,
+            FieldValue::String("Bug".into()),
         ))
         .await
         .unwrap_err();
@@ -665,7 +683,7 @@ async fn with_pushes_on_a_pushed_edit_queues_and_the_rest_stays_jiras() {
         matches!(
             err,
             StoreError::Mutation {
-                error: MutationError::LinkedReadOnly(ItemField::Description),
+                error: MutationError::LinkedReadOnly(ItemField::ItemType),
                 ..
             }
         ),
@@ -2555,4 +2573,39 @@ async fn the_markdown_migration_reads_linked_items_again() {
     // The live one is read again by id; the deleted one is not tracked.
     assert_eq!(tracked.len(), 1);
     assert!(tracked[0].stale);
+}
+
+#[tokio::test]
+async fn a_description_changed_in_jira_meanwhile_is_a_conflict_with_yours_kept() {
+    let (_dir, store) = open();
+    let mut first = issue(1, "one");
+    first.description = "## Steps".into();
+    store.apply_pull(page(vec![first], None)).await.unwrap();
+    let item = by_key(&store, "PLAT-1").await;
+    store.set_pushes(Some("work-jira"));
+    let md = |s: &str| FieldValue::Markdown(s.into());
+    store
+        .mutate(user_edit(item.id, ItemField::Description, md("## Mine")))
+        .await
+        .unwrap();
+    // Jira at the base: yours still waits, and shows.
+    let mut same = titled(1, "one", 401);
+    same.description = "## Steps".into();
+    store.apply_pull(page(vec![same], None)).await.unwrap();
+    let got = store.get_item(item.id, TODAY).await.unwrap().item;
+    assert_eq!(got.core.description, "## Mine");
+    assert_eq!(got.derived.pending_fields, [ItemField::Description]);
+    // Jira elsewhere: Jira's stands, yours is kept as a Suggestion.
+    let mut theirs = titled(1, "one", 500);
+    theirs.description = "## Theirs".into();
+    store.apply_pull(page(vec![theirs], None)).await.unwrap();
+    let got = store.get_item(item.id, TODAY).await.unwrap().item;
+    assert_eq!(got.core.description, "## Theirs");
+    assert!(got.derived.has_conflict);
+    let (all, _) = store.list_suggestions(Some(item.id)).await.unwrap();
+    let p = &all[0].patches[0];
+    assert_eq!(
+        (p.field, &p.expected_old, &p.new),
+        (ItemField::Description, &md("## Theirs"), &md("## Mine"))
+    );
 }

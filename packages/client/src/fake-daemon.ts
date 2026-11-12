@@ -463,7 +463,7 @@ export class FakeDaemon {
   maxPageSize = MAX_PAGE_SIZE;
   /** Runs before every ListItems; throw from it to fail that call. */
   onListItems: ((req: ListItemsRequest) => void) | undefined;
-  apiMinor = 24;
+  apiMinor = 25;
   /** What Export streams, as one batch; unset, Export is UNIMPLEMENTED (the format is the daemon's). */
   exportLines: string[] | undefined;
   /** What GetConfig serves; change it with {@link setConfig}. */
@@ -3043,8 +3043,8 @@ const CORE_PATHS: Record<string, string> = {
   remainingEstimate: "remaining_estimate",
 };
 const CORE_FIELDS = new Set(Object.keys(CORE_PATHS));
-/** The Core fields a push sends (ADR-0007), as todo_core's `pushed`. */
-const PUSHED_FIELDS = new Set(["title", "priority", "labels", "dueDate", "statusCategory", "resolutionKind"]);
+/** The Core fields a push sends (ADR-0007, ADR-0009), as todo_core's `pushed`. */
+const PUSHED_FIELDS = new Set(["title", "description", "priority", "labels", "dueDate", "statusCategory", "resolutionKind"]);
 
 /** The Item fields whose own fields are mask paths too ("waiting.reason"), as ItemField names them. */
 const NESTED_PATHS = new Set(["waiting", "archived", "remote_link", "recurrence", "staleness"]);

@@ -448,7 +448,8 @@ else
   #    `todo sync now` imports them, `todo sync status` says ok, and the
   #    TUI shows ⇅ in the status bar and the key in the detail. Then a
   #    push (ADR-0007): x on the to-do issue reaches the fake as a close
-  #    with resolution Done, and the next pull reads it back done.
+  #    with resolution Done, and the next pull reads it back done; E on the
+  #    other edits its description, which reaches the fake as wiki markup.
   if command -v python3 >/dev/null; then
     jhome=$root/jira
     new_home "$jhome"
@@ -468,7 +469,12 @@ else
     TODO_TUI_HOME=$jhome "$TODO_BIN" sync status | grep -q '^work-jira: ok · 2 items' || fail "sync status is not ok"
     TODO_TUI_HOME=$jhome list_items >"$root/jira.items" || fail "listing items failed"
     grep -qF '"key":"PLAT-1"' "$root/jira.items" || { cat "$root/jira.items" >&2; fail "PLAT-1 was not imported"; }
+    # E's editor here marks the first list item's line, as a person would.
+    jeditor=$root/jira-editor.sh
+    printf '%s\n' '#!/bin/sh' "sed -i.bak 's/^- weekly \`totals\`\$/- weekly \`totals\` **now**/' \"\$1\"" >"$jeditor"
+    chmod +x "$jeditor"
     tmx new-window -t tui -n jira -e "TODO_TUI_HOME=$jhome" -e "TODO_BIN=$TODO_BIN" -e "TODO_TUI_ENTRY=$TODO_TUI_ENTRY" \
+      -e "VISUAL=$jeditor" -e "EDITOR=$jeditor" \
       "\"\$TODO_BIN\"; sleep 600"
     tmx resize-window -t tui:jira -x 130 -y 30
     kscreen() { tmx capture-pane -p -t tui:jira; }
@@ -504,6 +510,19 @@ else
       { cat "$root/jira.after" >&2; fail "PLAT-1 did not read back done"; }
     grep -F '"key":"PLAT-1"' "$root/jira.after" | grep -qF '"remoteStatusName":"Closed"' ||
       { cat "$root/jira.after" >&2; fail "PLAT-1 did not read back Closed"; }
+    # E on PLAT-2 edits its description as Markdown; it reaches the fake as
+    # wiki markup, the colour it holds kept (ADR-0009).
+    tmx send-keys -t tui:jira k
+    ksee '^› ◐ .*smoke jira report +PLAT-2 ' "PLAT-2 selected"
+    tmx send-keys -t tui:jira E
+    for _ in $(seq 1 100); do
+      grep -q '"description"' "$root/jira.writes" 2>/dev/null && break
+      sleep 0.1
+    done
+    grep -F '"description"' "$root/jira.writes" |
+      grep -qF '"h2. Report\n* weekly {{totals}} *now*\n{color:#888}footer{color}"' ||
+      { cat "$root/jira.writes" >&2 2>/dev/null; fail "E on PLAT-2 did not reach the fake Jira as wiki markup"; }
+    out=$(TODO_TUI_HOME=$jhome "$TODO_BIN" sync now) || fail "sync now after the description push failed: $out"
     out=$(TODO_TUI_HOME=$jhome "$TODO_BIN" sync outbox) || fail "sync outbox failed: $out"
     [[ $out == "nothing waits to reach Jira" ]] || fail "unexpected sync outbox: $out"
     tmx send-keys -t tui:jira S

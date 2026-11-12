@@ -647,6 +647,11 @@ async fn push(
             .map(|w| {
                 let send = match &w.new {
                     V::Priority(p) => V::Priority(adapter.priority_read_back(*p).unwrap_or(*p)),
+                    // A description as Jira will read back: the wiki it is
+                    // sent as, read again (ADR-0009).
+                    V::Markdown(md) => {
+                        V::Markdown(todo_jira::wiki::to_markdown(&todo_jira::wiki::to_wiki(md)))
+                    }
                     v => v.clone(),
                 };
                 (w.clone(), send)
@@ -674,6 +679,9 @@ async fn push(
         for w in &edits {
             match (w.field, &w.new) {
                 (F::Title, V::String(t)) => fields.push(FieldPatch::Title(t.clone())),
+                (F::Description, V::Markdown(md)) => {
+                    fields.push(FieldPatch::Description(md.clone()));
+                }
                 (F::Priority, V::Priority(p)) => fields.push(FieldPatch::Priority(*p)),
                 (F::Labels, V::StringSet(l)) => fields.push(FieldPatch::Labels(l.clone())),
                 (F::DueDate, V::Date(day)) => fields.push(FieldPatch::DueDate(Some(*day))),
