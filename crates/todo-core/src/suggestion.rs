@@ -16,6 +16,9 @@ pub enum SuggestionKind {
     /// Claude's cleaner fields for an Item, asked for by the person (design
     /// 6.2 `refine`).
     Refine,
+    /// An attach (or a promote Jira changed) replaced local values with
+    /// Jira's (design 3.3): the person's, offered back.
+    LinkConflict,
 }
 
 impl SuggestionKind {

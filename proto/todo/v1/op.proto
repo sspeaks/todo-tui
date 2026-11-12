@@ -39,6 +39,10 @@ enum OpKind {
   OP_KIND_APPLY_SUGGESTION = 20;
   // SuggestionService.RejectSuggestion. Never an undo stack entry.
   OP_KIND_REJECT_SUGGESTION = 21;
+  // SyncService.Promote and Attach (design 5.7, 3.3): never undo stack
+  // entries, as the issue they link has no inverse.
+  OP_KIND_PROMOTE = 22;
+  OP_KIND_ATTACH = 23;
 }
 
 // An entry of the undo stack (design 3.10).

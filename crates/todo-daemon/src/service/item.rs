@@ -832,6 +832,8 @@ fn op_kind(kind: OpKind) -> v1::OpKind {
         OpKind::MoveView => v1::OpKind::MoveView,
         OpKind::ApplySuggestion => v1::OpKind::ApplySuggestion,
         OpKind::RejectSuggestion => v1::OpKind::RejectSuggestion,
+        OpKind::Promote => v1::OpKind::Promote,
+        OpKind::Attach => v1::OpKind::Attach,
     }
 }
 
@@ -923,6 +925,8 @@ mod tests {
             OpKind::Sync,
             OpKind::ApplySuggestion,
             OpKind::RejectSuggestion,
+            OpKind::Promote,
+            OpKind::Attach,
         ];
         let proto: HashSet<i32> = kinds.iter().map(|&k| op_kind(k) as i32).collect();
         assert_eq!(proto.len(), kinds.len());

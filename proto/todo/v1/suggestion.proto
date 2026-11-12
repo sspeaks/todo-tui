@@ -39,6 +39,9 @@ enum SuggestionKind {
   SUGGESTION_KIND_PUSH_FAILED = 2;
   // Claude's cleaner fields for an Item, asked for (design 6.2, ADR-0010).
   SUGGESTION_KIND_REFINE = 3;
+  // An attach replaced local values with Jira's (design 3.3): yours, offered
+  // back.
+  SUGGESTION_KIND_LINK_CONFLICT = 4;
 }
 
 enum SuggestionSource {

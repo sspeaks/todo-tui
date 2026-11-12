@@ -175,6 +175,12 @@ pub(crate) fn store(e: StoreError) -> Status {
             e.to_string(),
             [("patch_id", id.clone())],
         ),
+        StoreError::AlreadyLinked(ref key) => error_info(
+            Code::FailedPrecondition,
+            "ALREADY_LINKED",
+            e.to_string(),
+            [("key", key.clone())],
+        ),
         StoreError::SuggestionNotFound(ref id) => error_info(
             Code::NotFound,
             "SUGGESTION_NOT_FOUND",

@@ -852,6 +852,7 @@ impl From<&core::suggestion::Suggestion> for v1::Suggestion {
                 K::SyncConflict => v1::SuggestionKind::SyncConflict,
                 K::PushFailed => v1::SuggestionKind::PushFailed,
                 K::Refine => v1::SuggestionKind::Refine,
+                K::LinkConflict => v1::SuggestionKind::LinkConflict,
             } as i32,
             source: if s.kind.from_claude() {
                 v1::SuggestionSource::Claude

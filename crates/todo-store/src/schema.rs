@@ -44,6 +44,10 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0010_assistant.sql"),
         rebuilds: true,
     },
+    Migration {
+        sql: include_str!("../migrations/0011_link_conflict.sql"),
+        rebuilds: true,
+    },
 ];
 
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;

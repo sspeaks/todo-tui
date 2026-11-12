@@ -393,6 +393,22 @@ fn store_fail(state: &State, id: &str, e: &todo_store::StoreError) -> Outcome {
     Outcome::Degraded
 }
 
+/// An adapter for `i`, for a call that cannot wait for the loop (promote,
+/// attach): the credential read and discovery run now. The error is in the
+/// words the person can act on.
+pub(crate) async fn adapter_for(i: &Instance) -> Result<Adapter, JiraError> {
+    let token = resolve(&i.credential, &SystemSecrets)
+        .map_err(|e| JiraError::Refused(0, format!("credential {e}")))?;
+    let client = Client::new(&i.base_url, token)?;
+    Adapter::connect(
+        client,
+        &i.id,
+        i.cancelled_resolutions.clone(),
+        i.push.clone(),
+    )
+    .await
+}
+
 fn page(
     i: &Instance,
     issues: Vec<(todo_core::remote::RemoteIssue, Vec<String>)>,

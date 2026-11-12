@@ -5,6 +5,8 @@ package todo.v1;
 import "google/protobuf/timestamp.proto";
 import "todo/v1/field.proto";
 import "todo/v1/field_value.proto";
+import "todo/v1/common.proto";
+import "todo/v1/item.proto";
 
 // Jira sync (design 5, ADR-0006, ADR-0007): pulls, and the pushes of the
 // fields that push.
@@ -20,6 +22,50 @@ service SyncService {
   // push_failed Suggestion waits (design 5.6, 5.11): one entry per Item and
   // field, oldest first (`todo sync outbox`).
   rpc ListOutbox(ListOutboxRequest) returns (ListOutboxResponse);
+  // Creates a Jira issue from a local Item (design 5.7) and links it,
+  // while the caller waits: the Item takes the issue's fields, pinned.
+  // FAILED_PRECONDITION / NO_INSTANCE, PUSH_OFF (the instance is read-only),
+  // NO_PROMOTE_TARGET (no project given and no promote_default),
+  // MISSING_FIELDS (Jira needs more: ErrorInfo metadata `fields` lists their
+  // ids, the message what Jira said of each), ALREADY_LINKED; UNAVAILABLE when Jira does
+  // not answer (a lost answer is looked for first, so nothing is created
+  // twice). Not an undo stack entry.
+  rpc Promote(PromoteRequest) returns (PromoteResponse);
+  // Links a local Item to an existing issue by key (design 3.3), anyone's
+  // the person can read: the Item takes Jira's fields, pinned, and the
+  // values Jira replaced become a LINK_CONFLICT Suggestion. NOT_FOUND /
+  // ISSUE_NOT_FOUND when Jira has no such issue the person can read;
+  // ALREADY_LINKED; UNAVAILABLE. Not an undo stack entry.
+  rpc Attach(AttachRequest) returns (AttachResponse);
+}
+
+message PromoteRequest {
+  string item_id = 1;
+  // The project key; empty for promote_default's.
+  string project = 2;
+  // The issue type's name; empty for promote_default's (a subtask of a
+  // linked parent: subtask_issue_type).
+  string issue_type = 3;
+}
+
+message PromoteResponse {
+  Item item = 1;
+  MutationResult result = 2;
+  // A LINK_CONFLICT Suggestion when Jira changed what it was created with.
+  string suggestion_id = 3;
+}
+
+message AttachRequest {
+  string item_id = 1;
+  // The issue's key, e.g. "PLAT-12".
+  string key = 2;
+}
+
+message AttachResponse {
+  Item item = 1;
+  MutationResult result = 2;
+  // The LINK_CONFLICT Suggestion of what Jira replaced, if anything.
+  string suggestion_id = 3;
 }
 
 message ListOutboxRequest {

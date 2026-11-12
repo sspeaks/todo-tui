@@ -67,6 +67,7 @@ sql_enum!(SuggestionKind, "suggestion_kind", {
     SuggestionKind::SyncConflict => "sync_conflict",
     SuggestionKind::PushFailed => "push_failed",
     SuggestionKind::Refine => "refine",
+    SuggestionKind::LinkConflict => "link_conflict",
 });
 sql_enum!(SuggestionState, "suggestion_state", {
     SuggestionState::Pending => "pending",
@@ -159,6 +160,8 @@ sql_enum!(OpKind, "op_kind", {
     OpKind::MoveView => "move_view",
     OpKind::ApplySuggestion => "apply_suggestion",
     OpKind::RejectSuggestion => "reject_suggestion",
+    OpKind::Promote => "promote",
+    OpKind::Attach => "attach",
 });
 sql_enum!(RelationKind, "relation_kind", {
     RelationKind::Blocks => "blocks",

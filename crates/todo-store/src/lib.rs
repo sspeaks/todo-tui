@@ -52,7 +52,9 @@ pub use restore::{DbInfo, backup_file, inspect, prepare_restored};
 pub use schema::{SCHEMA_VERSION, free_backup_path};
 pub use suggestion::{ApplyInput, ApplyOutput, MAX_PATCHES, RejectOutput};
 use summary::Action;
-pub use sync::{PullOutcome, PullPage, Reconcile, ReconcileOutcome, Tracked};
+pub use sync::{
+    LinkInput, LinkOutput, PullOutcome, PullPage, Reconcile, ReconcileOutcome, Tracked,
+};
 pub use view::{
     CreateViewInput, MAX_VIEW_NAME_CHARS, MAX_VIEW_OFFSET_DAYS, MoveViewInput, UpdateViewInput,
     ViewOutput, ViewUpdate, check_view_filter, check_view_name,
@@ -78,6 +80,10 @@ pub enum StoreError {
     Import { record: usize, error: String },
     #[error("item {0} not found")]
     NotFound(ItemId),
+    /// Promote or attach of an Item already linked, or of an issue another
+    /// Item is linked to (design 3.3): the key it is linked to.
+    #[error("already linked to {0}")]
+    AlreadyLinked(String),
     #[error("item {id}: revision conflict: expected {expected}, found {actual}")]
     RevisionMismatch {
         id: ItemId,
@@ -292,6 +298,12 @@ pub enum OpKind {
     ApplySuggestion,
     /// [`Store::reject_suggestion`]: never an undo stack entry.
     RejectSuggestion,
+    /// [`Store::link`] by promote: the issue was created from the Item. Never
+    /// an undo stack entry: the issue it made has no inverse (design 3.10).
+    Promote,
+    /// [`Store::link`] by attach: the Item took an existing issue. Never an
+    /// undo stack entry, as promote.
+    Attach,
 }
 
 impl OpKind {
@@ -1117,6 +1129,15 @@ impl Store {
         item: Option<ItemId>,
     ) -> Result<(Vec<todo_core::suggestion::Suggestion>, Revision)> {
         self.read(move |conn| suggestion::list_tx(conn, item)).await
+    }
+
+    /// Links the local Item `item` to `issue` (design 3.3, 5.7): promote (the
+    /// issue was made from it) or attach. The Item takes Jira's Core fields,
+    /// pinned; what Jira replaced of the person's becomes a `link_conflict`
+    /// Suggestion. Refused when the Item is deleted or linked already, or
+    /// another Item holds the issue.
+    pub async fn link(&self, input: LinkInput) -> Result<LinkOutput> {
+        self.write(move |tx| sync::link_tx(tx, input)).await
     }
 
     /// Queues a refine of `items` (design 6.3); its job's id. A request for

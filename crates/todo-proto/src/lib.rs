@@ -61,5 +61,7 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
 /// pushed field: a person's edit of it is taken and queued, as the title's.
 /// 26 added the AssistantService (Refine, GetJob, ListJobs, ADR-0010),
 /// ConfigSnapshot.assistant, SUGGESTION_KIND_REFINE and
-/// SUGGESTION_SOURCE_CLAUDE.
-pub const API_MINOR: u32 = 26;
+/// SUGGESTION_SOURCE_CLAUDE. 27 added SyncService.Promote and Attach
+/// (design 5.7, 3.3), SUGGESTION_KIND_LINK_CONFLICT, OP_KIND_PROMOTE and
+/// OP_KIND_ATTACH.
+pub const API_MINOR: u32 = 27;

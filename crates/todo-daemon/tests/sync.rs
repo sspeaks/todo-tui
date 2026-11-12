@@ -1347,3 +1347,188 @@ async fn the_outbox_lists_a_refusal_until_its_suggestion_is_rejected() {
     assert!(!linked(&r).await[0].has_push_failure);
     r.stop().await;
 }
+
+/// A local todo, captured.
+async fn local(r: &Running, text: &str) -> Item {
+    ItemServiceClient::new(r.channel().await)
+        .capture_item(todo_proto::v1::CaptureItemRequest {
+            request_id: todo_core::new_ulid().to_string(),
+            text: text.to_owned(),
+            created_via: todo_proto::v1::CreatedVia::Cli.into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .item
+        .unwrap()
+}
+
+/// The daemon's config with `extra` appended to its instance, reloaded.
+async fn reconfigure(r: &Running, extra: &str) {
+    let config = std::fs::read_to_string(&r.paths.config).unwrap();
+    std::fs::write(&r.paths.config, format!("{config}{extra}")).unwrap();
+    todo_proto::v1::system_service_client::SystemServiceClient::new(r.channel().await)
+        .reload_config(todo_proto::v1::ReloadConfigRequest {})
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn promote_creates_the_issue_and_links_the_todo_to_it() {
+    use todo_proto::v1::PromoteRequest;
+    let fake = FakeJira::start("pat").await;
+    let issues = Arc::new(Mutex::new(vec![issue_json(1, "existing", "new", &at(1))]));
+    serve_writable(&fake, issues.clone());
+    let r = start(&fake, "pat").await;
+    settled(&r, SyncState::Ok).await;
+    let todo = local(&r, "Ship the report +2 #work").await;
+    let mut sync = SyncServiceClient::new(r.channel().await);
+    // No project and no promote_default: says what to set.
+    let err = sync
+        .promote(PromoteRequest {
+            item_id: todo.id.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.get_details_error_info().unwrap().reason,
+        "NO_PROMOTE_TARGET"
+    );
+    // A project Jira refuses: what is missing, by field.
+    let err = sync
+        .promote(PromoteRequest {
+            item_id: todo.id.clone(),
+            project: "OPS".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    let info = err.get_details_error_info().unwrap();
+    assert_eq!(
+        (info.reason.as_str(), info.metadata["fields"].as_str()),
+        ("MISSING_FIELDS", "issuetype")
+    );
+    reconfigure(
+        &r,
+        "promote_default = { project = \"PLAT\", issue_type = \"Task\" }\n",
+    )
+    .await;
+    let out = sync
+        .promote(PromoteRequest {
+            item_id: todo.id.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let item = out.item.unwrap();
+    let link = item.remote_link.as_ref().unwrap();
+    assert_eq!((link.key.as_str(), link.pinned), ("PLAT-2", true));
+    assert_eq!(item.id, todo.id);
+    // Jira has it, with the todo's title, priority and labels.
+    let jira = issues.lock().unwrap()[1].clone();
+    assert_eq!(jira["fields"]["summary"], "Ship the report");
+    assert_eq!(jira["fields"]["labels"], json!(["work"]));
+    assert_eq!(jira["fields"]["priority"]["name"], "Critical");
+    // Once linked, promote again is refused.
+    let err = sync
+        .promote(PromoteRequest {
+            item_id: todo.id.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.get_details_error_info().unwrap().reason,
+        "ALREADY_LINKED"
+    );
+    r.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn attach_links_a_todo_to_an_issue_and_offers_back_what_jira_replaced() {
+    use todo_proto::v1::AttachRequest;
+    use todo_proto::v1::ListSuggestionsRequest;
+    use todo_proto::v1::suggestion_service_client::SuggestionServiceClient;
+    let fake = FakeJira::start("pat").await;
+    let mut theirs = issue_json(7, "Fix the login test", "new", &at(1));
+    theirs["key"] = json!("PLAT-7");
+    theirs["fields"]["assignee"] =
+        json!({"key": "JIRAUSER2", "name": "alex", "displayName": "Alex Example"});
+    // Alex's issue is outside the person's scope: searches list none of it,
+    // while the issue reads by key.
+    let issues = Arc::new(Mutex::new(vec![theirs]));
+    serve_writable(&fake, issues.clone());
+    fake.serve_search(Arc::new(Mutex::new(Vec::new())), 100);
+    let r = start(&fake, "pat").await;
+    settled(&r, SyncState::Ok).await;
+    let todo = local(&r, "look at the login test +1").await;
+    let mut sync = SyncServiceClient::new(r.channel().await);
+    let err = sync
+        .attach(AttachRequest {
+            item_id: todo.id.clone(),
+            key: "PLAT-99".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::NotFound);
+    let err = sync
+        .attach(AttachRequest {
+            item_id: todo.id.clone(),
+            key: "not a key".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument);
+    // Someone else's issue links, pinned; Jira's title wins, yours is offered back.
+    let out = sync
+        .attach(AttachRequest {
+            item_id: todo.id.clone(),
+            key: "plat-7".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let item = out.item.unwrap();
+    assert_eq!(item.title, "Fix the login test");
+    assert!(item.remote_link.as_ref().unwrap().pinned);
+    assert!(!out.suggestion_id.is_empty());
+    let s = SuggestionServiceClient::new(r.channel().await)
+        .list_suggestions(ListSuggestionsRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .suggestions;
+    assert_eq!(s.len(), 1);
+    assert_eq!(
+        s[0].kind,
+        todo_proto::v1::SuggestionKind::LinkConflict as i32
+    );
+    let fields: Vec<i32> = s[0].patches.iter().map(|p| p.field).collect();
+    assert!(
+        fields.contains(&(todo_proto::v1::ItemField::Title as i32)),
+        "{fields:?}"
+    );
+    // Pinned: a pass with reconciliation keeps it, outside every scope.
+    sync_now(&r).await;
+    let kept = linked(&r)
+        .await
+        .into_iter()
+        .find(|i| i.id == todo.id)
+        .unwrap();
+    assert!(kept.archived.is_none(), "{:?}", kept.archived);
+    // Read-only: refused.
+    reconfigure(&r, "push = false\n").await;
+    let other = local(&r, "another").await;
+    let err = sync
+        .attach(AttachRequest {
+            item_id: other.id,
+            key: "PLAT-7".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.get_details_error_info().unwrap().reason, "PUSH_OFF");
+    r.stop().await;
+}

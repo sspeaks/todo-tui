@@ -205,6 +205,120 @@ pub(crate) fn apply_page_tx(tx: &mut WriteTx<'_>, page: PullPage) -> Result<Pull
     Ok(out)
 }
 
+/// [`crate::Store::link`]'s input.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkInput {
+    pub item: ItemId,
+    pub instance_id: String,
+    pub issue: RemoteIssue,
+    /// Promote (the issue was made from the Item) or attach.
+    pub promote: bool,
+    pub now: Timestamp,
+    pub today: Date,
+}
+
+/// What a link did.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkOutput {
+    pub item: todo_core::Item,
+    pub result: MutationResult,
+    /// The `link_conflict` Suggestion of what Jira replaced, if anything.
+    pub suggestion: Option<String>,
+}
+
+pub(crate) fn link_tx(tx: &mut WriteTx<'_>, input: LinkInput) -> Result<LinkOutput> {
+    let conn = tx.conn();
+    if let Some(other) = linked(conn, &input.instance_id, &input.issue.remote_id)?
+        && other != input.item
+    {
+        return Err(StoreError::AlreadyLinked(input.issue.key.clone()));
+    }
+    let mut batch = Batch::default();
+    let slot = batch.load(conn, input.item, input.today)?;
+    let current = batch.items[slot].clone();
+    if current.is_deleted() {
+        return Err(StoreError::Mutation {
+            index: 0,
+            error: todo_core::MutationError::Deleted,
+        });
+    }
+    if let Some(link) = &current.remote_link {
+        return Err(StoreError::AlreadyLinked(link.key.clone()));
+    }
+    // A sub-task's parent, when the issue names one an Item holds.
+    let parent = match &input.issue.parent_remote_id {
+        Some(p) => linked(conn, &input.instance_id, p)?,
+        None => None,
+    };
+    let (mut next, changes, lost) =
+        todo_core::remote::link_to(&current, &input.issue, parent, input.now);
+    next.derived.pending_fields = Vec::new();
+    // The person's values Jira did not take: offered back, unticked (3.3).
+    let suggestion = if lost.is_empty() {
+        None
+    } else {
+        let sid = new_ulid().to_string();
+        let now = ts_to_sql(input.now)?;
+        let key = &input.issue.key;
+        let why = if input.promote {
+            format!("Jira changed what {key} was created with")
+        } else {
+            format!("{key}'s values replaced this todo's when it was linked")
+        };
+        conn.prepare_cached(
+            "INSERT INTO suggestions (id, item_id, kind, source, rationale, state, created_at, updated_at)
+             VALUES (?1, ?2, 'link_conflict', 'sync', ?3, 'pending', ?4, ?4)",
+        )?
+        .execute(params![sid, input.item.to_string(), why, now])?;
+        for (ord, c) in lost.iter().enumerate() {
+            conn.prepare_cached(
+                "INSERT INTO suggestion_patches (id, suggestion_id, ord, field, expected_old_json, new_json, state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending')",
+            )?
+            .execute(params![
+                new_ulid().to_string(),
+                sid,
+                ord as i64,
+                c.field.number(),
+                codec::value_to_sql(&c.new)?,
+                codec::value_to_sql(&c.old)?
+            ])?;
+        }
+        next.derived.has_conflict = true;
+        Some(sid)
+    };
+    record(&mut batch, slot, next, changes);
+    let kind = if input.promote {
+        OpKind::Promote
+    } else {
+        OpKind::Attach
+    };
+    let mut op = OpRow::new(kind, todo_core::Actor::User, "")?;
+    op.stackable = false;
+    op.summary = format!(
+        "{} {}",
+        if input.promote {
+            "promote to"
+        } else {
+            "link to"
+        },
+        input.issue.key
+    );
+    let (mut revision, _) = write_op(tx, &op, &mut batch, input.today)?;
+    if let Some(id) = &suggestion {
+        revision = crate::outbox::record_suggestion(tx, id)?;
+    }
+    let item = batch.items[slot].clone();
+    Ok(LinkOutput {
+        item,
+        result: MutationResult {
+            op_id: op.id,
+            revision,
+        },
+        suggestion,
+    })
+}
+
 /// The scope reconciliation of one pass (design 5.5): `out_of_scope` are
 /// linked Items no scope lists any more, as fetched (`None` when the issue
 /// is gone or forbidden).

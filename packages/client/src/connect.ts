@@ -15,7 +15,7 @@ import { readDaemonPid, spawnDaemon, waitForDaemonExit, withAutoSpawn } from "./
 import { type TodoTransport, type TodoTransportOptions, UnsafeRuntimeDirError, checkRuntimeDir, createTodoTransport } from "./transport.js";
 
 /** The api_minor this client was built against. */
-export const CLIENT_API_MINOR = 26;
+export const CLIENT_API_MINOR = 27;
 export const CLIENT_VERSION = "0.1.0";
 
 export { type TodoClients, createClients } from "./clients.js";

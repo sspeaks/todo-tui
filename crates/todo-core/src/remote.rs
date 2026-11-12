@@ -263,6 +263,56 @@ pub fn update(
     (next, changes)
 }
 
+/// A local `item` linked to `issue` (design 3.3, 5.7): by promote (the issue
+/// was made from it) or attach (an existing one). It takes the issue's Core
+/// fields as a pull would, keeps its Overlay, and is pinned, so it never
+/// leaves the list for being outside every scope. Returns the Item, its
+/// changes, and the pushed fields whose local value Jira's replaced: the
+/// person's to have offered back (`link_conflict`, 3.3).
+pub fn link_to(
+    item: &Item,
+    issue: &RemoteIssue,
+    parent: Option<ItemId>,
+    now: Timestamp,
+) -> (Item, Vec<FieldChange>, Vec<FieldChange>) {
+    let mut next = item.clone();
+    write(&mut next, issue, parent.or(item.core.parent_id));
+    next.remote_link = Some(link(issue, LinkState::Ok, true));
+    next.derived.is_mine = issue.is_mine;
+    next.updated_at = now;
+    next.derived.staleness.last_remote_change_at = Some(issue.updated_at);
+    let mut changes = Vec::new();
+    let mut lost = Vec::new();
+    for field in SYNCED {
+        let (Some(old), Some(new)) = (FieldValue::of(item, field), FieldValue::of(&next, field))
+        else {
+            continue;
+        };
+        if old == new {
+            continue;
+        }
+        // What the person had set and Jira did not take: worth offering back.
+        // An empty local value lost nothing.
+        let had = !matches!(&old, FieldValue::Cleared)
+            && old != FieldValue::String(String::new())
+            && old != FieldValue::Markdown(String::new())
+            && old != FieldValue::StringSet(Vec::new())
+            && old != FieldValue::Priority(Priority::None);
+        if had && crate::mutation::pushed(field) && field != ItemField::ResolutionKind {
+            lost.push(FieldChange {
+                field,
+                old: old.clone(),
+                new: new.clone(),
+            });
+        }
+        changes.push(FieldChange { field, old, new });
+    }
+    if next.status() != item.status() {
+        next.derived.staleness.status_entered_at = Some(now);
+    }
+    (next, changes, lost)
+}
+
 /// The issue cannot be read any more (deleted, or permission lost, 5.5):
 /// the link breaks; content stays.
 pub fn break_link(item: &Item) -> Option<(Item, FieldChange)> {
