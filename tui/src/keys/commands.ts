@@ -2,7 +2,7 @@
 // completion over them, and a pointer to the milestone that brings each
 // planned one.
 
-export type CommandName = "quit" | "help" | "refresh" | "search" | "config" | "view" | "export" | "l48" | "meet" | "sync" | "suggestions" | "apply";
+export type CommandName = "quit" | "help" | "refresh" | "search" | "config" | "view" | "export" | "l48" | "meet" | "sync" | "suggestions" | "apply" | "refine";
 
 interface CommandSpec {
   readonly name: string;
@@ -25,6 +25,7 @@ export const COMMANDS: readonly CommandSpec[] = [
   { name: "meet", help: "Schedule a Teams meeting about the Item, or the marked ones", runs: "meet" },
   { name: "sync", help: "Sync with Jira now; :sync status says how it stands, :sync outbox what waits", runs: "sync", args: "[status | outbox | instance]" },
   { name: "suggestions", help: "The Suggestions pane: what Jira won over, and what it refused", runs: "suggestions" },
+  { name: "refine", help: "Ask Claude to refine the Item, or the marked ones (proposals land in S)", runs: "refine" },
   { name: "w", help: "In the Suggestions pane: apply what is ticked", runs: "apply" },
   { name: "export", help: "Write every record to a file (~/todo-export-….jsonl)", runs: "export", args: "[path]" },
 ];

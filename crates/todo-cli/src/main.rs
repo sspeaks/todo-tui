@@ -1,6 +1,7 @@
 //! The `todo` binary.
 
 mod add;
+mod assistant;
 mod backup;
 mod config;
 mod conn;
@@ -66,6 +67,17 @@ enum Command {
         #[arg(long)]
         copy: bool,
     },
+    /// Ask Claude to refine an Item (ADR-0010): it proposes a clearer title,
+    /// due date, priority, labels and waiting-on, for review in the TUI (S).
+    Refine {
+        /// The Item: the 8-character short id `todo add` prints, or the full id.
+        id: String,
+    },
+    /// The assistant (Claude, through Claude Code's CLI).
+    Assistant {
+        #[command(subcommand)]
+        action: AssistantAction,
+    },
     /// Serve the MCP tools on stdio, for Claude Code: `claude mcp add todo -- todo mcp`.
     Mcp {
         /// Offer only the tools that read: list, get, views and counts.
@@ -123,6 +135,12 @@ enum Command {
         #[command(subcommand)]
         action: RemoteAction,
     },
+}
+
+#[derive(Subcommand)]
+enum AssistantAction {
+    /// The latest requests to Claude and what they cost.
+    Usage,
 }
 
 #[derive(Subcommand)]
@@ -251,6 +269,12 @@ async fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
         // `--short` is run by main.
         Command::Status { .. } => return status::status(&paths).await,
         Command::L48 { since, copy } => return report::l48(&paths, since, copy).await,
+        Command::Refine { id } => return assistant::refine(&paths, id).await,
+        Command::Assistant { action } => {
+            return match action {
+                AssistantAction::Usage => assistant::usage(&paths).await,
+            };
+        }
         Command::Export { out, no_history } => {
             return export::export(&paths, out, no_history).await;
         }

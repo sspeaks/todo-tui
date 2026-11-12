@@ -326,11 +326,11 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
   server.registerTool(
     "todo_suggestions",
     {
-      title: "Jira sync fallout",
+      title: "Suggestions to review",
       description:
-        "What sync left for Seth to review: sync_conflict (Jira changed a field while his edit of it waited to push; Jira's value stands, his is offered again) " +
-        "and push_failed (Jira refused his change, with its error; Jira's value stands). Re-applying or rejecting is his, in the TUI's Suggestions pane (S); " +
-        "these tools never apply one.",
+        "What waits for Seth to review: sync_conflict (Jira changed a field while his edit of it waited to push; Jira's value stands, his is offered again), " +
+        "push_failed (Jira refused his change, with its error; Jira's value stands) and refine (Claude's cleaner fields for an item, which he asked for). " +
+        "Applying or rejecting is his, in the TUI's Suggestions pane (S); these tools never apply one.",
       inputSchema: { id: ID.optional().describe("Only this item's") },
       annotations: { readOnlyHint: true },
     },
@@ -349,7 +349,14 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
           const item = byId.get(s.itemId);
           return prune({
             item: item && { short_id: shortId(item.id), title: item.title, jira: item.remoteLink?.key },
-            kind: s.kind === SuggestionKind.SYNC_CONFLICT ? "sync_conflict" : s.kind === SuggestionKind.PUSH_FAILED ? "push_failed" : "unknown",
+            kind:
+              s.kind === SuggestionKind.SYNC_CONFLICT
+                ? "sync_conflict"
+                : s.kind === SuggestionKind.PUSH_FAILED
+                  ? "push_failed"
+                  : s.kind === SuggestionKind.REFINE
+                    ? "refine"
+                    : "unknown",
             why: s.rationale,
             jira_said: s.error || undefined,
             changes: s.patches

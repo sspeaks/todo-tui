@@ -57,6 +57,7 @@
       "command",
       "sync_now",
       "suggestions",
+      "refine",
       "help",
       "quit",
       "suspend"

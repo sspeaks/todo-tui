@@ -3,12 +3,13 @@
 // move over the rows, enter ticks a change (on a heading, all of it),
 // ctrl-s applies what is ticked in one undoable op, r rejects the
 // Suggestion under the cursor. A sync change starts unticked: re-applying
-// yours over Jira's is opt-in. A status (its category and resolution kind)
+// yours over Jira's is opt-in; Claude's start ticked, as asked for (design
+// 2.6, ADR-0010). A status (its category and resolution kind)
 // is one row, as it applies as one. The cursor is the row it is on, by its
 // Suggestion and patch: a background change (another client's apply) moves
 // the rows, never what r would reject.
 
-import { PatchState, type Suggestion, applySuggestionPatches, rejectSuggestion } from "@todo-tui/client";
+import { PatchState, type Suggestion, SuggestionSource, applySuggestionPatches, rejectSuggestion } from "@todo-tui/client";
 import { errorItemId as errorItemOf } from "./bulk.js";
 import { normalMode } from "../state/types.js";
 import type { Controller } from "./controller.js";
@@ -56,6 +57,17 @@ export function paneRows(suggestions: readonly Suggestion[]): PaneRow[] {
   return rows;
 }
 
+/** The open changes of Claude's Suggestions among `rows`: what starts ticked. */
+function claudes(rows: readonly PaneRow[]): Set<string> {
+  const ids = new Set<string>();
+  for (const r of rows) {
+    if (r.kind === "patch" && !r.closed && r.suggestion.source === SuggestionSource.CLAUDE) {
+      for (const id of r.ids) ids.add(id);
+    }
+  }
+  return ids;
+}
+
 export class Suggestions {
   constructor(private readonly c: Controller) {}
 
@@ -64,10 +76,24 @@ export class Suggestions {
     return paneRows(this.c.store.suggestions.getSnapshot().suggestions);
   }
 
-  /** S: the pane, ticks cleared, the cursor on the first row; loads what waits. */
+  /** S: the pane, Claude's changes ticked, the cursor on the first row; loads what waits. */
   open(): void {
-    this.c.setMode({ kind: "suggestions", cursor: 0, ticked: new Set() });
+    this.c.setMode({ kind: "suggestions", cursor: 0, ticked: claudes(this.rows()) });
     void this.c.store.suggestions.reload();
+  }
+
+  /**
+   * Claude's changes that arrived while the pane is open (a refine just
+   * done) start ticked too; a sync one never does.
+   */
+  arrived(before: ReadonlySet<string>): void {
+    const mode = this.c.state.mode;
+    if (mode.kind !== "suggestions") return;
+    const fresh = this.rows().filter((r) => !before.has(r.suggestion.id));
+    if (!fresh.length) return;
+    const ticked = new Set(mode.ticked);
+    for (const id of claudes(fresh)) ticked.add(id);
+    this.c.setMode({ ...mode, ticked });
   }
 
   /** The row under the cursor, and its index. */

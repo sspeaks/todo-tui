@@ -241,6 +241,26 @@ titles=$(sed -n 's/.*"title":"\([^"]*\)".*/\1/p' "$root/today.items" | paste -sd
 [[ $titles == "overdue,urgent,due today" ]] || { cat "$root/today.items" >&2; fail "unexpected Today view: $titles"; }
 "$TODO_BIN" daemon stop >/dev/null
 
+# 7b. Claude refines on request (ADR-0010), through a stub `claude` that
+#     prints the CLI's JSON envelope: never a real call. todo refine shows the
+#     proposal, and todo assistant usage what it cost.
+step "refine with a stub Claude"
+home=$root/refine
+new_home "$home"
+export TODO_TUI_HOME=$home
+stub=$root/claude-stub
+printf '%s\n' '#!/bin/sh' 'cat >/dev/null' \
+  "printf '%s' '{\"is_error\":false,\"duration_ms\":900,\"total_cost_usd\":0.0003,\"usage\":{\"input_tokens\":200,\"output_tokens\":30},\"structured_output\":{\"rationale\":\"A follow-up, due Friday.\",\"title\":\"Follow up with Dana on the login test\",\"waiting_on\":\"Dana\"}}'" >"$stub"
+chmod +x "$stub"
+printf '[assistant]\nprovider = "claude_code"\nclaude_bin = "%s"\n' "$stub" >"$home/config.toml"
+id=$("$TODO_BIN" add "ping dana re login test" | awk '{print $1}')
+out=$("$TODO_BIN" refine "$id") || fail "refine failed: $out"
+for line in 'A follow-up, due Friday.' '  title  "ping dana re login test" → "Follow up with Dana on the login test"' '  waiting  — → Dana'; do
+  grep -qxF -- "$line" <<<"$out" || fail "refine lacks '$line': $out"
+done
+"$TODO_BIN" assistant usage | grep -q '^1 requests, 230 tokens' || fail "unexpected assistant usage"
+"$TODO_BIN" daemon stop >/dev/null
+
 # 8. The TUI in a private tmux server, against a scratch daemon it spawns:
 #    quick-add with the live preview, x takes the row out of the Inbox and u
 #    brings it back, m m x completes two rows in one op and u brings both

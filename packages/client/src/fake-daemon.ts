@@ -76,7 +76,8 @@ import {
 } from "./gen/todo/v1/view_service_pb.js";
 import { type Change, ChangeSchema, type SubscribeResponse, SubscribeResponseSchema, WatchService } from "./gen/todo/v1/watch_service_pb.js";
 import { type FieldValue } from "./gen/todo/v1/field_value_pb.js";
-import { type Patch, PatchState, type Suggestion, SuggestionKind, SuggestionSchema, SuggestionState } from "./gen/todo/v1/suggestion_pb.js";
+import { type Patch, type PatchSchema, PatchState, type Suggestion, SuggestionKind, SuggestionSchema, SuggestionSource, SuggestionState } from "./gen/todo/v1/suggestion_pb.js";
+import { type AssistantJob, AssistantJobSchema, AssistantJobState, AssistantService } from "./gen/todo/v1/assistant_service_pb.js";
 import { SuggestionService } from "./gen/todo/v1/suggestion_service_pb.js";
 import { type OutboxEntry, OutboxEntrySchema, type SyncStatus, SyncStatusSchema, SyncService } from "./gen/todo/v1/sync_service_pb.js";
 import { parseCaptureText } from "./capture.js";
@@ -484,6 +485,9 @@ export class FakeDaemon {
   readonly syncNows: string[] = [];
   /** The Suggestions, by id: putSuggestion's, as the RPCs leave them. */
   readonly suggestions = new Map<string, Suggestion>();
+  /** The assistant's jobs (Refine), oldest first. */
+  private readonly jobs = new Map<string, AssistantJob>();
+  private refineAnswer: (item: Item) => { rationale: string; patches: MessageInitShape<typeof PatchSchema>[] } | { error: string } = () => ({ rationale: "", patches: [] });
   /** What ListOutbox answers: setOutbox's. */
   private outbox: OutboxEntry[] = [];
   /** The patches each apply op applied, by op id: its undo reopens them, a redo applies them again. */
@@ -663,6 +667,19 @@ export class FakeDaemon {
         },
         applySuggestionPatches: (req) => this.applyPatches(req.requestId, req.patchIds, req.confirmNotMine),
         rejectSuggestion: (req) => this.rejectSuggestion(req.requestId, req.id),
+      });
+      service(AssistantService, {
+        refine: (req) => this.refine(req.itemIds),
+        getJob: (req) => {
+          this.check();
+          const job = this.jobs.get(req.id);
+          if (!job) throw errorInfo(Code.NotFound, "JOB_NOT_FOUND", "no such job", {});
+          return { job };
+        },
+        listJobs: () => {
+          this.check();
+          return { jobs: [...this.jobs.values()].reverse() };
+        },
       });
       service(ViewService, {
         listViews: () => {
@@ -920,6 +937,48 @@ export class FakeDaemon {
     this.publish({ revision: this.revision, topic: Topic.SUGGESTION, id: s.id, resource: { case: "suggestion", value: s } });
     this.flag(s.itemId);
     return s;
+  }
+
+  /**
+   * What a refine of each Item comes to (ADR-0010): Claude's rationale and
+   * patches, or an error the job fails with; unset, nothing to change.
+   */
+  setRefine(answer: (item: Item) => { rationale: string; patches: MessageInitShape<typeof PatchSchema>[] } | { error: string }): void {
+    this.refineAnswer = answer;
+  }
+
+  /** Refine: a job, done on the next tick with what setRefine says. */
+  private refine(itemIds: readonly string[]): { job: AssistantJob } {
+    this.check();
+    if (!this.config.assistant?.provider) {
+      throw errorInfo(Code.FailedPrecondition, "ASSISTANT_OFF", 'the assistant is off: set [assistant] provider = "claude_code" in the config', {});
+    }
+    if (!itemIds.length || itemIds.length > 20) throw badRequest("item_ids", "must name 1 to 20 Items");
+    const ids = itemIds.map((id) => idOf("item_ids", id));
+    for (const id of ids) {
+      const item = this.items.get(id);
+      if (!item || item.deletedAt !== undefined) throw errorInfo(Code.NotFound, "ITEM_NOT_FOUND", `item ${id} not found`, { item_id: id });
+    }
+    const job = create(AssistantJobSchema, { id: ulid(), itemIds: ids, state: AssistantJobState.QUEUED, model: this.config.assistant.model, createdAt: this.stamp() });
+    this.jobs.set(job.id, job);
+    setTimeout(() => {
+      job.state = AssistantJobState.RUNNING;
+      for (const id of ids) {
+        const item = this.items.get(id);
+        if (!item) continue;
+        const out = this.refineAnswer(item);
+        if ("error" in out) {
+          job.state = AssistantJobState.FAILED;
+          job.error = out.error;
+          return;
+        }
+        if (!out.patches.length) continue;
+        const s = this.putSuggestion({ itemId: id, kind: SuggestionKind.REFINE, source: SuggestionSource.CLAUDE, rationale: out.rationale, patches: out.patches });
+        job.suggestionIds.push(s.id);
+      }
+      job.state = AssistantJobState.DONE;
+    }, 0);
+    return { job };
   }
 
   /** What ListOutbox answers from now on. */

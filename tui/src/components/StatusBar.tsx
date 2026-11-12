@@ -138,7 +138,7 @@ export function StatusBar({ width }: { width: number }) {
   const clock = useClock(controller.now);
   const syncs = syncLabels(useSyncStatus(), clock);
   const waiting = useSuggestions().suggestions.length;
-  const suggestions = waiting ? `✦ ${waiting}` : "";
+  const suggestions = [waiting ? `✦ ${waiting}` : "", state.refining ? "✦ refining…" : ""].filter(Boolean).join(" ");
   const undoKey = keyFor(state.keymap.bindings, "undo", sequenceLabel);
   const listed = useOptionalView(state.tab === undefined ? undefined : tabQuery(state.tab, state.narrow?.shown));
   const mode = modeLabel(state);

@@ -42,6 +42,7 @@ export type Action =
   | { type: "open_remote" }
   | { type: "sync_now" }
   | { type: "suggestions" }
+  | { type: "refine" }
   | { type: "suggestion_toggle" }
   | { type: "suggestion_apply" }
   | { type: "suggestion_reject" };
@@ -49,7 +50,7 @@ export type Action =
 /** The modes with a keymap; the text modes (command, quick-add, prompts, search) take their keys from the line editor. */
 export type KeymapMode = "normal" | "help" | "report" | "suggestions";
 
-export type Section = "Navigation" | "Views" | "Items" | "Marks" | "Undo" | "App" | "Help" | "Report" | "Suggestions";
+export type Section = "Navigation" | "Views" | "Items" | "Marks" | "Undo" | "Claude" | "App" | "Help" | "Report" | "Suggestions";
 
 export interface Binding {
   /** Stable snake_case id, e.g. "set_priority_1". */
@@ -155,7 +156,8 @@ export const BINDINGS: readonly Binding[] = [
 
   { id: "command", keys: [":"], action: { type: "command" }, section: "App", help: "Command line" },
   { id: "sync_now", keys: ["g s"], action: { type: "sync_now" }, section: "App", help: "Sync with Jira now" },
-  { id: "suggestions", keys: ["S"], action: { type: "suggestions" }, section: "App", help: "Suggestions: Jira's fallout to review" },
+  { id: "suggestions", keys: ["S"], action: { type: "suggestions" }, section: "App", help: "Suggestions: what Jira or Claude left to review" },
+  { id: "refine", keys: ["space r"], action: { type: "refine" }, markAware: true, section: "Claude", help: "Ask Claude to refine it (proposals land in S)" },
   { id: "help", keys: ["?", "fkey"], action: { type: "help" }, section: "App", help: "This help" },
   { id: "quit", keys: ["q", "ctrl+c"], action: { type: "quit" }, section: "App", help: "Quit" },
   { id: "suspend", keys: ["ctrl+z"], action: { type: "suspend" }, section: "App", help: "Suspend to the shell (fg resumes)" },

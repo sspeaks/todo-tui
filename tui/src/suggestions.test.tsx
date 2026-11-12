@@ -12,8 +12,9 @@ import {
   SuggestionState,
   SyncState,
 } from "@todo-tui/client";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fakeDaemon, item } from "./fake.test-util.js";
+import { timing } from "./controller/refine.js";
 import { cleanupTui, renderTui } from "./render.test-util.js";
 
 afterEach(async () => {
@@ -345,5 +346,44 @@ describe("E on a Jira item (ADR-0009)", () => {
     const t = renderTui({ daemon: fd, columns: 120, rows: 20 });
     await t.live();
     await t.waitFrame((f) => expect(f).toMatch(/To Jira\s+↑ the description waits to reach/));
+  });
+});
+
+describe("space r: Claude refines (ADR-0010)", () => {
+  const assistant = { assistant: { provider: "claude_code", model: "" } };
+  beforeEach(() => {
+    timing.pollMs = 20;
+  });
+
+  it("asks, says so, and what Claude proposes waits in S ticked; ctrl-s applies it", async () => {
+    const fd = fakeDaemon([item("ping dana fri re login test")]);
+    fd.daemon.setConfig(assistant);
+    fd.daemon.setRefine(() => ({
+      rationale: "A follow-up with Dana.",
+      patches: [{ field: ItemField.TITLE, expectedOld: str("ping dana fri re login test"), new: str("Follow up with Dana on the login test") }],
+    }));
+    const id = [...fd.daemon.items.values()][0]!.id;
+    const t = renderTui({ daemon: fd, columns: 120, rows: 20 });
+    await t.live();
+    await t.press("<space>r");
+    await t.waitFrame((f) => expect(f).toContain("Claude proposed changes for it · S to review"));
+    await t.press("S");
+    await t.waitFrame((f) => expect(f).toMatch(/\[x\] title/));
+    await t.press("<ctrl+s>");
+    await vi.waitFor(() => expect(fd.daemon.items.get(id)?.title).toBe("Follow up with Dana on the login test"));
+  });
+
+  it("says when Claude fails or is off, and space r is no key while it is off", async () => {
+    const fd = fakeDaemon([item("x")]);
+    fd.daemon.setConfig(assistant);
+    fd.daemon.setRefine(() => ({ error: "Claude Code is not logged in: run `claude` once to log in" }));
+    const t = renderTui({ daemon: fd, columns: 120, rows: 20 });
+    await t.live();
+    await t.press("<space>r");
+    await t.waitFrame((f) => expect(f).toContain("Claude could not refine it: Claude Code is not logged in"));
+    fd.daemon.setConfig({});
+    await vi.waitFor(() => expect(t.store.getConfig().config?.assistant?.provider ?? "").toBe(""));
+    await t.press(":refine<enter>");
+    await t.waitFrame((f) => expect(f).toContain("Claude is off"));
   });
 });

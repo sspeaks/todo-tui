@@ -69,6 +69,10 @@ Every tool returns `short_id` (8 characters, the same id `todo add` prints) and 
 - `todo_update` `labels` replaces the whole set. To add one, read the item's labels first and send them all.
 - If a tool says the item "changed elsewhere", Seth edited it in the TUI meanwhile. Get it again and retry.
 
+## Claude's refines
+
+When the assistant is on, Seth can ask Claude to refine an item (`space r` in the TUI, `todo refine <id>`): a clearer title, due date, priority, labels, waiting-on. The proposal is a `refine` Suggestion in `todo_suggestions`; applying it is his, in the TUI (S). You are Claude too: if he asks you to clean up an item, just edit it with `todo_update`; don't route it through refine.
+
 ## Jira-linked items
 
 An item with a `jira` field (key, url, remote_status) mirrors a Jira issue. Some edits of it are **pushed to Jira**: they change the real ticket that Seth's team sees. Read `references/jira.md` before changing one. In short:

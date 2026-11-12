@@ -46,6 +46,7 @@ import { type ExportFs, Exporter } from "./export.js";
 import { type Clipboard, systemClipboard } from "./clipboard.js";
 import { Meetings, type UrlOpener } from "./meeting.js";
 import { Sync, type SyncClient } from "./sync.js";
+import { Refine } from "./refine.js";
 import { Suggestions } from "./suggestions.js";
 import { errorItemId } from "./bulk.js";
 import { errorText, hints, notMineText } from "./messages.js";
@@ -141,6 +142,9 @@ export class Controller {
   readonly meetings: Meetings;
   readonly syncing: Sync;
   readonly suggestions: Suggestions;
+  readonly refine: Refine;
+  /** The Suggestions the last sync saw, to tell one that arrives. */
+  private knownSuggestions: ReadonlySet<string> = new Set();
   /** The NOT_MINE question's answer, while it is asked. */
   private notMine: ((yes: boolean) => void) | undefined;
   readonly now: () => Date;
@@ -198,6 +202,7 @@ export class Controller {
     this.meetings = new Meetings(this, opts.openUrl);
     this.syncing = new Sync(this, opts.openUrl, opts.sync);
     this.suggestions = new Suggestions(this);
+    this.refine = new Refine(this);
   }
 
   /** Observes the store: the tabs, the current view, the counts and the undo state; starts the midnight poll. */
@@ -598,6 +603,10 @@ export class Controller {
   private sync(): void {
     this.applyConfig();
     this.prompts.sync();
+    // A Suggestion that arrived since (a refine done): Claude's start ticked.
+    const ids = new Set(this.store.suggestions.getSnapshot().suggestions.map((s) => s.id));
+    if ([...ids].some((id) => !this.knownSuggestions.has(id))) this.suggestions.arrived(this.knownSuggestions);
+    this.knownSuggestions = ids;
     const { views } = this.store.getViews();
     const { tab } = this.state;
     const first = views[0];
@@ -793,9 +802,12 @@ export class Controller {
     // [meetings] provider = "none" unbinds M (design 2.9), after the
     // overrides, so an `"M" = ""` there is no warning; :meet says why.
     const meetingsOff = config?.meetings?.provider === "none";
-    const effective = meetingsOff
-      ? { ...applied, bindings: applied.bindings.map((b) => (b.id === "schedule_meeting" ? { ...b, keys: [] } : b)) }
-      : applied;
+    // Without [assistant] provider, space r is no key at all (design 2.5:
+    // the Claude actions are hidden); :refine says why.
+    const assistantOff = !config?.assistant?.provider;
+    const off = (id: string) => (id === "schedule_meeting" && meetingsOff) || (id === "refine" && assistantOff);
+    const effective =
+      meetingsOff || assistantOff ? { ...applied, bindings: applied.bindings.map((b) => (off(b.id) ? { ...b, keys: [] } : b)) } : applied;
     this.tries = triesOf(effective.bindings);
     hints.openKey = keyFor(effective.bindings, "open_remote", sequenceLabel);
     this.ui.setState((s) => ({
@@ -853,6 +865,8 @@ export class Controller {
         return this.syncing.run(r.args);
       case "suggestions":
         return this.suggestions.open();
+      case "refine":
+        return this.refine.start();
       case "apply":
         return this.suggestions.applyFromCommand();
     }
@@ -933,6 +947,8 @@ export class Controller {
         return this.setMode(normalMode);
       case "suggestions":
         return this.suggestions.open();
+      case "refine":
+        return this.refine.start();
       case "suggestion_toggle":
         return this.suggestions.toggle();
       case "suggestion_apply":

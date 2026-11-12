@@ -12,7 +12,7 @@ export interface HelpLine {
   readonly kind: "title" | "section" | "row" | "blank";
 }
 
-const SECTIONS: readonly Section[] = ["Navigation", "Views", "Items", "Marks", "Undo", "App"];
+const SECTIONS: readonly Section[] = ["Navigation", "Views", "Items", "Marks", "Undo", "Claude", "App"];
 const KEY_COLUMN = 20;
 
 const row = (keys: string, text: string): HelpLine => ({ text: `  ${keys.padEnd(KEY_COLUMN)}${text}`, kind: "row" });

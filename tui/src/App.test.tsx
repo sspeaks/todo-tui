@@ -409,9 +409,9 @@ describe("help, commands and toasts", () => {
   it("edits a command on the message line and reports what is not a command", async () => {
     const t = renderTui({ daemon: fakeDaemon(rows(2)), rows: 10 });
     await t.live();
-    t.type(":ref");
+    t.type(":refr");
     // The cursor is an inverse cell after the text.
-    await t.waitFrame((f) => expect(f.split("\n")[9]).toBe(":ref "));
+    await t.waitFrame((f) => expect(f.split("\n")[9]).toBe(":refr "));
     expect(t.raw()).toContain(`${INVERSE} `);
     t.type("\t");
     await t.waitFrame((f) => expect(f.split("\n")[9]).toBe(":refresh "));

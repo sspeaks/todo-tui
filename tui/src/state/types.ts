@@ -184,6 +184,8 @@ export interface UiState {
   readonly size: { readonly columns: number; readonly rows: number };
   /** An action that has run for a while: "saving…" in the status bar. */
   readonly busy?: string;
+  /** How many refines Claude is working on (space r): "✦ refining…". */
+  readonly refining?: number;
   readonly quitting: boolean;
   /** The keymap in effect: the defaults with config's [keymap] overrides, and what was wrong with them. */
   readonly keymap: { readonly bindings: readonly Binding[]; readonly warnings: readonly KeymapWarning[] };

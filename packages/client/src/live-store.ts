@@ -10,6 +10,7 @@ import type { Item } from "./gen/todo/v1/item_pb.js";
 import { ItemService, type ListItemsRequest, ListItemsRequestSchema, type StatusCounts } from "./gen/todo/v1/item_service_pb.js";
 import type { OpSummary } from "./gen/todo/v1/op_pb.js";
 import { type Suggestion, SuggestionState } from "./gen/todo/v1/suggestion_pb.js";
+import { AssistantService } from "./gen/todo/v1/assistant_service_pb.js";
 import { SuggestionService } from "./gen/todo/v1/suggestion_service_pb.js";
 import { SyncState, type SyncStatus } from "./gen/todo/v1/sync_service_pb.js";
 import { SystemService } from "./gen/todo/v1/system_service_pb.js";
@@ -170,6 +171,8 @@ export class LiveStore {
   private readonly watchClient: Client<typeof WatchService>;
   /** The SuggestionService client the store reads Suggestions with, for the pane's apply and reject. */
   readonly suggestionsClient: Client<typeof SuggestionService>;
+  /** Claude, on request (ADR-0010): Refine and its jobs. */
+  readonly assistantClient: Client<typeof AssistantService>;
   private revision: bigint | undefined;
   /** Set while a ResyncRequired reload has not completed; retried on CaughtUp. */
   private pendingResync = false;
@@ -192,6 +195,7 @@ export class LiveStore {
     this.systemClient = createClient(SystemService, opts.transport);
     this.watchClient = createClient(WatchService, opts.transport);
     this.suggestionsClient = createClient(SuggestionService, opts.transport);
+    this.assistantClient = createClient(AssistantService, opts.transport);
     this.debounceMs = opts.debounceMs ?? 150;
     this.pageSize = opts.pageSize ?? MAX_PAGE_SIZE;
     this.viewGraceMs = opts.viewGraceMs ?? 5_000;
