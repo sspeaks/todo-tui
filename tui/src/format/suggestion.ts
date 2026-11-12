@@ -12,6 +12,7 @@ import {
   StatusCategory,
   type Suggestion,
   SuggestionKind,
+  SuggestionSource,
 } from "@todo-tui/client";
 import { dayOf, shortDay } from "./dates.js";
 import { priorityName } from "./item.js";
@@ -22,7 +23,16 @@ export const statusPatch = (p: Patch): boolean => p.field === ItemField.STATUS_C
 
 /** "sync_conflict", "push_failed". */
 export const kindWord = (s: Suggestion): string =>
-  s.kind === SuggestionKind.SYNC_CONFLICT ? "sync_conflict" : s.kind === SuggestionKind.PUSH_FAILED ? "push_failed" : "suggestion";
+  s.kind === SuggestionKind.SYNC_CONFLICT
+    ? "sync_conflict"
+    : s.kind === SuggestionKind.PUSH_FAILED
+      ? "push_failed"
+      : s.kind === SuggestionKind.REFINE
+        ? "Claude"
+        : "suggestion";
+
+/** Claude's (ADR-0010): its rationale gets lines of its own, and its values are not Jira's. */
+export const fromClaude = (s: Suggestion): boolean => s.source === SuggestionSource.CLAUDE;
 
 /** The field a change sets, as a person names it. */
 export function fieldWord(field: ItemField): string {
@@ -88,9 +98,14 @@ export function patchText(s: Suggestion, ids: readonly string[], item: Item | un
   return { field: fieldWord(first.field), from: valueText(first.expectedOld, today), to: valueText(first.new, today) };
 }
 
-/** A heading: "PLAT-530 · sync_conflict · Jira changed the title on PLAT-530 while yours waited to push". */
+/**
+ * A heading: "PLAT-530 · sync_conflict · Jira changed the title on PLAT-530
+ * while yours waited to push". Claude's names the Item and itself: its
+ * rationale, often longer, goes on lines of its own under it.
+ */
 export function headingText(s: Suggestion, item: Item | undefined): string {
   const name = item ? (item.remoteLink?.key ?? truncate(singleLine(item.title), 40)) : "?";
+  if (fromClaude(s)) return `${singleLine(name)} · ${kindWord(s)}`;
   return `${singleLine(name)} · ${kindWord(s)} · ${singleLine(s.rationale)}`;
 }
 

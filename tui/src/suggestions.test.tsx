@@ -373,6 +373,28 @@ describe("space r: Claude refines (ADR-0010)", () => {
     await vi.waitFor(() => expect(fd.daemon.items.get(id)?.title).toBe("Follow up with Dana on the login test"));
   });
 
+  it("shows Claude's rationale in full, wrapped, and its sides as now and Claude's, not Jira's", async () => {
+    const fd = fakeDaemon([item("ping dana")]);
+    fd.daemon.setConfig(assistant);
+    const why = "The day named in the text is Friday, so that is the due date, and the title says who to ask and about what so it reads clearly later.";
+    fd.daemon.putSuggestion({
+      itemId: [...fd.daemon.items.values()][0]!.id,
+      kind: SuggestionKind.REFINE,
+      source: SuggestionSource.CLAUDE,
+      rationale: why,
+      patches: [{ field: ItemField.TITLE, expectedOld: str("ping dana"), new: str("Ask Dana") }],
+    });
+    const t = renderTui({ daemon: fd, columns: 60, rows: 20 });
+    await t.live();
+    await t.press("S");
+    await t.waitFrame((f) => expect(f).toMatch(/▾ ping dana · Claude\s*$/m));
+    // Every word of the rationale is on screen, over several lines.
+    const frame = t.frame();
+    for (const word of ["Friday,", "clearly", "later."]) expect(frame).toContain(word);
+    expect(frame).toMatch(/\[x\] title +ping dana \(now\) → Ask Dana \(Claude\)/);
+    expect(frame).not.toContain("(Jira)");
+  });
+
   it("says when Claude fails or is off, and space r is no key while it is off", async () => {
     const fd = fakeDaemon([item("x")]);
     fd.daemon.setConfig(assistant);
