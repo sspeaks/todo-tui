@@ -12,25 +12,50 @@
 
 /// `wiki` as Jira renders it alike: `\n` line ends, no trailing spaces or
 /// tabs, no trailing blank lines, and a list item's marker at its line's
-/// start. Non-breaking spaces stay.
+/// start. Non-breaking spaces stay, and so does every line of a `{code}` or
+/// `{noformat}` body, as typed: there whitespace is content.
 pub fn canonical(wiki: &str) -> String {
     let text = wiki.replace("\r\n", "\n").replace('\r', "\n");
-    let mut lines: Vec<&str> = text
-        .split('\n')
-        .map(|l| {
-            let l = l.trim_end_matches([' ', '\t']);
-            let start = l.trim_start_matches([' ', '\t']);
-            if start.len() < l.len() && list_item(start).is_some() {
-                start
-            } else {
-                l
+    // The closing tag of the verbatim body the line is in, if any.
+    let mut inside: Option<&str> = None;
+    let mut lines: Vec<&str> = Vec::new();
+    for l in text.split('\n') {
+        if let Some(close) = inside {
+            if l.contains(close) {
+                inside = None;
             }
-        })
-        .collect();
+            lines.push(l);
+            continue;
+        }
+        let l = l.trim_end_matches([' ', '\t']);
+        let start = l.trim_start_matches([' ', '\t']);
+        inside = verbatim_open(start);
+        lines.push(if start.len() < l.len() && list_item(start).is_some() {
+            start
+        } else {
+            l
+        });
+    }
     while lines.last().is_some_and(|l| l.is_empty()) {
         lines.pop();
     }
     lines.join("\n")
+}
+
+/// The closing tag of a `{code}` or `{noformat}` body that `line` opens and
+/// does not close.
+fn verbatim_open(line: &str) -> Option<&'static str> {
+    for (tag, close) in [("code", "{code}"), ("noformat", "{noformat}")] {
+        let Some(rest) = line.strip_prefix('{').and_then(|r| r.strip_prefix(tag)) else {
+            continue;
+        };
+        if !(rest.starts_with(':') || rest.starts_with('}')) {
+            continue;
+        }
+        let opened = line.find('}').map_or(line.len(), |i| i + 1);
+        return (!line[opened..].contains(close)).then_some(close);
+    }
+    None
 }
 
 /// A wiki list item: its marker (`*`, `**`, `#`, `*#`, or a lone `-`) and
@@ -372,11 +397,20 @@ pub fn to_wiki(md: &str) -> String {
     let text = md.replace("\r\n", "\n").replace('\r', "\n");
     let lines: Vec<&str> = text.split('\n').collect();
     let mut out: Vec<String> = Vec::new();
+    // The indents of the list items open around the line, outermost first:
+    // a list item's depth is how many of them are less indented than it.
+    let mut indents: Vec<usize> = Vec::new();
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
         if let Some((fence, info)) = fence_open(line) {
-            let end = (i + 1..lines.len()).find(|&j| lines[j].trim_end() == fence);
+            // Closed by a line of at least as many backticks and nothing
+            // else (CommonMark); an unclosed fence runs to the end.
+            let closes = |l: &str| {
+                let l = l.trim_end();
+                l.len() >= fence.len() && l.chars().all(|c| c == '`')
+            };
+            let end = (i + 1..lines.len()).find(|&j| closes(lines[j]));
             let body = &lines[i + 1..end.unwrap_or(lines.len())];
             if info == "wiki" {
                 out.extend(body.iter().map(|l| (*l).to_owned()));
@@ -401,16 +435,26 @@ pub fn to_wiki(md: &str) -> String {
             }
             continue;
         }
-        out.push(line_to_wiki(line));
+        out.push(line_to_wiki(line, &mut indents));
         i += 1;
     }
     canonical(&out.join("\n"))
 }
 
-/// A code fence's opening line: its fence and info string.
+/// A code fence's opening line: its fence and info string. An info string
+/// holding a backtick makes it no fence (CommonMark: ```` ```a``` ```` is a
+/// code span), and one a `{code:…}` cannot hold (braces, a pipe, spaces) is
+/// left out.
 fn fence_open(line: &str) -> Option<(&str, &str)> {
     let n = line.find(|c| c != '`').unwrap_or(line.len());
-    (n >= 3).then(|| (&line[..n], line[n..].trim()))
+    let info = line[n..].trim();
+    if n < 3 || info.contains('`') {
+        return None;
+    }
+    let fits = info
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "_+#-".contains(c));
+    Some((&line[..n], if fits || info == "wiki" { info } else { "" }))
 }
 
 /// A GFM table's rule row, `| --- | --- |`.
@@ -422,12 +466,19 @@ fn is_rule_row(line: &str) -> bool {
 fn wiki_row(line: &str, head: bool) -> String {
     let inner = line.trim().trim_start_matches('|').trim_end_matches('|');
     let sep = if head { "||" } else { "|" };
-    let cells: Vec<String> = inner.split('|').map(|c| inline_to_wiki(c.trim())).collect();
+    // An empty cell would read as `||`: a space keeps its column.
+    let cells: Vec<String> = inner
+        .split('|')
+        .map(|c| match inline_to_wiki(c.trim()) {
+            c if c.is_empty() => " ".to_owned(),
+            c => c,
+        })
+        .collect();
     format!("{sep}{}{sep}", cells.join(sep))
 }
 
 /// One Markdown line, not in a fence or a table, as wiki.
-fn line_to_wiki(line: &str) -> String {
+fn line_to_wiki(line: &str, indents: &mut Vec<usize>) -> String {
     let hashes = line.find(|c| c != '#').unwrap_or(line.len());
     if (1..=6).contains(&hashes)
         && let Some(text) = line[hashes..].strip_prefix(' ')
@@ -435,7 +486,34 @@ fn line_to_wiki(line: &str) -> String {
         return format!("h{hashes}. {}", inline_to_wiki(text));
     }
     let rest = line.trim_start_matches(' ');
-    let depth = (line.len() - rest.len()) / 2 + 1;
+    let indent = line.len() - rest.len();
+    let listed = ["- ", "* ", "+ ", "1. "]
+        .iter()
+        .any(|m| rest.starts_with(m))
+        || rest
+            .split_once(". ")
+            .is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+    if !listed {
+        indents.clear();
+    }
+    // Two spaces a level, as to_markdown writes, or CommonMark's three or
+    // four: what counts is being deeper than the item before. With none
+    // before (a line alone), two spaces a level.
+    while indents.last().is_some_and(|&d| d >= indent) {
+        indents.pop();
+    }
+    let depth = if indents.is_empty() {
+        indent / 2 + 1
+    } else {
+        indents.len() + 1
+    };
+    if listed {
+        // Levels the line skips are filled, so the next item nests from it.
+        while indents.len() + 1 < depth {
+            indents.push(indents.len() * 2);
+        }
+        indents.push(indent);
+    }
     for (md, wiki) in [("- ", "*"), ("* ", "*"), ("+ ", "-"), ("1. ", "#")] {
         if let Some(text) = rest.strip_prefix(md) {
             let marker = if wiki == "-" {
@@ -446,13 +524,27 @@ fn line_to_wiki(line: &str) -> String {
             return format!("{marker} {}", inline_to_wiki(text));
         }
     }
+    // Another number: Jira's numbered lists count from 1, so the number is
+    // kept as text rather than lost.
     if let Some((n, text)) = rest.split_once(". ")
         && !n.is_empty()
         && n.chars().all(|c| c.is_ascii_digit())
     {
-        return format!("{} {}", "#".repeat(depth), inline_to_wiki(text));
+        return format!("{n}. {}", inline_to_wiki(text));
     }
-    inline_to_wiki(line)
+    escape_wiki_start(&inline_to_wiki(line))
+}
+
+/// A paragraph line that wiki would read as a list item or a heading has
+/// its start escaped with `\`, as Jira's renderer takes it: a person's
+/// `\* text` or `####### x` stays text. [`to_markdown`] never writes such a
+/// line: it escapes Markdown's own block starts, which these are.
+fn escape_wiki_start(wiki: &str) -> String {
+    if list_item(wiki).is_some() || heading(wiki).is_some() {
+        format!("\\{wiki}")
+    } else {
+        wiki.to_owned()
+    }
 }
 
 /// Inline Markdown as wiki: `**bold**`, `` `mono` ``, links, the `wiki:`
@@ -464,19 +556,37 @@ fn inline_to_wiki(md: &str) -> String {
     while i < chars.len() {
         let rest: String = chars[i..].iter().collect();
         if chars[i] == '\\' && i + 1 < chars.len() && chars[i + 1].is_ascii_punctuation() {
+            // A Markdown escape: the character as text.
             out.push(chars[i + 1]);
             i += 2;
             continue;
         }
-        if chars[i] == '`'
-            && let Some(close) = rest[1..].find('`')
-        {
-            let inner = &rest[1..1 + close];
-            match inner.strip_prefix("wiki:") {
-                Some(raw) => out.push_str(raw),
-                None => out.push_str(&format!("{{{{{inner}}}}}")),
+        if chars[i] == '`' {
+            // A code span: a run of backticks, closed by a run as long.
+            let n = chars[i..].iter().take_while(|&&c| c == '`').count();
+            let fence: String = "`".repeat(n);
+            let after: String = chars[i + n..].iter().collect();
+            let close = after
+                .match_indices(&fence)
+                .find(|&(at, _)| !after[at + n..].starts_with('`') && !after[..at].ends_with('`'));
+            match close.map(|(at, _)| &after[..at]) {
+                Some(inner) if n == 1 && !inner.is_empty() => {
+                    match inner.strip_prefix("wiki:") {
+                        Some(raw) => out.push_str(raw),
+                        None => out.push_str(&format!("{{{{{inner}}}}}")),
+                    }
+                    i += n + inner.chars().count() + n;
+                }
+                // ``a ` b``: CommonMark's spaces trimmed, as monospace.
+                Some(inner) if !inner.trim().is_empty() && !inner.contains("}}") => {
+                    out.push_str(&format!("{{{{{}}}}}", inner.trim()));
+                    i += n + inner.chars().count() + n;
+                }
+                _ => {
+                    out.push_str(&fence);
+                    i += n;
+                }
             }
-            i += inner.chars().count() + 2;
             continue;
         }
         if let Some(body) = rest.strip_prefix("**")
@@ -486,6 +596,19 @@ fn inline_to_wiki(md: &str) -> String {
             let inner = &body[..close];
             out.push_str(&format!("*{}*", inline_to_wiki(inner)));
             i += inner.chars().count() + 4;
+            continue;
+        }
+        // A person's `*italic*` is wiki's `_italic_`, not its `*bold*`;
+        // to_markdown escapes every `*` it keeps, so none reaches here.
+        if chars[i] == '*'
+            && let Some(close) = rest[1..].find('*')
+            && close > 0
+            && !rest[1..].starts_with(' ')
+            && !rest[1..1 + close].ends_with(' ')
+        {
+            let inner = &rest[1..1 + close];
+            out.push_str(&format!("_{}_", inline_to_wiki(inner)));
+            i += inner.chars().count() + 2;
             continue;
         }
         if chars[i] == '['
@@ -515,7 +638,8 @@ fn md_link(s: &str) -> Option<(String, usize)> {
     let mid = s.find("](")?;
     let close = mid + 2 + s[mid + 2..].find(')')?;
     let (text, url) = (&s[1..mid], &s[mid + 2..close]);
-    (is_url(url) && !text.contains('[')).then(|| {
+    // A `|` or `]` in the text would end the wiki link early.
+    (is_url(url) && !text.contains(['[', ']', '|'])).then(|| {
         (
             format!("[{}|{url}]", inline_to_wiki(text)),
             s[..=close].chars().count(),
@@ -543,6 +667,53 @@ mod tests {
         "`ticks` and | pipes | and <angle> and 1. not a list and # not a heading",
         "||a||b||\n|x|y|z|\n|bad|",
     ];
+
+    #[test]
+    fn code_keeps_its_indentation_both_ways() {
+        // List-like lines in code are code (review M11).
+        let w = "{code}\ndef f():\n    # check\n    return 1\n{code}";
+        assert_eq!(canonical(w), w);
+        assert_eq!(to_wiki(&to_markdown(w)), w);
+        let yaml = "{code:yaml}\nitems:\n  - a\n  - b   \n{code}";
+        assert_eq!(canonical(yaml), yaml);
+        assert_eq!(to_wiki(&to_markdown(yaml)), yaml);
+        assert_eq!(
+            to_wiki("```yaml\na:\n  b:\n    - x\n```"),
+            "{code:yaml}\na:\n  b:\n    - x\n{code}"
+        );
+    }
+
+    #[test]
+    fn a_persons_markdown_keeps_what_review_found() {
+        // Backticks without a span stay backticks; a double-backtick span is
+        // monospace.
+        assert_eq!(to_wiki("use `` here"), "use `` here");
+        assert_eq!(to_wiki("``a ` b``"), "{{a ` b}}");
+        // A fence with a backtick in its info string is no fence: a span.
+        assert_eq!(to_wiki("```npm i``` then\nmore"), "{{npm i}} then\nmore");
+        assert_eq!(to_wiki("```{r}\nx\n```"), "{code}\nx\n{code}");
+        // A longer closing fence closes it.
+        assert_eq!(to_wiki("```\nx\n````\nafter"), "{code}\nx\n{code}\nafter");
+        // An empty cell keeps its column.
+        assert_eq!(
+            to_wiki("| a | b | c |\n|---|---|---|\n| 1 |  | 3 |"),
+            "||a||b||c||\n|1| |3|"
+        );
+        // Another start number is kept as text; nesting by four spaces is one level.
+        assert_eq!(to_wiki("5. Fifth"), "5. Fifth");
+        assert_eq!(to_wiki("- a\n    - b"), "* a\n** b");
+        // An escaped start, or seven #, stays text.
+        assert_eq!(to_wiki("\\* not a bullet"), "\\* not a bullet");
+        assert_eq!(to_wiki("####### x"), "\\####### x");
+        // Markdown italic is wiki italic.
+        assert_eq!(to_wiki("this is *important*"), "this is _important_");
+        assert_eq!(to_wiki("a * b * c"), "a * b * c");
+        // A | or ] in a link's text: not a wiki link.
+        assert_eq!(
+            to_wiki("[a|b](https://x.example.com)"),
+            "[a|b](https://x.example.com)"
+        );
+    }
 
     #[test]
     #[ignore = "prints the samples' Markdown, to read"]
@@ -660,6 +831,16 @@ mod tests {
             "{panel}",
             "word",
             "2*3*4",
+            "é",
+            "🚀",
+            "`é`",
+            "**ü**",
+            "[é](https://e.example.com)",
+            "<https://é.example.com>",
+            "`wiki:🚀`",
+            "](",
+            ")",
+            "**",
         ];
         let mut s = seed;
         let mut out = String::new();
@@ -690,12 +871,15 @@ mod tests {
         for seed in 0..2000 {
             let md = generated(seed, 2 + (seed as usize % 30)).replace("||", "| |");
             let wiki = to_wiki(&md);
-            // A list's number is markup (`1.` becomes `#`), not text.
+            // A list's number is markup (`1.` becomes `#`), and so is a raw
+            // span's `wiki:`; neither is text.
             let text: String = md
+                .replace("`wiki:", "`")
                 .lines()
                 .map(|l| {
                     l.trim_start()
                         .trim_start_matches(|c: char| c.is_ascii_digit())
+                        .to_owned()
                 })
                 .collect();
             for c in text.chars().filter(|c| c.is_alphanumeric()) {

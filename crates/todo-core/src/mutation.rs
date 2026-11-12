@@ -414,10 +414,22 @@ pub fn apply(item: &Item, op: &MutationOp, ctx: &ApplyCtx) -> Result<Applied, Mu
     // ADR-0007). Sync writes Core; undo restores what it recorded.
     // A field the instance keeps local is the person's alone.
     let local = |f: ItemField| ctx.local.has(item, f);
+    // A description not read since it was wiki text (an Item not pulled
+    // since migration 0009, ADR-0009) waits for that read: an edit of it
+    // would have the wiki as its base and read back as a conflict.
+    let unread = |f: ItemField| {
+        f == ItemField::Description
+            && item
+                .remote_link
+                .as_ref()
+                .is_some_and(|l| l.last_pulled_version.is_none())
+    };
     if item.is_linked()
         && matches!(ctx.actor, Actor::User | Actor::Suggestion(_))
         && let Some(c) = changes.iter().find(|c| {
-            is_core(c.field) && !local(c.field) && !(pushed(c.field) && pushes(item, ctx))
+            is_core(c.field)
+                && !local(c.field)
+                && (!(pushed(c.field) && pushes(item, ctx)) || unread(c.field))
         })
     {
         return Err(MutationError::LinkedReadOnly(c.field));

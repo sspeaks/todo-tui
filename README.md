@@ -716,7 +716,9 @@ The tab bar has the list, Search, and Settings (the connection and pairing).
 What you add while your computer is out of reach is kept on the phone and sent
 once it is back. Tap an item to edit its title, status,
 priority, due date, repeat, labels, waiting on and follow-up, hide-until date and
-notes, or to delete it. Every change can be undone from the snackbar. It is a thin client: it shows nothing while your
+notes, or to delete it. Every change can be undone from the snackbar. On a Jira
+item the same edits reach Jira as they do from the TUI ([Jira sync](#jira-sync)),
+and one assigned to someone else asks first. It is a thin client: it shows nothing while your
 computer is asleep or off the tailnet.
 
 Set it up once on the computer:

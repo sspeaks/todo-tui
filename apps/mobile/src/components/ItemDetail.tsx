@@ -124,7 +124,8 @@ function Loaded({ item }: { item: Item }) {
 
   const changeRepeat = async (choice: { rule: Parameters<typeof setRecurrence>[2] } | undefined) => {
     try {
-      const res = await setRecurrence(clients.items, item.id, choice?.rule, { timeoutMs: 15_000 });
+      // A rule sets the due date, which pushes: the same question.
+      const res = await withNotMine((once) => setRecurrence(clients.items, item.id, choice?.rule, { timeoutMs: 15_000, ...once }));
       snack.done(choice ? "Repeat set" : "Repeat stopped", { ...(res.result && { result: res.result }), items: [res.item] });
     } catch (err) {
       snack.fail(err);

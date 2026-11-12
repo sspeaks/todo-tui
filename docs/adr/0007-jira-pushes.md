@@ -37,7 +37,8 @@ month), Overcome by Events 287 (190 of them in one two-week clean-up), Incomplet
 - **Still read-only**: the description (it needs a wiki-markup converter that can tell
   when it would lose formatting, design 5.6), the assignee (it needs People, 3.5), and
   components, fix versions, story points, estimates and the parent. The guard keeps
-  refusing these, and refuses everything on a link that is `broken`.
+  refusing these, and refuses everything on a link that is `broken`. (M11 pushes the
+  description too, converted to and from wiki markup with nothing dropped: ADR-0009.)
 - **A transition** is chosen per Item by the target status category: the first one
   Jira offers into it, in Jira's order, or the one config names by its target status
   (`transitions = { todo = "Open" }`). Closing sets the resolution the transition

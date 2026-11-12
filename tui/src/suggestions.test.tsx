@@ -335,6 +335,8 @@ describe("E on a Jira item (ADR-0009)", () => {
       { line: "```", raw: true },
       { line: "after `wiki:+u+` text", raw: false },
     ]);
+    // A code block's body is code, even a ```wiki or `wiki:` line in it.
+    expect(rawLines("````\n```wiki\n`wiki:x`\n````\nhello").map((l) => l.raw)).toEqual([false, false, false, false, false]);
   });
 
   it("names the description among what waits to reach Jira", async () => {

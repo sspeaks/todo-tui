@@ -2550,6 +2550,7 @@ async fn a_local_due_date_left_empty_stays_empty_over_pulls() {
 async fn the_markdown_migration_reads_linked_items_again() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("todo.db");
+    let gone_id;
     {
         let store = Store::open(&path).unwrap();
         store
@@ -2557,6 +2558,7 @@ async fn the_markdown_migration_reads_linked_items_again() {
             .await
             .unwrap();
         let gone = by_key(&store, "PLAT-2").await;
+        gone_id = gone.id;
         let mut del = user_edit(gone.id, ItemField::Title, FieldValue::Cleared);
         del.kind = OpKind::Delete;
         del.mutations[0].op = MutationOp::Delete;
@@ -2573,6 +2575,58 @@ async fn the_markdown_migration_reads_linked_items_again() {
     // The live one is read again by id; the deleted one is not tracked.
     assert_eq!(tracked.len(), 1);
     assert!(tracked[0].stale);
+    // Undeleted, the deleted one is read again too: its description was
+    // still wiki text (review M11).
+    let mut back = user_edit(gone_id, ItemField::Title, FieldValue::Cleared);
+    back.kind = OpKind::Undelete;
+    back.mutations[0].op = MutationOp::Undelete;
+    store.mutate(back).await.unwrap();
+    let tracked = store.tracked("work-jira".into()).await.unwrap();
+    assert_eq!(tracked.len(), 2);
+    assert!(tracked.iter().all(|t| t.stale));
+    // Until it is read again its description is wiki text: an edit of it
+    // waits (it would have the wiki as its base); the title does not.
+    store.set_pushes(Some("work-jira"));
+    let one = by_key(&store, "PLAT-1").await;
+    let err = store
+        .mutate(user_edit(
+            one.id,
+            ItemField::Description,
+            FieldValue::Markdown("x".into()),
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StoreError::Mutation {
+                error: MutationError::LinkedReadOnly(ItemField::Description),
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    store
+        .mutate(user_edit(
+            one.id,
+            ItemField::Title,
+            FieldValue::String("t".into()),
+        ))
+        .await
+        .unwrap();
+    // Read again: the description takes edits.
+    store
+        .apply_pull(page(vec![titled(1, "t", 900)], None))
+        .await
+        .unwrap();
+    store
+        .mutate(user_edit(
+            one.id,
+            ItemField::Description,
+            FieldValue::Markdown("x".into()),
+        ))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

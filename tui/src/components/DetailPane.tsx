@@ -87,16 +87,20 @@ function Field({ label, children, dim }: { label: string; children: ReactNode; d
  * kept for Jira, not meant to be read.
  */
 export function rawLines(text: string): { line: string; raw: boolean }[] {
-  let fence: string | undefined;
+  // The fence the line is inside, and whether it is a ```wiki one: a code
+  // block's body is code, even a line of it that reads like a raw span.
+  let fence: { ticks: number; raw: boolean } | undefined;
   return text.split("\n").map((line) => {
-    const open = /^(`{3,})wiki\s*$/.exec(line);
-    if (fence === undefined && open) {
-      fence = open[1];
-      return { line, raw: true };
-    }
     if (fence !== undefined) {
-      if (line.trimEnd() === fence) fence = undefined;
-      return { line, raw: true };
+      const raw = fence.raw;
+      const ticks = /^(`+)\s*$/.exec(line)?.[1]?.length ?? 0;
+      if (ticks >= fence.ticks) fence = undefined;
+      return { line, raw };
+    }
+    const open = /^(`{3,})([^`]*)$/.exec(line);
+    if (open) {
+      fence = { ticks: open[1]!.length, raw: open[2]!.trim() === "wiki" };
+      return { line, raw: fence.raw };
     }
     return { line, raw: /^`wiki:[^`]*`$/.test(line) };
   });
