@@ -204,9 +204,12 @@ fn at(h: u32) -> String {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_first_pass_imports_the_scope_and_later_ones_follow_it() {
     let fake = FakeJira::start("pat").await;
+    let mut shipping = issue_json(2, "Ship the release", "indeterminate", &at(2));
+    shipping["fields"]["description"] =
+        json!("h2. Steps\r\n * tag {{v2}}\r\n * [notes|https://wiki.example.com/x]");
     let issues = Arc::new(Mutex::new(vec![
         issue_json(1, "Fix the login test", "new", &at(1)),
-        issue_json(2, "Ship the release", "indeterminate", &at(2)),
+        shipping,
     ]));
     serve(&fake, issues.clone());
     let r = start(&fake, "pat").await;
@@ -216,6 +219,11 @@ async fn the_first_pass_imports_the_scope_and_later_ones_follow_it() {
     assert_eq!(
         items.iter().map(|i| i.title.as_str()).collect::<Vec<_>>(),
         ["Fix the login test", "Ship the release"]
+    );
+    // Jira's wiki markup arrives as Markdown (ADR-0009).
+    assert_eq!(
+        items[1].description,
+        "## Steps\n- tag `v2`\n- [notes](https://wiki.example.com/x)"
     );
     assert_eq!(items[0].status, Status::Next as i32);
     assert_eq!(items[1].status, Status::InProgress as i32);

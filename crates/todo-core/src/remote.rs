@@ -34,7 +34,8 @@ pub struct RemoteIssue {
     pub key: String,
     pub url: String,
     pub title: String,
-    /// As the tracker stores it (wiki markup on Data Center, ADR-0006).
+    /// Markdown: the adapter converts the tracker's text (wiki markup on
+    /// Data Center), keeping what does not convert (ADR-0009).
     pub description: String,
     pub item_type: String,
     pub status_category: StatusCategory,

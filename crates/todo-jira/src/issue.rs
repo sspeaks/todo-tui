@@ -264,7 +264,9 @@ pub fn to_remote(v: &Value, d: &Discovery, instance: &str, base_url: &str) -> Op
         remote_id: id,
         key,
         title: str_at(f, &["summary"]).unwrap_or_default().to_owned(),
-        description: str_at(f, &["description"]).unwrap_or_default().to_owned(),
+        // Markdown, as an Item holds it; what does not convert is kept
+        // (ADR-0009).
+        description: crate::wiki::to_markdown(str_at(f, &["description"]).unwrap_or_default()),
         item_type: str_at(f, &["issuetype", "name"])
             .unwrap_or("Task")
             .to_owned(),
@@ -411,6 +413,8 @@ mod tests {
         let i = to_remote(&v, &discovery(), "work-jira", "https://jira.example.com/").unwrap();
         assert_eq!((i.remote_id.as_str(), i.key.as_str()), ("10001", "PLAT-1"));
         assert_eq!(i.url, "https://jira.example.com/browse/PLAT-1");
+        // Wiki markup read as Markdown (ADR-0009).
+        assert_eq!(i.description, "## Steps");
         assert_eq!(
             (i.status_category, i.remote_status_name.as_str()),
             (StatusCategory::InProgress, "In Review")

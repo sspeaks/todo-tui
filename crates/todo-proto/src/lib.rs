@@ -55,5 +55,7 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
 /// SuggestionService (ListSuggestions, ApplySuggestionPatches,
 /// RejectSuggestion), SyncService.ListOutbox, OP_KIND_APPLY_SUGGESTION and
 /// OP_KIND_REJECT_SUGGESTION; pending_ops counts a status once and
-/// failed_ops only while its push_failed Suggestion waits.
-pub const API_MINOR: u32 = 23;
+/// failed_ops only while its push_failed Suggestion waits. 24: a linked
+/// Item's description is Markdown, converted from the tracker's wiki markup
+/// (ADR-0009), no longer the tracker's text.
+pub const API_MINOR: u32 = 24;

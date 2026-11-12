@@ -39,6 +39,7 @@ const MIGRATIONS: &[Migration] = &[
         rebuilds: true,
     },
     plain(include_str!("../migrations/0008_outbox.sql")),
+    plain(include_str!("../migrations/0009_markdown_descriptions.sql")),
 ];
 
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;

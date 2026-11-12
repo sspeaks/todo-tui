@@ -305,7 +305,7 @@ async fn handshake_reports_version_and_api_minor() {
         .into_inner();
     assert_eq!(info.daemon_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(info.api_minor, todo_proto::API_MINOR);
-    assert_eq!(info.api_minor, 23);
+    assert_eq!(info.api_minor, 24);
     d.stop().await;
 }
 

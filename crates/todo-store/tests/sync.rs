@@ -2527,3 +2527,32 @@ async fn a_local_due_date_left_empty_stays_empty_over_pulls() {
     store.apply_pull(page(vec![dated], None)).await.unwrap();
     assert_eq!(by_key(&store, "PLAT-1").await.core.due_date, None);
 }
+
+#[tokio::test]
+async fn the_markdown_migration_reads_linked_items_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("todo.db");
+    {
+        let store = Store::open(&path).unwrap();
+        store
+            .apply_pull(page(vec![issue(1, "one"), issue(2, "two")], None))
+            .await
+            .unwrap();
+        let gone = by_key(&store, "PLAT-2").await;
+        let mut del = user_edit(gone.id, ItemField::Title, FieldValue::Cleared);
+        del.kind = OpKind::Delete;
+        del.mutations[0].op = MutationOp::Delete;
+        store.mutate(del).await.unwrap();
+        let stale = store.tracked("work-jira".into()).await.unwrap();
+        assert!(stale.iter().all(|t| !t.stale));
+    }
+    // As at version 8: the migration runs again on the next open.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.pragma_update(None, "user_version", 8).unwrap();
+    drop(conn);
+    let store = Store::open(&path).unwrap();
+    let tracked = store.tracked("work-jira".into()).await.unwrap();
+    // The live one is read again by id; the deleted one is not tracked.
+    assert_eq!(tracked.len(), 1);
+    assert!(tracked[0].stale);
+}
