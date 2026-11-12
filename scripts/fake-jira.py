@@ -100,8 +100,9 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path in GET:
             return self.reply(200, GET[path])
-        m = re.fullmatch(r"/rest/api/2/issue/(\d+)(/transitions)?", path)
-        found = [i for i in ISSUES if m and i["id"] == m.group(1)]
+        m = re.fullmatch(r"/rest/api/2/issue/([A-Z0-9-]+)(/transitions)?", path)
+        # By id or by key, as Jira takes either (attach reads by key).
+        found = [i for i in ISSUES if m and m.group(1) in (i["id"], i["key"])]
         if found and m.group(2):
             transitions = []
             for tid, name, to, key in WORKFLOW:
@@ -138,6 +139,20 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authorized():
             return
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+        if self.path.split("?")[0] == "/rest/api/2/issue":
+            # Promote (design 5.7): a new issue in PLAT, the next id.
+            f = body.get("fields", {})
+            if f.get("project", {}).get("key") != "PLAT":
+                return self.reply(400, {"errorMessages": [], "errors": {"issuetype": "valid issue type is required"}})
+            n = max(int(i["id"]) for i in ISSUES) + 1
+            new = issue(n, f.get("summary", ""), "new", "Open")
+            for k in ("description", "labels", "duedate"):
+                if f.get(k) is not None:
+                    new["fields"][k] = f[k]
+            touched(new)
+            ISSUES.append(new)
+            log({"method": "POST", "key": new["key"], "created": f.get("summary", "")})
+            return self.reply(201, {"id": new["id"], "key": new["key"]})
         m = re.fullmatch(r"/rest/api/2/issue/(\d+)/transitions", self.path.split("?")[0])
         if m:
             found = [i for i in ISSUES if i["id"] == m.group(1)]

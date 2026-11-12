@@ -76,6 +76,18 @@ pub struct Instance {
     /// leaves them alone. For a field the tracker's screens lack (BRME has
     /// no due date, so every due date push is refused).
     pub local_fields: Vec<todo_core::ItemField>,
+    /// Where promote creates an issue (design 5.7): `promote_default =
+    /// { project = "PLAT", issue_type = "Task" }`; `None` until set.
+    pub promote: Option<PromoteTarget>,
+    /// The issue type a sub-task is created as (`subtask_issue_type`).
+    pub subtask_issue_type: String,
+}
+
+/// `promote_default`: the project and issue type a promote uses unless told.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromoteTarget {
+    pub project: String,
+    pub issue_type: String,
 }
 
 /// An instance's push settings (ADR-0007).

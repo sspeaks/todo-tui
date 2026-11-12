@@ -8,5 +8,7 @@ pub mod fake;
 pub mod issue;
 pub mod wiki;
 
-pub use adapter::{Adapter, Fetched, FieldPatch, PullError, PushError, Target};
+pub use adapter::{
+    Adapter, CreateError, Fetched, FieldPatch, NewIssue, PullError, PushError, Target,
+};
 pub use client::{Client, JiraError, Myself};

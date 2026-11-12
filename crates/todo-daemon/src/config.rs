@@ -543,6 +543,8 @@ impl<'a> Reader<'a> {
         let mut cancelled = default_cancelled_resolutions();
         let mut push = Push::default();
         let mut local_fields = Vec::new();
+        let mut promote = None;
+        let mut subtask_issue_type = "Sub-task".to_owned();
         for (key, value) in table {
             let path = format!("{at}.{}", quote_key(&key));
             let text = value.as_str().map(str::trim);
@@ -633,8 +635,33 @@ impl<'a> Reader<'a> {
                 },
                 "transitions" => self.transitions(&path, value, &mut push.transitions),
                 "priority_map" => self.priority_map(&path, value, &mut push.priority_map),
-                "email" | "promote_default" | "subtask_issue_type" | "assistant_enabled" => {
-                    self.warn(path, "not used until promote arrives");
+                "promote_default" => {
+                    let t = value.as_table();
+                    let field = |k: &str| {
+                        t.and_then(|t| t.get(k))
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                    };
+                    match (field("project"), field("issue_type")) {
+                        (Some(project), Some(issue_type)) => {
+                            promote = Some(todo_sync::PromoteTarget {
+                                project: project.to_owned(),
+                                issue_type: issue_type.to_owned(),
+                            });
+                        }
+                        _ => self.warn(
+                            path,
+                            "must be { project = \"PLAT\", issue_type = \"Task\" }",
+                        ),
+                    }
+                }
+                "subtask_issue_type" => match text.filter(|s| !s.is_empty()) {
+                    Some(t) => subtask_issue_type = t.to_owned(),
+                    None => self.warn(path, "must be an issue type's name, e.g. \"Sub-task\""),
+                },
+                "email" | "assistant_enabled" => {
+                    self.warn(path, "not used yet");
                 }
                 _ => self.warn(path, "unknown key; ignored"),
             }
@@ -691,6 +718,8 @@ impl<'a> Reader<'a> {
             cancelled_resolutions: cancelled,
             push,
             local_fields,
+            promote,
+            subtask_issue_type,
         })
     }
 
@@ -1425,6 +1454,33 @@ mod tests {
     }
 
     #[test]
+    fn an_instance_reads_where_promote_creates() {
+        let base = "[[instances]]\nid = \"j\"\nkind = \"jira-dc\"\nbase_url = \"https://j.example.com\"\ncredential = \"env:X\"\n";
+        let i = &parse(base).instances[0];
+        assert_eq!(
+            (i.promote.clone(), i.subtask_issue_type.as_str()),
+            (None, "Sub-task")
+        );
+        let set = parse(&format!(
+            "{base}promote_default = {{ project = \"BRME\", issue_type = \"Task\" }}\nsubtask_issue_type = \"Subtask\"\n"
+        ));
+        assert_eq!(set.warnings, vec![]);
+        let i = &set.instances[0];
+        assert_eq!(
+            i.promote,
+            Some(todo_sync::PromoteTarget {
+                project: "BRME".into(),
+                issue_type: "Task".into()
+            })
+        );
+        assert_eq!(i.subtask_issue_type, "Subtask");
+        assert_eq!(
+            warnings(&format!("{base}promote_default = \"BRME\"\n")),
+            ["instances[0].promote_default: must be { project = \"PLAT\", issue_type = \"Task\" }"]
+        );
+    }
+
+    #[test]
     fn a_bad_instance_is_skipped_with_its_reasons() {
         assert_eq!(
             warnings(
@@ -1435,7 +1491,7 @@ mod tests {
                 "instances[0].kind: must be \"jira-dc\" (Jira Data Center); Jira Cloud is not built yet",
                 "instances[0].base_url: must be an https:// address, e.g. \"https://jira.example.com\" (http:// only to this machine)",
                 "instances[0].credential: vault: must be keychain:…, env:…, file:… or systemd:…",
-                "instances[0].email: not used until promote arrives",
+                "instances[0].email: not used yet",
                 "instances[0]: skipped: it does not sync until the errors above are fixed",
             ]
         );

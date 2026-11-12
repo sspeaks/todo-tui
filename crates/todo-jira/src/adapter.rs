@@ -387,6 +387,114 @@ impl Adapter {
     }
 }
 
+/// A new issue (design 5.7): what promote sends. `None` leaves a field to
+/// Jira's default.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct NewIssue {
+    pub project: String,
+    pub issue_type: String,
+    pub summary: String,
+    /// Markdown: sent as wiki markup (ADR-0009).
+    pub description: String,
+    pub priority: Option<Priority>,
+    pub labels: Vec<String>,
+    pub due_date: Option<Date>,
+    /// The parent issue's key, for a sub-task.
+    pub parent: Option<String>,
+}
+
+/// Why a create did not make an issue.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum CreateError {
+    #[error(transparent)]
+    Jira(#[from] JiraError),
+    /// Jira needs these fields set first (design 5.7 step 1): by id, what it
+    /// said of each.
+    #[error("Jira needs {}", .0.keys().cloned().collect::<Vec<_>>().join(", "))]
+    MissingFields(std::collections::BTreeMap<String, String>),
+}
+
+impl Adapter {
+    /// Creates the issue (`POST /issue`, design 5.7) and reads it back whole.
+    /// A create is not idempotent: a transient failure after the request may
+    /// have made the issue, so the caller looks with [`Adapter::find_created`]
+    /// before trying again.
+    pub async fn create(&self, new: &NewIssue) -> Result<RemoteIssue, CreateError> {
+        let mut fields = serde_json::Map::new();
+        fields.insert("project".into(), json!({ "key": new.project }));
+        fields.insert("issuetype".into(), json!({ "name": new.issue_type }));
+        fields.insert("summary".into(), json!(new.summary));
+        if !new.description.trim().is_empty() {
+            fields.insert(
+                "description".into(),
+                json!(crate::wiki::to_wiki(&new.description)),
+            );
+        }
+        if let Some(name) = new
+            .priority
+            .and_then(|p| self.discovery.priority_names.get(&p))
+        {
+            fields.insert("priority".into(), json!({ "name": name }));
+        }
+        if !new.labels.is_empty() {
+            fields.insert("labels".into(), json!(new.labels));
+        }
+        if let Some(d) = new.due_date {
+            fields.insert("duedate".into(), json!(d.to_string()));
+        }
+        if let Some(parent) = &new.parent {
+            fields.insert("parent".into(), json!({ "key": parent }));
+        }
+        let made: Value = match self
+            .client
+            .post("/rest/api/2/issue", &json!({ "fields": fields }))
+            .await
+        {
+            Ok(v) => v,
+            Err(JiraError::Fields(f)) => return Err(CreateError::MissingFields(f)),
+            Err(e) => return Err(e.into()),
+        };
+        let id = made
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| JiraError::Malformed("the created issue has no id".into()))?;
+        match self.fetch(id).await? {
+            Fetched::Found(issue) => Ok(*issue),
+            _ => Err(JiraError::Malformed(format!("the created issue {id} cannot be read")).into()),
+        }
+    }
+
+    /// An issue the person created in the last ten minutes with exactly
+    /// `summary`, newest first (design 5.7 step 4, open question 2): what a
+    /// create whose answer was lost may have made.
+    pub async fn find_created(&self, summary: &str) -> Result<Option<RemoteIssue>, JiraError> {
+        let words: String = summary
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == ' ' {
+                    c
+                } else {
+                    ' '
+                }
+            })
+            .collect();
+        let words = words.split_whitespace().collect::<Vec<_>>().join(" ");
+        if words.is_empty() {
+            return Ok(None);
+        }
+        let jql = format!(
+            "reporter = currentUser() AND created >= -10m AND summary ~ \"{words}\" ORDER BY created DESC"
+        );
+        let res = self
+            .search(&jql, 0, search_fields(&self.discovery), false)
+            .await?;
+        Ok(self
+            .issues_of(&res)
+            .into_iter()
+            .find(|i| i.title == summary))
+    }
+}
+
 /// A field a push sets (ADR-0007): the few that reach Jira.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FieldPatch {
@@ -1073,5 +1181,70 @@ mod tests {
                 .into()
             )))
         );
+    }
+
+    #[tokio::test]
+    async fn a_create_sends_the_fields_reads_the_issue_back_and_names_what_is_missing() {
+        let (fake, issues, a) = writable(Push::default()).await;
+        fake.serve_search(issues.clone(), 50);
+        let new = NewIssue {
+            project: "PLAT".into(),
+            issue_type: "Task".into(),
+            summary: "Ship the report".into(),
+            description: "## Steps\n- tag `v2`".into(),
+            priority: Some(Priority::High),
+            labels: vec!["work".into()],
+            due_date: Some(jiff::civil::date(2026, 11, 20)),
+            parent: None,
+        };
+        let made = a.create(&new).await.unwrap();
+        assert_eq!(
+            (made.key.as_str(), made.title.as_str()),
+            ("PLAT-2", "Ship the report")
+        );
+        let post = fake
+            .seen()
+            .into_iter()
+            .find(|s| s.method == "POST" && s.target == "/rest/api/2/issue")
+            .unwrap();
+        let body: Value = serde_json::from_str(&post.body).unwrap();
+        assert_eq!(
+            body["fields"],
+            json!({"project": {"key": "PLAT"}, "issuetype": {"name": "Task"}, "summary": "Ship the report",
+                   "description": "h2. Steps\n* tag {{v2}}", "priority": {"name": "Critical"},
+                   "labels": ["work"], "duedate": "2026-11-20"})
+        );
+        // A project Jira has no such type for: what is missing, by field.
+        let err = a
+            .create(&NewIssue {
+                project: "OPS".into(),
+                ..new.clone()
+            })
+            .await
+            .unwrap_err();
+        let CreateError::MissingFields(f) = err else {
+            panic!("{err:?}")
+        };
+        assert_eq!(f.keys().collect::<Vec<_>>(), ["issuetype"]);
+        // The lost-answer search finds an issue by its exact summary.
+        let found = a.find_created("Ship the report").await.unwrap();
+        assert_eq!(found.map(|i| i.key), Some("PLAT-2".to_owned()));
+        let seen = fake.seen();
+        let jql = seen
+            .iter()
+            .rev()
+            .find(|s| s.target == "/rest/api/2/search")
+            .unwrap();
+        assert!(
+            jql.body
+                .contains("reporter = currentUser() AND created >= -10m"),
+            "{}",
+            jql.body
+        );
+        // A key reads as an id does (attach).
+        let Fetched::Found(by_key) = a.fetch("PLAT-1").await.unwrap() else {
+            panic!()
+        };
+        assert_eq!(by_key.remote_id, "1");
     }
 }

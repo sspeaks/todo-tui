@@ -331,13 +331,47 @@ impl FakeJira {
                 .and_then(|p| p.strip_suffix(tail))
                 .map(str::to_owned)
         };
+        // POST /issue: a new issue, its id after the highest, in the project
+        // asked for; a project other than PLAT has no such issue type.
+        let (made, when) = (issues.clone(), now.clone());
+        self.route("/rest/api/2/issue", move |seen| {
+            if seen.method != "POST" {
+                return (405, json!({"errorMessages": ["method"]}), vec![]);
+            }
+            let body: Value = serde_json::from_str(&seen.body).unwrap_or_default();
+            let f = &body["fields"];
+            let project = f["project"]["key"].as_str().unwrap_or_default();
+            if f["summary"].as_str().unwrap_or_default().is_empty() {
+                return (400, json!({"errorMessages": [], "errors": {"summary": "You must specify a summary of the issue."}}), vec![]);
+            }
+            if project != "PLAT" {
+                return (400, json!({"errorMessages": [], "errors": {"issuetype": "valid issue type is required"}}), vec![]);
+            }
+            let mut all = made.lock().unwrap();
+            let id = all.iter().filter_map(|v| v["id"].as_str()?.parse::<u32>().ok()).max().unwrap_or(0) + 1;
+            let mut issue = issue_json(id, f["summary"].as_str().unwrap_or_default(), "new", &when());
+            for k in ["description", "labels", "duedate", "priority"] {
+                if !f[k].is_null() {
+                    issue["fields"][k] = f[k].clone();
+                }
+            }
+            issue["fields"]["issuetype"] = f["issuetype"].clone();
+            issue["fields"]["reporter"] = json!({"key": "JIRAUSER10100", "name": "dana", "displayName": "Dana Example"});
+            let key = issue["key"].clone();
+            all.push(issue);
+            (201, json!({"id": id.to_string(), "key": key}), vec![])
+        });
         let (list, at) = (issues.clone(), now.clone());
         self.route("/rest/api/2/issue/*", move |seen| {
             let Some(id) = id_of(seen, "").filter(|id| !id.contains('/')) else {
                 return transitions(seen, &list, &*at);
             };
             let mut all = list.lock().unwrap();
-            let Some(issue) = all.iter_mut().find(|v| v["id"] == id.as_str()) else {
+            // By id or by key, as Jira takes either.
+            let Some(issue) = all
+                .iter_mut()
+                .find(|v| v["id"] == id.as_str() || v["key"] == id.as_str())
+            else {
                 return (
                     404,
                     json!({"errorMessages": ["Issue Does Not Exist"]}),
