@@ -356,13 +356,18 @@ fn parsed_fields(draft: &CaptureDraft) -> Vec<String> {
         fields.push(format!("^{:04}-{:02}-{:02}", d.year, d.month, d.day));
     }
     fields.extend(draft.labels.iter().map(|label| format!("#{label}")));
-    match draft.waiting_on.as_ref().and_then(|p| p.r#ref.as_ref()) {
-        Some(person_ref::Ref::FreeText(name)) if name.contains(char::is_whitespace) => {
+    // A person by name (design 3.5), as the draft names them.
+    let person = draft.waiting_person.as_ref().map(|p| &p.display_name);
+    let waiting = match draft.waiting_on.as_ref().and_then(|p| p.r#ref.as_ref()) {
+        Some(person_ref::Ref::FreeText(name)) => Some(name),
+        Some(person_ref::Ref::PersonId(id)) => Some(person.unwrap_or(id)),
+        None => None,
+    };
+    match waiting {
+        Some(name) if name.contains(char::is_whitespace) => {
             fields.push(format!("~\"{name}\""));
         }
-        Some(person_ref::Ref::FreeText(name) | person_ref::Ref::PersonId(name)) => {
-            fields.push(format!("~{name}"));
-        }
+        Some(name) => fields.push(format!("~{name}")),
         None => {}
     }
     match draft.status() {
@@ -516,5 +521,20 @@ mod tests {
             ..plain.clone()
         };
         assert_eq!(parsed_fields(&draft), ["~\"the vendor\"", ">next"]);
+        // A person by their name.
+        let draft = CaptureDraft {
+            waiting_on: Some(todo_proto::v1::PersonRef {
+                r#ref: Some(person_ref::Ref::PersonId(
+                    "01JB8X4Z5Q6R7S8T9V0W1X2Y3Z".into(),
+                )),
+            }),
+            waiting_person: Some(todo_proto::v1::Person {
+                id: "01JB8X4Z5Q6R7S8T9V0W1X2Y3Z".into(),
+                display_name: "Dana Example".into(),
+                ..Default::default()
+            }),
+            ..plain.clone()
+        };
+        assert_eq!(parsed_fields(&draft), ["~\"Dana Example\""]);
     }
 }

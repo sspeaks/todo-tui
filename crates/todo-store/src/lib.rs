@@ -10,6 +10,7 @@ mod codec;
 mod export;
 mod hierarchy;
 pub mod outbox;
+mod people;
 mod query;
 mod relation;
 mod report;
@@ -227,6 +228,7 @@ pub enum Resource {
     Item(Arc<Item>),
     View(Arc<View>),
     Suggestion(Arc<todo_core::suggestion::Suggestion>),
+    Person(Arc<todo_core::Person>),
 }
 
 /// One row of the `changes` table: one revision (D9) for one resource.
@@ -1131,6 +1133,46 @@ impl Store {
         self.read(move |conn| suggestion::list_tx(conn, item)).await
     }
 
+    /// Everyone known (design 3.5), by display name, and the revision read at.
+    pub async fn list_people(&self) -> Result<(Vec<todo_core::Person>, Revision)> {
+        self.read(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let revision = current_revision_in(&tx)?;
+            Ok((people::load_all(&tx)?, revision))
+        })
+        .await
+    }
+
+    /// One person; `None` when there is no such person.
+    pub async fn get_person(&self, id: todo_core::PersonId) -> Result<Option<todo_core::Person>> {
+        self.read(move |conn| people::load(conn, id)).await
+    }
+
+    /// The Person of a tracker user on `instance` (design 3.5): made, or
+    /// brought up to what the tracker says, as a pull would.
+    pub async fn add_remote_person(
+        &self,
+        instance: String,
+        user: todo_core::remote::RemoteUser,
+    ) -> Result<todo_core::Person> {
+        self.write(move |tx| {
+            let id = people::upsert_remote(tx, &instance, &user, Timestamp::now())?;
+            people::load(tx.conn(), id)?
+                .ok_or_else(|| StoreError::Corrupt(format!("person {id} not written")))
+        })
+        .await
+    }
+
+    /// The Person holding `account` on `instance`, if any.
+    pub async fn person_by_identity(
+        &self,
+        instance: String,
+        account: String,
+    ) -> Result<Option<todo_core::PersonId>> {
+        self.read(move |conn| people::by_identity(conn, &instance, &account))
+            .await
+    }
+
     /// Links the local Item `item` to `issue` (design 3.3, 5.7): promote (the
     /// issue was made from it) or attach. The Item takes Jira's Core fields,
     /// pinned; what Jira replaced of the person's becomes a `link_conflict`
@@ -1542,11 +1584,11 @@ fn capture_replay(
     Ok(Some((item, MutationResult { op_id, revision })))
 }
 
-/// People arrive in a later milestone; until then only free text is stored.
-fn people_unsupported(field: ItemField) -> MutationError {
-    MutationError::Unsupported {
+/// A person id that names no one here.
+fn no_such_person(field: ItemField) -> MutationError {
+    MutationError::Invalid {
         field,
-        reason: "people are not available yet".to_owned(),
+        reason: "names no known person".to_owned(),
     }
 }
 
@@ -1565,7 +1607,10 @@ fn capture_tx(tx: &mut WriteTx<'_>, input: CaptureInput) -> Result<(Item, Mutati
     {
         return Ok(replay);
     }
-    let draft = input.draft;
+    let mut draft = input.draft;
+    // `~name` naming one person is that person (design 2.3), against the
+    // people of this transaction.
+    todo_core::resolve_waiting(&mut draft, &people::load_all(conn)?);
     let invalid = |error| StoreError::Mutation { index: 0, error };
     if draft.title.trim().is_empty() {
         return Err(invalid(MutationError::Invalid {
@@ -1573,12 +1618,10 @@ fn capture_tx(tx: &mut WriteTx<'_>, input: CaptureInput) -> Result<(Item, Mutati
             reason: "must not be empty".to_owned(),
         }));
     }
-    if draft
-        .waiting
-        .as_ref()
-        .is_some_and(|w| matches!(w.on, PersonRef::Person(_)))
+    if let Some(PersonRef::Person(id)) = draft.waiting.as_ref().map(|w| &w.on)
+        && !people::exists(conn, *id)?
     {
-        return Err(invalid(people_unsupported(ItemField::WaitingOn)));
+        return Err(invalid(no_such_person(ItemField::WaitingOn)));
     }
     if let Some(parent) = input.parent_id
         && let Some(reason) = Batch::default().unusable_parent(conn, parent)?
@@ -2087,7 +2130,8 @@ impl Batch {
 
     /// The first change to `id` the database cannot take: a parent that is
     /// missing, deleted (unless `deleted_parent_ok`: undo and redo check the
-    /// parent rule once they are done) or a descendant, or a person. Core
+    /// parent rule once they are done) or a descendant, or a person who is
+    /// not known here. Core
     /// refuses values too large for their nanosecond columns.
     fn change_error(
         &self,
@@ -2104,10 +2148,15 @@ impl Batch {
                         field: change.field,
                         reason: reason.to_owned(),
                     }),
-                FieldValue::Person(PersonRef::Person(_)) => Some(people_unsupported(change.field)),
-                FieldValue::Waiting(w) if matches!(w.on, PersonRef::Person(_)) => {
-                    Some(people_unsupported(ItemField::WaitingOn))
+                FieldValue::Person(PersonRef::Person(p)) => {
+                    (!people::exists(conn, *p)?).then(|| no_such_person(change.field))
                 }
+                FieldValue::Waiting(w) => match &w.on {
+                    PersonRef::Person(p) if !people::exists(conn, *p)? => {
+                        Some(no_such_person(ItemField::WaitingOn))
+                    }
+                    _ => None,
+                },
                 _ => None,
             };
             if error.is_some() {
@@ -2613,6 +2662,19 @@ fn changes_since_tx(
                     Replayed::None
                 }
             },
+            Topic::Person if !deleted => {
+                let person = match id.parse::<todo_core::PersonId>() {
+                    Ok(pid) => people::load(&tx, pid)?,
+                    Err(_) => None,
+                };
+                match person {
+                    Some(p) => Replayed::Person(Arc::new(p)),
+                    None => {
+                        deleted = true;
+                        Replayed::None
+                    }
+                }
+            }
             _ => Replayed::None,
         };
         changes.push((revision, topic, id, deleted, replayed));
@@ -2630,6 +2692,7 @@ fn changes_since_tx(
                 Replayed::Item(slot) => Some(Resource::Item(Arc::clone(&items[slot]))),
                 Replayed::View(view) => Some(Resource::View(view)),
                 Replayed::Suggestion(s) => Some(Resource::Suggestion(s)),
+                Replayed::Person(p) => Some(Resource::Person(p)),
                 Replayed::None => None,
             },
         })
@@ -2642,5 +2705,6 @@ enum Replayed {
     Item(usize),
     View(Arc<View>),
     Suggestion(Arc<todo_core::suggestion::Suggestion>),
+    Person(Arc<todo_core::Person>),
     None,
 }

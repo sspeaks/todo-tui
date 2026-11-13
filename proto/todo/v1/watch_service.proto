@@ -5,6 +5,7 @@ package todo.v1;
 import "todo/v1/common.proto";
 import "todo/v1/config.proto";
 import "todo/v1/item.proto";
+import "todo/v1/person.proto";
 import "todo/v1/suggestion.proto";
 import "todo/v1/sync_service.proto";
 import "todo/v1/view.proto";
@@ -56,7 +57,8 @@ message Change {
     // TOPIC_SUGGESTION: a Suggestion, new or changed (design 3.11).
     Suggestion suggestion = 11;
     View view = 12;
-    // Allocated: Person person = 13;
+    // TOPIC_PERSON: a person, new or changed (design 3.5).
+    Person person = 13;
     // Allocated: ReviewSession review = 15;
     // The config current when the change is sent (not stored), also on
     // replay. Its id is "config".

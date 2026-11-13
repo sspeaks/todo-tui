@@ -135,7 +135,8 @@ pub fn read_record(line: &str) -> Result<ExportRow, LineError> {
     row_of(&record).map_err(|e| LineError(e.to_string()))
 }
 
-const RECORD_TYPES: [&str; 9] = [
+const RECORD_TYPES: [&str; 10] = [
+    "person",
     "item",
     "relation",
     "view",
@@ -178,6 +179,7 @@ fn camel(s: &str) -> String {
 
 fn record_of(row: &ExportRow) -> ex::Record {
     let record = match row {
+        ExportRow::Person(p) => R::Person(v1::Person::from(&**p)),
         ExportRow::Item(item) => {
             let mut p = v1::Item::from(&**item);
             // Computed when read, so not part of the record.
@@ -355,6 +357,7 @@ fn row_of(record: &ex::Record) -> Result<ExportRow, ConvertError> {
                 created_at: ts("created_at", &o.created_at)?,
                 updated_at: ts("updated_at", &o.updated_at)?,
             })),
+            R::Person(p) => ExportRow::Person(Box::new(todo_core::Person::try_from(p)?)),
             R::Suggestion(s) => ExportRow::Suggestion(Box::new(SuggestionRecord {
                 id: s.id.clone(),
                 item_id: s.item_id.clone(),

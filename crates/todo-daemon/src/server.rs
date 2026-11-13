@@ -12,6 +12,7 @@ use anyhow::Context as _;
 use jiff::SignedDuration;
 use todo_proto::v1::assistant_service_server::AssistantServiceServer;
 use todo_proto::v1::item_service_server::ItemServiceServer;
+use todo_proto::v1::people_service_server::PeopleServiceServer;
 use todo_proto::v1::suggestion_service_server::SuggestionServiceServer;
 use todo_proto::v1::sync_service_server::SyncServiceServer;
 use todo_proto::v1::system_service_server::SystemServiceServer;
@@ -31,8 +32,8 @@ use crate::paths::Paths;
 use crate::remote::{self, Auth};
 use crate::scheduler::{self, Wake};
 use crate::service::{
-    Ctx, assistant::Assistants, item::Items, suggestion::Suggestions, sync::Sync, system::System,
-    view::Views, watch::Watch,
+    Ctx, assistant::Assistants, item::Items, people::People, suggestion::Suggestions, sync::Sync,
+    system::System, view::Views, watch::Watch,
 };
 use crate::spool;
 use crate::supervise::{Backoff, spawn_supervised};
@@ -397,6 +398,7 @@ impl Daemon {
             .add_service(ViewServiceServer::new(Views(ctx.clone())))
             .add_service(SyncServiceServer::new(Sync(ctx.clone())))
             .add_service(SuggestionServiceServer::new(Suggestions(ctx.clone())))
+            .add_service(PeopleServiceServer::new(People(ctx.clone())))
             .add_service(AssistantServiceServer::new(Assistants(ctx.clone())))
             .add_service(WatchServiceServer::new(Watch(ctx.clone())))
             .serve_with_incoming_shutdown(incoming, async move { stop.wait().await });
@@ -439,6 +441,10 @@ impl Daemon {
                 ))
                 .add_service(SuggestionServiceServer::with_interceptor(
                     Suggestions(ctx.clone()),
+                    auth.clone(),
+                ))
+                .add_service(PeopleServiceServer::with_interceptor(
+                    People(ctx.clone()),
                     auth.clone(),
                 ))
                 .add_service(AssistantServiceServer::with_interceptor(

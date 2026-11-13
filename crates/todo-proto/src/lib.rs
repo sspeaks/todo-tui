@@ -63,5 +63,9 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
 /// ConfigSnapshot.assistant, SUGGESTION_KIND_REFINE and
 /// SUGGESTION_SOURCE_CLAUDE. 27 added SyncService.Promote and Attach
 /// (design 5.7, 3.3), SUGGESTION_KIND_LINK_CONFLICT, OP_KIND_PROMOTE and
-/// OP_KIND_ATTACH.
-pub const API_MINOR: u32 = 27;
+/// OP_KIND_ATTACH. 28 added People (design 3.5): Person, the PeopleService
+/// (ListPeople, GetPerson, SearchDirectory, AddPerson), Change.person, the
+/// export's person record, and CaptureDraft.waiting_person and
+/// waiting_matches; an assignee, reporter or waiting.on of a known person
+/// is their person_id.
+pub const API_MINOR: u32 = 28;

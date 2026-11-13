@@ -6,13 +6,14 @@ import "google/protobuf/timestamp.proto";
 import "todo/v1/field.proto";
 import "todo/v1/field_value.proto";
 import "todo/v1/item.proto";
+import "todo/v1/person.proto";
 import "todo/v1/relation.proto";
 import "todo/v1/view.proto";
 
 // The export format (design 7.4): JSON Lines, the Header first, then one
 // Record per line, each in the canonical proto3 JSON of its message:
 // `{"type": "<record case>", "data": {…}}`. Records come in dependency
-// order: items (parents first), relations, views, view_seeds, ops, events.
+// order: people, items (parents first), relations, views, view_seeds, ops, events.
 // These messages are the schema, and follow todo.v1's rules: additive only.
 
 // Line 1.
@@ -52,6 +53,8 @@ message Record {
     // out; and a Suggestion with its patches (design 3.11).
     OutboxOp outbox_op = 8;
     SuggestionRecord suggestion = 9;
+    // A person (design 3.5), before the Items naming them.
+    todo.v1.Person person = 10;
   }
 }
 

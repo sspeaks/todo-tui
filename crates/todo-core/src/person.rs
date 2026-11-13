@@ -38,9 +38,25 @@ pub enum Match {
 /// an email or display name is the text; else, when none is, exactly one
 /// whose display name's first word is. Never a guess between two.
 pub fn match_person(text: &str, people: &[Person]) -> Match {
+    match named(text, people).as_slice() {
+        [] => Match::None,
+        [one] => Match::One(one.id),
+        _ => Match::Many,
+    }
+}
+
+/// How many people `text` names, as [`match_person`] counts them: what "2
+/// people match" says.
+pub fn count_matches(text: &str, people: &[Person]) -> usize {
+    named(text, people).len()
+}
+
+/// Everyone `text` names in the first tier that names anyone: the whole
+/// username, email or display name, then the display name's first word.
+fn named<'a>(text: &str, people: &'a [Person]) -> Vec<&'a Person> {
     let t = fold(text);
     if t.is_empty() {
-        return Match::None;
+        return Vec::new();
     }
     let whole = |p: &Person| {
         fold(&p.username) == t
@@ -54,14 +70,12 @@ pub fn match_person(text: &str, people: &[Person]) -> Match {
             .is_some_and(|w| fold(w) == t)
     };
     for tier in [&whole as &dyn Fn(&Person) -> bool, &first] {
-        let mut found = people.iter().filter(|p| tier(p));
-        match (found.next(), found.next()) {
-            (Some(p), None) => return Match::One(p.id),
-            (Some(_), Some(_)) => return Match::Many,
-            _ => {}
+        let found: Vec<&Person> = people.iter().filter(|p| tier(p)).collect();
+        if !found.is_empty() {
+            return found;
         }
     }
-    Match::None
+    Vec::new()
 }
 
 /// The capture's `~` token against `people` (design 2.3): free text naming
@@ -166,6 +180,9 @@ mod tests {
             person("Alex Two", "atwo", ""),
         ];
         assert_eq!(match_person("alex", &two), Match::Many);
+        assert_eq!(count_matches("alex", &two), 2);
+        assert_eq!(count_matches("dana", &people), 1);
+        assert_eq!(count_matches("nobody", &people), 0);
         let same = vec![person("Kim", "k1", ""), person("Kim", "k2", "")];
         assert_eq!(match_person("kim", &same), Match::Many);
     }

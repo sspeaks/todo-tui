@@ -229,7 +229,7 @@ impl Sync {
 
 /// A Jira error as the caller reads it: offline is UNAVAILABLE (try again),
 /// a refused token UNAUTHENTICATED, the rest a precondition with Jira's words.
-fn jira_status(e: todo_jira::JiraError) -> Status {
+pub(crate) fn jira_status(e: todo_jira::JiraError) -> Status {
     use todo_jira::JiraError as J;
     match e {
         J::Offline(_) | J::Server(..) | J::RateLimited(_) => {

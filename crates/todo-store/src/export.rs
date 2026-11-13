@@ -20,6 +20,9 @@ use todo_core::Topic;
 /// One exported record, in the store's own types.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExportRow {
+    /// A `people` row with its identities (design 3.5): before the Items
+    /// that name them.
+    Person(Box<todo_core::Person>),
     /// An Item as stored: the fields computed when it is read (status and
     /// effective priority aside, which follow from it) are their defaults.
     Item(Box<Item>),
@@ -144,13 +147,17 @@ fn corrupt(what: impl std::fmt::Display) -> StoreError {
     StoreError::Corrupt(what.to_string())
 }
 
-/// Every record, read in one transaction, in dependency order: Items with
+/// Every record, read in one transaction, in dependency order: People, Items with
 /// each parent (and merge target) before it, relations, views, view seeds,
 /// then with `history` ops (in log order) and events (in op order).
 pub(crate) fn export_tx(conn: &Connection, history: bool) -> Result<Export> {
     let tx = conn.unchecked_transaction()?;
     let revision = current_revision_in(&tx)?;
     let mut rows = Vec::new();
+
+    for p in crate::people::load_all(&tx)? {
+        rows.push(ExportRow::Person(Box::new(p)));
+    }
 
     let mut items = Vec::new();
     {
@@ -445,7 +452,7 @@ pub(crate) fn import_tx(
     conn.execute_batch(
         "DELETE FROM suggestion_patches; DELETE FROM suggestions; DELETE FROM outbox;
          DELETE FROM events; DELETE FROM relations; DELETE FROM items; DELETE FROM ops;
-         DELETE FROM sync_cursors;
+         DELETE FROM sync_cursors; DELETE FROM person_identities; DELETE FROM people;
          DELETE FROM views; DELETE FROM view_seeds; DELETE FROM changes;",
     )?;
     let mut items = 0;
@@ -490,6 +497,27 @@ pub(crate) fn import_tx(
 
 fn put(conn: &Connection, row: ExportRow, items: &mut u64) -> Result<()> {
     match row {
+        ExportRow::Person(p) => {
+            let at = ts_to_sql(Timestamp::now())?;
+            conn.execute(
+                "INSERT INTO people (id, display_name, username, emails, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                params![
+                    p.id.to_string(),
+                    p.display_name,
+                    p.username,
+                    crate::people::emails_to_sql(&p.emails)?,
+                    at
+                ],
+            )?;
+            for i in &p.identities {
+                conn.execute(
+                    "INSERT INTO person_identities (person_id, instance_id, account_id)
+                     VALUES (?1, ?2, ?3)",
+                    params![p.id.to_string(), i.instance_id, i.account_id],
+                )?;
+            }
+        }
         ExportRow::Item(item) => {
             codec::insert_item(conn, &item)?;
             *items += 1;

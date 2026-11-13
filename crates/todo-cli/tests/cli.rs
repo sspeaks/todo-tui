@@ -1487,10 +1487,20 @@ fn sync_now_pulls_and_status_reports_it() {
         h.ok(&["sync", "status"])
             .starts_with("work-jira: ok · 2 items")
     );
-    // The synced Items (their assignee a name, until People) export and
-    // import into a fresh home.
+    // The synced Items, their assignee one Person (design 3.5), export
+    // with that person and import into a fresh home.
     let file = h.home.join("export.jsonl");
     h.ok(&["export", "--out", file.to_str().unwrap()]);
+    let exported = std::fs::read_to_string(&file).unwrap();
+    let person = exported
+        .lines()
+        .find(|l| l.starts_with("{\"type\":\"person\""))
+        .expect("a person record");
+    assert!(
+        person.contains("\"displayName\":\"Dana Example\""),
+        "{person}"
+    );
+    assert!(person.contains("dana@example.com"), "{person}");
     let fresh = Home::new();
     let imported = fresh.todo(&["import", file.to_str().unwrap()]);
     assert!(imported.status.success(), "{}", text(&imported.stderr));
@@ -1499,7 +1509,12 @@ fn sync_now_pulls_and_status_reports_it() {
         .iter()
         .filter_map(|i| i.assignee.clone())
         .collect();
-    assert_eq!(assignees, vec![free_text("Dana Example").unwrap(); 2]);
+    assert_eq!(assignees.len(), 2);
+    assert_eq!(assignees[0], assignees[1]);
+    assert!(
+        matches!(&assignees[0].r#ref, Some(person_ref::Ref::PersonId(id)) if person.contains(id.as_str())),
+        "{assignees:?}"
+    );
     let missing = h.todo(&["sync", "now", "other"]);
     assert!(!missing.status.success());
     assert!(

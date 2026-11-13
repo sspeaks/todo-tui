@@ -737,7 +737,7 @@ async fn capture_stores_every_draft_field() {
 }
 
 #[tokio::test]
-async fn capture_rejects_an_empty_title_and_people() {
+async fn capture_rejects_an_empty_title_and_unknown_people() {
     let db = open();
     match db.store.capture(input(" ", 1)).await {
         Err(StoreError::Mutation {
@@ -761,12 +761,12 @@ async fn capture_rejects_an_empty_title_and_people() {
         Err(StoreError::Mutation {
             index: 0,
             error:
-                MutationError::Unsupported {
+                MutationError::Invalid {
                     field: ItemField::WaitingOn,
                     ..
                 },
         }) => {}
-        other => panic!("expected an unsupported person, got {other:?}"),
+        other => panic!("expected an unknown person, got {other:?}"),
     }
     assert_eq!(snapshot(&db).await, (SEEDED, [0, 0, rev(0), 0], vec![]));
 }
@@ -1604,7 +1604,7 @@ async fn a_parent_must_exist_be_live_and_not_create_a_cycle() {
 }
 
 #[tokio::test]
-async fn person_references_wait_for_people() {
+async fn a_person_reference_must_name_a_known_person() {
     let db = open();
     let a = capture(&db, "a").await;
     let person = PersonRef::Person(new_ulid());
@@ -1617,9 +1617,9 @@ async fn person_references_wait_for_people() {
     let unsupported = |result: Result<_, StoreError>, expected: ItemField| match result {
         Err(StoreError::Mutation {
             index: 0,
-            error: MutationError::Unsupported { field, .. },
+            error: MutationError::Invalid { field, .. },
         }) => assert_eq!(field, expected),
-        other => panic!("expected an unsupported {expected:?}, got {other:?}"),
+        other => panic!("expected an unknown {expected:?}, got {other:?}"),
     };
     // The error names the person's own field, as core does for waiting.on.
     for (field, value, named) in [
@@ -1638,7 +1638,7 @@ async fn person_references_wait_for_people() {
         unsupported(db.store.mutate(req).await, named);
     }
 
-    // Free text is stored, but its `on` cannot then become a person.
+    // Free text is stored, but its `on` cannot then become an unknown person.
     let vendor = waiting(PersonRef::FreeText("the vendor".into()));
     let out = db
         .store
@@ -1665,6 +1665,35 @@ async fn person_references_wait_for_people() {
     let stored = db.store.get_item(a.id, today()).await.unwrap().item;
     assert_eq!(stored.overlay.waiting, Some(vendor));
     assert_eq!(db.store.current_revision(), SEEDED + 2);
+
+    // A known person is taken (design 3.5).
+    let dana = db
+        .store
+        .add_remote_person(
+            "work-jira".into(),
+            todo_core::remote::RemoteUser {
+                id: "JIRAUSER1".into(),
+                display_name: "Dana Example".into(),
+                username: "dana".into(),
+                email: "dana@example.com".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let known = PersonRef::Person(dana.id);
+    let out = db
+        .store
+        .mutate(mutate(
+            OpKind::Update,
+            vec![set(
+                a.id,
+                ItemField::WaitingOn,
+                FieldValue::Person(known.clone()),
+            )],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(out.items[0].overlay.waiting.as_ref().unwrap().on, known);
 }
 
 #[tokio::test]

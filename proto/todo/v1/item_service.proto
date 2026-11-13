@@ -9,6 +9,7 @@ import "todo/v1/common.proto";
 import "todo/v1/filter.proto";
 import "todo/v1/item.proto";
 import "todo/v1/op.proto";
+import "todo/v1/person.proto";
 import "todo/v1/relation.proto";
 
 // Conventions for every mutating request: request_id = 1 is a client ULID
@@ -229,7 +230,8 @@ message CaptureDraft {
   Priority priority = 2;
   google.type.Date due_date = 3;
   repeated string labels = 4;
-  // Unset without a ~ token. Free text until People exist.
+  // Unset without a ~ token. A person when the text names exactly one
+  // (design 2.3), else free text.
   PersonRef waiting_on = 5;
   // STATUS_INBOX unless a >next / >someday token says otherwise.
   Status status = 6;
@@ -247,6 +249,11 @@ message CaptureDraft {
   google.type.Date recurrence_first = 10;
   // ENERGY_NONE without a % token.
   Energy energy = 11;
+  // The person waiting_on names, when the ~ text named exactly one.
+  Person waiting_person = 12;
+  // How many people the ~ text named when it was two or more, so it was
+  // kept as free text; else 0.
+  uint32 waiting_matches = 13;
 }
 
 message CaptureToken {

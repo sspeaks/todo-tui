@@ -8,6 +8,7 @@ mod conn;
 mod export;
 mod frames;
 mod launch;
+mod people;
 mod remote;
 mod report;
 mod rpc;
@@ -86,6 +87,16 @@ enum Command {
         id: String,
         /// The issue's key, e.g. PLAT-12.
         key: String,
+    },
+    /// List the people sync knows (design 3.5), best match first; with
+    /// --jira also those Jira's directory finds.
+    People {
+        /// A name, username or email to look for; all words are one query.
+        #[arg(trailing_var_arg = true)]
+        query: Vec<String>,
+        /// Also search Jira's user directory (online only).
+        #[arg(long)]
+        jira: bool,
     },
     /// Ask Claude to refine an Item (ADR-0010): it proposes a clearer title,
     /// due date, priority, labels and waiting-on, for review in the TUI (S).
@@ -290,6 +301,7 @@ async fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
         Command::Status { .. } => return status::status(&paths).await,
         Command::L48 { since, copy } => return report::l48(&paths, since, copy).await,
         Command::Refine { id } => return assistant::refine(&paths, id).await,
+        Command::People { query, jira } => return people::people(&paths, query, jira).await,
         Command::Promote { id, project, kind } => {
             return sync::promote(&paths, id, project, kind).await;
         }

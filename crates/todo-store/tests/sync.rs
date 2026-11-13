@@ -2568,10 +2568,13 @@ async fn the_markdown_migration_reads_linked_items_again() {
         assert!(stale.iter().all(|t| !t.stale));
     }
     // As at version 8: the migrations since run again on the next open
-    // (0010's table dropped, as it would not yet exist).
+    // (0010's and 0012's tables dropped, as they would not yet exist).
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.pragma_update(None, "user_version", 8).unwrap();
-    conn.execute_batch("DROP TABLE assistant_jobs;").unwrap();
+    conn.execute_batch(
+        "DROP TABLE assistant_jobs; DROP TABLE person_identities; DROP TABLE people;",
+    )
+    .unwrap();
     drop(conn);
     let store = Store::open(&path).unwrap();
     let tracked = store.tracked("work-jira".into()).await.unwrap();
@@ -2680,7 +2683,10 @@ async fn the_assistant_migration_keeps_sync_suggestions_and_takes_claudes() {
     // As at version 9: 0010 rebuilds suggestions with what it holds.
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.pragma_update(None, "user_version", 9).unwrap();
-    conn.execute_batch("DROP TABLE assistant_jobs;").unwrap();
+    conn.execute_batch(
+        "DROP TABLE assistant_jobs; DROP TABLE person_identities; DROP TABLE people;",
+    )
+    .unwrap();
     drop(conn);
     let store = Store::open(&path).unwrap();
     let (all, _) = store.list_suggestions(Some(item_id)).await.unwrap();
@@ -2857,4 +2863,215 @@ async fn an_attach_offers_back_what_jira_replaced_and_a_pull_keeps_the_marker() 
     store.apply_pull(page(vec![later], None)).await.unwrap();
     let pulled = store.get_item(todo.id, TODAY).await.unwrap().item;
     assert!(pulled.derived.has_conflict, "{sid}");
+}
+
+fn user(id: &str, name: &str, username: &str, email: &str) -> RemoteUser {
+    RemoteUser {
+        id: id.into(),
+        display_name: name.into(),
+        username: username.into(),
+        email: email.into(),
+    }
+}
+
+#[tokio::test]
+async fn a_pull_makes_people_once_and_keeps_them_current() {
+    let (_dir, store) = open();
+    let mut rx = store.subscribe();
+    let mut one = issue(1, "One");
+    one.assignee = Some(user(
+        "JIRAUSER1",
+        "Dana Example",
+        "dana",
+        "dana@example.com",
+    ));
+    one.reporter = Some(user("JIRAUSER2", "Sam Example", "sam", ""));
+    let mut two = issue(2, "Two");
+    two.assignee = Some(user(
+        "JIRAUSER1",
+        "Dana Example",
+        "dana",
+        "dana@example.com",
+    ));
+    store
+        .apply_pull(page(vec![one.clone(), two.clone()], None))
+        .await
+        .unwrap();
+    let (people, _) = store.list_people().await.unwrap();
+    assert_eq!(
+        people
+            .iter()
+            .map(|p| (p.display_name.as_str(), p.emails.clone()))
+            .collect::<Vec<_>>(),
+        [
+            ("Dana Example", vec!["dana@example.com".to_owned()]),
+            ("Sam Example", vec![])
+        ]
+    );
+    let dana = &people[0];
+    assert_eq!(
+        dana.identities,
+        [todo_core::Identity {
+            instance_id: "work-jira".into(),
+            account_id: "JIRAUSER1".into()
+        }]
+    );
+    let a = by_key(&store, "PLAT-1").await;
+    let b = by_key(&store, "PLAT-2").await;
+    assert_eq!(a.core.assignee, Some(todo_core::PersonRef::Person(dana.id)));
+    assert_eq!(a.core.assignee, b.core.assignee);
+    assert_eq!(
+        a.core.reporter,
+        Some(todo_core::PersonRef::Person(people[1].id))
+    );
+    // Each person a change of their own, before the Items naming them.
+    let mut topics = Vec::new();
+    while let Ok(c) = rx.try_recv() {
+        topics.push(c.topic);
+    }
+    assert_eq!(
+        topics,
+        [
+            todo_core::Topic::Person,
+            todo_core::Topic::Person,
+            todo_core::Topic::Item,
+            todo_core::Topic::Item
+        ]
+    );
+    // The same users again change no one; a new name or address does, and
+    // an address the tracker stops sending is kept.
+    store
+        .apply_pull(page(vec![one.clone()], None))
+        .await
+        .unwrap();
+    assert!(rx.try_recv().is_err(), "nothing changed");
+    one.assignee = Some(user("JIRAUSER1", "Dana Q. Example", "dana", ""));
+    one.updated_at = ts(300);
+    store.apply_pull(page(vec![one], None)).await.unwrap();
+    let renamed = store.get_person(dana.id).await.unwrap().unwrap();
+    assert_eq!(renamed.display_name, "Dana Q. Example");
+    assert_eq!(renamed.emails, ["dana@example.com"]);
+    assert_eq!(rx.try_recv().unwrap().topic, todo_core::Topic::Person);
+    // Still the same person: the Item's assignee did not change.
+    assert_eq!(
+        by_key(&store, "PLAT-1").await.core.assignee,
+        Some(todo_core::PersonRef::Person(dana.id))
+    );
+}
+
+#[tokio::test]
+async fn capture_links_waiting_on_to_the_one_person_it_names() {
+    let (_dir, store) = open();
+    let mut one = issue(1, "One");
+    one.assignee = Some(user(
+        "JIRAUSER1",
+        "Dana Example",
+        "dana",
+        "dana@example.com",
+    ));
+    one.reporter = Some(user("JIRAUSER2", "Alex One", "aone", ""));
+    let mut two = issue(2, "Two");
+    two.assignee = Some(user("JIRAUSER3", "Alex Two", "atwo", ""));
+    store.apply_pull(page(vec![one, two], None)).await.unwrap();
+    let (people, _) = store.list_people().await.unwrap();
+    let dana = people.iter().find(|p| p.username == "dana").unwrap().id;
+    let capture = |text: &str| todo_store::CaptureInput {
+        request_id: new_ulid().to_string(),
+        draft: todo_core::parse_capture(text, TODAY),
+        created_via: todo_core::CreatedVia::Cli,
+        parent_id: None,
+        spool_id: None,
+        now: ts(2_000),
+        today: TODAY,
+    };
+    let (item, _) = store.capture(capture("ping ~dana")).await.unwrap();
+    assert_eq!(
+        item.overlay.waiting.unwrap().on,
+        todo_core::PersonRef::Person(dana)
+    );
+    let (item, _) = store.capture(capture("ping ~alex")).await.unwrap();
+    assert_eq!(
+        item.overlay.waiting.unwrap().on,
+        todo_core::PersonRef::FreeText("alex".into())
+    );
+    let (item, _) = store
+        .capture(capture("ping ~\"the vendor\""))
+        .await
+        .unwrap();
+    assert_eq!(
+        item.overlay.waiting.unwrap().on,
+        todo_core::PersonRef::FreeText("the vendor".into())
+    );
+}
+
+#[tokio::test]
+async fn people_export_and_import_before_the_items_naming_them() {
+    let (_a, source) = open();
+    let mut one = issue(1, "One");
+    one.assignee = Some(user(
+        "JIRAUSER1",
+        "Dana Example",
+        "dana",
+        "dana@example.com",
+    ));
+    source.apply_pull(page(vec![one], None)).await.unwrap();
+    let export = source.export(true).await.unwrap();
+    assert!(matches!(
+        export.rows.first(),
+        Some(todo_store::ExportRow::Person(p)) if p.display_name == "Dana Example"
+    ));
+    let (_b, target) = open();
+    target.import(export.revision, export.rows).await.unwrap();
+    let (people, _) = target.list_people().await.unwrap();
+    let (before, _) = source.list_people().await.unwrap();
+    assert_eq!(people, before);
+    assert_eq!(
+        by_key(&target, "PLAT-1").await.core.assignee,
+        Some(todo_core::PersonRef::Person(people[0].id))
+    );
+}
+
+/// Migration 0012 (People): linked Items are read again, so the assignee a
+/// version 11 database holds as a name becomes a Person on the next pass.
+#[tokio::test]
+async fn migration_12_reads_linked_items_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("todo.db");
+    {
+        let store = Store::open(&path).unwrap();
+        store
+            .apply_pull(page(vec![issue(1, "One")], None))
+            .await
+            .unwrap();
+    }
+    {
+        // Back to version 11: no people tables, the assignee as text.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE person_identities; DROP TABLE people;
+             UPDATE items SET assignee_person_id = NULL, assignee_text = 'Dana Example',
+                              remote_last_pulled_version = 200000000000;
+             PRAGMA user_version = 11;",
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    let tracked = store.tracked("work-jira".into()).await.unwrap();
+    assert_eq!(tracked.len(), 1);
+    let before = store.get_item(tracked[0].id, TODAY).await.unwrap().item;
+    assert_eq!(
+        before.core.assignee,
+        Some(todo_core::PersonRef::FreeText("Dana Example".into()))
+    );
+    assert_eq!(before.remote_link.unwrap().last_pulled_version, None);
+    store
+        .apply_pull(page(vec![issue(1, "One")], None))
+        .await
+        .unwrap();
+    let (people, _) = store.list_people().await.unwrap();
+    assert_eq!(people.len(), 1);
+    assert_eq!(
+        by_key(&store, "PLAT-1").await.core.assignee,
+        Some(todo_core::PersonRef::Person(people[0].id))
+    );
 }

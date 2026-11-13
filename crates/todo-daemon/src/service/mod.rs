@@ -2,6 +2,7 @@
 
 pub(crate) mod assistant;
 pub(crate) mod item;
+pub(crate) mod people;
 pub(crate) mod suggestion;
 pub(crate) mod sync;
 pub(crate) mod system;

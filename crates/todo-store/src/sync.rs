@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use jiff::Timestamp;
 use jiff::civil::Date;
 use rusqlite::{Connection, OptionalExtension, params};
-use todo_core::remote::{PENDING_PARENT, RemoteIssue, adopt, break_link, by_name, import, update};
+use todo_core::remote::{PENDING_PARENT, RemoteIssue, adopt, break_link, import, update};
 use todo_core::{
     Actor, ApplyCtx, ArchiveReason, FieldChange, ItemId, MutationOp, MutationResult, apply,
     new_ulid,
@@ -53,7 +53,27 @@ pub(crate) fn linked(conn: &Connection, instance: &str, remote_id: &str) -> Resu
     id.map(|id| codec::item_id_from_str(&id)).transpose()
 }
 
+/// The users `issues` name: their assignees and reporters.
+fn users<'a>(
+    issues: impl IntoIterator<Item = &'a RemoteIssue>,
+) -> Vec<&'a todo_core::remote::RemoteUser> {
+    issues
+        .into_iter()
+        .flat_map(|i| [i.assignee.as_ref(), i.reporter.as_ref()])
+        .flatten()
+        .collect()
+}
+
 pub(crate) fn apply_page_tx(tx: &mut WriteTx<'_>, page: PullPage) -> Result<PullOutcome> {
+    // Each user a page names is a Person (design 3.5), before any Item
+    // refers to one.
+    let people = crate::people::resolve_users(
+        tx,
+        &page.instance_id,
+        users(page.issues.iter().map(|(i, _)| i)),
+        page.now,
+    )?;
+    let people = crate::people::resolver(&people);
     let pushes = tx.pushes();
     let local = tx.local();
     let conn = tx.conn();
@@ -93,7 +113,7 @@ pub(crate) fn apply_page_tx(tx: &mut WriteTx<'_>, page: PullPage) -> Result<Pull
         match linked(conn, &page.instance_id, &issue.remote_id)? {
             None if created.contains(&id) => {}
             None => {
-                let mut item = import(id, issue, parent, scopes, &by_name, page.now);
+                let mut item = import(id, issue, parent, scopes, &people, page.now);
                 // A field the instance keeps local starts empty: Jira's is
                 // not the person's.
                 for f in local.fields_of(&page.instance_id) {
@@ -132,14 +152,8 @@ pub(crate) fn apply_page_tx(tx: &mut WriteTx<'_>, page: PullPage) -> Result<Pull
                     crate::outbox::settle_pull(conn, &current, issue, pushes, local, page.now)?;
                 suggested.extend(settled.suggested);
                 let parent = kept_parent(conn, &current, issue, parent)?;
-                let (mut next, changes) = update(
-                    &current,
-                    &settled.issue,
-                    parent,
-                    &scopes,
-                    &by_name,
-                    page.now,
-                );
+                let (mut next, changes) =
+                    update(&current, &settled.issue, parent, &scopes, &people, page.now);
                 let mut changes = changes;
                 next.derived.pending_fields = crate::outbox::pending_fields(conn, id)?;
                 next.derived.has_conflict = crate::outbox::has_conflict(conn, id)?;
@@ -238,6 +252,9 @@ pub struct LinkOutput {
 }
 
 pub(crate) fn link_tx(tx: &mut WriteTx<'_>, input: LinkInput) -> Result<LinkOutput> {
+    let people =
+        crate::people::resolve_users(tx, &input.instance_id, users([&input.issue]), input.now)?;
+    let people = crate::people::resolver(&people);
     let local = tx.local();
     let conn = tx.conn();
     if let Some(other) = linked(conn, &input.instance_id, &input.issue.remote_id)?
@@ -263,7 +280,7 @@ pub(crate) fn link_tx(tx: &mut WriteTx<'_>, input: LinkInput) -> Result<LinkOutp
         None => None,
     };
     let (mut next, mut changes, mut lost) =
-        todo_core::remote::link_to(&current, &input.issue, parent, &by_name, input.now);
+        todo_core::remote::link_to(&current, &input.issue, parent, &people, input.now);
     // A field the instance keeps local stays the person's (ADR-0007): Jira's
     // is not theirs, and promote never sent it.
     for field in local.fields_of(&input.instance_id) {
@@ -368,6 +385,13 @@ pub struct ReconcileOutcome {
 }
 
 pub(crate) fn reconcile_tx(tx: &mut WriteTx<'_>, input: Reconcile) -> Result<ReconcileOutcome> {
+    let people = crate::people::resolve_users(
+        tx,
+        &input.instance_id,
+        users(input.out_of_scope.iter().filter_map(|(_, i)| i.as_ref())),
+        input.now,
+    )?;
+    let people = crate::people::resolver(&people);
     let pushes = tx.pushes();
     let local = tx.local();
     let conn = tx.conn();
@@ -398,7 +422,7 @@ pub(crate) fn reconcile_tx(tx: &mut WriteTx<'_>, input: Reconcile) -> Result<Rec
                     crate::outbox::settle_pull(conn, &current, issue, pushes, local, input.now)?;
                 suggested.extend(settled.suggested);
                 let (mut next, changes) =
-                    update(&current, &settled.issue, parent, &[], &by_name, input.now);
+                    update(&current, &settled.issue, parent, &[], &people, input.now);
                 next.derived.pending_fields = crate::outbox::pending_fields(conn, *id)?;
                 next.derived.has_conflict = crate::outbox::has_conflict(conn, *id)?;
                 next.derived.has_push_failure =

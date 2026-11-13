@@ -1640,3 +1640,163 @@ async fn two_promotes_of_one_todo_make_one_issue() {
     assert_eq!(issues.lock().unwrap().len(), 2, "one issue made");
     r.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn people_come_from_pulls_and_the_directory() {
+    use todo_proto::v1::people_service_client::PeopleServiceClient;
+    use todo_proto::v1::{
+        AddPersonRequest, BuildMeetingLinkRequest, ListPeopleRequest, ParseCaptureRequest,
+        SearchDirectoryRequest, person_ref,
+    };
+    let fake = FakeJira::start("pat").await;
+    let issues = Arc::new(Mutex::new(vec![issue_json(1, "One", "new", &at(9))]));
+    serve(&fake, issues);
+    fake.serve_users();
+    let r = start(&fake, "pat").await;
+    settled(&r, SyncState::Ok).await;
+    let mut people = PeopleServiceClient::new(r.channel().await);
+    let listed = people
+        .list_people(ListPeopleRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .people;
+    assert_eq!(
+        listed
+            .iter()
+            .map(|p| (p.display_name.as_str(), p.emails.clone()))
+            .collect::<Vec<_>>(),
+        [("Dana Example", vec!["dana@example.com".to_owned()])]
+    );
+    let dana = listed[0].id.clone();
+    let linked = linked(&r).await;
+    assert!(
+        matches!(&linked[0].assignee.as_ref().unwrap().r#ref, Some(person_ref::Ref::PersonId(id)) if *id == dana)
+    );
+
+    // The preview names who `~dana` is; capture stores it.
+    let mut items = ItemServiceClient::new(r.channel().await);
+    let draft = items
+        .parse_capture(ParseCaptureRequest {
+            text: "ping ~dana".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .draft
+        .unwrap();
+    assert_eq!(draft.waiting_person.unwrap().id, dana);
+    let todo = local(&r, "ask about the report ~dana").await;
+    assert!(matches!(
+        &todo.waiting.as_ref().unwrap().on.as_ref().unwrap().r#ref,
+        Some(person_ref::Ref::PersonId(id)) if *id == dana
+    ));
+    // The meeting invites her by address.
+    let link = items
+        .build_meeting_link(BuildMeetingLinkRequest {
+            ids: vec![todo.id.clone()],
+            subject: None,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(link.attendees, ["dana@example.com"]);
+
+    // The directory finds Jordan, on no issue, but not Dana, known already.
+    let found = people
+        .search_directory(SearchDirectoryRequest {
+            query: "j".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .users;
+    assert_eq!(
+        found
+            .iter()
+            .map(|u| u.display_name.as_str())
+            .collect::<Vec<_>>(),
+        ["Jordan Lee"]
+    );
+    let none = people
+        .search_directory(SearchDirectoryRequest {
+            query: "dana".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .users;
+    assert!(none.is_empty(), "{none:?}");
+    let jordan = people
+        .add_person(AddPersonRequest {
+            account_id: found[0].account_id.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .person
+        .unwrap();
+    assert_eq!(jordan.emails, ["jordan.lee@example.com"]);
+    // Now `~jordan` names them too.
+    let draft = items
+        .parse_capture(ParseCaptureRequest {
+            text: "ping ~jordan".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .draft
+        .unwrap();
+    assert_eq!(draft.waiting_person.unwrap().id, jordan.id);
+    let missing = people
+        .add_person(AddPersonRequest {
+            account_id: "JIRAUSER9".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), Code::NotFound);
+    assert_eq!(
+        missing.get_error_details().error_info().unwrap().reason,
+        "USER_NOT_FOUND"
+    );
+    let blank = people
+        .search_directory(SearchDirectoryRequest {
+            query: " ".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(blank.code(), Code::InvalidArgument);
+    r.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_directory_offline_says_try_again() {
+    use todo_proto::v1::SearchDirectoryRequest;
+    use todo_proto::v1::people_service_client::PeopleServiceClient;
+    let fake = FakeJira::start("pat").await;
+    serve(&fake, Arc::new(Mutex::new(vec![])));
+    let r = start(&fake, "pat").await;
+    settled(&r, SyncState::Ok).await;
+    // Jira goes away.
+    drop(fake);
+    let err = PeopleServiceClient::new(r.channel().await)
+        .search_directory(SearchDirectoryRequest {
+            query: "jordan".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::Unavailable, "{err:?}");
+    assert_eq!(
+        err.get_error_details().error_info().unwrap().reason,
+        "JIRA_UNAVAILABLE"
+    );
+    r.stop().await;
+}

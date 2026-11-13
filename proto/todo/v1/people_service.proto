@@ -1,0 +1,69 @@
+syntax = "proto3";
+
+package todo.v1;
+
+import "todo/v1/person.proto";
+
+// People (design 3.5): the tracker's users this database knows, which a
+// pull makes and keeps current, and the tracker's directory, for the
+// person who is on none of the issues that sync.
+service PeopleService {
+  // People matching query, best first: a whole name, username or email,
+  // then a word of one that starts with it, then one containing it. An
+  // empty query lists everyone by name.
+  rpc ListPeople(ListPeopleRequest) returns (ListPeopleResponse);
+  // NOT_FOUND / PERSON_NOT_FOUND (metadata person_id) for an id that names
+  // no one.
+  rpc GetPerson(GetPersonRequest) returns (GetPersonResponse);
+  // The tracker's directory for query (Data Center matches the start of a
+  // username, display name or email), active users only, without those
+  // already known here. Asks the tracker now: UNAVAILABLE /
+  // JIRA_UNAVAILABLE offline, FAILED_PRECONDITION / NO_INSTANCE with no
+  // [[instances]].
+  rpc SearchDirectory(SearchDirectoryRequest) returns (SearchDirectoryResponse);
+  // The Person of a directory user: read from the tracker and made (or
+  // brought up to date). NOT_FOUND / USER_NOT_FOUND when the tracker has no
+  // such user.
+  rpc AddPerson(AddPersonRequest) returns (AddPersonResponse);
+}
+
+message ListPeopleRequest {
+  string query = 1;
+  // 1 to 1000; 0 is 50.
+  uint32 limit = 2;
+}
+
+message ListPeopleResponse {
+  repeated Person people = 1;
+  // The revision this was read at.
+  uint64 revision = 2;
+}
+
+message GetPersonRequest {
+  string id = 1;
+}
+
+message GetPersonResponse {
+  Person person = 1;
+}
+
+message SearchDirectoryRequest {
+  // At least one character after trimming.
+  string query = 1;
+  // The instance to ask; empty is the first configured.
+  string instance_id = 2;
+}
+
+message SearchDirectoryResponse {
+  repeated DirectoryUser users = 1;
+}
+
+message AddPersonRequest {
+  // Empty is the first configured.
+  string instance_id = 1;
+  string account_id = 2;
+}
+
+message AddPersonResponse {
+  Person person = 1;
+}

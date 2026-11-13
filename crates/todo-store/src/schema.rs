@@ -48,6 +48,7 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0011_link_conflict.sql"),
         rebuilds: true,
     },
+    plain(include_str!("../migrations/0012_people.sql")),
 ];
 
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;

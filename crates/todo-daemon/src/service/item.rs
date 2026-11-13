@@ -39,6 +39,32 @@ const MAX_BATCH: usize = 1000;
 
 pub(crate) struct Items(pub(crate) Ctx);
 
+impl Items {
+    /// The draft of `text` as capture stores it (design 2.3): `~name` naming
+    /// exactly one known person is that person, and the answer says who, or
+    /// how many it named.
+    async fn draft(&self, text: &str, today: Date) -> Result<v1::CaptureDraft, Status> {
+        let mut draft = parse_capture(text, today);
+        let (people, _) = self.0.store.list_people().await.map_err(error::store)?;
+        let named = todo_core::resolve_waiting(&mut draft, &people);
+        let mut out = v1::CaptureDraft::from(&draft);
+        match named {
+            todo_core::Match::One(id) => {
+                out.waiting_person = people.iter().find(|p| p.id == id).map(v1::Person::from);
+            }
+            todo_core::Match::Many => {
+                let text = match draft.waiting.as_ref().map(|w| &w.on) {
+                    Some(todo_core::PersonRef::FreeText(t)) => t.clone(),
+                    _ => String::new(),
+                };
+                out.waiting_matches = todo_core::person::count_matches(&text, &people) as u32;
+            }
+            todo_core::Match::None => {}
+        }
+        Ok(out)
+    }
+}
+
 #[tonic::async_trait]
 impl ItemService for Items {
     async fn capture_item(
@@ -81,7 +107,7 @@ impl ItemService for Items {
             .transpose()?;
 
         let draft = parse_capture(&req.text, reference.date());
-        let parsed = v1::CaptureDraft::from(&draft);
+        let parsed = self.draft(&req.text, reference.date()).await?;
         let input = CaptureInput {
             request_id,
             draft,
@@ -104,7 +130,7 @@ impl ItemService for Items {
         let parsed = if created == reference.date() {
             parsed
         } else {
-            (&parse_capture(&req.text, created)).into()
+            self.draft(&req.text, created).await?
         };
         Ok(Response::new(CaptureItemResponse {
             item: Some(v1::Item::from(item)),
@@ -120,9 +146,8 @@ impl ItemService for Items {
         let req = request.into_inner();
         check_capture_length(&req.text)?;
         let reference = reference_time(req.reference_time.as_ref(), &Zoned::now())?;
-        let draft = parse_capture(&req.text, reference.date());
         Ok(Response::new(ParseCaptureResponse {
-            draft: Some((&draft).into()),
+            draft: Some(self.draft(&req.text, reference.date()).await?),
         }))
     }
 
@@ -496,7 +521,15 @@ impl ItemService for Items {
             }
             items.push(item);
         }
-        let m = todo_core::meeting::meeting(&items, req.subject.as_deref(), &|_| Vec::new());
+        let (people, _) = self.0.store.list_people().await.map_err(error::store)?;
+        let emails = |id: todo_core::PersonId| {
+            people
+                .iter()
+                .find(|p| p.id == id)
+                .map(|p| p.emails.clone())
+                .unwrap_or_default()
+        };
+        let m = todo_core::meeting::meeting(&items, req.subject.as_deref(), &emails);
         Ok(Response::new(BuildMeetingLinkResponse {
             url: m.teams_url(),
             subject: m.subject,

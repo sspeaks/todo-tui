@@ -840,6 +840,48 @@ impl TryFrom<v1::Item> for core::Item {
     }
 }
 
+// ---- people -------------------------------------------------------------
+
+impl From<&core::Person> for v1::Person {
+    fn from(p: &core::Person) -> Self {
+        v1::Person {
+            id: p.id.to_string(),
+            display_name: p.display_name.clone(),
+            username: p.username.clone(),
+            emails: p.emails.clone(),
+            identities: p
+                .identities
+                .iter()
+                .map(|i| v1::PersonIdentity {
+                    instance_id: i.instance_id.clone(),
+                    account_id: i.account_id.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl TryFrom<&v1::Person> for core::Person {
+    type Error = ConvertError;
+
+    fn try_from(p: &v1::Person) -> Result<Self> {
+        Ok(core::Person {
+            id: parse_id("person.id", &p.id)?,
+            display_name: p.display_name.clone(),
+            username: p.username.clone(),
+            emails: p.emails.clone(),
+            identities: p
+                .identities
+                .iter()
+                .map(|i| core::Identity {
+                    instance_id: i.instance_id.clone(),
+                    account_id: i.account_id.clone(),
+                })
+                .collect(),
+        })
+    }
+}
+
 // ---- field values -------------------------------------------------------
 
 impl From<&core::suggestion::Suggestion> for v1::Suggestion {
@@ -1328,6 +1370,9 @@ impl From<&core::CaptureDraft> for v1::CaptureDraft {
             recurrence: d.recurrence.as_ref().map(Into::into),
             recurrence_first: d.recurrence_first.map(date_to_proto),
             energy: d.energy.to_i32(),
+            // The daemon fills these in from the people it knows.
+            waiting_person: None,
+            waiting_matches: 0,
         }
     }
 }
