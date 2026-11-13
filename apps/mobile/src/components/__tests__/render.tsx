@@ -2,7 +2,7 @@
 // layout gives it: a ready session, the store, the clients, the snackbar
 // and the outbox.
 import { FakeDaemon } from "@todo-tui/client/fake";
-import { type ItemSchema, LiveStore, type MessageInitShape, createClients } from "@todo-tui/client/portable";
+import { type ItemSchema, LiveStore, type MessageInitShape, type StoreCache, type Transport, createClients } from "@todo-tui/client/portable";
 import { ClientsProvider, LiveStoreProvider } from "@todo-tui/client/react";
 import { act, render } from "@testing-library/react-native";
 import type { ReactElement } from "react";
@@ -20,10 +20,19 @@ export async function stopStores(): Promise<void> {
 
 export const URL = "https://mac.tail1.ts.net";
 
-export async function renderOn(items: MessageInitShape<typeof ItemSchema>[], ui: ReactElement, opts: { link?: Link; down?: boolean } = {}) {
-  const daemon = new FakeDaemon(items);
+/**
+ * `daemon` instead of a new one on `items`; `cache`, what the store shows
+ * until it loads (as at a launch); `transport`, the store's way to the
+ * daemon (one that holds its calls, say).
+ */
+export async function renderOn(
+  items: MessageInitShape<typeof ItemSchema>[],
+  ui: ReactElement,
+  opts: { link?: Link; down?: boolean; daemon?: FakeDaemon; cache?: StoreCache; transport?: Transport } = {},
+) {
+  const daemon = opts.daemon ?? new FakeDaemon(items);
   daemon.down = opts.down ?? false;
-  const store = new LiveStore({ transport: daemon.transport, debounceMs: 0, backoff: { initialMs: 10, maxMs: 20 } });
+  const store = new LiveStore({ transport: opts.transport ?? daemon.transport, debounceMs: 0, backoff: { initialMs: 10, maxMs: 20 }, ...(opts.cache && { cache: opts.cache }) });
   stores.push(store);
   store.start();
   const clients = createClients(daemon.transport);

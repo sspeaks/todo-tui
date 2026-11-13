@@ -5,13 +5,16 @@
 // 30 s while the app is not in the background. A refused token unpairs.
 // The store is dropped in the background (iOS suspends its stream anyway)
 // and made afresh on return, with the session still ready, so the screens
-// (and where you were) stay mounted.
+// (and where you were) stay mounted. A new store shows what the last one
+// showed until the computer answers: on return, the old store's rows; at
+// launch, the cache kept on the phone (./cache).
 import {
   ClientKind,
   type GetServerInfoResponse,
   LiveStore,
   type Pairing,
   REMOTE_API_MINOR,
+  type StoreCache,
   type TodoClients,
   type Transport,
   connectRemote,
@@ -21,6 +24,7 @@ import {
 import { fetch as expoFetch } from "expo/fetch";
 import { createContext, type ReactNode, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { AppState } from "react-native";
+import { clearCache, loadCache } from "./cache";
 import { describeError, isUnauthenticated } from "./errors";
 import { clearPairing, loadPairing, savePairing } from "./pairing";
 
@@ -63,9 +67,9 @@ export function useSession(): SessionApi {
 
 const fetch = expoFetch as unknown as typeof globalThis.fetch;
 
-/** A started store on `conn`: it reconnects with backoff on its own. */
-function storeOf(conn: Conn): LiveStore {
-  const store = new LiveStore({ transport: conn.transport });
+/** A started store on `conn`, showing `cache` until it loads: it reconnects with backoff on its own. */
+function storeOf(conn: Conn, cache?: StoreCache): LiveStore {
+  const store = new LiveStore({ transport: conn.transport, ...(cache && { cache }) });
   store.start();
   return store;
 }
@@ -87,6 +91,8 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   const attempt = useRef(0);
   const retryTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const failures = useRef(0);
+  /** The app has been in the background since the store was made: on return it is made afresh. */
+  const away = useRef(false);
   const clearRetry = useCallback(() => {
     if (retryTimer.current !== undefined) clearTimeout(retryTimer.current);
     retryTimer.current = undefined;
@@ -106,7 +112,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       clearRetry();
       const s = current.current;
       if (s.state === "ready") void s.store.stop();
-      await clearPairing();
+      await Promise.all([clearPairing(), clearCache().catch(() => {})]);
       setSession(message === undefined ? { state: "unpaired" } : { state: "unpaired", message });
     },
     [clearRetry, setSession],
@@ -146,11 +152,11 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     [clearRetry, setLink, unpair],
   );
 
-  /** Ready on `p` at once, saying hello in the background unless `link` is already ok. */
+  /** Ready on `p` at once (showing `cache` until the store loads), saying hello in the background unless `link` is already ok. */
   const start = useCallback(
-    (p: Pairing, link: Link = { state: "checking" }) => {
+    (p: Pairing, link: Link = { state: "checking" }, cache?: StoreCache) => {
       const conn = connOf(p);
-      setSession({ state: "ready", pairing: p, conn, store: storeOf(conn), link });
+      setSession({ state: "ready", pairing: p, conn, store: storeOf(conn, cache), link });
       failures.current = 0;
       if (link.state !== "ok") void hello();
     },
@@ -158,16 +164,21 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   );
 
   useEffect(() => {
-    void loadPairing().then((p) => (p ? start(p) : setSession({ state: "unpaired" })));
+    void Promise.all([loadPairing(), loadCache()]).then(([p, kept]) =>
+      p ? start(p, undefined, kept?.url === p.url ? kept.cache : undefined) : setSession({ state: "unpaired" }),
+    );
     const sub = AppState.addEventListener("change", (state) => {
       const s = current.current;
       if (s.state !== "ready") return;
-      if (state === "active") {
+      // Only back from the background: back from inactive (Control Center, a call's banner) the stream never stopped.
+      if (state === "active" && away.current) {
+        away.current = false;
         void s.store.stop();
-        setSession({ ...s, store: storeOf(s.conn) });
+        setSession({ ...s, store: storeOf(s.conn, s.store.toCache()) });
         failures.current = 0;
         void hello();
       } else if (state === "background") {
+        away.current = true;
         clearRetry();
         void s.store.stop();
       }

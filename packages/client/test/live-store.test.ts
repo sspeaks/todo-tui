@@ -1,4 +1,4 @@
-import { create } from "@bufbuild/protobuf";
+import { create, equals } from "@bufbuild/protobuf";
 import { SyncState } from "../src/gen/todo/v1/sync_service_pb.js";
 import { Code, ConnectError, type Transport, createClient } from "@connectrpc/connect";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -10,7 +10,8 @@ import { ItemService } from "../src/gen/todo/v1/item_service_pb.js";
 import type { SubscribeResponse } from "../src/gen/todo/v1/watch_service_pb.js";
 import { FakeDaemon } from "../src/fake-daemon.js";
 import { MAX_PAGE_SIZE } from "../src/limits.js";
-import { LiveStore, type LiveStoreOptions } from "../src/live-store.js";
+import { LiveStore, type LiveStoreOptions, type StoreCache } from "../src/live-store.js";
+import { decodeStoreCache, encodeStoreCache } from "../src/store-cache.js";
 import { RelationKind } from "../src/gen/todo/v1/relation_pb.js";
 import { SuggestionKind, SuggestionSource } from "../src/gen/todo/v1/suggestion_pb.js";
 import { addRelation, deleteItem, removeRelation, setStatus, undeleteItem, undo } from "../src/mutations.js";
@@ -953,5 +954,156 @@ describe("LiveStore Suggestions", () => {
     await waitFor(() => store.getConnection().state === "live" && store.getConnection().revision === 3n);
     await waitFor(() => !ids(store).includes(s.id));
     stop();
+  });
+});
+
+describe("LiveStore caches", () => {
+  const inboxOf = (daemon: FakeDaemon) => [...daemon.views.values()].find((v) => v.seed === "inbox")!.id;
+  const shown = (store: LiveStore, daemon: FakeDaemon) => store.view({ viewId: inboxOf(daemon) }).getSnapshot();
+
+  /** What a store that went live on `daemon`, showing the Inbox and the counts, caches. */
+  async function cacheOf(daemon: FakeDaemon): Promise<StoreCache> {
+    const first = new LiveStore({ transport: daemon.transport, debounceMs: 20, backoff: { initialMs: 10, maxMs: 40 } });
+    stores.push(first);
+    const inbox = first.view({ viewId: inboxOf(daemon) });
+    const unsubscribe = [inbox.subscribe(() => {}), first.subscribeCounts(() => {})];
+    first.start();
+    await waitFor(() => first.getConnection().state === "live" && inbox.getSnapshot().status === "ready" && first.getCounts().status === "ready");
+    expect(first.getConnection().cached).toBe(false);
+    const cache = first.toCache();
+    for (const u of unsubscribe) u();
+    await first.stop();
+    return cache;
+  }
+
+  function restored(daemon: FakeDaemon, cache: StoreCache, opts: Partial<LiveStoreOptions> = {}) {
+    const store = new LiveStore({ transport: daemon.transport, debounceMs: 20, backoff: { initialMs: 10, maxMs: 40 }, viewGraceMs: 200, cache, ...opts });
+    stores.push(store);
+    return store;
+  }
+
+  /** Observes the Inbox on `store` and starts it. */
+  function startOn(store: LiveStore, daemon: FakeDaemon) {
+    const unsubscribe = store.view({ viewId: inboxOf(daemon) }).subscribe(() => {});
+    store.start();
+    return unsubscribe;
+  }
+
+  it("caches nothing it has not loaded", () => {
+    const { store } = setup(2);
+    store.view();
+    expect(store.toCache()).toEqual({ views: [], lists: [], items: [] });
+  });
+
+  it("shows a cache at once, before it starts", async () => {
+    const { daemon } = setup(3);
+    const cache = await cacheOf(daemon);
+    const calls = { ...daemon.calls, subscribe: daemon.calls.subscribe.length };
+    const store = restored(daemon, cache);
+
+    expect(store.getConnection().cached).toBe(true);
+    expect(store.getViews().status).toBe("ready");
+    expect(store.getViews().views.map((v) => v.id)).toEqual([...daemon.views.values()].sort((a, b) => a.position - b.position).map((v) => v.id));
+    expect(shown(store, daemon).status).toBe("ready");
+    expect(shown(store, daemon).items.map((i) => i.title).sort()).toEqual(["item 0", "item 1", "item 2"]);
+    expect(store.getCounts()).toMatchObject({ status: "ready", counts: { inbox: 3 } });
+    // The daemon's today is not kept: a night makes it wrong.
+    expect(store.getCounts().today).toBeUndefined();
+    expect(daemon.calls.listItems).toBe(calls.listItems);
+    expect(daemon.calls.subscribe.length).toBe(calls.subscribe);
+  });
+
+  it("has the daemon's answer replace the cache, dropping what it no longer shows", async () => {
+    const { daemon } = setup(3);
+    const cache = await cacheOf(daemon);
+    const [a, b] = cache.items;
+    daemon.update(a!.id, { title: "retitled" });
+    daemon.remove(b!.id);
+    daemon.put({ title: "added" });
+    const store = restored(daemon, cache);
+    const stop = startOn(store, daemon);
+
+    await waitFor(() => !store.getConnection().cached);
+    const titles = shown(store, daemon).items.map((i) => i.title);
+    expect(titles).toContain("retitled");
+    expect(titles).toContain("added");
+    expect(titles).not.toContain(b!.title);
+    expect(store.getItem(b!.id)).toBeUndefined();
+    expect(store.getCounts().status).toBe("ready");
+    stop();
+  });
+
+  it("keeps showing the cache while the daemon is out of reach", async () => {
+    const { daemon } = setup(2);
+    const cache = await cacheOf(daemon);
+    daemon.down = true;
+    const store = restored(daemon, cache);
+    const stop = startOn(store, daemon);
+
+    await waitFor(() => store.getConnection().state === "reconnecting" && store.getConnection().attempt >= 2);
+    expect(store.getConnection().cached).toBe(true);
+    expect(shown(store, daemon)).toMatchObject({ status: "ready" });
+    expect(shown(store, daemon).items).toHaveLength(2);
+    expect(store.getViews().status).toBe("ready");
+    expect(store.getViews().views.length).toBeGreaterThan(0);
+
+    daemon.down = false;
+    daemon.put({ title: "while away" });
+    await waitFor(() => store.getConnection().state === "live");
+    expect(store.getConnection().cached).toBe(false);
+    await waitFor(() => shown(store, daemon).items.some((i) => i.title === "while away"));
+    stop();
+  });
+
+  it("lets a restored database whose revisions went backwards replace the cached Items", async () => {
+    const { daemon } = setup(2);
+    const ids = [...daemon.items.keys()];
+    for (let i = 0; i < 8; i++) daemon.update(ids[0]!, { title: `edit ${i}` });
+    const cache = await cacheOf(daemon);
+    const [x, y] = ids.map((id) => cache.items.find((i) => i.id === id)!);
+    expect(x!.title).toBe("edit 7");
+    daemon.restore(3n, [create(ItemSchema, { ...x!, title: "restored", revision: 3n }), create(ItemSchema, { ...y!, revision: 2n })]);
+    const store = restored(daemon, cache);
+    const stop = startOn(store, daemon);
+
+    await waitFor(() => !store.getConnection().cached);
+    expect(store.getItem(x!.id)?.title).toBe("restored");
+    stop();
+  });
+
+  it("loads the cached views in its baseline, and drops one nothing observes", async () => {
+    const { daemon } = setup(2);
+    const cache = await cacheOf(daemon);
+    const listed = daemon.calls.listItems;
+    const subscribed = daemon.calls.subscribe.length;
+    const store = restored(daemon, cache, { viewGraceMs: 30 });
+    store.start();
+
+    await waitFor(() => daemon.calls.subscribe.length > subscribed);
+    // The Inbox, read before Subscribe though no one has asked for it yet.
+    expect(daemon.calls.listItems).toBe(listed + 1);
+    await waitFor(() => store.getConnection().state === "live");
+    await sleep(60);
+    daemon.put({ title: "later" });
+    await sleep(80);
+    expect(daemon.calls.listItems).toBe(listed + 1);
+  });
+
+  it("encodes a cache as JSON and back, and reads anything else as none", async () => {
+    const { daemon } = setup(3);
+    const cache = await cacheOf(daemon);
+    const json = JSON.parse(JSON.stringify(encodeStoreCache(cache))) as Record<string, unknown>;
+    const back = decodeStoreCache(json)!;
+
+    expect(back.lists).toEqual(cache.lists);
+    expect(back.items).toHaveLength(cache.items.length);
+    back.items.forEach((item, i) => expect(equals(ItemSchema, item, cache.items[i]!)).toBe(true));
+    expect(back.views.map((v) => v.id)).toEqual(cache.views.map((v) => v.id));
+    expect([...back.counts!.views]).toEqual([...cache.counts!.views]);
+    expect(back.counts!.counts?.inbox).toBe(3);
+    expect(shown(restored(daemon, back), daemon).items.map((i) => i.title).sort()).toEqual(["item 0", "item 1", "item 2"]);
+
+    for (const bad of [undefined, null, "x", {}, { ...json, v: 2 }, { ...json, items: [42] }, { ...json, items: ["/w=="] }, { ...json, lists: [{ key: 1 }] }])
+      expect(decodeStoreCache(bad)).toBeUndefined();
   });
 });

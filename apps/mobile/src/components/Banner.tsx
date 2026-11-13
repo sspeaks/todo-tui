@@ -5,21 +5,27 @@ import { describeError } from "../errors";
 import { useSession } from "../session";
 import { size, space, type Theme, useTheme } from "../theme";
 
+/** What the banner says, when it shows: the computer out of reach, or its todo too old. */
+export function useBannerText(): { text: string; tooOld: boolean } | undefined {
+  const conn = useConnection();
+  const { session } = useSession();
+  const link = session.state === "ready" ? session.link : undefined;
+  if (link?.state === "too-old") return { text: link.message, tooOld: true };
+  if (link?.state === "unreachable" || (conn.state === "reconnecting" && conn.attempt > 1)) {
+    const why = link?.state === "unreachable" ? link.message : conn.error ? describeError(conn.error) : "Reconnecting…";
+    return { text: `${why} What you add is kept on this phone until then.`, tooOld: false };
+  }
+  return undefined;
+}
+
 /** Why the list may be stale: the computer out of reach, or its todo too old. Tap to retry now. */
 export function Banner() {
   const t = useTheme();
   const s = styles(t);
-  const conn = useConnection();
-  const { session, retry } = useSession();
-  const link = session.state === "ready" ? session.link : undefined;
-  let text: string | undefined;
-  const tooOld = link?.state === "too-old";
-  if (tooOld) text = link.message;
-  else if (link?.state === "unreachable" || (conn.state === "reconnecting" && conn.attempt > 1)) {
-    const why = link?.state === "unreachable" ? link.message : conn.error ? describeError(conn.error) : "Reconnecting…";
-    text = `${why} What you add is kept on this phone until then.`;
-  }
-  if (!text) return null;
+  const { retry } = useSession();
+  const banner = useBannerText();
+  if (!banner) return null;
+  const { text, tooOld } = banner;
   return (
     <Pressable onPress={retry} style={({ pressed }) => [s.banner, pressed && s.pressed]} accessibilityRole="button" accessibilityHint="Tries again now">
       <View style={s.edge} />

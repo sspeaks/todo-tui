@@ -85,7 +85,9 @@ over Tailscale.
   `todo daemon` with `TODO_NO_SPAWN` that finds the lock held fails. A VM test
   (`checks.<linux>.module`) exercises it.
 - **Scope.** The phone is a thin client of one daemon. When the laptop is asleep the
-  app has no data. This is not multi-device sync, which stays a non-goal.
+  app shows the list as it last saw it, kept on the phone to show at launch until the
+  daemon answers, and only adds work (the outbox). This is not multi-device sync,
+  which stays a non-goal.
 
 ## Risks to retire early
 

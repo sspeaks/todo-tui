@@ -8,16 +8,19 @@ import * as SplashScreen from "expo-splash-screen";
 import { StatusBar } from "expo-status-bar";
 import { type ReactNode, useEffect, useState } from "react";
 import { SafeAreaProvider } from "react-native-safe-area-context";
+import { CacheWriter } from "../cache";
 import { OutboxProvider } from "../outbox";
 import { SessionProvider, useSession } from "../session";
 import { SnackProvider } from "../snack";
 import { fallBackToSystemMono, useTheme } from "../theme";
 
-// The splash stays up until the mono font is in (in global scope, as the
-// splash screen docs ask: from a component it can be too late).
+// The splash stays up until the mono font is in and the session has read
+// the pairing and the kept list, so the list shows with no spinner before
+// it (in global scope, as the splash screen docs ask: from a component it
+// can be too late).
 void SplashScreen.preventAutoHideAsync().catch(() => {});
 
-/** How long the splash waits for the font before the system's mono is used instead. */
+/** How long the splash waits for the font (and the session) before the system's mono is used instead. */
 const FONT_WAIT_MS = 3_000;
 
 export default function RootLayout() {
@@ -31,49 +34,61 @@ export default function RootLayout() {
   const fallBack = !loaded && (error !== null || gaveUp);
   if (fallBack) fallBackToSystemMono();
   const ready = loaded || fallBack;
+  // The session reads the keychain and the kept list while the font loads; it renders no text.
+  return (
+    <SessionProvider>
+      <HideSplash ready={ready} gaveUp={gaveUp} />
+      {ready ? <Screens /> : null}
+    </SessionProvider>
+  );
+}
+
+/** Hides the splash once the font is ready and the session knows what to show (or it has waited FONT_WAIT_MS). */
+function HideSplash({ ready, gaveUp }: { ready: boolean; gaveUp: boolean }) {
+  const { session } = useSession();
+  const hide = ready && (session.state !== "loading" || gaveUp);
   useEffect(() => {
-    if (ready) SplashScreen.hide();
-  }, [ready]);
-  if (!ready) return null;
-  return <Screens />;
+    if (hide) SplashScreen.hide();
+  }, [hide]);
+  return null;
 }
 
 function Screens() {
   const t = useTheme();
   return (
     <SafeAreaProvider>
-      <SessionProvider>
-        <StatusBar style="auto" />
-        <Connected>
-          <Stack
-            screenOptions={{
-              headerStyle: { backgroundColor: t.bg },
-              headerTintColor: t.text,
-              headerTitleStyle: t.monoBold,
-              headerShadowVisible: false,
-              contentStyle: { backgroundColor: t.bg },
-            }}
-          >
-            <Stack.Screen name="(tabs)" options={{ headerShown: false, title: "todo" }} />
-            <Stack.Screen name="pair" options={{ title: "Pair with your computer" }} />
-            <Stack.Screen name="item/[id]" options={{ title: "" }} />
-          </Stack>
-        </Connected>
-      </SessionProvider>
+      <StatusBar style="auto" />
+      <Connected>
+        <Stack
+          screenOptions={{
+            headerStyle: { backgroundColor: t.bg },
+            headerTintColor: t.text,
+            headerTitleStyle: t.monoBold,
+            headerShadowVisible: false,
+            contentStyle: { backgroundColor: t.bg },
+          }}
+        >
+          <Stack.Screen name="(tabs)" options={{ headerShown: false, title: "todo" }} />
+          <Stack.Screen name="pair" options={{ title: "Pair with your computer" }} />
+          <Stack.Screen name="item/[id]" options={{ title: "" }} />
+        </Stack>
+      </Connected>
     </SafeAreaProvider>
   );
 }
 
 /**
  * While connected, every screen gets the store, the RPC clients and the
- * snackbar. Coming back from the background swaps in a new store with the
- * session still ready, so the screens stay mounted.
+ * snackbar, and the list is kept for the next launch. Coming back from the
+ * background swaps in a new store with the session still ready, so the
+ * screens stay mounted.
  */
 function Connected({ children }: { children: ReactNode }) {
   const { session } = useSession();
   if (session.state !== "ready") return children;
   return (
     <LiveStoreProvider store={session.store}>
+      <CacheWriter store={session.store} url={session.pairing.url} />
       <ClientsProvider clients={session.conn}>
         <SnackProvider>
           <OutboxProvider url={session.pairing.url}>{children}</OutboxProvider>

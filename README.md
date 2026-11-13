@@ -777,8 +777,9 @@ once it is back. Tap an item to edit its title, status,
 priority, due date, repeat, labels, waiting on and follow-up, hide-until date and
 notes, or to delete it. Every change can be undone from the snackbar. On a Jira
 item the same edits reach Jira as they do from the TUI ([Jira sync](#jira-sync)),
-and one assigned to someone else asks first. It is a thin client: it shows nothing while your
-computer is asleep or off the tailnet.
+and one assigned to someone else asks first. It is a thin client: it keeps only the list it
+last showed, so a launch shows that at once (the header says `updating…` until your computer
+answers), and so does a launch while your computer is asleep or off the tailnet.
 
 Set it up once on the computer:
 

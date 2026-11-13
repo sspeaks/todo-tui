@@ -1,5 +1,5 @@
-import { type MessageInitShape, create, toBinary } from "@bufbuild/protobuf";
-import { base64Encode } from "@bufbuild/protobuf/wire";
+import { type MessageInitShape, create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { base64Decode, base64Encode } from "@bufbuild/protobuf/wire";
 import { Code, type Client, ConnectError, type Transport, createClient } from "@connectrpc/connect";
 import { ErrorInfoSchema } from "./gen/google/rpc/error_details_pb.js";
 import type { Date as ProtoDate } from "./gen/google/type/date_pb.js";
@@ -36,6 +36,8 @@ export interface ConnectionSnapshot {
   /** Consecutive failed attempts since the stream was last healthy. */
   readonly attempt: number;
   readonly error?: unknown;
+  /** What the store shows came from a cache (LiveStoreOptions.cache) that no baseline has replaced yet. */
+  readonly cached: boolean;
 }
 
 export interface ViewSnapshot {
@@ -97,8 +99,43 @@ export interface UndoSnapshot {
   readonly error?: unknown;
 }
 
+/**
+ * What a store showed, for a store made later to show at once
+ * (LiveStoreOptions.cache), e.g. at an app's next launch: the saved views,
+ * each loaded view's rows and their Items, and the counts.
+ */
+export interface StoreCache {
+  /** The saved views, in tab order. */
+  readonly views: readonly View[];
+  /** Each view's rows, by its viewKey. */
+  readonly lists: readonly { readonly key: string; readonly ids: readonly string[] }[];
+  /** Every Item the lists hold. */
+  readonly items: readonly Item[];
+  /** Not the daemon's today: a night makes it wrong. */
+  readonly counts?: { readonly counts?: StatusCounts; readonly views: ReadonlyMap<string, number> };
+}
+
+const requestOf = (query: ViewQuery): ListItemsRequest =>
+  create(ListItemsRequestSchema, {
+    ...(query.filter !== undefined && { filter: query.filter }),
+    ...(query.sort !== undefined && { sort: query.sort }),
+    ...(query.viewId !== undefined && { viewId: query.viewId }),
+  });
+
+const keyOf = (request: ListItemsRequest): string => base64Encode(toBinary(ListItemsRequestSchema, request));
+
+/** The key a query's view goes by: equal queries share one, and a StoreCache's lists are keyed by it. */
+export const viewKey = (query: ViewQuery): string => keyOf(requestOf(query));
+
 export interface LiveStoreOptions {
   transport: Transport;
+  /**
+   * Shown until the baseline replaces it, so a new store need not start
+   * empty: the daemon's answers always win (nothing from the cache counts as
+   * seen at any revision), and the cached views are loaded in the baseline.
+   * A cached view nothing observes is dropped after viewGraceMs, as any.
+   */
+  cache?: StoreCache;
   /** Delay before re-running a view's ListItems, or the counts, after changes (default 150). */
   debounceMs?: number;
   /** Reconnect backoff: initialMs doubling up to maxMs (default 100 / 5000). */
@@ -177,7 +214,7 @@ export class LiveStore {
   /** Set while a ResyncRequired reload has not completed; retried on CaughtUp. */
   private pendingResync = false;
   private version = 0;
-  private conn: ConnectionSnapshot = { state: "idle", revision: 0n, attempt: 0 };
+  private conn: ConnectionSnapshot = { state: "idle", revision: 0n, attempt: 0, cached: false };
   private abort: AbortController | undefined;
   private runLoop: Promise<void> | undefined;
 
@@ -202,6 +239,56 @@ export class LiveStore {
     this.liveCounts = new LiveCounts(this);
     this.undoState = new LiveUndoState(this);
     this.suggestions = new LiveSuggestions(this);
+    if (opts.cache) this.restore(opts.cache);
+  }
+
+  /** Shows a cache until the baseline replaces it. */
+  private restore(cache: StoreCache): void {
+    for (const view of cache.views) this.savedViews.set(view.id, view);
+    this.savedViewsChanged("ready");
+    for (const item of cache.items) this.items.set(item.id, item);
+    for (const { key, ids } of cache.lists) {
+      let request: ListItemsRequest;
+      try {
+        request = fromBinary(ListItemsRequestSchema, base64Decode(key));
+      } catch {
+        continue;
+      }
+      // Keyed afresh, as view() keys it, in case an older app wrote the key.
+      const view = new LiveView(this, keyOf(request), request);
+      this.views.set(view.key, view);
+      view.restore(ids);
+    }
+    if (cache.counts) this.liveCounts.restore(cache.counts);
+    this.conn = { ...this.conn, cached: true };
+  }
+
+  /**
+   * What the store shows, for LiveStoreOptions.cache: the saved views once
+   * loaded, every view that has loaded (and whose saved view still exists)
+   * with its Items, and the counts once loaded.
+   */
+  toCache(): StoreCache {
+    const lists: { key: string; ids: string[] }[] = [];
+    const items = new Map<string, Item>();
+    for (const [key, view] of this.views) {
+      if (!view.cacheable) continue;
+      const ids: string[] = [];
+      for (const id of view.ids) {
+        const item = this.items.get(id);
+        if (!item) continue;
+        ids.push(id);
+        items.set(id, item);
+      }
+      lists.push({ key, ids });
+    }
+    const counts = this.liveCounts.toCache();
+    return {
+      views: this.savedSnap.status === "ready" ? this.savedSnap.views : [],
+      lists,
+      items: [...items.values()],
+      ...(counts && { counts }),
+    };
   }
 
   /** The transport the store reads through, for clients beside it. */
@@ -329,12 +416,8 @@ export class LiveStore {
    * nothing observes it, as for a search typed one key at a time.
    */
   view(query: ViewQuery = {}, opts: { graceMs?: number } = {}): LiveView {
-    const request = create(ListItemsRequestSchema, {
-      ...(query.filter !== undefined && { filter: query.filter }),
-      ...(query.sort !== undefined && { sort: query.sort }),
-      ...(query.viewId !== undefined && { viewId: query.viewId }),
-    });
-    const key = base64Encode(toBinary(ListItemsRequestSchema, request));
+    const request = requestOf(query);
+    const key = keyOf(request);
     let view = this.views.get(key);
     if (!view) {
       view = new LiveView(this, key, request);
@@ -544,6 +627,13 @@ export class LiveStore {
       revs.length > 0
         ? revs.reduce((a, b) => (b < a ? b : a))
         : (await this.itemsClient.listItems({ pageSize: 1 })).revision;
+    if (this.conn.cached) {
+      // What only the cache brought, and no view now holds: the daemon no longer shows it.
+      const held = new Set<string>();
+      for (const v of this.views.values()) for (const id of v.ids) held.add(id);
+      for (const id of [...this.items.keys()]) if (!this.seen.has(id) && !held.has(id)) this.items.delete(id);
+      this.setConn({ cached: false });
+    }
   }
 
   /** Subscribes from the current revision; `onHealthy` runs when the stream gets its first message. */
@@ -769,7 +859,8 @@ export class LiveView {
 
   constructor(
     private readonly store: LiveStore,
-    private readonly key: string,
+    /** @internal The key view() keeps it by. */
+    readonly key: string,
     /** @internal */
     readonly request: ListItemsRequest,
   ) {}
@@ -787,6 +878,23 @@ export class LiveView {
 
   get needsLoad(): boolean {
     return !this.loaded || this.status === "error" || this.stale;
+  }
+
+  /** @internal Whether it has rows worth caching (LiveStore.toCache). */
+  get cacheable(): boolean {
+    return this.loaded && !this.viewGone;
+  }
+
+  /**
+   * @internal Shows a cache's rows: ready, but stale, so it is reloaded,
+   * and dropped after the grace period unless something observes it.
+   */
+  restore(ids: readonly string[]): void {
+    this.ids = ids;
+    this.status = "ready";
+    this.loaded = true;
+    this.stale = true;
+    this.grace = setTimeout(() => this.store.dropView(this.key), this.graceMs ?? this.store.viewGraceMs);
   }
 
   /** Runs ListItems; out-of-order responses are discarded. Returns the read revision. */
@@ -909,6 +1017,18 @@ class LiveCounts {
 
   get needsLoad(): boolean {
     return !this.loaded || this.snap.status === "error" || this.stale;
+  }
+
+  /** Shows a cache's counts: ready, but stale, so the next observer reloads them. */
+  restore(c: NonNullable<StoreCache["counts"]>): void {
+    this.snap = { status: "ready", ...(c.counts !== undefined && { counts: c.counts }), views: new Map(c.views), revision: 0n };
+    this.loaded = true;
+    this.stale = true;
+  }
+
+  toCache(): StoreCache["counts"] {
+    if (!this.loaded) return undefined;
+    return { ...(this.snap.counts !== undefined && { counts: this.snap.counts }), views: this.snap.views };
   }
 
   /** Runs GetStatusCounts; out-of-order responses are discarded. Returns the read revision. */

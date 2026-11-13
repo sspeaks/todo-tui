@@ -1,8 +1,11 @@
 // The home screen on the FakeDaemon: tabs, rows, adding with the buttons,
 // complete and undo, and opening an item.
-import { CreatedVia, Priority, Status } from "@todo-tui/client/portable";
-import { fireEvent, screen, waitFor, within } from "@testing-library/react-native";
+import { FakeDaemon } from "@todo-tui/client/fake";
+import { CreatedVia, LiveStore, Priority, Status, type StoreCache, type Transport } from "@todo-tui/client/portable";
+import { tabQuery } from "@todo-tui/present";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react-native";
 import { router, useNavigation } from "expo-router";
+import type { ReactElement } from "react";
 import { Home } from "../Home";
 import { renderOn, stopStores } from "./render";
 
@@ -113,4 +116,56 @@ test("says so when a view is empty, and why the list may be stale, in a card tha
   const banner = screen.getByText(/out of reach\. What you add is kept on this phone until then\./);
   await fireEvent.press(banner);
   expect(session.retry).toHaveBeenCalled();
+});
+
+/** What a store that showed the first tab of `daemon` keeps for the next launch. */
+async function keptFrom(daemon: FakeDaemon): Promise<StoreCache> {
+  const store = new LiveStore({ transport: daemon.transport, debounceMs: 0 });
+  const first = [...daemon.views.values()].sort((a, b) => a.position - b.position)[0]!.id;
+  const view = store.view(tabQuery(first));
+  const unsubscribe = view.subscribe(() => {});
+  store.start();
+  await waitFor(() => expect(view.getSnapshot().status).toBe("ready"));
+  const cache = store.toCache();
+  unsubscribe();
+  await store.stop();
+  return cache;
+}
+
+test("shows the list kept from last time at once, saying it is updating until the computer answers", async () => {
+  const { setOptions } = useNavigation() as unknown as { setOptions: jest.Mock };
+  const daemon = new FakeDaemon(items);
+  const cache = await keptFrom(daemon);
+  daemon.update(items[0]!.id, { title: "buy oat milk" });
+  // The computer is slow to answer: its calls wait until opened.
+  let open!: () => void;
+  const opened = new Promise<void>((resolve) => (open = resolve));
+  const transport = {
+    unary: async (...args: Parameters<Transport["unary"]>) => {
+      await opened;
+      return daemon.transport.unary(...args);
+    },
+    stream: async (...args: Parameters<Transport["stream"]>) => {
+      await opened;
+      return daemon.transport.stream(...args);
+    },
+  } as Transport;
+  setOptions.mockClear();
+  await renderOn([], <Home />, { daemon, cache, transport });
+
+  // No spinner: last time's rows, and the cue in the header.
+  expect(screen.getByText("buy milk")).toBeTruthy();
+  const last = () => setOptions.mock.lastCall?.[0] as { title: string; headerRight?: () => ReactElement };
+  expect(last().title).toBe("Inbox");
+  const Cue = last().headerRight!;
+  expect(Cue).toBeDefined();
+
+  open();
+  expect(await screen.findByText("buy oat milk")).toBeTruthy();
+  await waitFor(() => expect(last().headerRight).toBeUndefined());
+
+  // The cue shows only once the kept list has been up a moment: a quick answer shows none.
+  await render(<Cue />);
+  expect(screen.queryByText("updating…")).toBeNull();
+  expect(await screen.findByText("updating…")).toBeTruthy();
 });

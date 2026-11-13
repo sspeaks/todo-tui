@@ -52,6 +52,7 @@ export {
 export * from "./clients.js";
 export * from "./errors.js";
 export * from "./live-store.js";
+export * from "./store-cache.js";
 export * from "./ulid.js";
 export * from "./mutations.js";
 export * from "./queries.js";
