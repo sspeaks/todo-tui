@@ -103,8 +103,19 @@ export type Mode =
   | { readonly kind: "command"; readonly line: LineState; readonly back?: Extract<Mode, { kind: "suggestions" }> }
   /** `/`: the text narrowing the tab, live as it is typed. */
   | { readonly kind: "search"; readonly line: LineState }
-  /** `pending`: a prefix of one of help's own bindings (gg), when one is typed. */
-  | { readonly kind: "help"; readonly scroll: number; readonly pending?: readonly KeyToken[] }
+  /**
+   * `pending`: a prefix of one of help's own bindings (gg), when one is
+   * typed. `/` narrows the help to `query`'s rows: `line` while it is
+   * typed, `saved` the scroll from before, which esc goes back to.
+   */
+  | {
+      readonly kind: "help";
+      readonly scroll: number;
+      readonly pending?: readonly KeyToken[];
+      readonly query?: string;
+      readonly line?: LineState;
+      readonly saved?: number;
+    }
   /** :l48: the report's text, scrolled; `y` copies it. */
   | { readonly kind: "report"; readonly scroll: number; readonly text: string; readonly pending?: readonly KeyToken[] }
   /**

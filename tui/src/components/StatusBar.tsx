@@ -1,8 +1,9 @@
 import { type ConnectionSnapshot, type SyncStatus, useConnection, useSuggestions, useSyncStatus, useUndoState } from "@todo-tui/client";
 import { Box, Text } from "ink";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { stateColor, stateWord } from "../controller/sync.js";
 import { displayWidth, singleLine, truncate } from "../format/text.js";
+import { helpLines, searchWords } from "../keys/help.js";
 import { keyFor, keyPair } from "../keys/overrides.js";
 import { sequenceLabel } from "../keys/tokenize.js";
 import type { UiState } from "../state/types.js";
@@ -66,7 +67,8 @@ const joined = (...parts: string[]) => parts.filter(Boolean).join(" · ");
 function hints(s: UiState): string {
   switch (s.mode.kind) {
     case "help":
-      return joined(pair(s, "help_down", "help_up", "scroll"), hint(s, "help_close", "close"));
+      if (s.mode.line) return "enter keep · esc clear";
+      return joined(pair(s, "help_down", "help_up", "scroll"), hint(s, "help_search", "search"), hint(s, "help_close", "close"));
     case "report":
       return joined(hint(s, "report_copy", "copy"), pair(s, "report_down", "report_up", "scroll"), hint(s, "report_close", "close"));
     case "suggestions":
@@ -148,7 +150,20 @@ export function StatusBar({ width }: { width: number }) {
   const narrowed = state.narrow?.shown;
   const rows = listed?.items ?? [];
   const marks = marksLabel(state.marks, rows, narrowed !== undefined);
-  const narrow = narrowed === undefined ? "" : `/${truncate(singleLine(narrowed), 24)} · ${rows.length}`;
+  // In the help, its own search (the list's / is not what is on screen).
+  const helpQuery = state.mode.kind === "help" ? state.mode.query : undefined;
+  const helpFound = useMemo(
+    () => (helpQuery === undefined || !searchWords(helpQuery).length ? undefined : helpLines(state.keymap.bindings, helpQuery).filter((l) => l.kind === "row").length),
+    [helpQuery, state.keymap.bindings],
+  );
+  const narrow =
+    state.mode.kind === "help"
+      ? helpFound === undefined
+        ? ""
+        : `/${truncate(singleLine(helpQuery!.trim()), 24)} · ${helpFound}`
+      : narrowed === undefined
+        ? ""
+        : `/${truncate(singleLine(narrowed), 24)} · ${rows.length}`;
   const keys = ` ${hints(state)}`;
   const essential = [mode, conn, ...syncs.map((s) => s.text), suggestions, busy, marks, pending, narrow].filter(Boolean).join(" · ");
   const showKeys = displayWidth(essential) + displayWidth(keys) <= width;

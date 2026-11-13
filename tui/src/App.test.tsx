@@ -377,7 +377,7 @@ describe("help, commands and toasts", () => {
     await t.live();
     for (const open of ["?", "\x1bOP", "\x1b[15~", ":help\r"]) {
       t.type(open);
-      await t.waitFrame((f) => expect(f).toContain("Help · j/k scroll · esc close"));
+      await t.waitFrame((f) => expect(f).toContain("Help · j/k scroll · / search · esc close"));
       expect(t.frame()).toMatch(/j ↓\s+Next row/);
       expect(t.lines()).toHaveLength(12);
       await t.press("<esc>");
@@ -389,6 +389,56 @@ describe("help, commands and toasts", () => {
     await t.waitFrame((f) => expect(f).toContain("the next Nov 2"));
     expect(t.frame()).not.toContain("Help ·");
     expect(t.lines()[10]).toMatch(/^HELP · ● live/);
+  });
+
+  it("searches the help with /: the matching rows under their sections, the words lit up, the line on the message line", async () => {
+    const t = renderTui({ daemon: fakeDaemon(rows(2)), columns: 100, rows: 14 });
+    await t.live();
+    t.type("?/due");
+    // While typing, the title names no keys: they are text on the line.
+    await t.waitFrame((f) => expect(f.split("\n")[1]).toMatch(/^Help \/due · \d+ rows\s*$/));
+    const lines = t.lines();
+    expect(lines[13]).toBe("/due ");
+    expect(lines[12]).toMatch(/^HELP · ● live · \/due · \d+\s+enter keep · esc clear$/);
+    expect(t.frame()).toMatch(/\^\s+Set the due date/);
+    expect(t.frame()).not.toContain("Next row");
+    expect(t.frame()).toContain("Capture syntax");
+    // The word it found is lit up in the row, in any case.
+    const raw = t.raw().split("\n").find((l) => l.includes("Set the"));
+    expect(raw).toContain(`${YELLOW}`);
+    expect(raw).toMatch(/\x1b\[33m(\x1b\[1m)?due/);
+    // enter keeps it: the line goes, the hints are help's again.
+    await t.press("<enter>");
+    const found = /Help \/due · (\d+) rows/.exec(t.frame())?.[1];
+    // The status bar says what the help is narrowed to, as it does for the list's /.
+    await t.waitFrame(() => expect(t.lines()[12]).toMatch(new RegExp(`^HELP · ● live · /due · ${found}\\s+j/k scroll · / search · esc close$`)));
+    expect(t.lines()[13]?.trim()).toBe("");
+    expect(t.frame()).toMatch(/Help \/due · \d+ rows · j\/k scroll · esc close/);
+    // / edits the kept text again.
+    await t.press("/");
+    await t.waitFrame(() => expect(t.lines()[13]).toBe("/due "));
+    await t.press("<ctrl+u>zzqx");
+    await t.waitFrame((f) => expect(f.split("\n")[1]).toMatch(/^Help \/zzqx · no row matches\s*$/));
+    await t.press("<esc>");
+    await t.waitFrame((f) => expect(f).toContain("Help · j/k scroll · / search · esc close"));
+    expect(t.frame()).toContain("Next row");
+  });
+
+  it("lights up a section's name that a help search matched, and shows the help's search, not the list's /, in the status bar", async () => {
+    const t = renderTui({ daemon: fakeDaemon(rows(2)), columns: 100, rows: 14 });
+    await t.live();
+    t.type("/row 1\r");
+    await t.waitFrame(() => expect(t.lines()[12]).toMatch(/^NORMAL · ● live · \/row 1 · 1/));
+    t.type("?");
+    await t.waitFrame((f) => expect(f).toContain("Help · j/k scroll"));
+    expect(t.lines()[12]).not.toContain("/row 1");
+    t.type("/dates\r");
+    await t.waitFrame(() => expect(t.lines()[12]).toMatch(/^HELP · ● live · \/dates · \d+\s/));
+    const heading = t.raw().split("\n").find((l) => l.includes("Dates") && !l.includes("Help"));
+    expect(heading).toMatch(/\x1b\[33m(\x1b\[1m)?Dates/);
+    // Closing the help: the list's / is back in the status bar.
+    t.type("q");
+    await t.waitFrame(() => expect(t.lines()[12]).toMatch(/^NORMAL · ● live · \/row 1 · 1/));
   });
 
   it("drops the key hints before the mode, the connection or a pending prefix when they do not fit", async () => {

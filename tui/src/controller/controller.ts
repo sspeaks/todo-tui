@@ -38,6 +38,7 @@ import { UiStore } from "../state/ui-store.js";
 import { ItemActions } from "./actions.js";
 import { MAX_BULK, TOO_MANY } from "./bulk.js";
 import { DescriptionEditor, type EditorRunner, type Suspend, systemEditor } from "./editor.js";
+import { type HelpMode, helpSearchKey, openHelpSearch, typedHelp } from "./help-search.js";
 import { Narrowing } from "./narrow.js";
 import { stopSelf } from "./job.js";
 import { DEFAULT_TIMING, Pipeline, type Timing } from "./pipeline.js";
@@ -691,7 +692,7 @@ export class Controller {
       // alt+X (Ink's meta): a word edit in a line being typed, never an esc
       // that would throw the line away (Alt+Left, Alt+Backspace); ESC then X
       // typed within Ink's 20 ms elsewhere, and for a character (hard case 3).
-      const inLine = TEXT_MODES.has(mode.kind) ? altInLine(input) : "esc";
+      const inLine = TEXT_MODES.has(mode.kind) || (mode.kind === "help" && mode.line) ? altInLine(input) : "esc";
       if (inLine === "ignore") return;
       if (inLine === "esc") {
         this.queue.unshift([alt]);
@@ -702,6 +703,8 @@ export class Controller {
       case "normal":
         return this.normalKey(mode.pending, input);
       case "help":
+        if (mode.line) return this.helpSearchKey(mode, mode.line, input);
+        return this.overlayKey(mode, input);
       case "report":
       case "suggestions":
         return this.overlayKey(mode, input);
@@ -746,6 +749,12 @@ export class Controller {
     if (r.kind === "run") return this.runBinding(r.binding);
   }
 
+  /** A key on the help's search line (`/` in the help). */
+  private helpSearchKey(mode: HelpMode, line: LineState, key: KeyToken): void {
+    const next = helpSearchKey(mode, line, key, () => this.charRun(key));
+    if (next) this.setMode(next);
+  }
+
   /** The command line's keys; leaving it goes back to the pane it was opened from, if any. */
   private commandKey(mode: Extract<Mode, { kind: "command" }>, key: KeyToken): void | Promise<void> {
     const { line } = mode;
@@ -780,6 +789,9 @@ export class Controller {
         return this.viewEdits.paste(mode, text);
       case "search":
         return this.narrowing.paste(mode, text);
+      case "help":
+        if (mode.line) return this.setMode(typedHelp(mode, insert(mode.line, singleLine(text))));
+        return;
       case "confirm":
         // Anything but y cancels.
         return this.setMode(normalMode);
@@ -975,7 +987,8 @@ export class Controller {
       case "suspend":
         return this.suspendJob();
       case "narrow":
-        return this.narrowing.open();
+        // In the help, `/` searches it.
+        return this.state.mode.kind === "help" ? this.setMode(openHelpSearch(this.state.mode)) : this.narrowing.open();
       case "mark":
         return this.mark();
       case "visual":
@@ -1015,8 +1028,9 @@ export class Controller {
   private navigate(scroll: (offset: number, max: number) => number, list: (l: ListState, ids: readonly string[]) => Resolved): void {
     const { mode } = this.state;
     if (mode.kind === "help") {
-      const max = Math.max(0, helpLines(this.state.keymap.bindings).length - this.height);
-      return this.setMode({ kind: "help", scroll: clamp(scroll(mode.scroll, max), 0, max) });
+      const max = Math.max(0, helpLines(this.state.keymap.bindings, mode.query).length - this.height);
+      const { pending: _, ...rest } = mode;
+      return this.setMode({ ...rest, scroll: clamp(scroll(mode.scroll, max), 0, max) });
     }
     if (mode.kind === "report") {
       const max = Math.max(0, mode.text.trimEnd().split("\n").length - this.height);

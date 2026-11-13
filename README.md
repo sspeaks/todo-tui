@@ -366,7 +366,7 @@ key hints) and a message line for prompts and results.
 | **Commands** | |
 | `:` | Command line: `:q`, `:help`, `:search <words>`, `:refresh`, `:view …` ([Views](#views-of-your-own)), `:config`, `:export [path]`, `:l48 [since]`, `:meet`, `:sync [status\|outbox]`, `:suggestions`, `:refine`, `:promote [PROJECT]`, `:link KEY`; `tab` completes |
 | `gs` | Sync with Jira now |
-| `?`, F1, `:help` | Help: every key, the capture syntax and the dates |
+| `?`, F1, `:help` | Help: every key, the capture syntax and the dates; `/` in it searches as you type (`enter` keeps the search, `esc` clears it) |
 | `ctrl-z` | Suspend to the shell; `fg` comes back |
 | `q`, `ctrl-c` | Quit |
 

@@ -68,7 +68,7 @@ function Picker({ mode }: { mode: Extract<Mode, { kind: "picker" }> }) {
   );
 }
 
-/** The bottom line: the command line, a prompt, the status picker or the dd confirm while open, else the toast. */
+/** The bottom line: the command line, `/`, a prompt, the status picker or the dd confirm while open, else the toast. */
 export function MessageLine({ width }: { width: number }) {
   const mode = useUi((s) => s.mode);
   const toast = useUi((s) => s.toast);
@@ -76,6 +76,8 @@ export function MessageLine({ width }: { width: number }) {
   if (mode.kind === "command") {
     content = <Editor label=":" line={mode.line} width={width} />;
   } else if (mode.kind === "search") {
+    content = <Editor label="/" line={mode.line} width={width} />;
+  } else if (mode.kind === "help" && mode.line) {
     content = <Editor label="/" line={mode.line} width={width} />;
   } else if (mode.kind === "prompt") {
     content = <Editor label={`${PROMPT_LABELS[mode.prompt]}${marked(mode.target)}: `} line={mode.line} width={width} />;

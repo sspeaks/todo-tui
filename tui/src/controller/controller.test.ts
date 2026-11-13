@@ -1,6 +1,7 @@
 import { Status, setStatus } from "@todo-tui/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fakeDaemon, item, rows } from "../fake.test-util.js";
+import { helpLines } from "../keys/help.js";
 import { ERROR_TOAST_MS, INFO_TOAST_MS, MIDNIGHT_POLL_MS } from "./controller.js";
 import { setup, stopControllers } from "./setup.test-util.js";
 
@@ -109,6 +110,98 @@ describe("keys", () => {
     expect(t.state().mode).toMatchObject({ kind: "help", scroll: bottom.kind === "help" ? bottom.scroll : -1 });
     await t.c.press("<esc>");
     expect(t.state().mode.kind).toBe("normal");
+  });
+
+  it("searches the help with /: narrowed as it is typed, enter keeps it, esc while typing shows all of it where it was", async () => {
+    const t = await setup(fakeDaemon(rows(2)), { rows: 10 });
+    await t.c.press("?jjj/th");
+    expect(t.state().mode).toEqual({ kind: "help", scroll: 0, query: "th", line: { text: "th", cursor: 2 }, saved: 3 });
+    // Keys are text on the line: q and ? do not close it, j does not scroll.
+    await t.c.press("e?q<backspace><backspace>");
+    expect(t.state().mode).toMatchObject({ kind: "help", query: "the", line: { text: "the" } });
+    await t.c.press("<enter>");
+    expect(t.state().mode).toEqual({ kind: "help", scroll: 0, query: "the", saved: 3 });
+    // j/k scroll what is left, no further than its end.
+    await t.c.press("G");
+    const max = t.state().mode;
+    expect(max.kind === "help" && max.scroll).toBeGreaterThan(0);
+    await t.c.press("jjjj");
+    expect(t.state().mode).toEqual(max);
+    // / edits it again; esc shows all of the help, at the scroll from before the first /.
+    await t.c.press("/");
+    expect(t.state().mode).toMatchObject({ kind: "help", query: "the", line: { text: "the", cursor: 3 }, saved: 3 });
+    await t.c.press("<esc>");
+    expect(t.state().mode).toEqual({ kind: "help", scroll: 3 });
+    // Backspace on an empty line leaves it, as does enter on blank text.
+    await t.c.press("/<backspace>");
+    expect(t.state().mode).toEqual({ kind: "help", scroll: 3 });
+    await t.c.press("/  <enter>");
+    expect(t.state().mode).toEqual({ kind: "help", scroll: 3 });
+    // A kept search goes with the help: esc closes it, and ? opens all of it.
+    await t.c.press("/redo<enter><esc>");
+    expect(t.state().mode.kind).toBe("normal");
+    await t.c.press("?");
+    expect(t.state().mode).toEqual({ kind: "help", scroll: 0 });
+  });
+
+  it("closes a kept help search with every close key, clears it with ctrl-c while typing, and keeps it through gg", async () => {
+    const t = await setup(fakeDaemon(rows(2)), { rows: 10 });
+    await t.c.press("?/the<ctrl+c>");
+    expect(t.state().mode).toEqual({ kind: "help", scroll: 0 });
+    await t.c.press("<esc>");
+    for (const close of ["q", "?", "<fkey>", "<ctrl+c>", "<esc>"]) {
+      await t.c.press(`?/the<enter>${close}`);
+      expect(t.state().mode.kind, close).toBe("normal");
+      expect(t.quit).not.toHaveBeenCalled();
+    }
+    // gg and G scroll the narrowed help, which stays narrowed.
+    await t.c.press("?/the<enter>G");
+    const bottom = t.state().mode;
+    expect(bottom).toMatchObject({ kind: "help", query: "the" });
+    expect(bottom.kind === "help" && bottom.scroll).toBeGreaterThan(0);
+    await t.c.press("gg");
+    expect(t.state().mode).toEqual({ kind: "help", scroll: 0, query: "the", saved: 0 });
+    // A cursor move, or a space after the last word, leaves the words as they were: the scroll stays.
+    await t.c.press("G/<left><enter>");
+    expect(t.state().mode).toEqual(bottom);
+    await t.c.press("/  <enter>");
+    expect(t.state().mode).toEqual({ ...bottom, query: "the  " });
+    // A space inside a word makes two words: the narrowed help starts from its top again.
+    await t.c.press("/<ctrl+u>the<left> <enter>");
+    expect(t.state().mode).toMatchObject({ kind: "help", query: "th e", scroll: 0 });
+  });
+
+  it("searches the help with the key [keymap] gives help_search, and not at all when it gives none", async () => {
+    const t = await setup(fakeDaemon(rows(2)), { rows: 10 });
+    t.daemon.setConfig({ keymap: { "/": "", s: "help_search" } });
+    await vi.waitFor(() => expect(t.state().keymap.bindings.find((b) => b.id === "help_search")?.keys).toEqual(["s"]));
+    await t.c.press("?/");
+    expect(t.state().mode).toEqual({ kind: "help", scroll: 0 });
+    expect(helpLines(t.state().keymap.bindings)[0]?.text).toBe("Help · j/k scroll · s search · esc close");
+    await t.c.press("sdue<enter>");
+    expect(t.state().mode).toMatchObject({ kind: "help", query: "due" });
+    // s is still the status picker outside the help.
+    await t.c.press("<esc>s");
+    expect(t.state().mode.kind).toBe("picker");
+    t.daemon.setConfig({ keymap: { "/": "", s: "" } });
+    await vi.waitFor(() => expect(t.state().keymap.bindings.find((b) => b.id === "help_search")?.keys).toEqual([]));
+    expect(helpLines(t.state().keymap.bindings)[0]?.text).toBe("Help · j/k scroll · esc close");
+  });
+
+  it("takes a paste and alt word edits on the help's search line", async () => {
+    const t = await setup(fakeDaemon(rows(2)), { rows: 10 });
+    await t.c.press("?/");
+    t.c.paste("set the\ndue");
+    await t.c.idle();
+    expect(t.state().mode).toMatchObject({ kind: "help", query: "set the due", line: { text: "set the due" } });
+    t.c.input("", { backspace: true, meta: true });
+    await t.c.idle();
+    expect(t.state().mode).toMatchObject({ kind: "help", query: "set the ", line: { text: "set the " } });
+    // Outside the line, a paste does nothing in the help.
+    await t.c.press("<enter>");
+    t.c.paste("xx");
+    await t.c.idle();
+    expect(t.state().mode).toEqual({ kind: "help", scroll: 0, query: "set the ", saved: 0 });
   });
 
   it("quits on q, :q, :quit and ctrl-c in normal mode; ctrl-c cancels the command line (hard case 9)", async () => {

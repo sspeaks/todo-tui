@@ -164,13 +164,14 @@ export const BINDINGS: readonly Binding[] = [
   { id: "quit", keys: ["q", "ctrl+c"], action: { type: "quit" }, section: "App", help: "Quit" },
   { id: "suspend", keys: ["ctrl+z"], action: { type: "suspend" }, section: "App", help: "Suspend to the shell (fg resumes)" },
 
-  // In help, the navigation actions scroll it.
+  // In help, the navigation actions scroll it, and narrow searches it.
   { id: "help_down", keys: ["j", "down"], action: { type: "move", by: 1 }, modes: ["help"], section: "Help", help: "Scroll down" },
   { id: "help_up", keys: ["k", "up"], action: { type: "move", by: -1 }, modes: ["help"], section: "Help", help: "Scroll up" },
   { id: "help_half_page_down", keys: ["ctrl+d", "pagedown", "space"], action: { type: "half_page", dir: 1 }, modes: ["help"], section: "Help", help: "Half a page down" },
   { id: "help_half_page_up", keys: ["ctrl+u", "pageup"], action: { type: "half_page", dir: -1 }, modes: ["help"], section: "Help", help: "Half a page up" },
   { id: "help_top", keys: ["g g", "home"], action: { type: "top" }, modes: ["help"], section: "Help", help: "Top" },
   { id: "help_bottom", keys: ["G", "end"], action: { type: "bottom" }, modes: ["help"], section: "Help", help: "Bottom" },
+  { id: "help_search", keys: ["/"], action: { type: "narrow" }, modes: ["help"], section: "Help", help: "Search the help (enter keeps, esc clears)" },
   { id: "help_close", keys: ["esc", "q", "?", "fkey", "ctrl+c"], action: { type: "help_close" }, modes: ["help"], section: "Help", help: "Close" },
 
   // :l48's panel (design 6.6).
