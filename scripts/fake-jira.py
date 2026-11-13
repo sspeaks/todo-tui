@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""A fake Jira Data Center for scripts/smoke.sh: /myself, discovery and
-search over two synthetic issues, on 127.0.0.1, and the writes a push
+"""A fake Jira Data Center for scripts/smoke.sh: /myself, discovery, a user
+directory and search over two synthetic issues, on 127.0.0.1, and the writes a push
 makes (ADR-0007): PUT /issue/{id} and BRME's transitions (Open, In
 Progress (2), and Closed, which requires a resolution). Each write is
 applied to its issue, so a later pull reads it back, and appended to
@@ -14,6 +14,7 @@ import json
 import re
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs
 
 TOKEN = sys.argv[1]
 WRITES = sys.argv[2] if len(sys.argv) > 2 else None
@@ -31,7 +32,7 @@ def make_issue(n, title, category, status):
             "issuetype": {"name": "Task"},
             "status": {"name": status, "statusCategory": {"key": category}},
             "priority": {"name": "Major"},
-            "assignee": {"key": "JIRAUSER10100", "name": "dana", "displayName": "Dana Example"},
+            "assignee": {"key": "JIRAUSER10100", "name": "dana", "displayName": "Dana Example", "emailAddress": "dana@example.com"},
             "labels": [],
             "components": [],
             "fixVersions": [],
@@ -49,7 +50,13 @@ ISSUES = [
 # reads by key (attach, design 3.3).
 ELSEWHERE = [make_issue(9, "smoke jira teammate's task", "new", "Open")]
 ELSEWHERE[0]["key"] = "OPS-9"
-ELSEWHERE[0]["fields"]["assignee"] = {"key": "JIRAUSER2", "name": "alex", "displayName": "Alex Example"}
+ELSEWHERE[0]["fields"]["assignee"] = {"key": "JIRAUSER2", "name": "alex", "displayName": "Alex Example", "emailAddress": "alex@example.com"}
+# The directory (design 3.5): Jordan is on no issue, so only a search finds them.
+USERS = [
+    {"key": "JIRAUSER10100", "name": "dana", "displayName": "Dana Example", "emailAddress": "dana@example.com", "active": True},
+    {"key": "JIRAUSER2", "name": "alex", "displayName": "Alex Example", "emailAddress": "alex@example.com", "active": True},
+    {"key": "JIRAUSER3", "name": "jlee", "displayName": "Jordan Lee", "emailAddress": "jordan.lee@example.com", "active": True},
+]
 # Wiki markup, read as Markdown (ADR-0009); the colour has no Markdown form.
 ISSUES[1]["fields"]["description"] = "h2. Report\r\n* weekly {{totals}}\r\n{color:#888}footer{color}"
 
@@ -75,7 +82,7 @@ def log(entry):
 
 
 GET = {
-    "/rest/api/2/myself": {"key": "JIRAUSER10100", "name": "dana", "displayName": "Dana Example", "timeZone": "UTC"},
+    "/rest/api/2/myself": {"key": "JIRAUSER10100", "name": "dana", "displayName": "Dana Example", "emailAddress": "dana@example.com", "timeZone": "UTC"},
     "/rest/api/2/priority": [{"name": n} for n in ["Blocker", "Critical", "Major", "Minor", "Trivial"]],
     "/rest/api/2/field": [{"id": "summary", "name": "Summary", "custom": False}],
 }
@@ -102,9 +109,22 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self.authorized():
             return
-        path = self.path.split("?")[0]
+        path, _, query = self.path.partition("?")
         if path in GET:
             return self.reply(200, GET[path])
+        params = parse_qs(query)
+        if path == "/rest/api/2/user/search":
+            # The start of a name, display name word or address, as DC matches.
+            q = params.get("username", [""])[0].lower()
+            hits = [u for u in USERS if q and (
+                u["name"].startswith(q) or u["emailAddress"].startswith(q)
+                or any(w.startswith(q) for w in u["displayName"].lower().split()))]
+            return self.reply(200, hits)
+        if path == "/rest/api/2/user":
+            hits = [u for u in USERS if u["key"] == params.get("key", [""])[0]]
+            if hits:
+                return self.reply(200, hits[0])
+            return self.reply(404, {"errorMessages": ["The user does not exist"]})
         m = re.fullmatch(r"/rest/api/2/issue/([A-Z0-9-]+)(/transitions)?", path)
         # By id or by key, as Jira takes either (attach reads by key).
         found = [i for i in ISSUES + ELSEWHERE if m and m.group(1) in (i["id"], i["key"])]

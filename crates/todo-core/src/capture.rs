@@ -26,7 +26,8 @@ pub struct CaptureDraft {
     pub due_date: Option<Date>,
     /// In order of first appearance, without duplicates.
     pub labels: Vec<String>,
-    /// Free text until People exist; `since` is the reference day.
+    /// Free text as parsed; [`crate::resolve_waiting`] makes one that names
+    /// a person that person. `since` is the reference day.
     pub waiting: Option<Waiting>,
     /// `Status::Inbox` unless a `>next` / `>someday` token says otherwise.
     pub status: Status,

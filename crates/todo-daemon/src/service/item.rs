@@ -496,7 +496,7 @@ impl ItemService for Items {
             }
             items.push(item);
         }
-        let m = todo_core::meeting::meeting(&items, req.subject.as_deref());
+        let m = todo_core::meeting::meeting(&items, req.subject.as_deref(), &|_| Vec::new());
         Ok(Response::new(BuildMeetingLinkResponse {
             url: m.teams_url(),
             subject: m.subject,

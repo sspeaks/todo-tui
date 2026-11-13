@@ -6,7 +6,7 @@ use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use todo_core::remote::RemoteIssue;
+use todo_core::remote::{RemoteIssue, RemoteUser};
 
 use crate::client::{Client, JiraError};
 use jiff::civil::Date;
@@ -101,8 +101,17 @@ impl Adapter {
             .find(|f| schema(f).ends_with(":gh-sprint"))
             .and_then(id_of);
         let (priorities, priority_names) = priority_maps(&names, &push.priority_map);
+        let myself = RemoteUser {
+            display_name: Some(me.display_name.trim().to_owned())
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| me.key.clone()),
+            username: me.name.trim().to_owned(),
+            email: me.email_address.trim().to_owned(),
+            id: me.key.clone(),
+        };
         let discovery = Discovery {
             me: me.key,
+            myself,
             time_zone: me.time_zone,
             priorities,
             priority_names,
@@ -382,6 +391,45 @@ impl Adapter {
                 }),
             Err(JiraError::NotFound) => Ok(Fetched::NotFound),
             Err(JiraError::Forbidden(_)) => Ok(Fetched::Forbidden),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+impl Adapter {
+    /// Users the directory finds for `query` (design 3.5), at most 20, active
+    /// ones: Data Center matches the start of a username, display name or
+    /// email address. An empty query finds no one.
+    pub async fn search_users(&self, query: &str) -> Result<Vec<RemoteUser>, JiraError> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let found: Vec<Value> = self
+            .client
+            .get(
+                "/rest/api/2/user/search",
+                &[("username", query), ("maxResults", "20")],
+            )
+            .await?;
+        Ok(found
+            .iter()
+            .filter(|u| u.get("active").and_then(Value::as_bool) != Some(false))
+            .filter_map(|u| crate::issue::user(Some(u)))
+            .collect())
+    }
+
+    /// One user by key; `None` when Jira has no such user.
+    pub async fn get_user(&self, key: &str) -> Result<Option<RemoteUser>, JiraError> {
+        match self
+            .client
+            .get::<Value>("/rest/api/2/user", &[("key", key)])
+            .await
+        {
+            Ok(v) => crate::issue::user(Some(&v))
+                .map(Some)
+                .ok_or_else(|| JiraError::Malformed(format!("user {key}: not a user"))),
+            Err(JiraError::NotFound) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -813,6 +861,51 @@ mod tests {
             (d.story_points.as_deref(), d.sprint.as_deref()),
             (Some("customfield_10002"), Some("customfield_10004"))
         );
+        assert_eq!(
+            d.myself,
+            RemoteUser {
+                id: "JIRAUSER10100".into(),
+                display_name: "Dana Example".into(),
+                username: "dana".into(),
+                email: "dana@example.com".into(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn the_directory_finds_active_users_and_one_by_key() {
+        let fake = FakeJira::start("t").await;
+        fake.serve_users();
+        let a = adapter(&fake).await;
+        let found = a.search_users("jor").await.unwrap();
+        assert_eq!(
+            found,
+            [RemoteUser {
+                id: "JIRAUSER10200".into(),
+                display_name: "Jordan Lee".into(),
+                username: "jlee".into(),
+                email: "jordan.lee@example.com".into(),
+            }]
+        );
+        // Inactive users are left out; a hidden address is empty.
+        assert!(a.search_users("gone").await.unwrap().is_empty());
+        assert_eq!(a.search_users("sam").await.unwrap()[0].email, "");
+        assert!(a.search_users("  ").await.unwrap().is_empty());
+        let asked = fake
+            .seen()
+            .into_iter()
+            .filter(|s| s.target.starts_with("/rest/api/2/user/search"))
+            .count();
+        assert_eq!(asked, 3, "an empty query asks nothing");
+        assert_eq!(
+            a.get_user("JIRAUSER10300")
+                .await
+                .unwrap()
+                .unwrap()
+                .display_name,
+            "Sam Example"
+        );
+        assert_eq!(a.get_user("JIRAUSER9").await.unwrap(), None);
     }
 
     #[tokio::test]

@@ -279,7 +279,7 @@ pub fn issue_json(id: u32, title: &str, category: &str, updated: &str) -> Value 
             "issuetype": {"name": "Task"},
             "status": {"name": "Open", "statusCategory": {"key": category}},
             "priority": {"name": "Major"},
-            "assignee": {"key": "JIRAUSER10100", "name": "dana", "displayName": "Dana Example"},
+            "assignee": {"key": "JIRAUSER10100", "name": "dana", "displayName": "Dana Example", "emailAddress": "dana@example.com"},
             "labels": [],
             "components": [],
             "fixVersions": [],
@@ -289,7 +289,103 @@ pub fn issue_json(id: u32, title: &str, category: &str, updated: &str) -> Value 
     })
 }
 
+/// The directory's synthetic users: key, name, display name, email (empty:
+/// hidden), active.
+pub const USERS: [(&str, &str, &str, &str, bool); 4] = [
+    (
+        "JIRAUSER10100",
+        "dana",
+        "Dana Example",
+        "dana@example.com",
+        true,
+    ),
+    (
+        "JIRAUSER10200",
+        "jlee",
+        "Jordan Lee",
+        "jordan.lee@example.com",
+        true,
+    ),
+    ("JIRAUSER10300", "sam", "Sam Example", "", true),
+    (
+        "JIRAUSER10400",
+        "gone",
+        "Gone Example",
+        "gone@example.com",
+        false,
+    ),
+];
+
+fn user_json(u: &(&str, &str, &str, &str, bool)) -> Value {
+    let mut v = json!({"key": u.0, "name": u.1, "displayName": u.2, "active": u.4});
+    if !u.3.is_empty() {
+        v["emailAddress"] = json!(u.3);
+    }
+    v
+}
+
+/// A query parameter of `seen`, decoded as a form value.
+fn query_param(seen: &Seen, name: &str) -> Option<String> {
+    let query = seen.target.split_once('?')?.1;
+    query.split('&').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        (k == name).then(|| {
+            let v = v.replace('+', " ");
+            let mut out = Vec::new();
+            let b = v.as_bytes();
+            let mut i = 0;
+            while i < b.len() {
+                if b[i] == b'%'
+                    && let Some(x) = v
+                        .get(i + 1..i + 3)
+                        .and_then(|h| u8::from_str_radix(h, 16).ok())
+                {
+                    out.push(x);
+                    i += 3;
+                    continue;
+                }
+                out.push(b[i]);
+                i += 1;
+            }
+            String::from_utf8_lossy(&out).into_owned()
+        })
+    })
+}
+
 impl FakeJira {
+    /// Serves the user directory over [`USERS`]: `GET /user/search?username=`
+    /// matches the start of a name, display name word or email address, as
+    /// Data Center does, inactive users too; `GET /user?key=` one by key.
+    pub fn serve_users(&self) {
+        self.route("/rest/api/2/user/search", |seen| {
+            let q = query_param(seen, "username")
+                .unwrap_or_default()
+                .to_lowercase();
+            let found: Vec<Value> = USERS
+                .iter()
+                .filter(|u| {
+                    !q.is_empty()
+                        && (u.1.starts_with(&q)
+                            || u.3.starts_with(&q)
+                            || u.2.to_lowercase().split(' ').any(|w| w.starts_with(&q)))
+                })
+                .map(user_json)
+                .collect();
+            (200, Value::Array(found), vec![])
+        });
+        self.route("/rest/api/2/user", |seen| {
+            let key = query_param(seen, "key").unwrap_or_default();
+            match USERS.iter().find(|u| u.0 == key) {
+                Some(u) => (200, user_json(u), vec![]),
+                None => (
+                    404,
+                    json!({"errorMessages": [format!("The user with the key '{key}' does not exist")]}),
+                    vec![],
+                ),
+            }
+        });
+    }
+
     /// Serves discovery: five priorities, a Story Points and a Sprint field.
     pub fn serve_discovery(&self) {
         self.route("/rest/api/2/priority", |_| {
@@ -362,7 +458,7 @@ impl FakeJira {
                     .strftime("%Y-%m-%dT%H:%M:%S%.3f+0000")
                     .to_string()
             );
-            issue["fields"]["reporter"] = json!({"key": "JIRAUSER10100", "name": "dana", "displayName": "Dana Example"});
+            issue["fields"]["reporter"] = json!({"key": "JIRAUSER10100", "name": "dana", "displayName": "Dana Example", "emailAddress": "dana@example.com"});
             let key = issue["key"].clone();
             all.push(issue);
             (201, json!({"id": id.to_string(), "key": key}), vec![])

@@ -42,6 +42,7 @@ fn issue(n: u32, title: &str) -> RemoteIssue {
         assignee: Some(RemoteUser {
             id: "JIRAUSER1".into(),
             display_name: "Dana Example".into(),
+            ..RemoteUser::default()
         }),
         reporter: None,
         labels: vec![],

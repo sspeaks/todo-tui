@@ -15,12 +15,16 @@ use crate::mutation::FieldChange;
 use crate::status::{ResolutionKind, StatusCategory, TodoRefinement};
 use crate::value::FieldValue;
 
-/// A tracker person, until People (design 3.5): who, in their words.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A tracker user, as the store makes a Person of one (design 3.5).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RemoteUser {
     /// The tracker's stable id (a Data Center user key).
     pub id: String,
     pub display_name: String,
+    /// The login name (Data Center `name`); empty when not sent.
+    pub username: String,
+    /// Empty when the instance hides it.
+    pub email: String,
 }
 
 /// A normalised tracker issue (design 5.2): Core fields in local vocabulary.
@@ -64,14 +68,15 @@ pub struct RemoteIssue {
     pub is_mine: bool,
 }
 
-/// A person as Core stores one until People exist: their display name.
-fn person(u: &Option<RemoteUser>) -> Option<PersonRef> {
-    u.as_ref().map(|u| {
-        PersonRef::FreeText(if u.display_name.is_empty() {
-            u.id.clone()
-        } else {
-            u.display_name.clone()
-        })
+/// Who a tracker user is here: the store's Person for them (design 3.5).
+pub type Resolve<'a> = &'a dyn Fn(&RemoteUser) -> PersonRef;
+
+/// A user as free text, their display name: for what has no store.
+pub fn by_name(u: &RemoteUser) -> PersonRef {
+    PersonRef::FreeText(if u.display_name.is_empty() {
+        u.id.clone()
+    } else {
+        u.display_name.clone()
     })
 }
 
@@ -82,11 +87,12 @@ pub fn import(
     issue: &RemoteIssue,
     parent: Option<ItemId>,
     scopes: &[String],
+    people: Resolve<'_>,
     now: Timestamp,
 ) -> Item {
     let mut item = Item::new_capture(id, issue.title.clone(), CreatedVia::RemoteImport, now);
     item.overlay.todo_refinement = TodoRefinement::Next;
-    write(&mut item, issue, parent);
+    write(&mut item, issue, parent, people);
     item.remote_link = Some(link(issue, LinkState::Ok, false));
     item.derived.scopes = scopes.to_vec();
     item.derived.is_mine = issue.is_mine;
@@ -113,7 +119,7 @@ fn link(issue: &RemoteIssue, state: LinkState, pinned: bool) -> RemoteLink {
 pub const PENDING_PARENT: &str = "todo-tui.parent_remote_id";
 
 /// Writes `issue`'s Core fields into `item`.
-fn write(item: &mut Item, issue: &RemoteIssue, parent: Option<ItemId>) {
+fn write(item: &mut Item, issue: &RemoteIssue, parent: Option<ItemId>, people: Resolve<'_>) {
     let c = &mut item.core;
     c.title = if issue.title.trim().is_empty() {
         issue.key.clone()
@@ -128,8 +134,8 @@ fn write(item: &mut Item, issue: &RemoteIssue, parent: Option<ItemId>) {
     c.remote_status_name = Some(issue.remote_status_name.clone()).filter(|s| !s.is_empty());
     c.resolution = issue.resolution.clone();
     c.priority = issue.priority;
-    c.assignee = person(&issue.assignee);
-    c.reporter = person(&issue.reporter);
+    c.assignee = issue.assignee.as_ref().map(people);
+    c.reporter = issue.reporter.as_ref().map(people);
     c.labels = issue.labels.clone();
     c.components = issue.components.clone();
     c.fix_versions = issue.fix_versions.clone();
@@ -207,10 +213,11 @@ pub fn update(
     issue: &RemoteIssue,
     parent: Option<ItemId>,
     scopes: &[String],
+    people: Resolve<'_>,
     now: Timestamp,
 ) -> (Item, Vec<FieldChange>) {
     let mut next = item.clone();
-    write(&mut next, issue, parent);
+    write(&mut next, issue, parent, people);
     let state = item
         .remote_link
         .as_ref()
@@ -273,10 +280,11 @@ pub fn link_to(
     item: &Item,
     issue: &RemoteIssue,
     parent: Option<ItemId>,
+    people: Resolve<'_>,
     now: Timestamp,
 ) -> (Item, Vec<FieldChange>, Vec<FieldChange>) {
     let mut next = item.clone();
-    write(&mut next, issue, parent.or(item.core.parent_id));
+    write(&mut next, issue, parent.or(item.core.parent_id), people);
     next.remote_link = Some(link(issue, LinkState::Ok, true));
     next.derived.is_mine = issue.is_mine;
     next.updated_at = now;
@@ -365,6 +373,7 @@ mod tests {
             assignee: Some(RemoteUser {
                 id: "JIRAUSER1".into(),
                 display_name: "Dana Example".into(),
+                ..RemoteUser::default()
             }),
             reporter: None,
             labels: vec!["auth".into()],
@@ -385,7 +394,14 @@ mod tests {
 
     #[test]
     fn an_import_lands_in_next_with_its_link() {
-        let item = import(crate::new_ulid(), &issue(), None, &["mine".into()], ts(300));
+        let item = import(
+            crate::new_ulid(),
+            &issue(),
+            None,
+            &["mine".into()],
+            &by_name,
+            ts(300),
+        );
         assert_eq!(item.status(), Status::Next);
         assert_eq!(item.created_via, CreatedVia::RemoteImport);
         let link = item.remote_link.as_ref().unwrap();
@@ -403,28 +419,35 @@ mod tests {
         let mut done = issue();
         done.status_category = StatusCategory::Done;
         assert_eq!(
-            import(crate::new_ulid(), &done, None, &[], ts(1)).status(),
+            import(crate::new_ulid(), &done, None, &[], &by_name, ts(1)).status(),
             Status::Done
         );
         done.resolution_kind = Some(ResolutionKind::Cancelled);
         assert_eq!(
-            import(crate::new_ulid(), &done, None, &[], ts(1)).status(),
+            import(crate::new_ulid(), &done, None, &[], &by_name, ts(1)).status(),
             Status::Cancelled
         );
         let mut started = issue();
         started.status_category = StatusCategory::InProgress;
         assert_eq!(
-            import(crate::new_ulid(), &started, None, &[], ts(1)).status(),
+            import(crate::new_ulid(), &started, None, &[], &by_name, ts(1)).status(),
             Status::InProgress
         );
     }
 
     #[test]
     fn an_update_changes_core_only_and_nothing_twice() {
-        let mut item = import(crate::new_ulid(), &issue(), None, &["mine".into()], ts(300));
+        let mut item = import(
+            crate::new_ulid(),
+            &issue(),
+            None,
+            &["mine".into()],
+            &by_name,
+            ts(300),
+        );
         item.overlay.private_notes = "mine".into();
         item.overlay.local_priority_override = Some(Priority::Low);
-        let (same, none) = update(&item, &issue(), None, &["mine".into()], ts(400));
+        let (same, none) = update(&item, &issue(), None, &["mine".into()], &by_name, ts(400));
         assert!(none.is_empty(), "{none:?}");
         assert_eq!(same.core, item.core);
         let mut edited = issue();
@@ -434,7 +457,7 @@ mod tests {
         edited.url = "https://jira.example.com/browse/WEB-9".into();
         edited.status_category = StatusCategory::InProgress;
         edited.updated_at = ts(500);
-        let (next, changes) = update(&item, &edited, None, &["mine".into()], ts(600));
+        let (next, changes) = update(&item, &edited, None, &["mine".into()], &by_name, ts(600));
         let fields: Vec<_> = changes.iter().map(|c| c.field).collect();
         assert_eq!(
             fields,
@@ -455,13 +478,13 @@ mod tests {
         // A later pull of an unchanged issue only moves the pulled version.
         let mut later = edited.clone();
         later.updated_at = ts(500);
-        let (_, again) = update(&next, &later, None, &["mine".into()], ts(700));
+        let (_, again) = update(&next, &later, None, &["mine".into()], &by_name, ts(700));
         assert!(again.is_empty(), "{again:?}");
     }
 
     #[test]
     fn a_broken_link_breaks_once_and_heals_on_the_next_pull() {
-        let item = import(crate::new_ulid(), &issue(), None, &[], ts(300));
+        let item = import(crate::new_ulid(), &issue(), None, &[], &by_name, ts(300));
         let (broken, change) = break_link(&item).unwrap();
         assert_eq!(change.field, ItemField::RemoteLink);
         assert_eq!(
@@ -469,7 +492,7 @@ mod tests {
             LinkState::Broken
         );
         assert!(break_link(&broken).is_none());
-        let (healed, changes) = update(&broken, &issue(), None, &[], ts(400));
+        let (healed, changes) = update(&broken, &issue(), None, &[], &by_name, ts(400));
         assert_eq!(
             healed.remote_link.as_ref().unwrap().link_state,
             LinkState::Ok

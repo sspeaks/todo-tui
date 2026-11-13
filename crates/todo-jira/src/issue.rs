@@ -14,6 +14,8 @@ use todo_core::{Priority, ResolutionKind, StatusCategory};
 pub struct Discovery {
     /// The authenticated user's key, for `is_mine` (5.9).
     pub me: String,
+    /// The authenticated user, who is a Person too (design 3.5).
+    pub myself: RemoteUser,
     /// The user's profile time zone, which JQL dates are read in.
     pub time_zone: String,
     /// Priority name → local level, by rank (5.8).
@@ -164,15 +166,25 @@ fn names(v: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn user(v: Option<&Value>) -> Option<RemoteUser> {
+/// A Data Center user object: its key (else its name), display name, name
+/// and email address, which an instance may hide.
+pub fn user(v: Option<&Value>) -> Option<RemoteUser> {
     let v = v.filter(|v| !v.is_null())?;
     let id = v.get("key").or_else(|| v.get("name"))?.as_str()?.to_owned();
-    Some(RemoteUser {
-        display_name: v
-            .get("displayName")
+    let text = |k: &str| {
+        v.get(k)
             .and_then(Value::as_str)
-            .unwrap_or(&id)
-            .to_owned(),
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    };
+    let display_name = Some(text("displayName"))
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| id.clone());
+    Some(RemoteUser {
+        display_name,
+        username: text("name"),
+        email: text("emailAddress"),
         id,
     })
 }
@@ -306,6 +318,7 @@ mod tests {
     fn discovery() -> Discovery {
         Discovery {
             me: "JIRAUSER1".into(),
+            myself: RemoteUser::default(),
             time_zone: "America/Los_Angeles".into(),
             priorities: map_priorities(
                 &["Blocker", "Critical", "Major", "Minor", "Trivial"].map(String::from),
@@ -394,7 +407,7 @@ mod tests {
                 "issuetype": {"name": "Bug"},
                 "status": {"name": "In Review", "statusCategory": {"key": "indeterminate"}},
                 "priority": {"name": "Critical"},
-                "assignee": {"key": "JIRAUSER1", "name": "dana", "displayName": "Dana Example"},
+                "assignee": {"key": "JIRAUSER1", "name": "dana", "displayName": "Dana Example", "emailAddress": "dana@example.com"},
                 "reporter": {"key": "JIRAUSER2", "displayName": "Sam Example"},
                 "labels": ["auth"],
                 "components": [{"id": "1", "name": "Web"}],
@@ -421,7 +434,21 @@ mod tests {
         );
         assert_eq!(i.priority, Priority::High);
         assert!(i.is_mine);
-        assert_eq!(i.reporter.unwrap().display_name, "Sam Example");
+        let assignee = i.assignee.unwrap();
+        assert_eq!(
+            (assignee.username.as_str(), assignee.email.as_str()),
+            ("dana", "dana@example.com")
+        );
+        let reporter = i.reporter.unwrap();
+        // No name or address sent: empty, not invented.
+        assert_eq!(
+            (
+                reporter.display_name.as_str(),
+                reporter.username.as_str(),
+                reporter.email.as_str()
+            ),
+            ("Sam Example", "", "")
+        );
         assert_eq!(
             (i.components, i.fix_versions),
             (vec!["Web".to_owned()], vec!["2.3".to_owned()])

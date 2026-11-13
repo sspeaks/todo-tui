@@ -1,6 +1,7 @@
 //! The Teams meeting form, prefilled from Items (design 2.9): a deep link
 //! that Teams opens; todo-tui never creates the meeting itself.
 
+use crate::ids::PersonId;
 use crate::item::{Item, PersonRef};
 
 /// Teams' new-meeting form.
@@ -22,8 +23,13 @@ const MAX_CONTENT: usize = 2000;
 /// The meeting about `items` (at least one), in order: the subject is the
 /// first title plus "+ N more" (unless `subject` overrides it), the content
 /// each Item's first description paragraph and Jira link, the attendees
-/// each `waiting.on` that is one email address.
-pub fn meeting(items: &[Item], subject: Option<&str>) -> Meeting {
+/// the email addresses of each `waiting.on`, assignee and reporter, by
+/// `emails` for a Person, a free-text `waiting.on` that is one address.
+pub fn meeting(
+    items: &[Item],
+    subject: Option<&str>,
+    emails: &dyn Fn(PersonId) -> Vec<String>,
+) -> Meeting {
     let first = items
         .first()
         .map(|i| single_line(&i.core.title))
@@ -67,10 +73,21 @@ pub fn meeting(items: &[Item], subject: Option<&str>) -> Meeting {
     }
     let mut attendees: Vec<String> = Vec::new();
     for item in items {
-        if let Some(PersonRef::FreeText(on)) = item.overlay.waiting.as_ref().map(|w| &w.on) {
-            let on = on.trim();
-            if is_email(on) && !attendees.iter().any(|a| a.eq_ignore_ascii_case(on)) {
-                attendees.push(on.to_owned());
+        let people = [
+            item.overlay.waiting.as_ref().map(|w| &w.on),
+            item.core.assignee.as_ref(),
+            item.core.reporter.as_ref(),
+        ];
+        for who in people.into_iter().flatten() {
+            let addresses = match who {
+                PersonRef::FreeText(on) => vec![on.clone()],
+                PersonRef::Person(id) => emails(*id),
+            };
+            for on in &addresses {
+                let on = on.trim();
+                if is_email(on) && !attendees.iter().any(|a| a.eq_ignore_ascii_case(on)) {
+                    attendees.push(on.to_owned());
+                }
             }
         }
     }
@@ -166,6 +183,10 @@ mod tests {
         )
     }
 
+    fn none(_: PersonId) -> Vec<String> {
+        Vec::new()
+    }
+
     fn waiting_on(item: &mut Item, on: &str) {
         item.overlay.waiting = Some(Waiting {
             on: PersonRef::FreeText(on.into()),
@@ -190,7 +211,7 @@ mod tests {
             pinned: false,
         });
         waiting_on(&mut a, "dana@example.com");
-        let m = meeting(&[a], None);
+        let m = meeting(&[a], None, &none);
         assert_eq!(
             m,
             Meeting {
@@ -216,7 +237,7 @@ mod tests {
         let c = item("c");
         waiting_on(&mut a, "Dana@Example.com");
         waiting_on(&mut b, "dana@example.com");
-        let m = meeting(&[a.clone(), b, c], None);
+        let m = meeting(&[a.clone(), b, c], None, &none);
         assert_eq!(m.subject, "Café #1 + 2 more");
         assert_eq!(m.content, "Café #1\n\nb\n\nc");
         assert_eq!(m.attendees, ["Dana@Example.com"]);
@@ -226,12 +247,39 @@ mod tests {
         // A subject given wins; free text that is not one address is no attendee.
         let mut d = item("d");
         waiting_on(&mut d, "the vendor");
-        let m = meeting(&[d], Some("  Kickoff\n"));
+        let m = meeting(&[d], Some("  Kickoff\n"), &none);
         assert_eq!((m.subject.as_str(), m.attendees.len()), ("Kickoff", 0));
         assert_eq!(
             m.teams_url(),
             format!("{TEAMS_NEW_MEETING}?subject=Kickoff")
         );
+    }
+
+    #[test]
+    fn people_bring_their_addresses_once_each() {
+        let (dana, sam) = (crate::new_ulid(), crate::new_ulid());
+        let emails = |id: PersonId| -> Vec<String> {
+            if id == dana {
+                vec!["dana@example.com".into(), "Dana@example.com".into()]
+            } else {
+                // Sam's address is hidden: none.
+                vec![]
+            }
+        };
+        let mut a = item("a");
+        a.overlay.waiting = Some(Waiting {
+            on: PersonRef::Person(dana),
+            reason: String::new(),
+            since: date(2026, 11, 13),
+            follow_up_on: None,
+        });
+        a.core.assignee = Some(PersonRef::Person(sam));
+        a.core.reporter = Some(PersonRef::Person(dana));
+        let mut b = item("b");
+        waiting_on(&mut b, "lee@example.com");
+        b.core.assignee = Some(PersonRef::Person(dana));
+        let m = meeting(&[a, b], None, &emails);
+        assert_eq!(m.attendees, ["dana@example.com", "lee@example.com"]);
     }
 
     #[test]
@@ -257,7 +305,7 @@ mod tests {
     fn long_content_is_cut() {
         let mut a = item("x");
         a.core.description = "é".repeat(MAX_CONTENT);
-        let m = meeting(&[a], None);
+        let m = meeting(&[a], None, &none);
         assert!(m.content.len() <= MAX_CONTENT + '…'.len_utf8());
         assert!(m.content.ends_with('…'));
     }

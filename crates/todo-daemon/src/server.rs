@@ -499,7 +499,7 @@ async fn bind_remote(paths: &Paths) -> Option<TcpListener> {
     };
     match TcpListener::bind(config.listen).await {
         Ok(l) => {
-            tracing::info!(addr = %l.local_addr().map_or(config.listen, |a| a), "remote listener bound");
+            tracing::info!(addr = %l.local_addr().unwrap_or(config.listen), "remote listener bound");
             Some(l)
         }
         Err(e) => {

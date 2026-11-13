@@ -10,6 +10,7 @@ pub mod inverse;
 pub mod item;
 pub mod meeting;
 pub mod mutation;
+pub mod person;
 pub mod query;
 pub mod recurrence;
 pub mod relation;
@@ -36,6 +37,7 @@ pub use mutation::{
     MutationError, MutationOp, Pushes, RestoreSkip, RestoreUnit, SkipReason, apply, is_core,
     pushed, write_field,
 };
+pub use person::{Identity, Match, Person, match_person, resolve_waiting};
 pub use query::{MAX_QUERY_BYTES, ParsedQuery, Query, QueryError, parse_query, print_query};
 pub use recurrence::{
     InvalidRule, Rule, RuleError, RuleSpec, Weekday, first_on_or_after, next_after, next_instance,
