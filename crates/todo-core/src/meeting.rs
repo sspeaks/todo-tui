@@ -23,8 +23,8 @@ const MAX_CONTENT: usize = 2000;
 /// The meeting about `items` (at least one), in order: the subject is the
 /// first title plus "+ N more" (unless `subject` overrides it), the content
 /// each Item's first description paragraph and Jira link, the attendees
-/// the email addresses of each `waiting.on`, assignee and reporter, by
-/// `emails` for a Person, a free-text `waiting.on` that is one address.
+/// each `waiting.on`, assignee and reporter: a Person's current address
+/// (the first of `emails`), or free text that is one address.
 pub fn meeting(
     items: &[Item],
     subject: Option<&str>,
@@ -81,7 +81,9 @@ pub fn meeting(
         for who in people.into_iter().flatten() {
             let addresses = match who {
                 PersonRef::FreeText(on) => vec![on.clone()],
-                PersonRef::Person(id) => emails(*id),
+                // The current one: an old address the tracker no longer
+                // sends is kept, but would bounce.
+                PersonRef::Person(id) => emails(*id).into_iter().take(1).collect(),
             };
             for on in &addresses {
                 let on = on.trim();

@@ -69,8 +69,8 @@ function cutBytes(s: string, max: number): string {
 
 /**
  * The meeting about `items`, as the daemon's (todo_core::meeting): the
- * attendees are the addresses of each waiting.on, assignee and reporter,
- * by `emails` for a Person, a free-text waiting.on that is one address.
+ * attendees are each waiting.on, assignee and reporter: a Person's current
+ * address (the first of `emails`), or free text that is one address.
  */
 export function meeting(items: readonly Item[], subject?: string, emails: (personId: string) => readonly string[] = () => []): Meeting {
   const first = singleLine(items[0]?.title ?? "");
@@ -91,7 +91,8 @@ export function meeting(items: readonly Item[], subject?: string, emails: (perso
   const attendees: string[] = [];
   for (const item of items) {
     for (const who of [item.waiting?.on?.ref, item.assignee?.ref, item.reporter?.ref]) {
-      const addrs = who?.case === "freeText" ? [who.value] : who?.case === "personId" ? emails(who.value) : [];
+      // A Person's current address only: an old one would bounce.
+      const addrs = who?.case === "freeText" ? [who.value] : who?.case === "personId" ? emails(who.value).slice(0, 1) : [];
       for (const raw of addrs) {
         const addr = rustTrim(raw);
         if (isEmail(addr) && !attendees.some((a) => asciiLower(a) === asciiLower(addr))) attendees.push(addr);

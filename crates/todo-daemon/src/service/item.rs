@@ -46,22 +46,47 @@ impl Items {
     async fn draft(&self, text: &str, today: Date) -> Result<v1::CaptureDraft, Status> {
         let mut draft = parse_capture(text, today);
         let (people, _) = self.0.store.list_people().await.map_err(error::store)?;
-        let named = todo_core::resolve_waiting(&mut draft, &people);
+        todo_core::resolve_waiting(&mut draft, &people);
+        let waiting = draft.waiting.as_ref().map(|w| w.on.clone());
         let mut out = v1::CaptureDraft::from(&draft);
-        match named {
-            todo_core::Match::One(id) => {
-                out.waiting_person = people.iter().find(|p| p.id == id).map(v1::Person::from);
-            }
-            todo_core::Match::Many => {
-                let text = match draft.waiting.as_ref().map(|w| &w.on) {
-                    Some(todo_core::PersonRef::FreeText(t)) => t.clone(),
-                    _ => String::new(),
-                };
-                out.waiting_matches = todo_core::person::count_matches(&text, &people) as u32;
-            }
-            todo_core::Match::None => {}
-        }
+        describe_waiting(&mut out, text, today, waiting.as_ref(), &people);
         Ok(out)
+    }
+}
+
+/// Says in `out` who the `~` text named: the person `on` is, or how many
+/// the free text could have meant. CaptureItem passes the stored Item's
+/// `on`, so a replay or a person added meanwhile never contradicts it.
+fn describe_waiting(
+    out: &mut v1::CaptureDraft,
+    text: &str,
+    today: Date,
+    on: Option<&todo_core::PersonRef>,
+    people: &[todo_core::Person],
+) {
+    out.waiting_person = None;
+    out.waiting_matches = 0;
+    match on {
+        Some(todo_core::PersonRef::Person(id)) => {
+            out.waiting_on = Some(v1::PersonRef::from(&todo_core::PersonRef::Person(*id)));
+            out.waiting_person = people.iter().find(|p| p.id == *id).map(v1::Person::from);
+        }
+        Some(todo_core::PersonRef::FreeText(t)) => {
+            // As typed (the parse's), not as stored: a matched name is
+            // replaced, a kept one is the same.
+            let typed = match parse_capture(text, today).waiting.map(|w| w.on) {
+                Some(todo_core::PersonRef::FreeText(typed)) => typed,
+                _ => t.clone(),
+            };
+            out.waiting_on = Some(v1::PersonRef::from(&todo_core::PersonRef::FreeText(
+                t.clone(),
+            )));
+            let n = todo_core::person::count_matches(&typed, people);
+            if n > 1 {
+                out.waiting_matches = n as u32;
+            }
+        }
+        None => {}
     }
 }
 
@@ -107,7 +132,6 @@ impl ItemService for Items {
             .transpose()?;
 
         let draft = parse_capture(&req.text, reference.date());
-        let parsed = self.draft(&req.text, reference.date()).await?;
         let input = CaptureInput {
             request_id,
             draft,
@@ -125,13 +149,13 @@ impl ItemService for Items {
             .map_err(|e| error::mutation(e, &Shape::Capture, &[]))?;
         self.0.wake.poke();
         // A replay returns the Item the original request created at its
-        // reference time, so the draft is the text as parsed then.
+        // reference time, so the draft is the text as parsed then; who it
+        // waits on is the Item's own, matched in the capture's transaction.
         let created = item.created_at.to_zoned(now.time_zone().clone()).date();
-        let parsed = if created == reference.date() {
-            parsed
-        } else {
-            self.draft(&req.text, created).await?
-        };
+        let mut parsed = v1::CaptureDraft::from(&parse_capture(&req.text, created));
+        let (people, _) = self.0.store.list_people().await.map_err(error::store)?;
+        let on = item.overlay.waiting.as_ref().map(|w| &w.on);
+        describe_waiting(&mut parsed, &req.text, created, on, &people);
         Ok(Response::new(CaptureItemResponse {
             item: Some(v1::Item::from(item)),
             result: Some(result.into()),

@@ -70,10 +70,10 @@ function Loaded({ item }: { item: Item }) {
   const due = item.dueDate ? dayOf(item.dueDate) : undefined;
   const defer = item.deferUntil ? dayOf(item.deferUntil) : undefined;
   const waitingOn = personName(item.waiting?.on, people);
-  /** A name the picker gave: the Person whose name it is (design 3.5), else free text. */
+  /** A name the picker gave: the one Person of that name (design 3.5), else free text. */
   const refOf = (name: string): WaitingInit["on"] => {
-    const person = [...people.values()].find((p) => p.displayName === name);
-    return person ? { ref: { case: "personId", value: person.id } } : { ref: { case: "freeText", value: name } };
+    const named = [...people.values()].filter((p) => p.displayName === name);
+    return named.length === 1 && named[0] ? { ref: { case: "personId", value: named[0].id } } : { ref: { case: "freeText", value: name } };
   };
   const followUp = item.waiting?.followUpOn ? dayOf(item.waiting.followUpOn) : undefined;
   const rule = item.recurrence?.rule;

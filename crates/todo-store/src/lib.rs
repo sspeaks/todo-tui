@@ -1163,16 +1163,6 @@ impl Store {
         .await
     }
 
-    /// The Person holding `account` on `instance`, if any.
-    pub async fn person_by_identity(
-        &self,
-        instance: String,
-        account: String,
-    ) -> Result<Option<todo_core::PersonId>> {
-        self.read(move |conn| people::by_identity(conn, &instance, &account))
-            .await
-    }
-
     /// Links the local Item `item` to `issue` (design 3.3, 5.7): promote (the
     /// issue was made from it) or attach. The Item takes Jira's Core fields,
     /// pinned; what Jira replaced of the person's becomes a `link_conflict`
@@ -1610,7 +1600,12 @@ fn capture_tx(tx: &mut WriteTx<'_>, input: CaptureInput) -> Result<(Item, Mutati
     let mut draft = input.draft;
     // `~name` naming one person is that person (design 2.3), against the
     // people of this transaction.
-    todo_core::resolve_waiting(&mut draft, &people::load_all(conn)?);
+    if matches!(
+        draft.waiting.as_ref().map(|w| &w.on),
+        Some(PersonRef::FreeText(_))
+    ) {
+        todo_core::resolve_waiting(&mut draft, &people::load_all(conn)?);
+    }
     let invalid = |error| StoreError::Mutation { index: 0, error };
     if draft.title.trim().is_empty() {
         return Err(invalid(MutationError::Invalid {

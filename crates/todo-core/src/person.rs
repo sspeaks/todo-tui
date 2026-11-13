@@ -63,11 +63,13 @@ fn named<'a>(text: &str, people: &'a [Person]) -> Vec<&'a Person> {
             || fold(&p.display_name) == t
             || p.emails.iter().any(|e| fold(e) == t)
     };
+    // "Speaks, Seth" is a common Data Center form: the comma is no part of
+    // the word.
     let first = |p: &Person| {
         p.display_name
             .split_whitespace()
             .next()
-            .is_some_and(|w| fold(w) == t)
+            .is_some_and(|w| fold(w.trim_end_matches([',', ';'])) == t)
     };
     for tier in [&whole as &dyn Fn(&Person) -> bool, &first] {
         let found: Vec<&Person> = people.iter().filter(|p| tier(p)).collect();
@@ -106,10 +108,18 @@ pub fn search<'a>(query: &str, people: &'a [Person], limit: usize) -> Vec<&'a Pe
         }
         let mut keys = vec![fold(&p.display_name), fold(&p.username)];
         keys.extend(p.emails.iter().map(|e| fold(e)));
+        // The words of a name, a username, and an address's local part: a
+        // domain everyone shares ("example.com") is nobody's word.
+        let mut words = vec![fold(&p.display_name), fold(&p.username)];
+        words.extend(
+            p.emails
+                .iter()
+                .map(|e| fold(e.split('@').next().unwrap_or(""))),
+        );
         if keys.contains(&q) {
             Some(0)
-        } else if keys.iter().any(|k| {
-            k.split(|c: char| c.is_whitespace() || matches!(c, '.' | '@' | '_' | '-'))
+        } else if words.iter().any(|k| {
+            k.split(|c: char| c.is_whitespace() || matches!(c, '.' | ',' | '_' | '-'))
                 .any(|w| w.starts_with(&q))
         }) {
             Some(1)
@@ -183,6 +193,12 @@ mod tests {
         assert_eq!(count_matches("alex", &two), 2);
         assert_eq!(count_matches("dana", &people), 1);
         assert_eq!(count_matches("nobody", &people), 0);
+        // "Last, First": the first word is the last name, without its comma.
+        let seth = person("Speaks, Seth", "sspeaks", "");
+        assert_eq!(
+            match_person("speaks", std::slice::from_ref(&seth)),
+            Match::One(seth.id)
+        );
         let same = vec![person("Kim", "k1", ""), person("Kim", "k2", "")];
         assert_eq!(match_person("kim", &same), Match::Many);
     }
@@ -224,6 +240,17 @@ mod tests {
         assert_eq!(names("dan"), ["Dana Example", "Danielle Ray", "Jordan Lee"]);
         assert_eq!(names("lee"), ["Jordan Lee"]);
         assert_eq!(names("zzz"), Vec::<String>::new());
+        // A shared domain is no one's word: "e" finds Erin by name first.
+        let erin = person("Erin Ng", "eng", "eng@example.com");
+        let aaron = person("Aaron Abel", "aabel", "aabel@example.com");
+        let both = vec![aaron, erin];
+        assert_eq!(
+            search("e", &both, 10)
+                .iter()
+                .map(|p| p.display_name.as_str())
+                .collect::<Vec<_>>(),
+            ["Erin Ng", "Aaron Abel"]
+        );
         assert_eq!(names(""), ["Dana Example", "Danielle Ray", "Jordan Lee"]);
         assert_eq!(search("", &people, 1).len(), 1);
     }

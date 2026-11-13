@@ -29,7 +29,8 @@ Jira Data Center (`todo sync check|now|status`, `⇅` in the status bar, `o`).
 The second (M10) pushes edits back: the title, priority, labels, due date
 and status, with what Jira refuses or overwrites kept in a Suggestions pane
 (`S`); M11 the description too, and M13 makes a todo a Jira issue (`P`) or
-links it to one (`L`); see [Jira sync](#jira-sync). The first Claude milestone (M12) refines
+links it to one (`L`); M14 makes Jira's users People, so `~dana` and `w`
+name a coworker and a meeting invites them; see [Jira sync](#jira-sync). The first Claude milestone (M12) refines
 an item on request through your own Claude Code: `space r` or `todo refine`;
 see [Claude refines an item](#claude-refines-an-item). A phone app (Expo) can
 capture, browse the views and complete items over Tailscale; see
@@ -675,6 +676,16 @@ exists, yours or a teammate's: Jira's fields replace the todo's, and what
 differed waits in `S` to put back. Either way the todo stays in your list,
 even outside your scopes.
 
+**People.** Each Jira user sync sees (assignees, reporters, and you) is a
+person here, with their name and address. `~dana` in a capture waits on
+the one person whose username, email, full name or first name is "dana";
+when two answer to it, it stays text and the preview says so. In `w`, `tab`
+completes from the people known and the names you have waited on; a name
+no one here has makes `tab` ask Jira's directory, and `enter` adds the
+person it found. Names typed for anyone else (`~"the vendor"`) stay text,
+as before. A person's address goes into `M`'s meeting. `todo people
+[name] [--jira]` lists them.
+
 **Turning it off.** `push = false` on the instance makes it read-only again:
 nothing more is sent, the title and the rest are refused as Jira's, and
 what was waiting goes once pushes are back on. `local_fields = ["due_date"]`
@@ -742,6 +753,7 @@ claude mcp add --scope user todo -- todo mcp
 | `todo_meeting_link` | A Teams new-meeting link for items, prefilled as `M` fills it |
 | `todo_suggestions` | What waits to review (Jira conflicts and refusals, Claude's refines); applying one is yours, in the TUI's `S` |
 | `todo_promote`, `todo_link` | Make a todo a Jira issue (ask first: it is real); link one to an issue by key |
+| `todo_people` | The people sync knows, with a `person_id` for `todo_update`'s `waiting_on: "person:<id>"`; `jira: true` also asks Jira's directory |
 | `todo_capture` | A capture, as `todo add` takes it (tokens and all) |
 | `todo_update` | Title, description, priority, local priority, energy, due, defer, labels, waiting, private notes; on a Jira item the title, description, priority, labels and due date reach Jira |
 | `todo_set_status` | `inbox`, `next`, `someday`, `in_progress`, `done`, `cancelled`; completing a repeating item returns the next one |

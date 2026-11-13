@@ -434,7 +434,7 @@ fn is_empty(conn: &Connection) -> Result<bool> {
 }
 
 /// Puts `rows` into an empty database, all or nothing: the seeded views give
-/// way to the export's, each record keeps its ids and times, and the
+/// way to the export's, each record keeps its ids and times (a person, who carries none, takes the import's), and the
 /// revision moves past both the export's and the database's. The change log
 /// is emptied and holds one change at that revision, so every client
 /// resyncs: a live subscriber sees the gap before it and replays, and any
@@ -498,6 +498,7 @@ pub(crate) fn import_tx(
 fn put(conn: &Connection, row: ExportRow, items: &mut u64) -> Result<()> {
     match row {
         ExportRow::Person(p) => {
+            // The export carries no times of a person's own: the import's.
             let at = ts_to_sql(Timestamp::now())?;
             conn.execute(
                 "INSERT INTO people (id, display_name, username, emails, created_at, updated_at)

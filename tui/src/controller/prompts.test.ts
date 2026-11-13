@@ -422,6 +422,27 @@ describe("w and W", () => {
     expect(t.byTitle("X")?.waiting?.on?.ref).toEqual({ case: "personId", value: jordan?.id });
   });
 
+  it("the same person typed another way keeps since and the reason", async () => {
+    const fd = dated([item("X")]);
+    const dana = fd.daemon.putPerson({ displayName: "Dana Example", username: "dana" });
+    const x = [...fd.daemon.items.values()][0]!;
+    fd.daemon.update(x.id, { waiting: { on: { ref: { case: "personId", value: dana.id } }, since: date(1), reason: "the quote" } });
+    const t = await setup(fd, { now: clock });
+    await vi.waitFor(() => expect(t.store.people.get(dana.id)).toBeDefined());
+    await t.c.press("w<ctrl+u>dana ^fri<enter>");
+    expect(t.byTitle("X")?.waiting).toMatchObject({ on: { ref: { case: "personId", value: dana.id } }, since: date(1), reason: "the quote", followUpOn: date(30) });
+  });
+
+  it("a surname the directory found completes to the one person it found", async () => {
+    const fd = dated([item("X")]);
+    fd.daemon.putDirectoryUser({ accountId: "JIRAUSER3", displayName: "Jordan Smith", username: "jsmith", email: "jordan.smith@example.com" });
+    const t = await setup(fd, { now: clock });
+    await t.c.press("w");
+    await prompt(t);
+    await t.c.press("smith<tab>");
+    await vi.waitFor(() => expect(t.mode()).toMatchObject({ line: { text: "Jordan Smith " } }));
+  });
+
   it("tab with no one here and Jira away keeps free text and says why", async () => {
     const t = await setup(dated([item("X")]), { now: clock });
     await t.c.press("w");

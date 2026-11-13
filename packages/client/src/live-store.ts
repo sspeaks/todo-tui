@@ -802,6 +802,7 @@ export class LiveStore {
     // Every undo entry changes some Item, so Item changes are what can
     // move the stack.
     this.undoState.scheduleRequery();
+    this.people.retry();
     this.bump();
   }
 
@@ -834,9 +835,11 @@ export class LiveStore {
     this.undoState.invalidate();
     if (this.suggestions.wanted) loads.push(this.suggestions.load(true));
     else this.suggestions.invalidate();
-    // Names only: a daemon without People (UNIMPLEMENTED) or a failed read
-    // leaves ids unnamed and holds up nothing.
-    void this.people.load();
+    // Its revision counts toward the subscribe point, so no person change
+    // between its read and the others' is missed; a daemon without People
+    // (UNIMPLEMENTED) or a failed read leaves ids unnamed and holds up
+    // nothing.
+    loads.push(this.people.load().then((rev) => rev ?? Promise.reject(new Error("no people"))));
     return loads;
   }
 
@@ -1410,26 +1413,49 @@ export class LivePeople {
     return !this.loaded || this.snap.status === "error";
   }
 
-  /** @internal Runs ListPeople; out-of-order answers are discarded. */
-  async load(): Promise<void> {
+  private inFlight: Promise<bigint | undefined> | undefined;
+
+  /**
+   * @internal Runs ListPeople, or joins the read in flight; returns its
+   * revision, undefined when it failed. Out-of-order answers are
+   * discarded, and a person a change brought newer is kept; one the list
+   * no longer has (the database was replaced) goes.
+   */
+  load(): Promise<bigint | undefined> {
+    this.inFlight ??= this.read().finally(() => (this.inFlight = undefined));
+    return this.inFlight;
+  }
+
+  private async read(): Promise<bigint | undefined> {
     const seq = ++this.seq;
     try {
       const res = await this.store.fetchPeople();
-      if (seq !== this.seq) return;
+      if (seq !== this.seq) return res.revision;
+      const listed = new Set(res.people.map((p) => p.id));
       for (const p of res.people) {
         if ((this.seen.get(p.id) ?? 0n) <= res.revision) {
           this.byId.set(p.id, p);
           this.seen.set(p.id, res.revision);
         }
       }
+      for (const id of [...this.byId.keys()]) {
+        if (!listed.has(id) && (this.seen.get(id) ?? 0n) <= res.revision) this.byId.delete(id);
+      }
       this.loaded = true;
       this.publish("ready");
+      return res.revision;
     } catch (err) {
       if (seq === this.seq && !this.loaded) {
         this.snap = { ...this.snap, status: "error", error: err };
         this.store.bump();
       }
+      return undefined;
     }
+  }
+
+  /** @internal After an Item change: a load that failed is tried again (a daemon before People answers UNIMPLEMENTED each time, cheaply). */
+  retry(): void {
+    if (this.snap.status === "error" && !this.inFlight) void this.load();
   }
 
   /** @internal A TOPIC_PERSON change. People are never removed. */
@@ -1438,7 +1464,8 @@ export class LivePeople {
     this.seen.set(change.id, change.revision);
     if (change.resource.case === "person") this.byId.set(change.id, change.resource.value);
     else if (change.deleted) this.byId.delete(change.id);
-    this.publish(this.loaded ? "ready" : this.snap.status);
+    if (this.loaded) this.publish("ready");
+    else this.snap = { ...this.snap, people: new Map(this.byId) };
   }
 
   /** @internal After ResyncRequired. */

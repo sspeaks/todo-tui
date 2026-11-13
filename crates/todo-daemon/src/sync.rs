@@ -342,6 +342,14 @@ async fn pass(store: &Store, i: &Instance, state: &State, reconcile: bool) -> Ou
         },
         Err(e) => return fail(state, &i.id, &e),
     };
+    // The token's own user is a Person too (design 3.5): `~me` names them,
+    // and a meeting invites them. Recorded only when it changes.
+    let me = adapter.discovery().myself.clone();
+    if !me.id.is_empty()
+        && let Err(e) = store.add_remote_person(i.id.clone(), me).await
+    {
+        return store_fail(state, &i.id, &e);
+    }
     let mut pulled = 0u32;
     // What the scope pulls returned, so the rest can be read by id.
     let mut seen: HashSet<String> = HashSet::new();

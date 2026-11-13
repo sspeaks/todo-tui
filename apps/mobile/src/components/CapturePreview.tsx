@@ -22,7 +22,7 @@ export function previewTags(draft: CaptureDraft, today: number): { icon: Icon; t
   }
   for (const l of draft.labels) tags.push({ icon: "pricetag-outline", text: singleLine(l) });
   // The person `~` named, by name (design 2.3); free text as typed.
-  const waiting = draft.waitingPerson ? singleLine(draft.waitingPerson.displayName) : personName(draft.waitingOn);
+  const waiting = draft.waitingPerson ? singleLine(draft.waitingPerson.displayName) || "someone" : personName(draft.waitingOn);
   if (waiting) tags.push({ icon: "hourglass-outline", text: draft.waitingMatches > 1 ? `${waiting} (${draft.waitingMatches} match)` : waiting });
   if (draft.status === Status.NEXT) tags.push({ icon: "arrow-forward-circle-outline", text: "Next" });
   if (draft.status === Status.SOMEDAY) tags.push({ icon: "moon-outline", text: "Someday" });

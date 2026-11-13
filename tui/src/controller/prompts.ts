@@ -114,11 +114,27 @@ interface RepeatQuery {
 
 type PersonRefInit = { ref: { case: "personId" | "freeText"; value: string } };
 
-/** Who an Item waits on as `w` shows it: the free text, or the Person's name. */
+/**
+ * Who an Item waits on as `w` shows it: the free text, or the Person's
+ * name; "" for a Person not loaded yet (never their id, which enter would
+ * take for free text).
+ */
 function waitingOn(item: Item, people: Pick<Controller["store"]["people"], "get">): string | undefined {
   const on = item.waiting?.on?.ref;
-  if (on?.case === "personId") return people.get(on.value)?.displayName ?? on.value;
+  if (on?.case === "personId") return people.get(on.value)?.displayName ?? "";
   return on?.value;
+}
+
+/**
+ * Whether `on` (what enter would save) is who `item` already waits on: the
+ * same Person, or the same free text (case aside). Then only the follow-up
+ * changes, and since and the reason stay.
+ */
+function sameWaiting(item: Item, on: PersonRefInit): boolean {
+  const now = item.waiting?.on?.ref;
+  if (!now) return false;
+  if (now.case === "personId") return on.ref.case === "personId" && on.ref.value === now.value;
+  return on.ref.case === "freeText" && now.case === "freeText" && on.ref.value.trim().toLowerCase() === now.value.trim().toLowerCase();
 }
 
 /** `w`'s prefill: "dana ^2026-10-30". */
@@ -308,7 +324,19 @@ export class Prompts {
   sync(): void {
     const { mode } = this.c.state;
     if (mode.kind === "prompt" && mode.prompt === "repeat" && this.repeatQuery(mode).key !== this.repeatAsked) this.preview();
+    // People loaded or renamed: who enter saves may have changed.
+    const people = this.c.store.people.getSnapshot();
+    if (mode.kind === "prompt" && mode.prompt === "waiting" && people !== this.peopleShown) {
+      this.peopleShown = people;
+      if (mode.preview) {
+        this.c.setMode({ ...mode, preview: undefined });
+        this.preview();
+      }
+    }
   }
+
+  /** The People snapshot the waiting preview was last made from. */
+  private peopleShown: unknown;
 
   /**
    * The anchor `@`'s preview resolves weekly and monthly against: the
@@ -443,7 +471,12 @@ export class Prompts {
     const people = [...(latest.people ?? []), ...found];
     const next = { ...latest, people };
     this.c.setMode(next);
-    this.fill(next, starts(found));
+    // The directory matches a surname or an address too: then the one hit
+    // it found is completed whole, else what the hits' names share.
+    this.fill(next, starts(found).length ? starts(found) : found.length === 1 ? found : []);
+    if (!starts(found).length && found.length > 1) {
+      this.c.setMode({ ...this.latest(next), error: `${found.length} in Jira: ${found.slice(0, 3).map((f) => f.name).join(", ")}${found.length > 3 ? "…" : ""} · type more of the name` });
+    }
   }
 
   /** Completes the line to `matches`' agreed prefix (one: its whole name and a space). */
@@ -455,7 +488,7 @@ export class Prompts {
     const names = [...new Set(matches.map((m) => m.name))];
     const one = names.length === 1;
     const person = one ? (names[0] ?? "") : commonPrefix(names);
-    if (!one && person.length <= prefix.length) return;
+    if (!one && (person.length <= prefix.length || !person.toLowerCase().startsWith(prefix))) return;
     const head = one && !after ? `${person} ` : person;
     this.edit(mode, { text: head + after, cursor: [...head].length });
   }
@@ -495,6 +528,8 @@ export class Prompts {
           { timeoutMs: this.c.timing.rpcTimeoutMs },
         );
         if (res.person) return { ref: { case: "personId", value: res.person.id } };
+        this.c.failed("Jira did not say who that is: nothing saved");
+        return undefined;
       } catch (err) {
         this.c.failed(errorText(err));
         return undefined;
@@ -659,14 +694,14 @@ export class Prompts {
       followUpOn = await this.parse(mode, item, dateText);
       if (!followUpOn) return;
     }
-    if (current && waitingOn(item, this.c.store.people) === person) {
+    const on = await this.refFor(person);
+    if (!on) return;
+    if (current && sameWaiting(item, on)) {
       if (sameDate(followUpOn, current.followUpOn)) return this.c.setMode(normalMode);
       // The whole value, so that a daemon that copies the parent on a leaf path agrees.
       const waiting = { on: current.on, since: current.since, reason: current.reason, followUpOn };
       return this.saveWaitingPatch(item, { id: item.id, waiting }, ["waiting.follow_up_on"]);
     }
-    const on = await this.refFor(person);
-    if (!on) return;
     const waiting = { on, ...(followUpOn && { followUpOn }) };
     return this.saveWaitingPatch(item, { id: item.id, waiting }, ["waiting"]);
   }
@@ -785,12 +820,11 @@ export class Prompts {
       followUpOn = await this.parse(mode, undefined, dateText);
       if (!followUpOn) return undefined;
     }
-    const others = items.filter((i) => !(i.waiting && waitingOn(i, this.c.store.people) === person));
-    const on = others.length ? await this.refFor(person) : undefined;
-    if (others.length && !on) return undefined;
+    const on = await this.refFor(person);
+    if (!on) return undefined;
     return stepsOf(items, (i) => {
       const current = i.waiting;
-      if (current && waitingOn(i, this.c.store.people) === person) {
+      if (current && sameWaiting(i, on)) {
         if (sameDate(followUpOn, current.followUpOn)) return undefined;
         const waiting = { on: current.on, since: current.since, reason: current.reason, followUpOn };
         return updateStep({ id: i.id, waiting }, ["waiting.follow_up_on"]);

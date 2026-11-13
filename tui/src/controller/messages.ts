@@ -79,8 +79,9 @@ export function notMineText(
   if (others !== undefined && others > 1) return `${others} of these Jira issues are assigned to someone else: change them in Jira? y/N`;
   const key = item?.remoteLink?.key ? singleLine(item.remoteLink.key) : "This issue";
   // An Item the store lacks is someone else's, as the daemon said: never "no one".
-  const named = item?.assignee ? personName(item.assignee, people) : "";
-  const who = named && named !== "someone" ? named : item && !item.assignee ? "no one" : "someone else";
+  const a = item?.assignee?.ref;
+  const known = a?.case === "freeText" || (a?.case === "personId" && people?.get(a.value) !== undefined);
+  const who = known ? personName(item?.assignee, people) : item && !item.assignee ? "no one" : "someone else";
   return `${key} is assigned to ${who}: change it in Jira? y/N`;
 }
 

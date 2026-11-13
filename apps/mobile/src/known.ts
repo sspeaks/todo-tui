@@ -17,8 +17,10 @@ export function useKnown(): { labels: string[]; names: string[] } {
     const names = new Map<string, number>();
     for (const i of view.items) {
       for (const l of i.labels) labels.set(l, (labels.get(l) ?? 0) + 1);
-      const n = personName(i.waiting?.on, people);
-      if (n && n !== "someone") names.set(n, (names.get(n) ?? 0) + 1);
+      const on = i.waiting?.on;
+      // A Person not loaded yet has no name to offer.
+      const n = on?.ref.case === "personId" && !people.has(on.ref.value) ? "" : personName(on, people);
+      if (n) names.set(n, (names.get(n) ?? 0) + 1);
     }
     // Everyone known, after those waited on.
     for (const p of people.values()) if (p.displayName && !names.has(p.displayName)) names.set(p.displayName, 0);

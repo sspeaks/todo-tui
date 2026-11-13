@@ -164,17 +164,37 @@ pub(crate) fn load(conn: &Connection, id: PersonId) -> Result<Option<Person>> {
     }))
 }
 
-/// Everyone, by display name.
+/// Everyone, by display name: two queries, whatever their number.
 pub(crate) fn load_all(conn: &Connection) -> Result<Vec<Person>> {
-    let ids = conn
-        .prepare_cached("SELECT id FROM people ORDER BY display_name COLLATE NOCASE, id")?
-        .query_map([], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut all = Vec::with_capacity(ids.len());
-    for id in ids {
-        if let Some(p) = load(conn, person_id(&id)?)? {
-            all.push(p);
-        }
+    let mut identities: std::collections::HashMap<String, Vec<Identity>> =
+        std::collections::HashMap::new();
+    let mut stmt = conn.prepare_cached(
+        "SELECT person_id, instance_id, account_id FROM person_identities
+         ORDER BY instance_id, account_id",
+    )?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        identities.entry(r.get(0)?).or_default().push(Identity {
+            instance_id: r.get(1)?,
+            account_id: r.get(2)?,
+        });
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, display_name, username, emails FROM people
+         ORDER BY display_name COLLATE NOCASE, id",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut all = Vec::new();
+    while let Some(r) = rows.next()? {
+        let id: String = r.get(0)?;
+        let emails: String = r.get(3)?;
+        all.push(Person {
+            id: person_id(&id)?,
+            display_name: r.get(1)?,
+            username: r.get(2)?,
+            emails: emails_from_sql(&emails)?,
+            identities: identities.remove(&id).unwrap_or_default(),
+        });
     }
     Ok(all)
 }
@@ -184,21 +204,6 @@ pub(crate) fn exists(conn: &Connection, id: PersonId) -> Result<bool> {
     Ok(conn
         .prepare_cached("SELECT EXISTS (SELECT 1 FROM people WHERE id = ?1)")?
         .query_row([id.to_string()], |r| r.get(0))?)
-}
-
-/// The Person holding `account` on `instance`, if any.
-pub(crate) fn by_identity(
-    conn: &Connection,
-    instance: &str,
-    account: &str,
-) -> Result<Option<PersonId>> {
-    let id: Option<String> = conn
-        .prepare_cached(
-            "SELECT person_id FROM person_identities WHERE instance_id = ?1 AND account_id = ?2",
-        )?
-        .query_row(params![instance, account], |r| r.get(0))
-        .optional()?;
-    id.as_deref().map(person_id).transpose()
 }
 
 pub(crate) fn person_id(s: &str) -> Result<PersonId> {

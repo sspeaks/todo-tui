@@ -41,9 +41,27 @@ impl People {
     }
 
     async fn adapter(&self, i: &todo_sync::Instance) -> Result<todo_jira::Adapter, Status> {
-        crate::sync::adapter_for(i)
-            .await
-            .map_err(super::sync::jira_status)
+        crate::sync::adapter_for(i).await.map_err(directory_status)
+    }
+}
+
+/// A Jira error as the directory's caller reads it: offline is UNAVAILABLE
+/// (try again); a refused token is FAILED_PRECONDITION / JIRA_AUTH, not
+/// UNAUTHENTICATED, which a remote client takes for its own pairing; a 404
+/// is the instance's (a wrong base_url), not a user's.
+fn directory_status(e: todo_jira::JiraError) -> Status {
+    use todo_jira::JiraError as J;
+    match e {
+        J::Offline(_) | J::Server(..) | J::RateLimited(_) => {
+            error::error_info(Code::Unavailable, "JIRA_UNAVAILABLE", e.to_string(), [])
+        }
+        J::Auth => error::error_info(
+            Code::FailedPrecondition,
+            "JIRA_AUTH",
+            format!("Jira refused the token: {e} (todo sync check)"),
+            [],
+        ),
+        _ => error::error_info(Code::FailedPrecondition, "JIRA_REFUSED", e.to_string(), []),
     }
 }
 
@@ -108,18 +126,18 @@ impl PeopleService for People {
         let found = adapter
             .search_users(query)
             .await
-            .map_err(super::sync::jira_status)?;
+            .map_err(directory_status)?;
+        // Those known already are ListPeople's.
+        let (all, _) = self.0.store.list_people().await.map_err(error::store)?;
+        let known: std::collections::HashSet<&str> = all
+            .iter()
+            .flat_map(|p| p.identities.iter())
+            .filter(|ident| ident.instance_id == i.id)
+            .map(|ident| ident.account_id.as_str())
+            .collect();
         let mut users = Vec::with_capacity(found.len());
         for u in found {
-            // Those known already are ListPeople's.
-            if self
-                .0
-                .store
-                .person_by_identity(i.id.clone(), u.id.clone())
-                .await
-                .map_err(error::store)?
-                .is_some()
-            {
+            if known.contains(u.id.as_str()) {
                 continue;
             }
             users.push(v1::DirectoryUser {
@@ -144,11 +162,7 @@ impl PeopleService for People {
         }
         let i = self.instance(&req.instance_id)?;
         let adapter = self.adapter(&i).await?;
-        let Some(user) = adapter
-            .get_user(account)
-            .await
-            .map_err(super::sync::jira_status)?
-        else {
+        let Some(user) = adapter.get_user(account).await.map_err(directory_status)? else {
             return Err(error::error_info(
                 Code::NotFound,
                 "USER_NOT_FOUND",
