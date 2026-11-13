@@ -27,9 +27,12 @@ export function Pill({
   onPress,
   icon,
   dot,
+  mono,
   accessibilityLabel,
 }: {
   label: string;
+  /** In mono, as the list prints it (`#work`). */
+  mono?: boolean;
   on?: boolean;
   onPress: () => void;
   icon?: Icon;
@@ -54,7 +57,7 @@ export function Pill({
       accessibilityLabel={accessibilityLabel ?? label}
     >
       {on ? <Ionicons name="checkmark" size={15} color={fg} /> : dot ? <View style={[s.dot, { backgroundColor: dot }]} /> : icon ? <Ionicons name={icon} size={15} color={t.dim} /> : null}
-      <Text style={[s.text, compact && s.compactText, { color: fg }, on && s.onText]} numberOfLines={1}>
+      <Text style={[s.text, compact && s.compactText, mono && s.mono, { color: fg }, on && s.onText]} numberOfLines={1}>
         {label}
       </Text>
     </Pressable>
@@ -119,5 +122,6 @@ const styles = (t: Theme) =>
     pressed: { opacity: 0.7 },
     dot: { width: 9, height: 9, borderRadius: 5 },
     text: { fontSize: 15 },
+    mono: { ...t.mono, fontSize: 14 },
     onText: { fontWeight: "600" },
   });

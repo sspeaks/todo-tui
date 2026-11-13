@@ -1,8 +1,8 @@
 // The home screen on the FakeDaemon: tabs, rows, adding with the buttons,
 // complete and undo, and opening an item.
 import { CreatedVia, Priority, Status } from "@todo-tui/client/portable";
-import { fireEvent, screen, waitFor } from "@testing-library/react-native";
-import { router } from "expo-router";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react-native";
+import { router, useNavigation } from "expo-router";
 import { Home } from "../Home";
 import { renderOn, stopStores } from "./render";
 
@@ -21,6 +21,21 @@ test("shows the views as tabs and the first one's items", async () => {
   expect(screen.queryByText("plan trip")).toBeNull();
   await fireEvent.press(screen.getByRole("tab", { name: /Next/ }));
   expect(await screen.findByText("plan trip")).toBeTruthy();
+});
+
+test("names the selected view in the header, and each tab with its position and count", async () => {
+  const { setOptions } = useNavigation() as unknown as { setOptions: jest.Mock };
+  setOptions.mockClear();
+  await setup();
+  await screen.findByText("buy milk");
+  await waitFor(() => expect(setOptions).toHaveBeenLastCalledWith({ title: "Inbox" }));
+  const inbox = screen.getByRole("tab", { name: "Inbox, 1" });
+  expect(inbox.props.accessibilityState).toMatchObject({ selected: true });
+  await fireEvent.press(screen.getByRole("tab", { name: /^Next/ }));
+  await waitFor(() => expect(setOptions).toHaveBeenLastCalledWith({ title: "Next" }));
+  expect(screen.getByRole("tab", { name: /^Next/ }).props.accessibilityState).toMatchObject({ selected: true });
+  // Its position and its count.
+  expect(within(inbox).getAllByText("1")).toHaveLength(2);
 });
 
 test("adds with one tap per choice: due, priority, a label in use, a status", async () => {
@@ -89,4 +104,13 @@ test("a row opens its item", async () => {
   await setup();
   await fireEvent.press(await screen.findByText("buy milk"));
   expect(router.push).toHaveBeenCalledWith({ pathname: "/item/[id]", params: { id: "01JB0000000000000000000001" } });
+});
+
+test("says so when a view is empty, and why the list may be stale, in a card that retries on a tap", async () => {
+  const { session } = await renderOn([], <Home />, { link: { state: "unreachable", message: "mac.tail1.ts.net is out of reach." } });
+  expect(await screen.findByText("Nothing here.")).toBeTruthy();
+  expect(screen.getByText("Pull to refresh · + adds one")).toBeTruthy();
+  const banner = screen.getByText(/out of reach\. What you add is kept on this phone until then\./);
+  await fireEvent.press(banner);
+  expect(session.retry).toHaveBeenCalled();
 });

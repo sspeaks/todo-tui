@@ -17,14 +17,15 @@ import {
 import { useClients, useItem } from "@todo-tui/client/react";
 import { createdViaName, dayLabel, dayOf, describeRule, localTime, personName, priorityName, repeatsLine, ruleText, shortId } from "@todo-tui/present";
 import { Stack, router } from "expo-router";
-import { type ReactNode, useState } from "react";
+import { useState } from "react";
 import { ActivityIndicator, Alert, KeyboardAvoidingView, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { protoDate } from "../dates";
 import { useKnown } from "../known";
 import { withNotMine } from "../not-mine";
 import { useSnack } from "../snack";
-import { type Theme, useTheme } from "../theme";
+import { size, space, type Theme, useTheme } from "../theme";
 import { useToday } from "../today";
+import { CardGroup, CardRow } from "./Card";
 import { ALL_STATUSES, StatusPicker } from "./pickers/StatusPicker";
 import { PillRow } from "./quick/Pill";
 import { type RepeatPreset, presetOf } from "./quick/presets";
@@ -33,6 +34,7 @@ import { QuickLabels } from "./quick/QuickLabels";
 import { QuickPriority } from "./quick/QuickPriority";
 import { QuickRepeat } from "./quick/QuickRepeat";
 import { QuickWaiting } from "./quick/QuickWaiting";
+import { StatusMark } from "./StatusMark";
 
 type Patch = Omit<MessageInitShape<typeof ItemSchema>, "id" | "$typeName">;
 // The plain-object form of Waiting (not the message, which needs $typeName).
@@ -168,192 +170,199 @@ function Loaded({ item }: { item: Item }) {
     <KeyboardAvoidingView style={s.page} behavior={Platform.OS === "ios" ? "padding" : undefined} keyboardVerticalOffset={100}>
       <Stack.Screen options={{ title: shortId(item.id) }} />
       <ScrollView contentContainerStyle={s.content} keyboardShouldPersistTaps="handled">
-        <TextInput
-          style={[s.title, isClosed && s.closedTitle]}
-          value={title ?? item.title}
-          onFocus={() => setTitle(item.title)}
-          onChangeText={setTitle}
-          onEndEditing={saveTitle}
-          onSubmitEditing={saveTitle}
-          submitBehavior="blurAndSubmit"
-          returnKeyType="done"
-          multiline
-          accessibilityLabel="Title"
-        />
-
-        <StatusPicker value={item.status} options={ALL_STATUSES} onChange={changeStatus} />
-
-        <Section label="Priority">
-          <QuickPriority
-            value={item.priority === Priority.NONE ? undefined : item.priority}
-            onChange={(pr) => void update(pr === undefined ? {} : { priority: pr }, ["priority"], pr === undefined ? "Priority cleared" : `Priority ${priorityName(pr)}`)}
-          />
-        </Section>
-        <Section label="Due" value={due === undefined ? undefined : dayLabel(due, today)} danger={item.isOverdue}>
-          <QuickDate
-            title="Due"
-            value={due}
-            today={today}
-            onChange={(d) => void update(d === undefined ? {} : { dueDate: protoDate(d) }, ["due_date"], d === undefined ? "Due date cleared" : `Due ${dayLabel(d, today)}`)}
-          />
-        </Section>
-        <Section label="Repeats" value={repeatsLine(item, today) ?? (isClosed ? "Reopen it to set a repeat" : undefined)}>
-          {isClosed ? null : (
-            <QuickRepeat
-              preset={presetOf(rule)}
-              custom={rule && !presetOf(rule) ? describeRule(rule) : undefined}
-              anchor={due}
-              current={rule ? ruleText(rule) : undefined}
-              onPreset={(preset) => void repeatPreset(preset)}
-              onChange={(c) => void changeRepeat(c)}
+        <CardGroup>
+          <View style={s.titleRow}>
+            <View style={s.titleMark}>
+              <StatusMark status={item.status} size={26} />
+            </View>
+            <TextInput
+              style={[s.title, isClosed && s.closedTitle]}
+              value={title ?? item.title}
+              onFocus={() => setTitle(item.title)}
+              onChangeText={setTitle}
+              onEndEditing={saveTitle}
+              onSubmitEditing={saveTitle}
+              submitBehavior="blurAndSubmit"
+              returnKeyType="done"
+              multiline
+              accessibilityLabel="Title"
             />
-          )}
-        </Section>
-        <Section label="Labels">
-          <QuickLabels
-            value={item.labels}
-            known={known.labels}
-            onChange={(labels) => void update({ labels }, ["labels"], labels.length ? `Labels ${labels.map((l) => `#${l}`).join(" ")}` : "Labels cleared")}
-          />
-        </Section>
-        <Section label="Waiting on">
-          <QuickWaiting
-            value={waitingOn || undefined}
-            known={known.names}
-            onChange={(name) =>
-              void update(
-                name === undefined ? {} : { waiting: waitingWith({ on: { ref: { case: "freeText", value: name } } }) },
-                ["waiting"],
-                name === undefined ? "No longer waiting" : `Waiting on ${name}`,
-              )
-            }
-          />
-        </Section>
-        {item.waiting ? (
-          <Section label="Follow up" value={followUp === undefined ? undefined : dayLabel(followUp, today)} danger={followUp !== undefined && followUp <= today}>
-            <QuickDate
-              title="Follow up"
-              value={followUp}
-              today={today}
-              onChange={(d) =>
-                void update(
-                  {
-                    waiting:
-                      d === undefined
-                        ? (({ followUpOn: _, ...rest }) => rest)(waitingWith({}))
-                        : waitingWith({ followUpOn: protoDate(d) }),
-                  },
-                  ["waiting.follow_up_on"],
-                  d === undefined ? "Follow-up cleared" : `Follow up ${dayLabel(d, today)}`,
-                )
-              }
-            />
-          </Section>
-        ) : null}
-        <Section label="Hide until" value={defer === undefined ? undefined : dayLabel(defer, today)}>
-          <QuickDate
-            title="Hide until"
-            value={defer}
-            today={today}
-            onChange={(d) =>
-              void update(d === undefined ? {} : { deferUntil: protoDate(d) }, ["defer_until"], d === undefined ? "Shown again" : `Hidden until ${dayLabel(d, today)}`)
-            }
-          />
-        </Section>
-
-        <Text style={s.section}>Notes</Text>
-        <TextInput
-          style={s.notes}
-          value={notes ?? item.description}
-          onFocus={() => setNotes(item.description)}
-          onChangeText={setNotes}
-          placeholder="Add notes"
-          placeholderTextColor={t.dim}
-          multiline
-          textAlignVertical="top"
-          accessibilityLabel="Notes"
-        />
-        {notesDirty ? (
-          <View style={s.notesActions}>
-            <Pressable onPress={() => setNotes(undefined)} hitSlop={8}>
-              <Text style={s.cancel}>Discard</Text>
-            </Pressable>
-            <Pressable style={s.save} onPress={saveNotes}>
-              <Text style={s.saveText}>Save notes</Text>
-            </Pressable>
           </View>
-        ) : null}
+        </CardGroup>
 
-        <View style={s.info}>
+        <CardGroup title="Status">
+          <CardRow>
+            <StatusPicker value={item.status} options={ALL_STATUSES} onChange={changeStatus} />
+          </CardRow>
+        </CardGroup>
+
+        <CardGroup title="Priority">
+          <CardRow>
+            <PillRow>
+              <QuickPriority
+                value={item.priority === Priority.NONE ? undefined : item.priority}
+                onChange={(pr) => void update(pr === undefined ? {} : { priority: pr }, ["priority"], pr === undefined ? "Priority cleared" : `Priority ${priorityName(pr)}`)}
+              />
+            </PillRow>
+          </CardRow>
+        </CardGroup>
+
+        <CardGroup title="When">
+          <CardRow icon="calendar-outline" label="Due" value={due === undefined ? undefined : dayLabel(due, today)} danger={item.isOverdue}>
+            <PillRow>
+              <QuickDate
+                title="Due"
+                value={due}
+                today={today}
+                onChange={(d) => void update(d === undefined ? {} : { dueDate: protoDate(d) }, ["due_date"], d === undefined ? "Due date cleared" : `Due ${dayLabel(d, today)}`)}
+              />
+            </PillRow>
+          </CardRow>
+          <CardRow icon="repeat-outline" label="Repeats" value={repeatsLine(item, today) ?? (isClosed ? "Reopen it to set a repeat" : undefined)}>
+            {isClosed ? null : (
+              <PillRow>
+                <QuickRepeat
+                  preset={presetOf(rule)}
+                  custom={rule && !presetOf(rule) ? describeRule(rule) : undefined}
+                  anchor={due}
+                  current={rule ? ruleText(rule) : undefined}
+                  onPreset={(preset) => void repeatPreset(preset)}
+                  onChange={(c) => void changeRepeat(c)}
+                />
+              </PillRow>
+            )}
+          </CardRow>
+          <CardRow icon="eye-off-outline" label="Hide until" value={defer === undefined ? undefined : dayLabel(defer, today)}>
+            <PillRow>
+              <QuickDate
+                title="Hide until"
+                value={defer}
+                today={today}
+                onChange={(d) =>
+                  void update(d === undefined ? {} : { deferUntil: protoDate(d) }, ["defer_until"], d === undefined ? "Shown again" : `Hidden until ${dayLabel(d, today)}`)
+                }
+              />
+            </PillRow>
+          </CardRow>
+        </CardGroup>
+
+        <CardGroup title="People & labels">
+          <CardRow icon="pricetag-outline" label="Labels">
+            <PillRow>
+              <QuickLabels
+                value={item.labels}
+                known={known.labels}
+                onChange={(labels) => void update({ labels }, ["labels"], labels.length ? `Labels ${labels.map((l) => `#${l}`).join(" ")}` : "Labels cleared")}
+              />
+            </PillRow>
+          </CardRow>
+          <CardRow icon="hourglass-outline" label="Waiting on">
+            <PillRow>
+              <QuickWaiting
+                value={waitingOn || undefined}
+                known={known.names}
+                onChange={(name) =>
+                  void update(
+                    name === undefined ? {} : { waiting: waitingWith({ on: { ref: { case: "freeText", value: name } } }) },
+                    ["waiting"],
+                    name === undefined ? "No longer waiting" : `Waiting on ${name}`,
+                  )
+                }
+              />
+            </PillRow>
+          </CardRow>
+          {item.waiting ? (
+            <CardRow icon="alarm-outline" label="Follow up" value={followUp === undefined ? undefined : dayLabel(followUp, today)} danger={followUp !== undefined && followUp <= today}>
+              <PillRow>
+                <QuickDate
+                  title="Follow up"
+                  value={followUp}
+                  today={today}
+                  onChange={(d) =>
+                    void update(
+                      {
+                        waiting:
+                          d === undefined
+                            ? (({ followUpOn: _, ...rest }) => rest)(waitingWith({}))
+                            : waitingWith({ followUpOn: protoDate(d) }),
+                      },
+                      ["waiting.follow_up_on"],
+                      d === undefined ? "Follow-up cleared" : `Follow up ${dayLabel(d, today)}`,
+                    )
+                  }
+                />
+              </PillRow>
+            </CardRow>
+          ) : null}
+        </CardGroup>
+
+        <CardGroup title="Notes">
+          <CardRow>
+            <TextInput
+              style={s.notes}
+              value={notes ?? item.description}
+              onFocus={() => setNotes(item.description)}
+              onChangeText={setNotes}
+              placeholder="Add notes"
+              placeholderTextColor={t.dim}
+              multiline
+              textAlignVertical="top"
+              accessibilityLabel="Notes"
+            />
+            {notesDirty ? (
+              <View style={s.notesActions}>
+                <Pressable onPress={() => setNotes(undefined)} hitSlop={8}>
+                  <Text style={s.cancel}>Discard</Text>
+                </Pressable>
+                <Pressable style={s.save} onPress={saveNotes}>
+                  <Text style={s.saveText}>Save notes</Text>
+                </Pressable>
+              </View>
+            ) : null}
+          </CardRow>
+        </CardGroup>
+
+        <CardGroup title="Info">
           {item.parentTitle && item.parentId ? (
-            <Pressable onPress={() => router.push({ pathname: "/item/[id]", params: { id: item.parentId! } })}>
-              <Text style={s.infoText}>
-                Part of <Text style={s.link}>{item.parentTitle}</Text>
-              </Text>
-            </Pressable>
+            <CardRow
+              icon="git-branch-outline"
+              label="Part of"
+              value={item.parentTitle}
+              valueColor={t.accent}
+              onPress={() => router.push({ pathname: "/item/[id]", params: { id: item.parentId! } })}
+            />
           ) : null}
-          {item.subtasksTotal ? (
-            <Text style={s.infoText}>
-              Subtasks: {item.subtasksDone} of {item.subtasksTotal} done
-            </Text>
-          ) : null}
+          {item.subtasksTotal ? <CardRow icon="list-outline" label="Subtasks" value={`${item.subtasksDone}/${item.subtasksTotal} done`} /> : null}
           {item.createdAt ? (
-            <Text style={s.infoText}>
-              Created {localTime(item.createdAt)}
-              {createdViaName(item.createdVia) ? ` from ${createdViaName(item.createdVia)}` : ""}
-            </Text>
+            <CardRow
+              icon="add-circle-outline"
+              label="Created"
+              value={`${localTime(item.createdAt)}${createdViaName(item.createdVia) ? ` · ${createdViaName(item.createdVia)}` : ""}`}
+            />
           ) : null}
-          {item.updatedAt ? <Text style={s.infoText}>Changed {localTime(item.updatedAt)}</Text> : null}
-        </View>
+          {item.updatedAt ? <CardRow icon="time-outline" label="Changed" value={localTime(item.updatedAt)} /> : null}
+        </CardGroup>
 
-        <Pressable style={s.delete} onPress={confirmDelete}>
-          <Text style={s.deleteText}>Delete</Text>
-        </Pressable>
+        <CardGroup>
+          <CardRow label="Delete" onPress={confirmDelete} danger center />
+        </CardGroup>
       </ScrollView>
-
     </KeyboardAvoidingView>
-  );
-}
-
-/** A field: its name and (when set) how it reads, then its one-tap choices. */
-function Section({ label, value, danger, children }: { label: string; value?: string | undefined; danger?: boolean; children?: ReactNode }) {
-  const s = styles(useTheme());
-  return (
-    <View style={s.field}>
-      <View style={s.fieldHead}>
-        <Text style={s.fieldLabel}>{label}</Text>
-        {value ? (
-          <Text style={[s.fieldValue, danger && s.danger]} numberOfLines={2}>
-            {value}
-          </Text>
-        ) : null}
-      </View>
-      {children ? <PillRow>{children}</PillRow> : null}
-    </View>
   );
 }
 
 const styles = (t: Theme) =>
   StyleSheet.create({
-    page: { flex: 1, backgroundColor: t.bg },
-    center: { flex: 1, alignItems: "center", justifyContent: "center", backgroundColor: t.bg },
-    content: { padding: 16, gap: 14, paddingBottom: 48 },
-    title: { color: t.text, fontSize: 22, fontWeight: "600", padding: 0 },
+    page: { flex: 1, backgroundColor: t.grouped },
+    center: { flex: 1, alignItems: "center", justifyContent: "center", backgroundColor: t.grouped },
+    content: { padding: space.l, gap: space.l + 2, paddingBottom: 48 },
+    titleRow: { flexDirection: "row", alignItems: "flex-start", gap: space.m, padding: 14 },
+    titleMark: { paddingTop: 1 },
+    title: { flex: 1, color: t.text, fontSize: size.title, fontWeight: "600", padding: 0 },
     closedTitle: { color: t.dim, textDecorationLine: "line-through" },
-    field: { gap: 6 },
-    fieldHead: { flexDirection: "row", justifyContent: "space-between", alignItems: "baseline", gap: 12 },
-    fieldLabel: { color: t.dim, fontSize: 13, textTransform: "uppercase" },
-    fieldValue: { color: t.text, fontSize: 14, flexShrink: 1, textAlign: "right" },
-    danger: { color: t.danger, fontWeight: "600" },
-    section: { color: t.dim, fontSize: 13, textTransform: "uppercase", marginTop: 4 },
-    notes: { backgroundColor: t.surface, color: t.text, borderRadius: 12, padding: 12, minHeight: 120, fontSize: 15 },
-    notesActions: { flexDirection: "row", justifyContent: "flex-end", alignItems: "center", gap: 16 },
+    notes: { color: t.text, minHeight: 110, fontSize: 15, lineHeight: 21, padding: 0 },
+    notesActions: { flexDirection: "row", justifyContent: "flex-end", alignItems: "center", gap: space.l, marginTop: space.s },
     cancel: { color: t.dim, fontSize: 15 },
     save: { backgroundColor: t.accent, borderRadius: 8, paddingHorizontal: 14, paddingVertical: 8 },
-    saveText: { color: t.onAccent, fontWeight: "600" },
-    info: { gap: 4, marginTop: 4 },
-    infoText: { color: t.dim, fontSize: 13 },
-    link: { color: t.accent },
-    delete: { alignSelf: "center", marginTop: 16, paddingHorizontal: 16, paddingVertical: 10 },
-    deleteText: { color: t.danger, fontSize: 16 },
+    saveText: { ...t.monoBold, color: t.onAccent },
   });

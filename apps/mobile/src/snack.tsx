@@ -168,5 +168,6 @@ const styles = (_t: Theme) =>
       elevation: 5,
     },
     text: { flex: 1, color: "#f3f4f6", fontSize: 14, lineHeight: 19 },
-    action: { color: "#93c5fd", fontWeight: "700", fontSize: 15 },
+    // The accent's cyan, light enough for the dark snackbar in both themes.
+    action: { color: "#67e8f9", fontWeight: "700", fontSize: 15 },
   });

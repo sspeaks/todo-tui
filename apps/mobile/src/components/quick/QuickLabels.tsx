@@ -25,7 +25,7 @@ export function QuickLabels({
   return (
     <>
       {all.map((l) => (
-        <Pill key={l} label={`#${l}`} on={value.includes(l)} onPress={() => toggle(l)} />
+        <Pill key={l} label={`#${l}`} mono on={value.includes(l)} onPress={() => toggle(l)} />
       ))}
       <Pill icon="add" label={more ? "More…" : "New label"} onPress={() => setAdding(true)} accessibilityLabel={more ? "More labels" : "New label"} />
       {adding ? <LabelsSheet visible value={value} known={known} onChange={onChange} onClose={() => setAdding(false)} /> : null}

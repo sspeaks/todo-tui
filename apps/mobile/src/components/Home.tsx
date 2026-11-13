@@ -1,17 +1,19 @@
 import { Ionicons } from "@expo/vector-icons";
 import { useStatusCounts, useViews } from "@todo-tui/client/react";
 import { tabQuery } from "@todo-tui/present";
-import { useState } from "react";
-import { ActivityIndicator, Pressable, StyleSheet, Text, View } from "react-native";
+import { useNavigation } from "expo-router";
+import { useLayoutEffect, useState } from "react";
+import { ActivityIndicator, Pressable, StyleSheet, View } from "react-native";
 import { type Theme, useTheme } from "../theme";
 import { useToday } from "../today";
 import { AddTodo } from "./AddTodo";
 import { Banner } from "./Banner";
+import { EmptyState } from "./EmptyState";
 import { ItemList } from "./ItemList";
 import { OutboxBar } from "./OutboxBar";
 import { TabStrip } from "./TabStrip";
 
-/** The views as tabs, the selected one's list, and the + button that adds. */
+/** The views as tabs, the selected one's list (its name the header's title), and the + button that adds. */
 export function Home() {
   const t = useTheme();
   const s = styles(t);
@@ -21,6 +23,9 @@ export function Home() {
   const [tab, setTab] = useState<string>();
   const [adding, setAdding] = useState(false);
   const selected = tab !== undefined && views.views.some((v) => v.id === tab) ? tab : views.views[0]?.id;
+  const name = views.views.find((v) => v.id === selected)?.name;
+  const navigation = useNavigation();
+  useLayoutEffect(() => navigation.setOptions({ title: name ?? "todo" }), [navigation, name]);
 
   return (
     <View style={s.page}>
@@ -28,9 +33,13 @@ export function Home() {
       <TabStrip views={views.views} counts={counts.views} selected={selected} onSelect={setTab} />
       <OutboxBar />
       {selected ? (
-        <ItemList query={tabQuery(selected)} today={today} empty="Nothing here." />
+        <ItemList key={selected} query={tabQuery(selected)} today={today} empty="Nothing here." emptyIcon="checkmark-done-outline" emptyHint="Pull to refresh · + adds one" />
+      ) : views.status === "loading" ? (
+        <View style={s.center}>
+          <ActivityIndicator color={t.accent} />
+        </View>
       ) : (
-        <View style={s.center}>{views.status === "loading" ? <ActivityIndicator color={t.accent} /> : <Text style={s.message}>No views yet.</Text>}</View>
+        <EmptyState icon="albums-outline" text="No views yet." hint="Make one on your computer: :view new <name>" />
       )}
       <Pressable
         style={({ pressed }) => [s.fab, pressed && s.fabPressed]}
@@ -49,7 +58,6 @@ const styles = (t: Theme) =>
   StyleSheet.create({
     page: { flex: 1, backgroundColor: t.bg },
     center: { flex: 1, alignItems: "center", justifyContent: "center", padding: 24, backgroundColor: t.bg },
-    message: { color: t.dim, textAlign: "center", fontSize: 15 },
     fab: {
       position: "absolute",
       right: 20,

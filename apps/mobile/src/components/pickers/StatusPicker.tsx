@@ -1,5 +1,5 @@
 import { Status } from "@todo-tui/client/portable";
-import { Pressable, ScrollView, StyleSheet, Text } from "react-native";
+import { Pressable, StyleSheet, Text, View } from "react-native";
 import { type Theme, useTheme } from "../../theme";
 
 export const OPEN_STATUSES: { value: Status; label: string }[] = [
@@ -15,7 +15,7 @@ export const ALL_STATUSES: { value: Status; label: string }[] = [
   { value: Status.CANCELLED, label: "Cancelled" },
 ];
 
-/** A row of segments, one per status. */
+/** The statuses as segments, wrapping onto as many lines as they need: every one in sight. */
 export function StatusPicker({
   value,
   options,
@@ -27,7 +27,7 @@ export function StatusPicker({
 }) {
   const s = styles(useTheme());
   return (
-    <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.row}>
+    <View style={s.row}>
       {options.map((o) => {
         const on = o.value === value;
         return (
@@ -36,14 +36,14 @@ export function StatusPicker({
           </Pressable>
         );
       })}
-    </ScrollView>
+    </View>
   );
 }
 
 const styles = (t: Theme) =>
   StyleSheet.create({
-    row: { gap: 6 },
-    seg: { paddingHorizontal: 12, paddingVertical: 8, borderRadius: 8, backgroundColor: t.surface },
+    row: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
+    seg: { paddingHorizontal: 12, paddingVertical: 8, borderRadius: 8, backgroundColor: t.chip },
     on: { backgroundColor: t.accent },
     text: { color: t.text, fontWeight: "500" },
     onText: { color: t.onAccent },

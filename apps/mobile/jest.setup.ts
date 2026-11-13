@@ -1,11 +1,14 @@
 // Native-only modules the screens import, replaced for Jest.
 jest.mock("react-native-safe-area-context", () => jest.requireActual<{ default: unknown }>("react-native-safe-area-context/jest/mock").default);
 jest.mock("@react-native-community/datetimepicker", () => ({ __esModule: true, default: () => null }));
+// One navigation object, as a screen's is: its setOptions records the headers set.
+const mockNavigation = { setOptions: jest.fn() };
 jest.mock("expo-router", () => ({
   Stack: { Screen: () => null },
   usePathname: () => "/",
   useFocusEffect: (effect: () => void) => jest.requireActual<typeof import("react")>("react").useEffect(effect, [effect]),
   router: { push: jest.fn(), back: jest.fn(), replace: jest.fn() },
+  useNavigation: () => mockNavigation,
 }));
 jest.mock("expo-haptics", () => ({
   selectionAsync: jest.fn(async () => {}),

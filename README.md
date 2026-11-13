@@ -764,11 +764,13 @@ an edit pushes, and to ask before closing or renaming a ticket as a side effect.
 
 `apps/mobile` is an Expo (React Native) app that talks to the daemon on your
 computer over [Tailscale](https://tailscale.com) ([ADR-0008](docs/adr/0008-remote-transport.md)).
-It shows the views as tabs with the same rows as the TUI. To add an item, tap the
+It shows the views as tabs with the same rows as the TUI, in its look: the TUI's cyan,
+JetBrains Mono for dates, labels, counts and ids, a row's priority as its coloured left
+edge, and light or dark with the phone. To add an item, tap the
 round + button, type a title and set the rest with one tap each (due, priority,
 status, repeat, the labels and names you use), or type the capture syntax; a preview
 shows what will be captured. The item screen has the same one-tap choices.
-Tap ○ (or swipe right) to complete an item and ● to reopen it; swipe left to delete.
+Tap the ring (or swipe right) to complete an item and the check to reopen it; swipe left to delete.
 The tab bar has the list, Search, and Settings (the connection and pairing).
 What you add while your computer is out of reach is kept on the phone and sent
 once it is back. Tap an item to edit its title, status,

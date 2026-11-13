@@ -1,13 +1,12 @@
 // The computer this phone is paired with and how the link is, what waits
 // to be sent, and pairing: with another computer, or none.
-import { Ionicons } from "@expo/vector-icons";
 import { useConnection } from "@todo-tui/client/react";
 import { router } from "expo-router";
-import type { ReactNode } from "react";
-import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { Alert, ScrollView, StyleSheet, Text } from "react-native";
 import { useOutbox } from "../outbox";
 import { APP_VERSION, useSession } from "../session";
-import { type Theme, useTheme } from "../theme";
+import { size, space, type Theme, useTheme } from "../theme";
+import { CardGroup as Group, CardRow } from "./Card";
 
 export function SettingsScreen() {
   const t = useTheme();
@@ -50,23 +49,23 @@ export function SettingsScreen() {
   return (
     <ScrollView style={s.page} contentContainerStyle={s.content}>
       <Group title="Computer">
-        <Row icon="desktop-outline" label={host} />
-        <Row icon="pulse-outline" label="Status" value={status.text} valueColor={status.color} />
-        {link.state === "ok" ? <Row icon="information-circle-outline" label="todo on it" value={`${link.serverInfo.daemonVersion} · API ${link.serverInfo.apiMinor}`} /> : null}
-        {link.state !== "ok" || conn.state !== "live" ? <Row icon="refresh" label="Reconnect now" onPress={retry} accent /> : null}
+        <CardRow icon="desktop-outline" label={host} />
+        <CardRow icon="pulse-outline" label="Status" value={status.text} valueColor={status.color} />
+        {link.state === "ok" ? <CardRow icon="information-circle-outline" label="todo on it" value={`${link.serverInfo.daemonVersion} · API ${link.serverInfo.apiMinor}`} /> : null}
+        {link.state !== "ok" || conn.state !== "live" ? <CardRow icon="refresh" label="Reconnect now" onPress={retry} accent /> : null}
       </Group>
 
       {pending.length > 0 ? (
         <Group title="Added offline">
           {pending.map((p) => (
-            <Row key={p.requestId} icon="cloud-upload-outline" label={p.title} value="waiting" />
+            <CardRow key={p.requestId} icon="cloud-upload-outline" label={p.title} value="waiting" />
           ))}
         </Group>
       ) : null}
 
       <Group title="Pairing">
-        <Row icon="swap-horizontal" label="Pair with a different computer" onPress={() => router.push("/pair")} accent />
-        <Row icon="log-out-outline" label="Unpair this phone" onPress={confirmUnpair} danger />
+        <CardRow icon="swap-horizontal" label="Pair with a different computer" onPress={() => router.push("/pair")} accent />
+        <CardRow icon="log-out-outline" label="Unpair this phone" onPress={confirmUnpair} danger />
       </Group>
 
       <Text style={s.footer}>todo for iPhone {APP_VERSION}</Text>
@@ -74,69 +73,9 @@ export function SettingsScreen() {
   );
 }
 
-function Group({ title, children }: { title: string; children: ReactNode }) {
-  const s = styles(useTheme());
-  return (
-    <View style={s.group}>
-      <Text style={s.groupTitle}>{title}</Text>
-      <View style={s.card}>{children}</View>
-    </View>
-  );
-}
-
-function Row({
-  icon,
-  label,
-  value,
-  valueColor,
-  onPress,
-  accent,
-  danger,
-}: {
-  icon: keyof typeof Ionicons.glyphMap;
-  label: string;
-  value?: string;
-  valueColor?: string;
-  onPress?: () => void;
-  accent?: boolean;
-  danger?: boolean;
-}) {
-  const t = useTheme();
-  const s = styles(t);
-  const color = danger ? t.danger : accent ? t.accent : t.text;
-  return (
-    <Pressable style={({ pressed }) => [s.row, pressed && onPress && s.pressed]} onPress={onPress} disabled={!onPress} accessibilityRole={onPress ? "button" : "text"}>
-      <Ionicons name={icon} size={20} color={danger ? t.danger : accent ? t.accent : t.dim} />
-      <Text style={[s.label, { color }]} numberOfLines={2}>
-        {label}
-      </Text>
-      {value ? (
-        <Text style={[s.value, valueColor ? { color: valueColor } : null]} numberOfLines={3}>
-          {value}
-        </Text>
-      ) : null}
-    </Pressable>
-  );
-}
-
 const styles = (t: Theme) =>
   StyleSheet.create({
-    page: { flex: 1, backgroundColor: t.bg },
-    content: { padding: 16, gap: 24, paddingBottom: 48 },
-    group: { gap: 8 },
-    groupTitle: { color: t.dim, fontSize: 13, textTransform: "uppercase", paddingHorizontal: 4 },
-    card: { backgroundColor: t.surface, borderRadius: 12, overflow: "hidden" },
-    row: {
-      flexDirection: "row",
-      alignItems: "center",
-      gap: 12,
-      paddingHorizontal: 14,
-      paddingVertical: 13,
-      borderBottomWidth: StyleSheet.hairlineWidth,
-      borderBottomColor: t.border,
-    },
-    pressed: { opacity: 0.6 },
-    label: { flex: 1, fontSize: 15 },
-    value: { flexShrink: 1, maxWidth: "55%", color: t.dim, fontSize: 14, textAlign: "right" },
-    footer: { color: t.dim, fontSize: 12, textAlign: "center" },
+    page: { flex: 1, backgroundColor: t.grouped },
+    content: { padding: space.l, gap: space.xl, paddingBottom: 48 },
+    footer: { ...t.mono, color: t.dim, fontSize: size.caption, textAlign: "center" },
   });

@@ -40,6 +40,8 @@ export function AddTodo({ visible, today, onClose }: { visible: boolean; today: 
   const outbox = useOutbox();
   const known = useKnown();
   const [title, setTitle] = useState("");
+  /** The title field has the keyboard: its border turns the accent. */
+  const [focused, setFocused] = useState(false);
   const [choices, setChoices] = useState<CaptureChoices>(NO_CHOICES);
   /** How a repeat from the sheet reads ("every Mon, Thu"); presets need none. */
   const [customRepeat, setCustomRepeat] = useState<string>();
@@ -137,16 +139,18 @@ export function AddTodo({ visible, today, onClose }: { visible: boolean; today: 
               accessibilityLabel="Add"
               style={({ pressed }) => [s.add, !canAdd && s.disabled, pressed && s.pressed]}
             >
-              {busy ? <ActivityIndicator color={t.onAccent} /> : <Text style={s.addText}>Add</Text>}
+              {busy ? <ActivityIndicator color={t.onAccent} /> : <Text style={[s.addText, !canAdd && s.disabledText]}>Add</Text>}
             </Pressable>
           </View>
         </View>
         <ScrollView style={s.page} contentContainerStyle={s.content} keyboardShouldPersistTaps="always">
           <View style={[s.card, s.titleCard]}>
             <TextInput
-              style={s.input}
+              style={[s.input, focused && s.inputFocused]}
               value={title}
               onChangeText={(next) => update(next, choices)}
+              onFocus={() => setFocused(true)}
+              onBlur={() => setFocused(false)}
               placeholder="What needs doing?"
               placeholderTextColor={t.dim}
               returnKeyType="done"
@@ -239,16 +243,33 @@ const styles = (t: Theme) =>
     header: { flexDirection: "row", alignItems: "center", paddingHorizontal: 16, paddingTop: 12, paddingBottom: 8 },
     headerSide: { flex: 1 },
     headerEnd: { alignItems: "flex-end" },
-    heading: { color: t.text, fontWeight: "600", fontSize: 17 },
+    heading: { ...t.monoBold, color: t.text, fontSize: 16 },
     cancel: { color: t.accent, fontSize: 17 },
     add: { backgroundColor: t.accent, borderRadius: 20, minWidth: 76, paddingHorizontal: 20, paddingVertical: 9, alignItems: "center" },
     addText: { color: t.onAccent, fontWeight: "700", fontSize: 17 },
-    disabled: { opacity: 0.35 },
+    // Plainly off, not a faded accent that reads as broken.
+    disabled: { backgroundColor: t.chip },
+    disabledText: { color: t.dim },
     pressed: { opacity: 0.8 },
     content: { paddingHorizontal: 12, paddingTop: 4, paddingBottom: 24, gap: 10 },
     card: { backgroundColor: t.card, borderRadius: 12, overflow: "hidden" },
     titleCard: { paddingHorizontal: 14, paddingVertical: 12, gap: 10 },
-    input: { color: t.text, fontSize: 20, fontWeight: "600", padding: 0, minHeight: 28 },
+    // A field of its own, recessed into the card: room around the text, and a hairline that turns the accent while typing.
+    input: {
+      color: t.text,
+      fontSize: 20,
+      lineHeight: 26,
+      fontWeight: "600",
+      minHeight: 50,
+      paddingHorizontal: 14,
+      paddingTop: 12,
+      paddingBottom: 12,
+      borderRadius: 10,
+      borderWidth: 1,
+      borderColor: t.border,
+      backgroundColor: t.grouped,
+    },
+    inputFocused: { borderColor: t.accent },
     warning: { flexDirection: "row", alignItems: "center", gap: 6 },
     warn: { color: t.warn, fontSize: 13, flexShrink: 1 },
     divider: { height: StyleSheet.hairlineWidth, backgroundColor: t.border, marginLeft: 12 },

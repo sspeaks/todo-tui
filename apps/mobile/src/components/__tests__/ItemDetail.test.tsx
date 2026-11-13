@@ -86,3 +86,20 @@ test("deletes after confirming, and goes back", async () => {
   await waitFor(() => expect(daemon.items.get(ID)?.deletedAt).toBeDefined());
   expect(router.back).toHaveBeenCalled();
 });
+
+test("groups the fields in cards, with the status mark by the title, every status in sight, and the parent under Info", async () => {
+  await renderOn(
+    [
+      { id: "01JB0000000000000000000009", title: "plan trip", status: Status.NEXT },
+      { id: ID, title: "buy milk", status: Status.DONE, parentId: "01JB0000000000000000000009" },
+    ],
+    <ItemDetail id={ID} />,
+  );
+  await screen.findByDisplayValue("buy milk");
+  for (const caption of ["Status", "Priority", "When", "People & labels", "Notes", "Info"]) expect(screen.getByText(caption)).toBeTruthy();
+  expect(screen.getByTestId("status-done")).toBeTruthy();
+  for (const status of ["Inbox", "Next", "Someday", "Doing", "Done", "Cancelled"]) expect(screen.getByRole("button", { name: status })).toBeTruthy();
+  // The parent opens from Info.
+  await fireEvent.press(await screen.findByText("plan trip"));
+  expect(router.push).toHaveBeenCalledWith({ pathname: "/item/[id]", params: { id: "01JB0000000000000000000009" } });
+});

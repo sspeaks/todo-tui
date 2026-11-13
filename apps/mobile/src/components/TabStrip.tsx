@@ -1,8 +1,13 @@
 import type { View as SavedView } from "@todo-tui/client/portable";
-import { Pressable, ScrollView, StyleSheet, Text } from "react-native";
-import { type Theme, useTheme } from "../theme";
+import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { size, space, type Theme, useTheme } from "../theme";
 
-/** The saved views as tabs, each with its count when the view shows one. */
+/**
+ * The saved views as tabs, as the TUI's tab bar reads (`1 Inbox 4`): the
+ * position dim, the name, the count when the view shows one. The selected
+ * one is tinted, in the accent; the name keeps its weight, so the tabs
+ * beside it do not shift.
+ */
 export function TabStrip({
   views,
   counts,
@@ -17,15 +22,27 @@ export function TabStrip({
   const s = styles(useTheme());
   return (
     <ScrollView horizontal showsHorizontalScrollIndicator={false} style={s.strip} contentContainerStyle={s.content}>
-      {views.map((v) => {
+      {views.map((v, i) => {
         const on = v.id === selected;
         const count = counts.get(v.id);
         return (
-          <Pressable key={v.id} onPress={() => onSelect(v.id)} style={[s.tab, on && s.on]} accessibilityRole="tab" accessibilityState={{ selected: on }}>
-            <Text style={[s.name, on && s.onText]}>
+          <Pressable
+            key={v.id}
+            onPress={() => onSelect(v.id)}
+            style={({ pressed }) => [s.tab, on && s.on, pressed && s.pressed]}
+            accessibilityRole="tab"
+            accessibilityState={{ selected: on }}
+            accessibilityLabel={count ? `${v.name}, ${count}` : v.name}
+          >
+            <Text style={s.index}>{i + 1}</Text>
+            <Text style={[s.name, on && s.onText]} numberOfLines={1}>
               {v.name}
-              {count ? <Text style={[s.count, on && s.onText]}> {count}</Text> : null}
             </Text>
+            {count ? (
+              <View style={[s.badge, on && s.onBadge]}>
+                <Text style={[s.count, on && s.onCount]}>{count}</Text>
+              </View>
+            ) : null}
           </Pressable>
         );
       })}
@@ -36,10 +53,15 @@ export function TabStrip({
 const styles = (t: Theme) =>
   StyleSheet.create({
     strip: { flexGrow: 0, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: t.border },
-    content: { paddingHorizontal: 8, paddingVertical: 8, gap: 6 },
-    tab: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 16, backgroundColor: t.surface },
-    on: { backgroundColor: t.accent },
-    name: { color: t.text, fontWeight: "500" },
-    count: { color: t.dim, fontWeight: "400" },
-    onText: { color: t.onAccent },
+    content: { paddingHorizontal: space.s, paddingVertical: space.s, gap: space.xs },
+    tab: { flexDirection: "row", alignItems: "center", gap: 6, paddingHorizontal: 10, paddingVertical: 7, borderRadius: 6 },
+    on: { backgroundColor: t.accentSoft },
+    pressed: { opacity: 0.6 },
+    index: { ...t.mono, color: t.dim, fontSize: size.caption },
+    name: { color: t.text, fontSize: 15, fontWeight: "500", maxWidth: 180 },
+    onText: { color: t.accent },
+    badge: { borderRadius: 4, paddingHorizontal: 5, paddingVertical: 1, backgroundColor: t.chip },
+    onBadge: { backgroundColor: t.accent },
+    count: { ...t.mono, color: t.dim, fontSize: size.caption },
+    onCount: { color: t.onAccent },
   });

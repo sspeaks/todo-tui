@@ -22,8 +22,12 @@ export default function TabsLayout() {
         tabBarActiveTintColor: t.accent,
         tabBarInactiveTintColor: t.dim,
         tabBarStyle: { backgroundColor: t.bg, borderTopColor: t.border },
+        // The labels stay in the system font: the tab bar gives them a fixed height that JetBrains Mono's tall metrics overflow.
         headerStyle: { backgroundColor: t.bg },
         headerTintColor: t.text,
+        headerTitleStyle: t.monoBold,
+        // Navigation's default hairline is its light theme's, stark in dark mode; the tab strip under Home has its own.
+        headerShadowVisible: false,
         sceneStyle: { backgroundColor: t.bg },
       }}
     >
