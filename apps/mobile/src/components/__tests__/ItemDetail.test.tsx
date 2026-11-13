@@ -1,4 +1,5 @@
 // The item screen on the FakeDaemon: each field is its own undoable change.
+import { FakeDaemon } from "@todo-tui/client/fake";
 import { Priority, Status } from "@todo-tui/client/portable";
 import { fireEvent, screen, waitFor } from "@testing-library/react-native";
 import { router } from "expo-router";
@@ -102,4 +103,25 @@ test("groups the fields in cards, with the status mark by the title, every statu
   // The parent opens from Info.
   await fireEvent.press(await screen.findByText("plan trip"));
   expect(router.push).toHaveBeenCalledWith({ pathname: "/item/[id]", params: { id: "01JB0000000000000000000009" } });
+});
+
+test("names a person by their name, offers the People known, and saves one by id", async () => {
+  const daemon = new FakeDaemon([
+    {
+      id: ID,
+      title: "buy milk",
+      status: Status.INBOX,
+      remoteLink: { trackerKind: "jira", instanceId: "work-jira", remoteId: "1", key: "PLAT-1", url: "https://jira.example.com/browse/PLAT-1" },
+    },
+  ]);
+  const dana = daemon.putPerson({ displayName: "Dana Example", emails: ["dana@example.com"] });
+  const item = daemon.items.get(ID)!;
+  item.assignee = { $typeName: "todo.v1.PersonRef", ref: { case: "personId", value: dana.id } };
+  await renderOn([], <ItemDetail id={ID} />, { daemon });
+  await screen.findByDisplayValue("buy milk");
+  // The assignee, and a pill to wait on her: by name, never her id.
+  expect(await screen.findAllByText("Dana Example")).toHaveLength(2);
+  expect(screen.queryByText(dana.id)).toBeNull();
+  await fireEvent.press(await screen.findByLabelText("Waiting on Dana Example"));
+  await waitFor(() => expect(daemon.items.get(ID)?.waiting?.on?.ref).toEqual({ case: "personId", value: dana.id }));
 });

@@ -9,7 +9,7 @@
 | `+1` … `+5` | Priority, 1 = highest | `+2` |
 | `^<date>` | Due date | `^fri`, `^tom`, `^+3d`, `^eow`, `^nov2`, `^2026-11-02` |
 | `#<label>` | Label; repeat for more | `#home #errand` |
-| `~<person>` | Waiting on someone (free text) | `~dana`, `~"the vendor"` |
+| `~<person>` | Waiting on someone: the one known person whose username, email, full name or first name it is, else free text | `~dana`, `~"the vendor"` |
 | `>next`, `>someday` | Status instead of the default `inbox` | `>someday` |
 | `@<rule>` | Repeat rule (below) | `@daily`, `@mon,thu`, `@15th`, `@2w` |
 | `\` | Escapes a sigil so it stays in the title | `fix \#1 fan`, `email bob\@x.com` |

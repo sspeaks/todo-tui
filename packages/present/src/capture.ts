@@ -77,8 +77,10 @@ export function captureSummary(draft: CaptureDraft, today: number): string {
     if (first && due && dayOf(first) !== dayOf(due)) parts.push(`first ${dayLabel(dayOf(first), today)}`);
   }
   if (draft.labels.length) parts.push(draft.labels.map((l) => `#${singleLine(l)}`).join(" "));
-  const waiting = personName(draft.waitingOn);
-  if (waiting) parts.push(`⧗${waiting}`);
+  // The person `~` named, by name; free text as typed, with how many it
+  // could have meant (design 2.3).
+  const waiting = draft.waitingPerson ? singleLine(draft.waitingPerson.displayName) : personName(draft.waitingOn);
+  if (waiting) parts.push(draft.waitingMatches > 1 ? `⧗${waiting} (${draft.waitingMatches} people match: kept as text)` : `⧗${waiting}`);
   if (draft.status === Status.NEXT) parts.push(">next");
   if (draft.status === Status.SOMEDAY) parts.push(">someday");
   return parts.join(" · ");

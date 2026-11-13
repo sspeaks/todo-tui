@@ -14,7 +14,7 @@ import {
   setStatus,
   updateItem,
 } from "@todo-tui/client/portable";
-import { useClients, useItem } from "@todo-tui/client/react";
+import { useClients, useItem, usePeople } from "@todo-tui/client/react";
 import { createdViaName, dayLabel, dayOf, describeRule, localTime, personName, priorityName, repeatsLine, ruleText, shortId } from "@todo-tui/present";
 import { Stack, router } from "expo-router";
 import { useState } from "react";
@@ -62,13 +62,19 @@ function Loaded({ item }: { item: Item }) {
   const snack = useSnack();
   const today = useToday();
   const known = useKnown();
+  const people = usePeople().people;
   /** The title and notes while being edited; undefined shows the Item's. */
   const [title, setTitle] = useState<string>();
   const [notes, setNotes] = useState<string>();
 
   const due = item.dueDate ? dayOf(item.dueDate) : undefined;
   const defer = item.deferUntil ? dayOf(item.deferUntil) : undefined;
-  const waitingOn = personName(item.waiting?.on);
+  const waitingOn = personName(item.waiting?.on, people);
+  /** A name the picker gave: the Person whose name it is (design 3.5), else free text. */
+  const refOf = (name: string): WaitingInit["on"] => {
+    const person = [...people.values()].find((p) => p.displayName === name);
+    return person ? { ref: { case: "personId", value: person.id } } : { ref: { case: "freeText", value: name } };
+  };
   const followUp = item.waiting?.followUpOn ? dayOf(item.waiting.followUpOn) : undefined;
   const rule = item.recurrence?.rule;
   const isClosed = closed(item.status);
@@ -247,6 +253,8 @@ function Loaded({ item }: { item: Item }) {
         </CardGroup>
 
         <CardGroup title="People & labels">
+          {item.assignee ? <CardRow icon="person-outline" label="Assignee" value={personName(item.assignee, people)} /> : null}
+          {item.reporter ? <CardRow icon="create-outline" label="Reporter" value={personName(item.reporter, people)} /> : null}
           <CardRow icon="pricetag-outline" label="Labels">
             <PillRow>
               <QuickLabels
@@ -263,7 +271,7 @@ function Loaded({ item }: { item: Item }) {
                 known={known.names}
                 onChange={(name) =>
                   void update(
-                    name === undefined ? {} : { waiting: waitingWith({ on: { ref: { case: "freeText", value: name } } }) },
+                    name === undefined ? {} : { waiting: waitingWith({ on: refOf(name) }) },
                     ["waiting"],
                     name === undefined ? "No longer waiting" : `Waiting on ${name}`,
                   )

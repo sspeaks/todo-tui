@@ -1,6 +1,6 @@
 // How an Item reads in a list row and in the detail pane (design 2.2).
 
-import { CreatedVia, Energy, type Item, type PersonRef, Priority, Status } from "@todo-tui/client/portable";
+import { CreatedVia, Energy, type Item, type Person, type PersonRef, Priority, Status } from "@todo-tui/client/portable";
 import { dayOf, shortDay } from "./dates.js";
 import { singleLine } from "./text.js";
 
@@ -85,11 +85,28 @@ export const energyName = (e: Energy): string => energyNames[e] ?? "none";
 /** "+3 medium", or "none". */
 export const priorityName = (p: Priority): string => (priorities[p] ? `${priorities[p]} ${priorityNames[p]}` : "none");
 
-/** A person as text: the free text, or the Person's id until People exist (P2). */
-export function personName(p: PersonRef | undefined): string {
+/** The People a client knows, by id (LiveStore.people). */
+export interface People {
+  get(id: string): Person | undefined;
+}
+
+/**
+ * A person as text: the free text, or the Person's display name (design
+ * 3.5); "someone" for a person not known yet (never their id).
+ */
+export function personName(p: PersonRef | undefined, people?: People): string {
   if (p?.ref.case === "freeText") return singleLine(p.ref.value);
-  if (p?.ref.case === "personId") return singleLine(p.ref.value);
+  if (p?.ref.case === "personId") {
+    const name = people?.get(p.ref.value)?.displayName;
+    return name ? singleLine(name) : "someone";
+  }
   return "";
+}
+
+/** A person's first email address, or "". */
+export function personEmail(p: PersonRef | undefined, people?: People): string {
+  if (p?.ref.case !== "personId") return "";
+  return singleLine(people?.get(p.ref.value)?.emails[0] ?? "");
 }
 
 /** The short id the CLI prints: the last 8 characters of the ULID. */
@@ -117,13 +134,13 @@ export interface RowCells {
   energy: string;
 }
 
-export function rowCells(item: Item, today: number): RowCells {
+export function rowCells(item: Item, today: number, people?: People): RowCells {
   const waiting = item.waiting;
   let waitingText = "";
   let age = "";
   if (waiting) {
     age = waiting.since ? ` ${Math.max(0, today - dayOf(waiting.since))}d` : "";
-    waitingText = `⧗${personName(waiting.on)}${age}`;
+    waitingText = `⧗${personName(waiting.on, people)}${age}`;
   }
   const markers: string[] = [];
   if (item.deferUntil && dayOf(item.deferUntil) > today) markers.push(`⏸${shortDay(dayOf(item.deferUntil), today)}`);

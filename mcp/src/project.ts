@@ -11,6 +11,8 @@ import {
   LinkState,
   Priority,
   type ProtoDate,
+  type Person,
+  type PersonRef,
   ResolutionKind,
   Status,
   StatusCategory,
@@ -72,12 +74,22 @@ const SYNC_ARCHIVE: ReadonlyMap<ArchiveReason, string> = new Map([
 export interface ProjectOptions {
   /** Include the description and private notes (todo_get). */
   detail?: boolean;
+  /** The People known, by id, to name a person (design 3.5). */
+  people?: ReadonlyMap<string, Person>;
+}
+
+/** A person as tool output: free text as it is; a Person by name, with their address and id. */
+export function personOf(ref: PersonRef | undefined, people?: ReadonlyMap<string, Person>): unknown {
+  const r = ref?.ref;
+  if (r?.case === "freeText") return r.value;
+  if (r?.case !== "personId") return undefined;
+  const p = people?.get(r.value);
+  return prune({ name: p?.displayName ?? "someone", email: p?.emails[0], person_id: r.value });
 }
 
 /** The Item as tool output; keys with no value are dropped. */
 export function project(item: Item, opts: ProjectOptions = {}): Record<string, unknown> {
   const waiting = item.waiting;
-  const on = waiting?.on?.ref;
   const rule = item.recurrence?.rule && ruleFromProto("rule", item.recurrence.rule);
   const link = item.remoteLink;
   const out: Record<string, unknown> = {
@@ -94,7 +106,7 @@ export function project(item: Item, opts: ProjectOptions = {}): Record<string, u
     defer_until: date(item.deferUntil),
     labels: item.labels.length > 0 ? item.labels : undefined,
     waiting: waiting && {
-      on: on?.case === "freeText" ? on.value : on?.value,
+      on: personOf(waiting.on, opts.people),
       reason: waiting.reason || undefined,
       since: date(waiting.since),
       follow_up_on: date(waiting.followUpOn),
@@ -105,6 +117,8 @@ export function project(item: Item, opts: ProjectOptions = {}): Record<string, u
     // Sync's reasons say why; a person's archive is just true.
     archived: item.archived ? (SYNC_ARCHIVE.get(item.archived.reason) ?? true) : undefined,
     deleted: item.deletedAt ? true : undefined,
+    assignee: link && personOf(item.assignee, opts.people),
+    reporter: link && personOf(item.reporter, opts.people),
     jira: link && {
       key: link.key,
       url: link.url,
@@ -125,8 +139,8 @@ export function project(item: Item, opts: ProjectOptions = {}): Record<string, u
   return prune(out);
 }
 
-/** A Suggestion patch's value as plain JSON: a string, number, list, date, or null for none. */
-export function valueOf(v: FieldValue | undefined): unknown {
+/** A Suggestion patch's value as plain JSON: a string, number, list, date, person, or null for none. */
+export function valueOf(v: FieldValue | undefined, people?: ReadonlyMap<string, Person>): unknown {
   const k = v?.kind;
   if (!k) return null;
   switch (k.case) {
@@ -145,6 +159,10 @@ export function valueOf(v: FieldValue | undefined): unknown {
       return ResolutionKind[k.value]?.toLowerCase() ?? null;
     case "stringValue":
       return k.value;
+    case "person":
+      return personOf(k.value, people) ?? null;
+    case "waiting":
+      return prune({ on: personOf(k.value.on, people), follow_up_on: isoDate(k.value.followUpOn), reason: k.value.reason || undefined });
     default:
       return String(k.value);
   }

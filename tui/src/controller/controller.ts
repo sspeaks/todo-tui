@@ -670,7 +670,7 @@ export class Controller {
       return i?.remoteLink !== undefined && !i.isMine;
     }).length;
     const back = this.state.mode;
-    this.setMode({ kind: "confirm", action: "not_mine", text: notMineText(item, others), back });
+    this.setMode({ kind: "confirm", action: "not_mine", text: notMineText(item, others, this.store.people), back });
     return new Promise<boolean>((resolve) => (this.notMine = resolve));
   }
 

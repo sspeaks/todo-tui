@@ -78,6 +78,9 @@ import { type Change, ChangeSchema, type SubscribeResponse, SubscribeResponseSch
 import { type FieldValue } from "./gen/todo/v1/field_value_pb.js";
 import { type Patch, type PatchSchema, PatchState, type Suggestion, SuggestionKind, SuggestionSchema, SuggestionSource, SuggestionState } from "./gen/todo/v1/suggestion_pb.js";
 import { type AssistantJob, AssistantJobSchema, AssistantJobState, AssistantService } from "./gen/todo/v1/assistant_service_pb.js";
+import { PeopleService } from "./gen/todo/v1/people_service_pb.js";
+import { type DirectoryUser, DirectoryUserSchema, type Person, PersonSchema } from "./gen/todo/v1/person_pb.js";
+import { namedBy, searchPeople } from "./people.js";
 import { SuggestionService } from "./gen/todo/v1/suggestion_service_pb.js";
 import { type OutboxEntry, OutboxEntrySchema, type SyncStatus, SyncStatusSchema, SyncService } from "./gen/todo/v1/sync_service_pb.js";
 import { parseCaptureText } from "./capture.js";
@@ -464,7 +467,7 @@ export class FakeDaemon {
   maxPageSize = MAX_PAGE_SIZE;
   /** Runs before every ListItems; throw from it to fail that call. */
   onListItems: ((req: ListItemsRequest) => void) | undefined;
-  apiMinor = 27;
+  apiMinor = 28;
   /** What Export streams, as one batch; unset, Export is UNIMPLEMENTED (the format is the daemon's). */
   exportLines: string[] | undefined;
   /** What GetConfig serves; change it with {@link setConfig}. */
@@ -485,6 +488,13 @@ export class FakeDaemon {
   readonly syncNows: string[] = [];
   /** The Suggestions, by id: putSuggestion's, as the RPCs leave them. */
   readonly suggestions = new Map<string, Suggestion>();
+  /** The People it knows (design 3.5), by id: put them with {@link putPerson}. */
+  readonly people = new Map<string, Person>();
+  /**
+   * Jira's directory for SearchDirectory and AddPerson, by account id; unset,
+   * SearchDirectory fails with JIRA_UNAVAILABLE, as offline.
+   */
+  directory: DirectoryUser[] | undefined;
   /** The issues attach can link to (setIssue), and the last made number. */
   private readonly issues = new Map<string, { title: string; remoteId: string }>();
   private issueSeq = 100;
@@ -612,7 +622,7 @@ export class FakeDaemon {
             if (!item || item.deletedAt !== undefined) throw notFound(idOf(`ids[${i}]`, id));
             return item;
           });
-          const m = meeting(items, req.subject);
+          const m = meeting(items, req.subject, (id) => this.people.get(id.toUpperCase())?.emails ?? []);
           return { url: teamsUrl(m), ...m };
         },
         getActivityReport: () => {
@@ -682,6 +692,55 @@ export class FakeDaemon {
         },
         applySuggestionPatches: (req) => this.applyPatches(req.requestId, req.patchIds, req.confirmNotMine),
         rejectSuggestion: (req) => this.rejectSuggestion(req.requestId, req.id),
+      });
+      service(PeopleService, {
+        listPeople: (req) => {
+          this.check();
+          if (req.limit > 1000) throw badRequest("limit", "must be 0 to 1000");
+          return { people: searchPeople(req.query, this.people.values(), req.limit || 50), revision: this.revision };
+        },
+        getPerson: (req) => {
+          this.check();
+          const id = idOf("id", req.id);
+          const person = this.people.get(id);
+          if (!person) throw errorInfo(Code.NotFound, "PERSON_NOT_FOUND", `person ${id} not found`, { person_id: id });
+          return { person };
+        },
+        searchDirectory: (req) => {
+          this.check();
+          const query = rustTrim(req.query).toLowerCase();
+          if (!query) throw badRequest("query", "must not be empty");
+          if (!this.directory) throw errorInfo(Code.Unavailable, "JIRA_UNAVAILABLE", "Jira is unreachable", {});
+          const known = new Set([...this.people.values()].flatMap((p) => p.identities.map((i) => `${i.instanceId}/${i.accountId}`)));
+          const users = this.directory.filter(
+            (u) =>
+              !known.has(`${u.instanceId}/${u.accountId}`) &&
+              (u.username.toLowerCase().startsWith(query) ||
+                u.email.toLowerCase().startsWith(query) ||
+                u.displayName.toLowerCase().split(/\s+/).some((w) => w.startsWith(query))),
+          );
+          return { users };
+        },
+        addPerson: (req) => {
+          this.check();
+          const account = rustTrim(req.accountId);
+          if (!account) throw badRequest("account_id", "must not be empty");
+          if (!this.directory) throw errorInfo(Code.Unavailable, "JIRA_UNAVAILABLE", "Jira is unreachable", {});
+          const user = this.directory.find((u) => u.accountId === account && (!req.instanceId || u.instanceId === req.instanceId));
+          if (!user) throw errorInfo(Code.NotFound, "USER_NOT_FOUND", `no user ${JSON.stringify(account)}`, { account_id: account });
+          const existing = [...this.people.values()].find((p) =>
+            p.identities.some((i) => i.instanceId === user.instanceId && i.accountId === user.accountId),
+          );
+          return {
+            person: this.putPerson({
+              ...(existing && { id: existing.id }),
+              displayName: user.displayName,
+              username: user.username,
+              emails: user.email ? [user.email] : [],
+              identities: [{ instanceId: user.instanceId, accountId: user.accountId }],
+            }),
+          };
+        },
       });
       service(AssistantService, {
         refine: (req) => this.refine(req.itemIds),
@@ -933,6 +992,26 @@ export class FakeDaemon {
    */
   forgetSyncStatus(instanceId: string): void {
     this.syncStatus.delete(instanceId);
+  }
+
+  /**
+   * Adds (or replaces) a Person, as a pull makes one, and publishes its
+   * change (TOPIC_PERSON). An id is made when none is given.
+   */
+  putPerson(init: MessageInitShape<typeof PersonSchema>): Person {
+    const p = create(PersonSchema, init);
+    p.id ||= ulid();
+    this.people.set(p.id, p);
+    this.revision++;
+    this.publish({ revision: this.revision, topic: Topic.PERSON, id: p.id, resource: { case: "person", value: p } });
+    return p;
+  }
+
+  /** A directory user, for SearchDirectory and AddPerson; the directory is answered from then on. */
+  putDirectoryUser(init: MessageInitShape<typeof DirectoryUserSchema>): DirectoryUser {
+    const u = create(DirectoryUserSchema, { instanceId: "work-jira", ...init });
+    (this.directory ??= []).push(u);
+    return u;
   }
 
   /**
@@ -1575,7 +1654,24 @@ export class FakeDaemon {
   /** ParseCapture: the capture syntax on the reference day; blank text gives an empty draft. */
   private parseCapture(req: ParseCaptureRequest): { draft: CaptureDraft } {
     if (overCaptureLimit(req.text)) throw badRequest("text", TOO_LONG);
-    return { draft: parseCaptureText(req.text, this.referenceDay(req.referenceTime)) };
+    return { draft: this.resolveWaiting(parseCaptureText(req.text, this.referenceDay(req.referenceTime))) };
+  }
+
+  /**
+   * `~name` naming exactly one known person is that person (design 2.3),
+   * and the draft says who; two or more, how many, kept as free text.
+   */
+  private resolveWaiting(draft: CaptureDraft): CaptureDraft {
+    const on = draft.waitingOn?.ref;
+    if (on?.case !== "freeText") return draft;
+    const named = namedBy(on.value, this.people.values());
+    if (named.length === 1 && named[0]) {
+      draft.waitingOn = create(PersonRefSchema, { ref: { case: "personId", value: named[0].id } });
+      draft.waitingPerson = named[0];
+    } else if (named.length > 1) {
+      draft.waitingMatches = named.length;
+    }
+    return draft;
   }
 
   /**
@@ -1598,14 +1694,14 @@ export class FakeDaemon {
     const recorded = this.recorded("CaptureItem", requestId) ?? (spoolId === undefined ? undefined : this.spools.get(spoolId));
     if (recorded) {
       const item = this.present(this.get(recorded.id), this.today());
-      return { item, result: recorded.result, draft: parseCaptureText(req.text, this.today(item.createdAt)) };
+      return { item, result: recorded.result, draft: this.resolveWaiting(parseCaptureText(req.text, this.today(item.createdAt))) };
     }
     const problem = parentId === undefined ? undefined : this.batch().unusableParent(parentId);
     if (problem) throw badRequest("parent_id", problem);
     // The reference time is the new Item's created_at, as a spool import's capture time is.
     const now = req.referenceTime ?? this.stamp();
     const day = this.today(now);
-    const draft = parseCaptureText(req.text, day);
+    const draft = this.resolveWaiting(parseCaptureText(req.text, day));
     const item = create(ItemSchema, {
       id: this.newId(),
       title: draft.title,
@@ -1755,6 +1851,14 @@ export class FakeDaemon {
       const parent = changes.find((c) => c.field === "parentId")?.new;
       const problem = typeof parent === "string" ? batch.parentProblem(p.id, parent) : undefined;
       if (problem) throw badRequest(`${p.prefix}item.parent_id`, problem);
+      // A person id must name a known person (design 3.5).
+      for (const c of changes) {
+        const ref = c.field === "waiting" ? (c.new as Waiting | undefined)?.on?.ref : c.field === "assignee" || c.field === "reporter" ? (c.new as PersonRef | undefined)?.ref : undefined;
+        if (ref?.case === "personId" && !this.people.has(ref.value.toUpperCase())) {
+          const path = c.field === "waiting" ? "waiting.on" : c.field;
+          throw badRequest(`${p.prefix}item.${path}`, "names no known person");
+        }
+      }
       const changed = changes.length > 0;
       if (p.kind === "delete" && changed) {
         // The live descendants go too, deepest first, then the Item: undo

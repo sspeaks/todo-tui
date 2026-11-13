@@ -8,11 +8,22 @@ import {
   RelationKind,
   type ViewQuery,
   useItem,
+  usePeople,
 } from "@todo-tui/client";
 import { type DOMElement, Box, Text, useBoxMetrics } from "ink";
 import { type ReactNode, useEffect, useRef } from "react";
 import { dayOf, localTime, longDay, relativeDays, shortDay } from "../format/dates.js";
-import { createdViaName, energyGlyph, energyName, personName, priorityName, shortId, statusGlyph, statusName } from "../format/item.js";
+import {
+  createdViaName,
+  energyGlyph,
+  energyName,
+  personEmail,
+  personName,
+  priorityName,
+  shortId,
+  statusGlyph,
+  statusName,
+} from "../format/item.js";
 import { repeatsLine } from "../format/recurrence.js";
 import { sanitize, singleLine } from "../format/text.js";
 import { useController, useDebounced, useOptionalView, useToday, useUi } from "./hooks.js";
@@ -175,6 +186,7 @@ export function DetailPane({ id, width, height, focused }: { id: string | undefi
   const subtasks = useOptionalView(settled && item ? subtasksOf(item.id) : undefined);
   const scroll = useUi((s) => (s.detail.id === id ? s.detail.scroll : 0));
   const today = useToday();
+  const people = usePeople().people;
   const content = useRef<DOMElement>(null);
   const { height: lines, hasMeasured } = useBoxMetrics(content);
   useEffect(() => {
@@ -240,7 +252,8 @@ export function DetailPane({ id, width, height, focused }: { id: string | undefi
         <Field label="Waiting" dim={!waiting}>
           {waiting
             ? [
-                personName(waiting.on) || "someone",
+                personName(waiting.on, people) || "someone",
+                personEmail(waiting.on, people),
                 waiting.since ? `since ${shortDay(dayOf(waiting.since), today)} (${Math.max(0, today - dayOf(waiting.since))}d)` : "",
                 waiting.followUpOn ? `follow up ${shortDay(dayOf(waiting.followUpOn), today)}` : "",
                 singleLine(waiting.reason),
@@ -268,8 +281,8 @@ export function DetailPane({ id, width, height, focused }: { id: string | undefi
             {[minutes(item.originalEstimate), item.remainingEstimate ? `${minutes(item.remainingEstimate)} left` : ""].filter(Boolean).join(" · ")}
           </Field>
         ) : null}
-        {item.assignee ? <Field label="Assignee">{personName(item.assignee)}</Field> : null}
-        {item.reporter ? <Field label="Reporter">{personName(item.reporter)}</Field> : null}
+        {item.assignee ? <Field label="Assignee">{personName(item.assignee, people)}</Field> : null}
+        {item.reporter ? <Field label="Reporter">{personName(item.reporter, people)}</Field> : null}
         {item.components.length ? <Field label="Component">{item.components.map(singleLine).join(", ")}</Field> : null}
         {item.fixVersions.length ? <Field label="Fix ver.">{item.fixVersions.map(singleLine).join(", ")}</Field> : null}
         {item.sprint ? <Field label="Sprint">{singleLine(item.sprint)}</Field> : null}

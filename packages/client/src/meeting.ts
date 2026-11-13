@@ -67,7 +67,12 @@ function cutBytes(s: string, max: number): string {
   return `${out}…`;
 }
 
-export function meeting(items: readonly Item[], subject?: string): Meeting {
+/**
+ * The meeting about `items`, as the daemon's (todo_core::meeting): the
+ * attendees are the addresses of each waiting.on, assignee and reporter,
+ * by `emails` for a Person, a free-text waiting.on that is one address.
+ */
+export function meeting(items: readonly Item[], subject?: string, emails: (personId: string) => readonly string[] = () => []): Meeting {
   const first = singleLine(items[0]?.title ?? "");
   const given = subject === undefined ? "" : singleLine(subject);
   const subj = given || (items.length > 1 ? `${first} + ${items.length - 1} more` : first);
@@ -85,10 +90,13 @@ export function meeting(items: readonly Item[], subject?: string): Meeting {
   }
   const attendees: string[] = [];
   for (const item of items) {
-    const on = item.waiting?.on?.ref;
-    if (on?.case !== "freeText") continue;
-    const addr = rustTrim(on.value);
-    if (isEmail(addr) && !attendees.some((a) => asciiLower(a) === asciiLower(addr))) attendees.push(addr);
+    for (const who of [item.waiting?.on?.ref, item.assignee?.ref, item.reporter?.ref]) {
+      const addrs = who?.case === "freeText" ? [who.value] : who?.case === "personId" ? emails(who.value) : [];
+      for (const raw of addrs) {
+        const addr = rustTrim(raw);
+        if (isEmail(addr) && !attendees.some((a) => asciiLower(a) === asciiLower(addr))) attendees.push(addr);
+      }
+    }
   }
   return { subject: subj, content: cutBytes(parts.join("\n\n"), MAX_CONTENT), attendees };
 }

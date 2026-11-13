@@ -24,6 +24,7 @@ import {
   create,
   equals,
   errorReason,
+  matchPerson,
   parseDate,
   parseRecurrence,
   setRecurrence,
@@ -45,7 +46,7 @@ import { singleLine } from "../format/text.js";
 import type { PromptKind } from "../keys/keymap.js";
 import { editLine, insert, type LineState, lineOf } from "../keys/line-editor.js";
 import { isChar, type KeyToken } from "../keys/tokenize.js";
-import { type Mode, normalMode, type PromptPreview, type Target } from "../state/types.js";
+import { type Mode, normalMode, type PromptPreview, type Target, type WaitingChoice } from "../state/types.js";
 import { Bulk, type BulkStep, bulkText, stepsOf, updateStep } from "./bulk.js";
 import type { Controller } from "./controller.js";
 import { Latest } from "./latest.js";
@@ -111,15 +112,46 @@ interface RepeatQuery {
   readonly key: string;
 }
 
-/** The free text an Item waits on; a Person id (P2) as is. */
-const waitingOn = (item: Item): string | undefined => item.waiting?.on?.ref.value;
+type PersonRefInit = { ref: { case: "personId" | "freeText"; value: string } };
+
+/** Who an Item waits on as `w` shows it: the free text, or the Person's name. */
+function waitingOn(item: Item, people: Pick<Controller["store"]["people"], "get">): string | undefined {
+  const on = item.waiting?.on?.ref;
+  if (on?.case === "personId") return people.get(on.value)?.displayName ?? on.value;
+  return on?.value;
+}
 
 /** `w`'s prefill: "dana ^2026-10-30". */
-function waitingText(item: Item): string {
-  const on = waitingOn(item);
+function waitingText(item: Item, people: Pick<Controller["store"]["people"], "get">): string {
+  const on = waitingOn(item, people);
   if (on === undefined) return "";
   const follow = item.waiting?.followUpOn;
   return follow ? `${on} ^${isoDay(dayOf(follow))}` : on;
+}
+
+/**
+ * `w`'s choices: People by name, then each free text not a Person's name
+ * (one spelling per name, the first met), then directory users; sorted by
+ * name within each.
+ */
+export function choices(
+  people: Iterable<{ id: string; displayName: string; emails: readonly string[] }>,
+  texts: readonly string[],
+  directory: readonly WaitingChoice[],
+): WaitingChoice[] {
+  const byName = (a: WaitingChoice, b: WaitingChoice) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
+  const known: WaitingChoice[] = [...people]
+    .map((p) => ({ name: p.displayName, personId: p.id, ...(p.emails[0] && { email: p.emails[0] }) }))
+    .sort(byName);
+  const taken = new Set(known.map((k) => k.name.toLowerCase()));
+  const free: WaitingChoice[] = [];
+  for (const t of texts) {
+    const key = t.toLowerCase();
+    if (taken.has(key)) continue;
+    taken.add(key);
+    free.push({ name: t });
+  }
+  return [...known, ...free.sort(byName), ...directory];
 }
 
 /** The date text a prompt's line asks ParseDate about; undefined when there is none to ask. */
@@ -206,7 +238,7 @@ export class Prompts {
         text = item.deferUntil ? isoDay(dayOf(item.deferUntil)) : "";
         break;
       case "waiting":
-        text = waitingText(item);
+        text = waitingText(item, this.c.store.people);
         break;
       case "repeat":
         text = ruleText(item.recurrence?.rule);
@@ -226,7 +258,7 @@ export class Prompts {
     let text: string | undefined;
     if (kind === "due") text = shared(items, (i) => (i.dueDate ? isoDay(dayOf(i.dueDate)) : ""));
     if (kind === "defer") text = shared(items, (i) => (i.deferUntil ? isoDay(dayOf(i.deferUntil)) : ""));
-    if (kind === "waiting") text = shared(items, waitingText);
+    if (kind === "waiting") text = shared(items, (i) => waitingText(i, this.c.store.people));
     if (kind === "repeat") text = shared(items, (i) => ruleText(i.recurrence?.rule));
     this.c.setMode({ kind: "prompt", prompt: kind, target, line: lineOf(text ?? "") });
     this.preview();
@@ -241,7 +273,7 @@ export class Prompts {
       case "enter":
         return this.submit(mode);
       case "tab":
-        if (mode.prompt === "waiting") this.complete(mode);
+        if (mode.prompt === "waiting") return this.complete(mode);
         return;
     }
     const line = isChar(key) ? insert(mode.line, this.c.charRun(key)) : editLine(mode.line, key);
@@ -323,8 +355,9 @@ export class Prompts {
       const w = parseWaiting(text);
       if (!w.person && w.date === undefined) return info(`enter clears waiting${bulk > 1 ? ` on ${bulk} items` : ""}`);
       if (!w.person) return warn("who is it waiting on? type a name before the ^date");
-      if (w.date === undefined) return info(`→ ⧗${singleLine(w.person)}`);
-      return date ? info(`→ ⧗${singleLine(w.person)} · follow up ${date}`) : warn(singleLine(res?.warning ?? ""));
+      const who = this.whoText(w.person);
+      if (w.date === undefined) return info(`→ ⧗${who}`);
+      return date ? info(`→ ⧗${who} · follow up ${date}`) : warn(singleLine(res?.warning ?? ""));
     }
     if (!text.trim()) return info(`enter clears the ${kind === "due" ? "due" : "defer"} date${of}`);
     return date ? info(`→ ${date}`) : warn(singleLine(res?.warning ?? ""));
@@ -345,9 +378,13 @@ export class Prompts {
     return info(repeatPreview({ ...res, first: undefined }, this.c.today()));
   }
 
-  /** The people already waited on, for tab: one ListItems over every Item waiting. */
+  /**
+   * Who tab completes from (design 3.5): the People the daemon knows, then
+   * the free text already waited on (one ListItems over every Item
+   * waiting), one entry per name.
+   */
   private async loadPeople(target: Target): Promise<void> {
-    let people: string[];
+    const texts: string[] = [];
     try {
       const res = await this.c.items.listItems(
         {
@@ -361,33 +398,109 @@ export class Prompts {
         },
         { timeoutMs: this.c.timing.rpcTimeoutMs },
       );
-      const names = new Map<string, string>();
       for (const item of res.items) {
         const on = item.waiting?.on?.ref;
-        // One spelling per person, the first met.
-        const key = on?.case === "freeText" ? on.value.trim().toLowerCase() : "";
-        if (on?.case === "freeText" && key && !names.has(key)) names.set(key, on.value.trim());
+        if (on?.case === "freeText" && on.value.trim()) texts.push(on.value.trim());
       }
-      people = [...names.values()].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
     } catch {
-      return;
+      // The People alone, then.
     }
     const { mode } = this.c.state;
-    if (mode.kind === "prompt" && mode.prompt === "waiting" && mode.target === target) this.c.setMode({ ...mode, people });
+    if (mode.kind === "prompt" && mode.prompt === "waiting" && mode.target === target) {
+      this.c.setMode({ ...mode, people: choices(this.c.store.people.getSnapshot().people.values(), texts, []) });
+    }
   }
 
-  /** tab: completes the person from the people already waited on, as far as they agree. */
-  private complete(mode: Prompt): void {
+  /**
+   * tab: completes the person, as far as the choices that start with what
+   * is typed agree. With none here, asks Jira's directory once for what is
+   * typed (online only) and completes from what it finds.
+   */
+  private async complete(mode: Prompt): Promise<void> {
+    const typed = waitingPrefix(mode.line.text);
+    const prefix = typed.trim().toLowerCase();
+    const starts = (list: readonly WaitingChoice[]) => list.filter((p) => p.name.toLowerCase().startsWith(prefix));
+    if (starts(mode.people ?? []).length || !prefix) return this.fill(mode, starts(mode.people ?? []));
+    let found: WaitingChoice[] = [];
+    try {
+      const res = await this.c.store.peopleClient.searchDirectory({ query: typed.trim() }, { timeoutMs: this.c.timing.rpcTimeoutMs });
+      found = res.users.map((u) => ({
+        name: u.displayName,
+        directory: { instanceId: u.instanceId, accountId: u.accountId, email: u.email },
+        ...(u.email && { email: u.email }),
+      }));
+    } catch (err) {
+      // Offline, or no Jira: free text it is, and the line says why.
+      const latest = this.latest(mode);
+      if (latest.line.text === mode.line.text) {
+        this.c.setMode({ ...latest, error: errorReason(err) === "NO_INSTANCE" ? "No one here by that name" : "No one here by that name, and Jira's directory could not be asked" });
+      }
+      return;
+    }
+    const latest = this.latest(mode);
+    if (latest.line.text !== mode.line.text) return;
+    if (!found.length) return this.c.setMode({ ...latest, error: "No one by that name here or in Jira" });
+    const people = [...(latest.people ?? []), ...found];
+    const next = { ...latest, people };
+    this.c.setMode(next);
+    this.fill(next, starts(found));
+  }
+
+  /** Completes the line to `matches`' agreed prefix (one: its whole name and a space). */
+  private fill(mode: Prompt, matches: readonly WaitingChoice[]): void {
+    if (!matches.length) return;
     const typed = waitingPrefix(mode.line.text);
     const after = mode.line.text.slice(typed.length);
     const prefix = typed.trim().toLowerCase();
-    const matches = (mode.people ?? []).filter((p) => p.toLowerCase().startsWith(prefix));
-    if (!matches.length) return;
-    const one = matches.length === 1;
-    const person = one ? (matches[0] ?? "") : commonPrefix(matches);
+    const names = [...new Set(matches.map((m) => m.name))];
+    const one = names.length === 1;
+    const person = one ? (names[0] ?? "") : commonPrefix(names);
     if (!one && person.length <= prefix.length) return;
     const head = one && !after ? `${person} ` : person;
     this.edit(mode, { text: head + after, cursor: [...head].length });
+  }
+
+  /**
+   * Who enter saves for `person` (design 3.5): the choice of that exact name
+   * (a Person, or a directory user to add), else the one Person the name
+   * names, else free text.
+   */
+  private whoFor(person: string): WaitingChoice {
+    const { mode } = this.c.state;
+    const list = mode.kind === "prompt" && mode.prompt === "waiting" ? (mode.people ?? []) : [];
+    const exact = list.filter((p) => p.name.toLowerCase() === person.trim().toLowerCase() && (p.personId || p.directory));
+    if (exact.length === 1 && exact[0]) return exact[0];
+    const one = matchPerson(person, this.c.store.people.getSnapshot().people.values());
+    if (one) return { name: one.displayName, personId: one.id, ...(one.emails[0] && { email: one.emails[0] }) };
+    return { name: person.trim() };
+  }
+
+  /** The preview's person: "Dana Example <dana@…>", "Jordan Lee (new, from Jira)" or the text as typed. */
+  private whoText(person: string): string {
+    const who = this.whoFor(person);
+    const name = singleLine(who.name);
+    if (who.directory) return `${name}${who.email ? ` <${singleLine(who.email)}>` : ""} (new, from Jira)`;
+    if (who.personId) return `${name}${who.email ? ` <${singleLine(who.email)}>` : ""}`;
+    return name;
+  }
+
+  /** Who enter saves for `person`, as a PersonRef: a directory user is made a Person first. */
+  private async refFor(person: string): Promise<PersonRefInit | undefined> {
+    const who = this.whoFor(person);
+    if (who.personId) return { ref: { case: "personId", value: who.personId } };
+    if (who.directory) {
+      try {
+        const res = await this.c.store.peopleClient.addPerson(
+          { instanceId: who.directory.instanceId, accountId: who.directory.accountId },
+          { timeoutMs: this.c.timing.rpcTimeoutMs },
+        );
+        if (res.person) return { ref: { case: "personId", value: res.person.id } };
+      } catch (err) {
+        this.c.failed(errorText(err));
+        return undefined;
+      }
+    }
+    return { ref: { case: "freeText", value: person } };
   }
 
   // --- enter ---
@@ -546,13 +659,15 @@ export class Prompts {
       followUpOn = await this.parse(mode, item, dateText);
       if (!followUpOn) return;
     }
-    if (current && waitingOn(item) === person) {
+    if (current && waitingOn(item, this.c.store.people) === person) {
       if (sameDate(followUpOn, current.followUpOn)) return this.c.setMode(normalMode);
       // The whole value, so that a daemon that copies the parent on a leaf path agrees.
       const waiting = { on: current.on, since: current.since, reason: current.reason, followUpOn };
       return this.saveWaitingPatch(item, { id: item.id, waiting }, ["waiting.follow_up_on"]);
     }
-    const waiting = { on: { ref: { case: "freeText" as const, value: person } }, ...(followUpOn && { followUpOn }) };
+    const on = await this.refFor(person);
+    if (!on) return;
+    const waiting = { on, ...(followUpOn && { followUpOn }) };
     return this.saveWaitingPatch(item, { id: item.id, waiting }, ["waiting"]);
   }
 
@@ -670,14 +785,17 @@ export class Prompts {
       followUpOn = await this.parse(mode, undefined, dateText);
       if (!followUpOn) return undefined;
     }
+    const others = items.filter((i) => !(i.waiting && waitingOn(i, this.c.store.people) === person));
+    const on = others.length ? await this.refFor(person) : undefined;
+    if (others.length && !on) return undefined;
     return stepsOf(items, (i) => {
       const current = i.waiting;
-      if (current && waitingOn(i) === person) {
+      if (current && waitingOn(i, this.c.store.people) === person) {
         if (sameDate(followUpOn, current.followUpOn)) return undefined;
         const waiting = { on: current.on, since: current.since, reason: current.reason, followUpOn };
         return updateStep({ id: i.id, waiting }, ["waiting.follow_up_on"]);
       }
-      const waiting = { on: { ref: { case: "freeText" as const, value: person } }, ...(followUpOn && { followUpOn }) };
+      const waiting = { on, ...(followUpOn && { followUpOn }) };
       return updateStep({ id: i.id, waiting }, ["waiting"]);
     });
   }

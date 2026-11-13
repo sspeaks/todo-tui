@@ -1,6 +1,7 @@
 import { Ionicons } from "@expo/vector-icons";
 import { type Item, Status } from "@todo-tui/client/portable";
 import { dayOf, personName, priorityLabel, priorityName, rowCells, singleLine } from "@todo-tui/present";
+import { type People } from "@todo-tui/present";
 import { memo, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import { priorityColor, size, space, type Theme, useTheme } from "../theme";
@@ -18,11 +19,14 @@ const closed = (s: Status) => s === Status.DONE || s === Status.CANCELLED;
 export const ItemRow = memo(function ItemRow({
   item,
   today,
+  people,
   onToggle,
   onOpen,
 }: {
   item: Item;
   today: number;
+  /** Who a person id names (design 3.5); without it a Person shows as "someone". */
+  people?: People;
   onToggle: (item: Item) => Promise<boolean>;
   onOpen: (item: Item) => void;
 }) {
@@ -34,11 +38,11 @@ export const ItemRow = memo(function ItemRow({
   if (asked && asked.from !== item.status) setAsked(undefined);
   const status = asked?.from === item.status ? asked.status : item.status;
   const done = closed(status);
-  const cells = rowCells(item, today);
+  const cells = rowCells(item, today, people);
   const edge = priorityColor(t, item.effectivePriority);
   const priority = priorityLabel(item);
   const dueToday = item.dueDate !== undefined && dayOf(item.dueDate) === today;
-  const waitingOn = item.waiting ? personName(item.waiting.on) : "";
+  const waitingOn = item.waiting ? personName(item.waiting.on, people) : "";
 
   const toggle = async () => {
     // One change at a time: a second tap while the first is on its way (or the row lingers, done) would send the same change again.

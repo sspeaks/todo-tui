@@ -1,4 +1,4 @@
-import { type Item, errorReason, useConnection, useViews } from "@todo-tui/client";
+import { type Item, errorReason, useConnection, usePeople, useViews } from "@todo-tui/client";
 import { Box, Text } from "ink";
 import { type RowCells, energyGlyph, fitWaiting, priorityLabel, rowCells, statusGlyph, titleCell } from "../format/item.js";
 import { displayWidth, fit, singleLine } from "../format/text.js";
@@ -36,6 +36,7 @@ export function ListPane({ tab, width, height }: { tab: TabId; width: number; he
   const marks = useUi((s) => s.marks);
   const narrow = useUi((s) => s.narrow?.shown);
   const search = searchQuery(tab);
+  const people = usePeople().people;
 
   let body;
   if (snap.status === "loading") {
@@ -55,7 +56,7 @@ export function ListPane({ tab, width, height }: { tab: TabId; width: number; he
   } else {
     const r = reconcile(list, ids, height);
     const rows = snap.items.slice(r.offset, r.offset + height);
-    const cells = rows.map((item) => rowCells(item, today));
+    const cells = rows.map((item) => rowCells(item, today, people));
     const widest = (pick: (c: RowCells) => string) => Math.max(0, ...cells.map((c) => displayWidth(pick(c))));
     // A cell of margin on the right, before the detail's separator.
     // The parent fills what the title leaves: it never widens a column.
@@ -80,7 +81,7 @@ export function ListPane({ tab, width, height }: { tab: TabId; width: number; he
       <Row
         key={item.id}
         item={item}
-        cells={cells[i] ?? rowCells(item, today)}
+        cells={cells[i] ?? rowCells(item, today, people)}
         cols={cols}
         selected={item.id === r.selectedId}
         marked={marks.has(item.id)}

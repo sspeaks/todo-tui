@@ -120,6 +120,26 @@ describe("todo mcp tools", () => {
     expect(done.waiting).toBeUndefined();
   });
 
+  it("names People: ~ links the one person it names, todo_people finds them, and waiting_on takes person:<id>", async () => {
+    const { call, daemon } = await harness();
+    const dana = daemon.putPerson({ displayName: "Dana Example", username: "dana", emails: ["dana@example.com"] });
+    daemon.putPerson({ displayName: "Alex One", username: "aone" });
+    daemon.putPerson({ displayName: "Alex Two", username: "atwo" });
+    const { item } = await call("todo_capture", { text: "Budget sign-off ~dana" });
+    expect(item.waiting.on).toEqual({ name: "Dana Example", email: "dana@example.com", person_id: dana.id });
+    const two = await call("todo_capture", { text: "Ask ~alex" });
+    expect(two.item.waiting.on).toBe("alex");
+    expect(two.waiting_matches).toBe(2);
+    const found = await call("todo_people", { query: "dan" });
+    expect(found.people).toEqual([{ name: "Dana Example", email: "dana@example.com", username: "dana", person_id: dana.id }]);
+    const set = await call("todo_update", { id: two.item.id, waiting_on: `person:${dana.id}` });
+    expect(set.waiting.on.person_id).toBe(dana.id);
+    await expect(call("todo_people", { query: "jordan", jira: true })).rejects.toThrow(/JIRA_UNAVAILABLE/);
+    daemon.putDirectoryUser({ accountId: "JIRAUSER3", displayName: "Jordan Lee", username: "jlee", email: "jordan.lee@example.com" });
+    const jira = await call("todo_people", { query: "jor", jira: true });
+    expect(jira).toEqual({ people: [], jira: [{ name: "Jordan Lee", email: "jordan.lee@example.com", username: "jlee" }] });
+  });
+
   it("completes a repeating item and returns the next instance; undo takes both back", async () => {
     const { call } = await harness();
     const { item } = await call("todo_capture", { text: "Check the build dashboard @mon" });
@@ -253,7 +273,16 @@ describe("todo mcp tools", () => {
   it("registers only the read tools when read-only", async () => {
     const { client } = await harness({ readOnly: true });
     const { tools } = await client.listTools();
-    expect(tools.map((t) => t.name).sort()).toEqual(["todo_get", "todo_l48", "todo_list", "todo_meeting_link", "todo_status", "todo_suggestions", "todo_views"]);
+    expect(tools.map((t) => t.name).sort()).toEqual([
+      "todo_get",
+      "todo_l48",
+      "todo_list",
+      "todo_meeting_link",
+      "todo_people",
+      "todo_status",
+      "todo_suggestions",
+      "todo_views",
+    ]);
     expect(tools.every((t) => t.annotations?.readOnlyHint)).toBe(true);
   });
 });

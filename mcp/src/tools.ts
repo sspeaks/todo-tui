@@ -13,6 +13,7 @@ import {
   type Item,
   ItemField,
   type MessageInitShape,
+  type Person,
   PatchState,
   SuggestionKind,
   MAX_MATCHES_BYTES,
@@ -63,6 +64,7 @@ function describe(err: unknown): Error {
     const reason = errorReason(err);
     const field = err.findDetails(ErrorInfoSchema)[0]?.metadata.field;
     if (err.code === Code.Aborted) return new ToolError(`changed elsewhere since it was read; get it again and retry (${err.rawMessage})`);
+    if (reason === "JIRA_UNAVAILABLE") return new ToolError(`JIRA_UNAVAILABLE: Jira is not answering (offline?): ${err.rawMessage}`);
     if (err.code === Code.Unavailable) return new ToolError(`the todo daemon is not answering: ${err.rawMessage}`);
     if (reason === "LINKED_READ_ONLY") {
       return new ToolError(
@@ -104,7 +106,20 @@ const textOf = (text: string): FilterInit["anyOf"] =>
   }));
 
 export function registerTools(server: McpServer, clients: TodoClients, opts: ToolOptions = {}): void {
-  const { items, views, sync, suggestions } = clients;
+  const { items, views, sync, suggestions, people } = clients;
+
+  /**
+   * Everyone the daemon knows, by id, read afresh for each call that shows
+   * Items (a person's name may have changed); an older daemon has none.
+   */
+  async function known(): Promise<ReadonlyMap<string, Person>> {
+    try {
+      const res = await people.listPeople({ limit: 1000 });
+      return new Map(res.people.map((p) => [p.id, p]));
+    } catch {
+      return new Map();
+    }
+  }
 
   /** Runs `fn`, rewording daemon errors for a model. */
   async function run(fn: () => Promise<unknown>): Promise<Result> {
@@ -207,7 +222,8 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
           pageSize: limit ?? 100,
           ...(view !== undefined && { viewId: await viewId(view) }),
         });
-        return { items: res.items.map((i) => project(i)), more: res.nextPageToken !== "" };
+        const names = await known();
+        return { items: res.items.map((i) => project(i, { people: names })), more: res.nextPageToken !== "" };
       }),
   );
 
@@ -219,7 +235,7 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
       inputSchema: { id: ID },
       annotations: { readOnlyHint: true },
     },
-    ({ id }) => run(async () => project(await resolve(id), { detail: true })),
+    ({ id }) => run(async () => project(await resolve(id), { detail: true, people: await known() })),
   );
 
   server.registerTool(
@@ -338,6 +354,7 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
       run(async () => {
         const itemId = id === undefined ? undefined : (await resolve(id)).id;
         const res = await suggestions.listSuggestions(itemId === undefined ? {} : { itemId });
+        const names = await known();
         const byId = new Map<string, Item>();
         for (const s of res.suggestions) {
           if (!byId.has(s.itemId)) {
@@ -363,9 +380,42 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
             jira_said: s.error || undefined,
             changes: s.patches
               .filter((p) => p.state === PatchState.PENDING)
-              .map((p) => ({ field: ItemField[p.field]?.toLowerCase() ?? String(p.field), jira: valueOf(p.expectedOld), yours: valueOf(p.new) })),
+              .map((p) => ({
+                field: ItemField[p.field]?.toLowerCase() ?? String(p.field),
+                jira: valueOf(p.expectedOld, names),
+                yours: valueOf(p.new, names),
+              })),
           });
         });
+      }),
+  );
+
+  server.registerTool(
+    "todo_people",
+    {
+      title: "Find people",
+      description:
+        "The people sync knows from Jira (assignees, reporters, and anyone added), best match first, each with a person_id for " +
+        'todo_update\'s waiting_on ("person:<person_id>"). With jira: true, also asks Jira\'s user directory for people not known yet (online only); ' +
+        "those are listed but not added: waiting on one in the TUI adds them.",
+      inputSchema: {
+        query: z.string().optional().describe("A name, username or email; empty lists everyone"),
+        jira: z.boolean().optional().describe("Also search Jira's user directory"),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    ({ query, jira }) =>
+      run(async () => {
+        const res = await people.listPeople({ query: query ?? "", limit: 50 });
+        const out: Record<string, unknown> = {
+          people: res.people.map((p) => prune({ name: p.displayName, email: p.emails[0], username: p.username, person_id: p.id })),
+        };
+        if (jira) {
+          if (!query?.trim()) throw new ToolError("give a query to search Jira's directory");
+          const found = await people.searchDirectory({ query });
+          out.jira = found.users.map((u) => prune({ name: u.displayName, email: u.email, username: u.username }));
+        }
+        return out;
       }),
   );
 
@@ -390,7 +440,12 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
       run(async () => {
         const parentId = parent === undefined ? undefined : (await resolve(parent)).id;
         const res = await captureItem(items, text, { createdVia: CreatedVia.MCP, ...(parentId !== undefined && { parentId }) });
-        return { item: res.item && project(res.item), warnings: res.draft?.warnings.length ? res.draft.warnings : undefined };
+        return {
+          item: res.item && project(res.item, { people: await known() }),
+          warnings: res.draft?.warnings.length ? res.draft.warnings : undefined,
+          // Two or more people answer to the ~ text: it was kept as text.
+          waiting_matches: res.draft && res.draft.waitingMatches > 1 ? res.draft.waitingMatches : undefined,
+        };
       }),
   );
 
@@ -416,7 +471,11 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
         due: DATE.optional(),
         defer_until: DATE.optional().describe("Hide the item from views until this date"),
         labels: z.array(z.string()).optional().describe("The whole new label set (replaces the old one)"),
-        waiting_on: z.string().nullable().optional().describe("Who or what it waits on; null or empty to stop waiting"),
+        waiting_on: z
+          .string()
+          .nullable()
+          .optional()
+          .describe('Who or what it waits on: "person:<person_id>" from todo_people for a known person, else free text; null or empty to stop waiting'),
         waiting_reason: z.string().optional(),
         follow_up: DATE.optional().describe("When to chase the waiting-on"),
         private_notes: z.string().optional().describe("Markdown, local only"),
@@ -450,7 +509,12 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
           // on an item already waiting, change only the subfields given.
           const followUp = args.follow_up === undefined ? undefined : await date(args.follow_up);
           const sub: [string, string, unknown][] = [];
-          if (args.waiting_on !== undefined) sub.push(["waiting.on", "on", { ref: { case: "freeText", value: args.waiting_on } }]);
+          if (args.waiting_on !== undefined) {
+            // "person:<id>" names a Person (todo_people); anything else is free text.
+            const id = /^person:([0-9A-Za-z]{26})$/.exec(args.waiting_on.trim())?.[1];
+            const on = id ? { ref: { case: "personId", value: id.toUpperCase() } } : { ref: { case: "freeText", value: args.waiting_on } };
+            sub.push(["waiting.on", "on", on]);
+          }
           if (args.waiting_reason !== undefined) sub.push(["waiting.reason", "reason", args.waiting_reason]);
           if (args.follow_up !== undefined) sub.push(["waiting.follow_up_on", "followUpOn", followUp]);
           if (!item.waiting && args.waiting_on === undefined) throw new ToolError("the item is not waiting; give waiting_on to start");
@@ -462,7 +526,7 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
         }
         if (paths.length === 0) throw new ToolError("give at least one field to change");
         const res = await updateItem(items, patch as Parameters<typeof updateItem>[1], paths, args.confirm_not_mine ? { confirmNotMine: true } : {});
-        return res.item && project(res.item);
+        return res.item && project(res.item, { people: await known() });
       }),
   );
 
@@ -481,7 +545,7 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
       run(async () => {
         const item = await resolve(id);
         const res = await setStatus(items, item.id, STATUS_NAMES[status]!, confirm_not_mine ? { confirmNotMine: true } : {});
-        return { item: res.item && project(res.item), next: res.generated && project(res.generated) };
+        return { item: res.item && project(res.item, { people: await known() }), next: res.generated && project(res.generated, { people: await known() }) };
       }),
   );
 
@@ -500,12 +564,12 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
         const confirm = confirm_not_mine ? { confirmNotMine: true } : {};
         if (rule.trim() === "") {
           const res = await setRecurrence(items, item.id, undefined, confirm);
-          return res.item && project(res.item);
+          return res.item && project(res.item, { people: await known() });
         }
         const parsed = await parseRecurrence(items, rule, item.dueDate ? { anchor: item.dueDate } : {});
         if (!parsed.rule) throw new ToolError(`${rule}: ${parsed.warning || "not a repeat rule"}`);
         const res = await setRecurrence(items, item.id, parsed.rule, confirm);
-        return res.item && project(res.item);
+        return res.item && project(res.item, { people: await known() });
       }),
   );
 
@@ -522,7 +586,7 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
       ({ id }) =>
         run(async () => {
           const res = await call((await resolve(id)).id);
-          return res.item && project(res.item);
+          return res.item && project(res.item, { people: await known() });
         }),
     );
 
@@ -555,7 +619,7 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
       run(async () => {
         const item = await resolve(args.id);
         const res = await sync.promote({ itemId: item.id, project: args.project ?? "", issueType: args.issue_type ?? "" });
-        return { ...(res.item && project(res.item)), ...(res.suggestionId && { jira_changed: "Jira changed what it was created with; it waits in todo_suggestions" }) };
+        return { ...(res.item && project(res.item, { people: await known() })), ...(res.suggestionId && { jira_changed: "Jira changed what it was created with; it waits in todo_suggestions" }) };
       }),
   );
 
@@ -573,7 +637,7 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
       run(async () => {
         const item = await resolve(args.id);
         const res = await sync.attach({ itemId: item.id, key: args.key });
-        return { ...(res.item && project(res.item)), ...(res.suggestionId && { replaced: "Jira's values replaced some of the todo's; see todo_suggestions" }) };
+        return { ...(res.item && project(res.item, { people: await known() })), ...(res.suggestionId && { replaced: "Jira's values replaced some of the todo's; see todo_suggestions" }) };
       }),
   );
 
@@ -586,9 +650,10 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
     () =>
       run(async () => {
         const res = await undo(items);
+        const names = await known();
         return {
           undid: res.entry?.description ?? "nothing to undo",
-          items: res.items.map((i) => project(i)),
+          items: res.items.map((i) => project(i, { people: names })),
           skipped: res.skipped.length ? res.skipped.map((s) => s.message) : undefined,
         };
       }),
@@ -600,9 +665,10 @@ export function registerTools(server: McpServer, clients: TodoClients, opts: Too
     () =>
       run(async () => {
         const res = await redo(items);
+        const names = await known();
         return {
           redid: res.entry?.description ?? "nothing to redo",
-          items: res.items.map((i) => project(i)),
+          items: res.items.map((i) => project(i, { people: names })),
           skipped: res.skipped.length ? res.skipped.map((s) => s.message) : undefined,
         };
       }),

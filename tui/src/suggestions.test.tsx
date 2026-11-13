@@ -398,6 +398,30 @@ describe("space r: Claude refines (ADR-0010)", () => {
     expect(frame).not.toContain("(Jira)");
   });
 
+  it("names the person a waiting patch proposes, not their id", async () => {
+    const fd = fakeDaemon([item("ping dana")]);
+    fd.daemon.setConfig(assistant);
+    const dana = fd.daemon.putPerson({ displayName: "Dana Example", emails: ["dana@example.com"] });
+    fd.daemon.putSuggestion({
+      itemId: [...fd.daemon.items.values()][0]!.id,
+      kind: SuggestionKind.REFINE,
+      source: SuggestionSource.CLAUDE,
+      rationale: "Dana is who it waits on.",
+      patches: [
+        {
+          field: ItemField.WAITING,
+          expectedOld: { kind: { case: "cleared", value: {} } },
+          new: { kind: { case: "waiting", value: { on: { ref: { case: "personId", value: dana.id } }, since: { year: 2026, month: 11, day: 13 } } } },
+        },
+      ],
+    });
+    const t = renderTui({ daemon: fd, columns: 80, rows: 20 });
+    await t.live();
+    await t.press("S");
+    await t.waitFrame((f) => expect(f).toMatch(/\[x\] waiting +— \(now\) → ⧗Dana Example \(Claude\)/));
+    expect(t.frame()).not.toContain(dana.id);
+  });
+
   it("says when Claude fails or is off, and space r is no key while it is off", async () => {
     const fd = fakeDaemon([item("x")]);
     fd.daemon.setConfig(assistant);

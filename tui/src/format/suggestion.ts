@@ -15,7 +15,7 @@ import {
   SuggestionSource,
 } from "@todo-tui/client";
 import { dayOf, shortDay } from "./dates.js";
-import { priorityName } from "./item.js";
+import { type People, personName, priorityName } from "./item.js";
 import { singleLine, truncate } from "./text.js";
 
 /** A status patch: the category, or the resolution kind; the two read and apply as one. */
@@ -48,13 +48,16 @@ export function fieldWord(field: ItemField): string {
     case ItemField.STATUS_CATEGORY:
     case ItemField.RESOLUTION_KIND:
       return "status";
+    case ItemField.WAITING:
+    case ItemField.WAITING_ON:
+      return "waiting";
     default:
       return "field";
   }
 }
 
-/** A patch value as text: "+2 high", "#a #b", "Fri Nov 13", "—" for none. */
-export function valueText(v: FieldValue | undefined, today: number): string {
+/** A patch value as text: "+2 high", "#a #b", "Fri Nov 13", "⧗Dana Example", "—" for none. */
+export function valueText(v: FieldValue | undefined, today: number, people?: People): string {
   const k = v?.kind;
   switch (k?.case) {
     case undefined:
@@ -68,6 +71,10 @@ export function valueText(v: FieldValue | undefined, today: number): string {
       return k.value.values.length ? k.value.values.map((l) => `#${singleLine(l)}`).join(" ") : "—";
     case "dateValue":
       return shortDay(dayOf(k.value), today);
+    case "person":
+      return personName(k.value, people) || "—";
+    case "waiting":
+      return `⧗${personName(k.value.on, people)}${k.value.followUpOn ? ` · follow up ${shortDay(dayOf(k.value.followUpOn), today)}` : ""}`;
     default:
       return "?";
   }
@@ -82,7 +89,13 @@ function statusWord(category: FieldValue | undefined, kind: FieldValue | undefin
 }
 
 /** A change's text: "title  theirs (Jira) → mine (yours)". */
-export function patchText(s: Suggestion, ids: readonly string[], item: Item | undefined, today: number): { field: string; from: string; to: string } {
+export function patchText(
+  s: Suggestion,
+  ids: readonly string[],
+  item: Item | undefined,
+  today: number,
+  people?: People,
+): { field: string; from: string; to: string } {
   const patches = s.patches.filter((p) => ids.includes(p.id));
   const [first] = patches;
   if (!first) return { field: "?", from: "?", to: "?" };
@@ -95,7 +108,7 @@ export function patchText(s: Suggestion, ids: readonly string[], item: Item | un
     const catNew = cat?.new ?? (kind ? done : undefined);
     return { field: "status", from: statusWord(catOld, kind?.expectedOld, item), to: statusWord(catNew, kind?.new, item) };
   }
-  return { field: fieldWord(first.field), from: valueText(first.expectedOld, today), to: valueText(first.new, today) };
+  return { field: fieldWord(first.field), from: valueText(first.expectedOld, today, people), to: valueText(first.new, today, people) };
 }
 
 /**

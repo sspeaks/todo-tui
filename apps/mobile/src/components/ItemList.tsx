@@ -3,7 +3,8 @@
 // a tap stays a beat, checked, before it goes; a row that comes or goes
 // (one completed, deleted or added) fades in or out and the rows close up.
 import { type Item, ItemSchema, Status, type ViewQuery, clone } from "@todo-tui/client/portable";
-import { useLiveStore, useView } from "@todo-tui/client/react";
+import { useLiveStore, usePeople, useView } from "@todo-tui/client/react";
+import type { People } from "@todo-tui/present";
 import { type ReactElement, memo, useCallback, useMemo, useState } from "react";
 import { ActivityIndicator, FlatList, LayoutAnimation, RefreshControl, StyleSheet, View } from "react-native";
 import { describeError } from "../errors";
@@ -34,6 +35,7 @@ export function ItemList({
   const store = useLiveStore();
   const view = useView(query);
   const actions = useItemActions(today);
+  const people = usePeople().people;
   const [refreshing, setRefreshing] = useState(false);
   const [kept, setKept] = useState<ReadonlyMap<string, Kept>>(NONE_KEPT);
   const rows = useMemo(() => withKept(view.items, kept), [view.items, kept]);
@@ -76,13 +78,15 @@ export function ItemList({
         <ActivityIndicator color={t.accent} />
       </View>
     );
-  const row = ({ item }: { item: Item }) => <SwipeItem item={item} today={today} actions={actions} onToggle={toggle} />;
+  const row = ({ item }: { item: Item }) => <SwipeItem item={item} today={today} people={people} actions={actions} onToggle={toggle} />;
   return (
     <FlatList
       style={s.page}
       data={rows}
       keyExtractor={(i) => i.id}
       renderItem={row}
+      // People that arrive after the rows name them (design 3.5).
+      extraData={people}
       ItemSeparatorComponent={Separator}
       {...(header && { ListHeaderComponent: header })}
       refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={t.dim} />}
@@ -109,11 +113,13 @@ const REOPEN = { label: "Reopen", icon: "refresh" } as const;
 const SwipeItem = memo(function SwipeItem({
   item,
   today,
+  people,
   actions,
   onToggle,
 }: {
   item: Item;
   today: number;
+  people: People;
   actions: ItemActions;
   onToggle: (item: Item) => Promise<boolean>;
 }) {
@@ -121,7 +127,7 @@ const SwipeItem = memo(function SwipeItem({
   const onLeft = useCallback(() => actions.remove(item), [actions, item]);
   return (
     <SwipeRow right={isClosed(item.status) ? REOPEN : DONE} left={DELETE} onRight={onRight} onLeft={onLeft} settled={`${item.status}:${item.revision}`}>
-      <ItemRow item={item} today={today} onToggle={onToggle} onOpen={actions.open} />
+      <ItemRow item={item} today={today} people={people} onToggle={onToggle} onOpen={actions.open} />
     </SwipeRow>
   );
 });

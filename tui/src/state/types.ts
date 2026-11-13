@@ -28,6 +28,17 @@ export interface PromptPreview {
   readonly warn: boolean;
 }
 
+/** One name `w` can complete to, and what enter saves for it. */
+export interface WaitingChoice {
+  readonly name: string;
+  /** A known Person's id. */
+  readonly personId?: string;
+  /** A directory user's, not yet a Person: enter adds them first. */
+  readonly directory?: { readonly instanceId: string; readonly accountId: string; readonly email: string };
+  /** The address shown in the hint. */
+  readonly email?: string;
+}
+
 /** What a :view prompt's text parses to, shown under it. */
 export interface QueryPreview {
   readonly for: string;
@@ -70,8 +81,12 @@ export type Mode =
       readonly error?: string;
       /** The field's value on the server after a conflict, which the next enter overwrites. */
       readonly conflict?: string;
-      /** `w`: the people already waited on, for tab. */
-      readonly people?: readonly string[];
+      /**
+       * `w`: who tab completes from: the People the daemon knows, then the
+       * free text already waited on, then (after a tab found no one here)
+       * Jira's directory (design 3.5).
+       */
+      readonly people?: readonly WaitingChoice[];
     }
   | { readonly kind: "picker"; readonly picker: "status"; readonly target: Target; readonly index: number }
   /** `dd`: y confirms, any other key cancels and is swallowed. */

@@ -18,6 +18,7 @@ import {
 function errorField(err: unknown): string | undefined {
   return err instanceof ConnectError ? err.findDetails(ErrorInfoSchema)[0]?.metadata.field : undefined;
 }
+import { type People, personName } from "../format/item.js";
 import { singleLine, truncate } from "../format/text.js";
 
 /** An action gave up waiting for the daemon after a connection failure. */
@@ -70,11 +71,16 @@ function fieldWords(path: string): string {
  * it in Jira? y/N"; with `others` (a batch) how many of the Items are not
  * the person's.
  */
-export function notMineText(item: Pick<Item, "title" | "remoteLink" | "assignee"> | undefined, others?: number): string {
+export function notMineText(
+  item: Pick<Item, "title" | "remoteLink" | "assignee"> | undefined,
+  others?: number,
+  people?: People,
+): string {
   if (others !== undefined && others > 1) return `${others} of these Jira issues are assigned to someone else: change them in Jira? y/N`;
   const key = item?.remoteLink?.key ? singleLine(item.remoteLink.key) : "This issue";
   // An Item the store lacks is someone else's, as the daemon said: never "no one".
-  const who = item?.assignee?.ref.case === "freeText" ? singleLine(item.assignee.ref.value) : item && !item.assignee ? "no one" : "someone else";
+  const named = item?.assignee ? personName(item.assignee, people) : "";
+  const who = named && named !== "someone" ? named : item && !item.assignee ? "no one" : "someone else";
   return `${key} is assigned to ${who}: change it in Jira? y/N`;
 }
 

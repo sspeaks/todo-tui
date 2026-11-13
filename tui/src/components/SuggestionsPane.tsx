@@ -1,4 +1,4 @@
-import { useItem, useSuggestions } from "@todo-tui/client";
+import { useItem, usePeople, useSuggestions } from "@todo-tui/client";
 import { Box, Text } from "ink";
 import { type PaneRow, cursorIndex, paneRows } from "../controller/suggestions.js";
 import { closedWord, fromClaude, headingText, patchText } from "../format/suggestion.js";
@@ -21,6 +21,7 @@ export function paneMode(mode: Mode): Extract<Mode, { kind: "suggestions" }> | u
 function Row({ row, selected, ticked, today, width }: { row: PaneRow; selected: boolean; ticked: boolean; today: number; width: number }) {
   // An Item no loaded view holds is read once: the heading names it.
   const item = useItem(row.suggestion.itemId, { fetch: true });
+  const people = usePeople().people;
   const mark = selected ? "› " : "  ";
   if (row.kind === "heading") {
     return (
@@ -29,7 +30,7 @@ function Row({ row, selected, ticked, today, width }: { row: PaneRow; selected: 
       </Text>
     );
   }
-  const { field, from, to } = patchText(row.suggestion, row.ids, item, today);
+  const { field, from, to } = patchText(row.suggestion, row.ids, item, today, people);
   const closed = row.closed ? closedWord(row.suggestion.patches.find((p) => row.ids.includes(p.id))!) : undefined;
   const label = field.padEnd(9);
   // Whose each side is: Jira's and yours for sync, the Item's and Claude's for a refine.

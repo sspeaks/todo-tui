@@ -21,8 +21,9 @@ export function previewTags(draft: CaptureDraft, today: number): { icon: Icon; t
     tags.push({ icon: "repeat", text: `${describeRule(draft.recurrence)}${from}` });
   }
   for (const l of draft.labels) tags.push({ icon: "pricetag-outline", text: singleLine(l) });
-  const waiting = personName(draft.waitingOn);
-  if (waiting) tags.push({ icon: "hourglass-outline", text: waiting });
+  // The person `~` named, by name (design 2.3); free text as typed.
+  const waiting = draft.waitingPerson ? singleLine(draft.waitingPerson.displayName) : personName(draft.waitingOn);
+  if (waiting) tags.push({ icon: "hourglass-outline", text: draft.waitingMatches > 1 ? `${waiting} (${draft.waitingMatches} match)` : waiting });
   if (draft.status === Status.NEXT) tags.push({ icon: "arrow-forward-circle-outline", text: "Next" });
   if (draft.status === Status.SOMEDAY) tags.push({ icon: "moon-outline", text: "Someday" });
   return tags;

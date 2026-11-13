@@ -60,6 +60,24 @@ describe("the quick-add preview", () => {
     );
   });
 
+  it("names the one person `~` matched, and keeps text that several people match", () => {
+    const today = dayNumber(2026, 10, 26);
+    const one = create(CaptureDraftSchema, {
+      title: "ping",
+      status: Status.INBOX,
+      waitingOn: { ref: { case: "personId", value: "01JB8X4Z5Q6R7S8T9V0W1X2Y3Z" } },
+      waitingPerson: { id: "01JB8X4Z5Q6R7S8T9V0W1X2Y3Z", displayName: "Dana Example" },
+    });
+    expect(captureSummary(one, today)).toBe("→ ping · ⧗Dana Example");
+    const many = create(CaptureDraftSchema, {
+      title: "ping",
+      status: Status.INBOX,
+      waitingOn: { ref: { case: "freeText", value: "alex" } },
+      waitingMatches: 2,
+    });
+    expect(captureSummary(many, today)).toBe("→ ping · ⧗alex (2 people match: kept as text)");
+  });
+
   it("sums up a repeat rule and the due date it gives: `^Mon Nov 2 · repeats every Mon, Thu`", () => {
     const today = dayNumber(2026, 10, 26);
     const weekly = { kind: { case: "weekly" as const, value: { days: [Weekday.MONDAY, Weekday.THURSDAY] } } };

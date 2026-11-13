@@ -350,7 +350,7 @@ describe("w and W", () => {
     ]);
     const t = await setup(fd, { now: clock });
     await t.c.press("w");
-    expect((await prompt(t)).people).toEqual(["Dana Scully", "dave"]);
+    expect((await prompt(t)).people?.map((p) => p.name)).toEqual(["Dana Scully", "dave"]);
     // "da" is all they share: tab does nothing; "dan" is one person.
     await t.c.press("da<tab>");
     expect((await prompt(t)).line.text).toBe("da");
@@ -382,6 +382,54 @@ describe("w and W", () => {
     expect((await prompt(t)).preview?.text).toBe("enter clears waiting");
     await t.c.press("<enter>");
     expect(t.byTitle("X")?.waiting).toBeUndefined();
+  });
+
+  it("completes and saves a known Person by id, and the preview names them with their address", async () => {
+    const fd = dated([item("X")]);
+    const dana = fd.daemon.putPerson({ displayName: "Dana Example", username: "dana", emails: ["dana@example.com"] });
+    const t = await setup(fd, { now: clock });
+    await vi.waitFor(() => expect(t.store.people.get(dana.id)).toBeDefined());
+    await t.c.press("w");
+    expect((await prompt(t)).people?.map((p) => [p.name, p.personId])).toEqual([["Dana Example", dana.id]]);
+    await t.c.press("Da<tab>");
+    expect((await prompt(t)).line.text).toBe("Dana Example ");
+    expect((await prompt(t)).preview?.text).toBe("→ ⧗Dana Example <dana@example.com>");
+    await t.c.press("<enter>");
+    expect(t.byTitle("X")?.waiting?.on?.ref).toEqual({ case: "personId", value: dana.id });
+    // Prefilled with her name; the same name keeps her and changes only the follow-up.
+    await t.c.press("w");
+    expect((await prompt(t)).line.text).toBe("Dana Example");
+    await t.c.press(" ^fri<enter>");
+    expect(t.byTitle("X")?.waiting).toMatchObject({ on: { ref: { case: "personId", value: dana.id } }, since: date(26), followUpOn: date(30) });
+    // A name one person answers to links them too.
+    await t.c.press("w<ctrl+u>dana<enter>");
+    expect(t.byTitle("X")?.waiting?.on?.ref).toEqual({ case: "personId", value: dana.id });
+  });
+
+  it("tab with no one here asks Jira's directory, and enter adds the person found", async () => {
+    const fd = dated([item("X")]);
+    fd.daemon.putDirectoryUser({ accountId: "JIRAUSER3", displayName: "Jordan Lee", username: "jlee", email: "jordan.lee@example.com" });
+    const t = await setup(fd, { now: clock });
+    await t.c.press("w");
+    await prompt(t);
+    await t.c.press("jor<tab>");
+    await vi.waitFor(() => expect(t.mode()).toMatchObject({ line: { text: "Jordan Lee " } }));
+    expect((await prompt(t)).preview?.text).toBe("→ ⧗Jordan Lee <jordan.lee@example.com> (new, from Jira)");
+    await t.c.press("<enter>");
+    await vi.waitFor(() => expect(t.byTitle("X")?.waiting).toBeDefined());
+    const jordan = [...fd.daemon.people.values()].find((p) => p.username === "jlee");
+    expect(jordan?.emails).toEqual(["jordan.lee@example.com"]);
+    expect(t.byTitle("X")?.waiting?.on?.ref).toEqual({ case: "personId", value: jordan?.id });
+  });
+
+  it("tab with no one here and Jira away keeps free text and says why", async () => {
+    const t = await setup(dated([item("X")]), { now: clock });
+    await t.c.press("w");
+    await prompt(t);
+    await t.c.press("the vendor<tab>");
+    await vi.waitFor(() => expect(t.mode()).toMatchObject({ error: "No one here by that name, and Jira's directory could not be asked" }));
+    await t.c.press("<enter>");
+    expect(t.byTitle("X")?.waiting?.on?.ref).toEqual({ case: "freeText", value: "the vendor" });
   });
 
   it("refuses a follow-up without a person, and keeps the prompt on a date that is not one", async () => {

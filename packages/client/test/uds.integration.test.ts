@@ -20,6 +20,7 @@ import { ulid } from "../src/ulid.js";
 import { CAPTURE_ZONE, captureConformance } from "./conformance/capture.js";
 import { energyConformance } from "./conformance/energy.js";
 import { meetingConformance } from "./conformance/meeting.js";
+import { peopleConformance, seedExport } from "./conformance/people.js";
 import { configConformance } from "./conformance/config.js";
 import { queryConformance } from "./conformance/query.js";
 import { viewEditsConformance } from "./conformance/view-edits.js";
@@ -303,6 +304,22 @@ describe.skipIf(!TODO_BIN)("meeting links against $TODO_BIN", { timeout: 60_000 
     const h = await home();
     const conn = await h.open();
     return { items: conn.items };
+  });
+});
+
+describe.skipIf(!TODO_BIN)("people against $TODO_BIN", { timeout: 60_000 }, () => {
+  // The suite FakeDaemon runs too, each test on a fresh daemon, which is
+  // given the People by `todo import` (an empty home takes one).
+  peopleConformance(async () => {
+    const h = await home();
+    const file = join(h.dir, "people.jsonl");
+    // The schema version the daemon's own export would write.
+    const { stdout } = await run(TODO_BIN!, ["export"], { env: h.env });
+    const schema = (JSON.parse(stdout.split("\n")[0]!) as { schemaVersion: number }).schemaVersion;
+    writeFileSync(file, seedExport(schema));
+    await run(TODO_BIN!, ["import", file], { env: h.env });
+    const conn = await h.open();
+    return { items: conn.items, people: conn.people };
   });
 });
 

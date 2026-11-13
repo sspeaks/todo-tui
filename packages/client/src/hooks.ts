@@ -7,6 +7,7 @@ import type {
   CountsSnapshot,
   LiveConfigSnapshot,
   LiveStore,
+  PeopleSnapshot,
   SavedViewsSnapshot,
   SuggestionsSnapshot,
   UndoSnapshot,
@@ -115,4 +116,10 @@ export function useUndoState(): UndoSnapshot {
 export function useSuggestions(): SuggestionsSnapshot {
   const store = useLiveStore();
   return useSyncExternalStore(store.suggestions.subscribe, store.suggestions.getSnapshot);
+}
+
+/** The People the daemon knows (design 3.5), by id, kept live from TOPIC_PERSON changes. */
+export function usePeople(): PeopleSnapshot {
+  const store = useLiveStore();
+  return useSyncExternalStore(store.people.subscribe, store.people.getSnapshot);
 }

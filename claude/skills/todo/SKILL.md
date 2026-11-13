@@ -26,7 +26,7 @@ Capture text carries fields as inline tokens, so one call does the whole job. Pr
 | `+1` … `+5` | Priority, 1 = highest. Map "urgent/high" → `+1`/`+2`, "low" → `+4` |
 | `^<date>` | Due: `today` `tom` `fri` `+3d` `+2w` `eow` `eom` `nov2` `2026-11-02` |
 | `#label` | Label, repeatable |
-| `~person` / `~"two words"` | Waiting on someone |
+| `~person` / `~"two words"` | Waiting on someone: links the one known person the name means, else free text |
 | `>next` / `>someday` | Status instead of the default inbox |
 | `@rule` | Repeat: `@daily` `@weekdays` `@mon,thu` `@weekly` `@monthly` `@15th` `@3d` `@2w` |
 | `\` | Escapes a sigil that belongs in the title (`fix \#1 fan`) |
@@ -56,7 +56,7 @@ Every tool returns `short_id` (8 characters, the same id `todo add` prints) and 
 
 - **Complete**: `todo_set_status` `done` (or `cancelled` for "never mind"). For a repeating item the result's `next` is the next instance — tell the user its due date.
 - **Triage the inbox**: list Inbox and decide each item's status (`next`, `someday`, `done`, `cancelled`), plus labels, priority or due date where they're obvious. Show the plan as a short table and apply it after the user agrees, unless they already told you the rules ("cluster stuff to next with #brgs, everything else someday" is enough to just do it).
-- **Waiting on someone**: `todo_update` with `waiting_on` (and `follow_up` for when to chase), or capture with `~person`. Stop waiting with `waiting_on: null`.
+- **Waiting on someone**: `todo_update` with `waiting_on` (and `follow_up` for when to chase), or capture with `~person`. Stop waiting with `waiting_on: null`. A coworker is a Person (from Jira), so their name and address reach a meeting link: find them with `todo_people` and pass `waiting_on: "person:<person_id>"`. `~dana` links on its own when one person answers to it; when two do, `todo_capture` says `waiting_matches` and keeps the text, so ask Seth which one he meant. `todo_people` with `jira: true` searches Jira's directory for someone not known yet; it does not add them (picking them in the TUI's `w` does). Free text (`~"the vendor"`) is fine for anyone who is not a person in Jira.
 - **Not now**: `defer_until` hides it until a date; status `someday` parks it indefinitely.
 - **Repeat**: `todo_set_repeat`, or `@rule` at capture. For what completing, skipping and deleting do to a series, read `references/recurrence.md`.
 - **Review**: list Today and Next, call out overdue items and stale waiting items, and suggest — don't apply — changes.

@@ -9,6 +9,8 @@ import type { FilterSchema, SortKeySchema } from "./gen/todo/v1/filter_pb.js";
 import type { Item } from "./gen/todo/v1/item_pb.js";
 import { ItemService, type ListItemsRequest, ListItemsRequestSchema, type StatusCounts } from "./gen/todo/v1/item_service_pb.js";
 import type { OpSummary } from "./gen/todo/v1/op_pb.js";
+import { PeopleService } from "./gen/todo/v1/people_service_pb.js";
+import type { Person } from "./gen/todo/v1/person_pb.js";
 import { type Suggestion, SuggestionState } from "./gen/todo/v1/suggestion_pb.js";
 import { AssistantService } from "./gen/todo/v1/assistant_service_pb.js";
 import { SuggestionService } from "./gen/todo/v1/suggestion_service_pb.js";
@@ -87,6 +89,16 @@ export interface CountsSnapshot {
 export interface SuggestionsSnapshot {
   readonly status: "loading" | "ready" | "error";
   readonly suggestions: readonly Suggestion[];
+  readonly error?: unknown;
+}
+
+/**
+ * The People the daemon knows (design 3.5), by id: ListPeople, then
+ * TOPIC_PERSON changes. Always loaded, as rows show their names.
+ */
+export interface PeopleSnapshot {
+  readonly status: "loading" | "ready" | "error";
+  readonly people: ReadonlyMap<string, Person>;
   readonly error?: unknown;
 }
 
@@ -210,6 +222,8 @@ export class LiveStore {
   readonly suggestionsClient: Client<typeof SuggestionService>;
   /** Claude, on request (ADR-0010): Refine and its jobs. */
   readonly assistantClient: Client<typeof AssistantService>;
+  /** People (design 3.5): the directory search and AddPerson, beside the store's own reads. */
+  readonly peopleClient: Client<typeof PeopleService>;
   private revision: bigint | undefined;
   /** Set while a ResyncRequired reload has not completed; retried on CaughtUp. */
   private pendingResync = false;
@@ -225,6 +239,8 @@ export class LiveStore {
   readonly undoState: LiveUndoState;
   /** The Suggestions that wait, kept live while observed (useSuggestions). */
   readonly suggestions: LiveSuggestions;
+  /** The People the daemon knows, always loaded (usePeople). */
+  readonly people: LivePeople;
 
   constructor(private readonly opts: LiveStoreOptions) {
     this.itemsClient = createClient(ItemService, opts.transport);
@@ -233,12 +249,14 @@ export class LiveStore {
     this.watchClient = createClient(WatchService, opts.transport);
     this.suggestionsClient = createClient(SuggestionService, opts.transport);
     this.assistantClient = createClient(AssistantService, opts.transport);
+    this.peopleClient = createClient(PeopleService, opts.transport);
     this.debounceMs = opts.debounceMs ?? 150;
     this.pageSize = opts.pageSize ?? MAX_PAGE_SIZE;
     this.viewGraceMs = opts.viewGraceMs ?? 5_000;
     this.liveCounts = new LiveCounts(this);
     this.undoState = new LiveUndoState(this);
     this.suggestions = new LiveSuggestions(this);
+    this.people = new LivePeople(this);
     if (opts.cache) this.restore(opts.cache);
   }
 
@@ -479,6 +497,11 @@ export class LiveStore {
     return this.suggestionsClient.listSuggestions({}, this.callOptions());
   }
 
+  /** @internal Everyone: ListPeople's most. */
+  fetchPeople() {
+    return this.peopleClient.listPeople({ limit: 1000 }, this.callOptions());
+  }
+
   private callOptions() {
     return this.abort ? { signal: this.abort.signal } : {};
   }
@@ -690,6 +713,7 @@ export class LiveStore {
               if (this.liveCounts.wanted && this.liveCounts.needsLoad) void this.liveCounts.load();
               if (this.undoState.wanted && this.undoState.needsLoad) void this.undoState.load();
               if (this.suggestions.wanted && this.suggestions.needsLoad) void this.suggestions.load();
+              if (this.people.needsLoad) void this.people.load();
             }
             break;
           case "resyncRequired":
@@ -700,6 +724,7 @@ export class LiveStore {
             this.seen.clear();
             this.seenViews.clear();
             this.suggestions.forgetSeen();
+            this.people.forgetSeen();
             this.configSnap = { ...this.configSnap, revision: 0n };
             this.pendingResync = true;
             break;
@@ -745,6 +770,11 @@ export class LiveStore {
     if (change.topic === Topic.SUGGESTION) {
       this.conn = { ...this.conn, revision: this.revision };
       this.suggestions.apply(change);
+      return;
+    }
+    if (change.topic === Topic.PERSON) {
+      this.conn = { ...this.conn, revision: this.revision };
+      this.people.apply(change);
       return;
     }
     if (change.topic !== Topic.ITEM) {
@@ -804,6 +834,9 @@ export class LiveStore {
     this.undoState.invalidate();
     if (this.suggestions.wanted) loads.push(this.suggestions.load(true));
     else this.suggestions.invalidate();
+    // Names only: a daemon without People (UNIMPLEMENTED) or a failed read
+    // leaves ids unnamed and holds up nothing.
+    void this.people.load();
     return loads;
   }
 
@@ -1354,6 +1387,78 @@ export class LiveSuggestions {
   };
 
   getSnapshot = (): SuggestionsSnapshot => this.snap;
+}
+
+/**
+ * ListPeople kept live by its LiveStore: loaded with every baseline, then
+ * each TOPIC_PERSON change replaces its Person. Unlike the Suggestions it
+ * loads unobserved, since any row may name a person. A daemon before
+ * People answers UNIMPLEMENTED: the snapshot is an error, and names stay
+ * unresolved.
+ */
+export class LivePeople {
+  private readonly byId = new Map<string, Person>();
+  private readonly seen = new Map<string, bigint>();
+  private snap: PeopleSnapshot = { status: "loading", people: new Map() };
+  private loaded = false;
+  private seq = 0;
+
+  constructor(private readonly store: LiveStore) {}
+
+  /** @internal */
+  get needsLoad(): boolean {
+    return !this.loaded || this.snap.status === "error";
+  }
+
+  /** @internal Runs ListPeople; out-of-order answers are discarded. */
+  async load(): Promise<void> {
+    const seq = ++this.seq;
+    try {
+      const res = await this.store.fetchPeople();
+      if (seq !== this.seq) return;
+      for (const p of res.people) {
+        if ((this.seen.get(p.id) ?? 0n) <= res.revision) {
+          this.byId.set(p.id, p);
+          this.seen.set(p.id, res.revision);
+        }
+      }
+      this.loaded = true;
+      this.publish("ready");
+    } catch (err) {
+      if (seq === this.seq && !this.loaded) {
+        this.snap = { ...this.snap, status: "error", error: err };
+        this.store.bump();
+      }
+    }
+  }
+
+  /** @internal A TOPIC_PERSON change. People are never removed. */
+  apply(change: Change): void {
+    if ((this.seen.get(change.id) ?? 0n) > change.revision) return;
+    this.seen.set(change.id, change.revision);
+    if (change.resource.case === "person") this.byId.set(change.id, change.resource.value);
+    else if (change.deleted) this.byId.delete(change.id);
+    this.publish(this.loaded ? "ready" : this.snap.status);
+  }
+
+  /** @internal After ResyncRequired. */
+  forgetSeen(): void {
+    this.seen.clear();
+  }
+
+  /** A person by id, once known. */
+  get(id: string): Person | undefined {
+    return this.byId.get(id) ?? this.byId.get(id.toUpperCase());
+  }
+
+  private publish(status: PeopleSnapshot["status"]): void {
+    this.snap = { status, people: new Map(this.byId) };
+    this.store.bump();
+  }
+
+  subscribe = (listener: () => void): (() => void) => this.store.subscribe(listener);
+
+  getSnapshot = (): PeopleSnapshot => this.snap;
 }
 
 /** Whether ListItems failed because its view_id names no saved view. */
